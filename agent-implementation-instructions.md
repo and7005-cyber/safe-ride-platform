@@ -41,23 +41,39 @@ SafeRide is a school bus management platform (Nairobi private schools) with thre
 
 ## What still needs doing
 
-### High priority
-1. **Repoint local development at `safe-ride-platform`.** Clone it fresh (`git clone git@github.com:and7005-cyber/safe-ride-platform.git`), copy untracked env files (`backend/.env`, `frontend/.env.local` if present in the old tree), confirm `scripts/start-local.sh --reset` boots and all test suites pass from the clone. Do new work there, not in the monorepo.
-2. **Prune the legacy unauthenticated admin router.** `backend/app/api/` still mounts the original migration-era `/api/admin/*` endpoints that accept `school_id` from the client with **no auth**. The new live-model routers enforce roles; the legacy ones must be deleted or put behind admin auth before any non-local deployment. (Legacy frontend pages using them were already removed.)
-3. **Rate-limit the credential endpoints.** `auth/login`, `auth/pin-login` (4-digit PIN space is tiny), and the legacy driver PIN login have no brute-force protection. Add per-IP + per-account throttling; make it reverse-proxy aware (X-Forwarded-For) for production.
-4. **Rotate the seeded credentials / gate the seed** so demo logins never reach production.
+> **Update (June 2026):** the former high-priority list is done and pushed to
+> `safe-ride-platform` `main`: local dev repointed at the clean clone; the
+> legacy unauthenticated routers were deleted outright; all credential
+> endpoints are rate-limited per IP + per account (reverse-proxy aware via
+> `TRUST_PROXY_HEADERS`); demo seeds are double-gated (APP_ENV=local check in
+> the scripts + a SQL session-flag guard in each seed file). Push delivery is
+> implemented end-to-end: typed parent notifications (run-started,
+> student-boarded, bus-approaching, reached-school, on-way-home, dropped-off,
+> incident) stored in `live_notifications` and delivered via Firebase Cloud
+> Messaging and/or VAPID web push when configured (see
+> `docs/push-notifications.md`); the app is installable as a PWA. Test
+> certification: `scripts/certify.sh` runs backend unit (51), live-stack API
+> integration (19), tsc, vitest (14), build, and Playwright e2e (41) and
+> reseeds. A 54-agent adversarial review of the change set was run and all 24
+> confirmed findings were fixed.
 
-### Medium priority
-5. **Real web-push delivery.** The parent profile has subscribe/unsubscribe UI and the backend stores subscriptions (`push` router), but nothing sends actual notifications — no VAPID keys, no service-worker push handler, no send-on-incident hook. Wire `pywebpush` (or similar) + a service worker, triggered on incident creation and arrival events.
-6. **Parent ETA is a mock.** `ParentHomePage` shows a deterministic fake "~N min" (matching the live app's own mock, see `mockEta`). Replace with a real computation from bus GPS (`live_buses.current_lat/lng`) vs. the child's stop once that matters.
-7. **Driver GPS → Fleet Map live updates.** Driver browser geolocation posts to the backend during a run; verify the admin Fleet Map polls/refreshes frequently enough and renders movement smoothly with multiple concurrent buses.
-8. **CI.** The new repo has no CI. Add a GitHub Actions workflow: backend pytest (with a Postgres service), frontend vitest + tsc + build, optionally Playwright against the composed stack.
-
-### Nice to have
-9. Production deployment story (Dockerfile for the frontend, reverse proxy, env-based config, real domain).
-10. SMS notifications via Africa's Talking (env vars exist; delivery is simulated locally).
-11. Admin attendance / absence marking parity check — the old monorepo had a daily-attendance flow; confirm the live platform's equivalent (if any) is covered or intentionally dropped.
-12. Accessibility & mobile QA pass on real devices (the driver/parent flows are mobile web).
+### Remaining
+1. **Real FCM credentials.** Local delivery is simulated; create the Firebase
+   project and set `FIREBASE_*` env vars per `docs/push-notifications.md`,
+   then verify on a real phone (install PWA → Profile → Enable Push).
+2. **Parent ETA is a mock.** `ParentHomePage` shows a deterministic fake
+   "~N min" (`mockEta`, live-app parity). Replace with a real computation from
+   bus GPS vs. the child's stop once that matters.
+3. **CI.** Add a GitHub Actions workflow: backend pytest (Postgres service),
+   frontend vitest + tsc + build, optionally Playwright against the composed
+   stack (mirror `scripts/certify.sh`).
+4. Production deployment story (frontend Dockerfile, reverse proxy with
+   `TRUST_PROXY_HEADERS=true`, env-based config, real domain).
+5. Admin attendance / absence marking parity check — the old monorepo had a
+   daily-attendance flow; confirm the live platform's equivalent (if any) is
+   covered or intentionally dropped.
+6. Accessibility & mobile QA pass on real devices (driver/parent flows are
+   mobile web; push on iOS requires the installed PWA, iOS 16.4+).
 
 ## Verification protocol (follow this for any UI change)
 
