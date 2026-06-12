@@ -20,8 +20,6 @@ class Settings(BaseSettings):
         default="11111111-1111-1111-1111-111111111111",
         alias="DEMO_SCHOOL_ID",
     )
-    africas_talking_api_key: str = Field(default="", alias="AFRICAS_TALKING_API_KEY")
-    africas_talking_username: str = Field(default="", alias="AFRICAS_TALKING_USERNAME")
     trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
     # Firebase Cloud Messaging. Service account JSON (inline or a file path)
     # enables backend sends; the web config + VAPID key are served to the

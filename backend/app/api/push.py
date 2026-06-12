@@ -6,7 +6,9 @@ from pydantic import BaseModel
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user
 from app.core.config import get_settings
+from app.core.errors import BadRequestError
 from app.dao.push_dao import PushDao
+from app.services.push_service import is_safe_push_endpoint
 
 router = APIRouter(prefix="/api/push", tags=["push"])
 dao = PushDao()
@@ -48,6 +50,8 @@ def push_config():
 
 @router.post("/subscribe")
 def subscribe(payload: SubscribePayload, user: dict = Depends(get_current_user)):
+    if not is_safe_push_endpoint(payload.endpoint):
+        raise BadRequestError("Invalid push endpoint")
     return safe_call(
         lambda: (
             dao.subscribe(user["id"], payload.endpoint, payload.p256dh, payload.auth, payload.user_agent),

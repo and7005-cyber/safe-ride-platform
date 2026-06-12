@@ -17,6 +17,15 @@ if ! curl -fsS http://localhost:9001/api/health > /dev/null 2>&1; then
   exit 1
 fi
 
+# Fresh API process: in-process rate-limiter budgets (signups per hour etc.)
+# must not accumulate across repeated certification runs.
+echo "==> Restarting API (reset in-process rate limits)"
+docker compose -f "$ROOT_DIR/docker-compose.local.yml" restart api > /dev/null
+for _ in $(seq 1 30); do
+  curl -fsS http://localhost:9001/api/health > /dev/null 2>&1 && break
+  sleep 1
+done
+
 echo "==> Backend unit tests"
 (cd backend && "$PYTHON" -m pytest -q)
 

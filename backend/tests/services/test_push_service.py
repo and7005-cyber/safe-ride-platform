@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.services.push_service import PushService, haversine_m
+from app.services.push_service import PushService, haversine_m, is_safe_push_endpoint
 
 
 class FakePushDao:
@@ -12,7 +12,6 @@ class FakePushDao:
         self.bus_parents: list[dict] = []
         self.run_students: list[dict] = []
         self.stops: list[dict] = []
-        self.active_run: dict | None = None
         self.dedup_keys: set[tuple] = set()
 
     def insert_notification(self, user_id, type, title, body, student_id=None, run_id=None, bus_id=None):
@@ -44,9 +43,6 @@ class FakePushDao:
 
     def remaining_student_stops(self, run_id, stops_completed):
         return [s for s in self.stops if s["stop_order"] > stops_completed]
-
-    def active_run_for_driver(self, driver_id):
-        return self.active_run
 
     def bus_name(self, bus_id):
         return "Kifaru Bus"
@@ -117,22 +113,12 @@ def test_absent_students_are_not_notified(service: PushService, dao: FakePushDao
 def test_boarding_notifies_each_parent_of_the_student(
     service: PushService, dao: FakePushDao
 ) -> None:
-    dao.active_run = RUN
     dao.parents = {"s1": [link("p1", "s1", "Leila"), link("p9", "s1", "Leila")]}
 
-    service.notify_student_boarded("driver-1", "s1")
+    service.notify_student_boarded(RUN, "s1")
 
     assert [n["type"] for n in dao.notifications] == ["student-boarded", "student-boarded"]
     assert {n["user_id"] for n in dao.notifications} == {"p1", "p9"}
-
-
-def test_boarding_without_active_run_is_silent(service: PushService, dao: FakePushDao) -> None:
-    dao.active_run = None
-    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
-
-    service.notify_student_boarded("driver-1", "s1")
-
-    assert dao.notifications == []
 
 
 def test_reached_school_only_for_morning_runs(service: PushService, dao: FakePushDao) -> None:
@@ -146,6 +132,25 @@ def test_reached_school_only_for_morning_runs(service: PushService, dao: FakePus
     assert [n["type"] for n in dao.notifications] == ["reached-school"]
 
 
+def test_reached_school_skips_students_who_never_boarded(
+    service: PushService, dao: FakePushDao
+) -> None:
+    # Leila missed the bus (still at-school); no false safety assertion.
+    dao.run_students = [
+        {"id": "s1", "name": "Leila", "status": "at-school"},
+        {"id": "s2", "name": "Baraka", "status": "on-bus"},
+    ]
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila")],
+        "s2": [link("p2", "s2", "Baraka")],
+    }
+
+    service.notify_reached_school(RUN)
+
+    assert len(dao.notifications) == 1
+    assert dao.notifications[0]["user_id"] == "p2"
+
+
 def test_reached_school_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:
     dao.run_students = [{"id": "s1", "name": "Leila", "status": "on-bus"}]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
@@ -156,39 +161,56 @@ def test_reached_school_dedups_within_a_run(service: PushService, dao: FakePushD
     assert len(dao.notifications) == 1
 
 
-def test_afternoon_run_end_sends_dropped_off(service: PushService, dao: FakePushDao) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "dropped-off"}]
-    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+def test_afternoon_run_end_sends_dropped_off_for_boarded_snapshot(
+    service: PushService, dao: FakePushDao
+) -> None:
+    # end_run captured the pre-sweep on-bus roster; statuses already swept.
+    run = {**AFTERNOON_RUN, "boarded_student_ids": ["s1"]}
+    dao.run_students = [
+        {"id": "s1", "name": "Leila", "status": "dropped-off"},
+        {"id": "s2", "name": "Baraka", "status": "dropped-off"},  # never boarded
+    ]
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila")],
+        "s2": [link("p2", "s2", "Baraka")],
+    }
 
-    service.notify_run_ended(AFTERNOON_RUN)
+    service.notify_run_ended(run)
 
     assert [n["type"] for n in dao.notifications] == ["dropped-off"]
+    assert dao.notifications[0]["user_id"] == "p1"
 
 
 def test_morning_run_end_falls_back_to_reached_school(
     service: PushService, dao: FakePushDao
 ) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "at-school"}]
+    run = {**RUN, "boarded_student_ids": ["s1"]}
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
-    service.notify_run_ended(RUN)
+    service.notify_run_ended(run)
 
     assert [n["type"] for n in dao.notifications] == ["reached-school"]
 
 
-def test_incident_notifies_bus_parents_without_dedup(
+def test_incident_notifies_each_parent_once_without_run_dedup(
     service: PushService, dao: FakePushDao
 ) -> None:
     incident = {
         "type": "breakdown", "bus_id": "bus-1", "bus_name": "Kifaru Bus",
         "description": "Flat tire on Ngong Road",
     }
-    dao.bus_parents = [link("p1", "s1", "Leila")]
+    # One parent with two children on the bus, plus another parent.
+    dao.bus_parents = [
+        link("p1", "s1", "Leila"),
+        link("p1", "s2", "Baraka"),
+        link("p2", "s3", "Wanjiru"),
+    ]
 
     service.notify_incident(incident)
-    service.notify_incident(incident)  # a second report still notifies
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p2"]  # p1 once
 
-    assert [n["type"] for n in dao.notifications] == ["incident", "incident"]
+    service.notify_incident(incident)  # a second report still notifies
+    assert len(dao.notifications) == 4
     assert dao.notifications[0]["title"] == "Vehicle breakdown"
     assert "Flat tire" in dao.notifications[0]["body"]
 
@@ -202,7 +224,6 @@ def test_arrival_incidents_do_not_double_notify(service: PushService, dao: FakeP
 
 
 def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -> None:
-    dao.active_run = RUN
     # ~550m from the bus position below.
     dao.stops = [
         {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
@@ -216,35 +237,34 @@ def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -
         "s2": [link("p2", "s2", "Baraka")],
     }
 
-    service.notify_bus_position("driver-1", -1.2871, 36.8219, )
+    service.notify_bus_position(RUN, -1.2871, 36.8219)
 
     assert [n["type"] for n in dao.notifications] == ["bus-approaching"]
     assert dao.notifications[0]["user_id"] == "p1"
 
 
 def test_bus_approaching_dedups_per_run(service: PushService, dao: FakePushDao) -> None:
-    dao.active_run = RUN
     dao.stops = [
         {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
          "student_name": "Leila", "student_status": "at-school"},
     ]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
-    service.notify_bus_position("driver-1", -1.2920, 36.8219)
-    service.notify_bus_position("driver-1", -1.2919, 36.8219)
+    service.notify_bus_position(RUN, -1.2920, 36.8219)
+    service.notify_bus_position(RUN, -1.2919, 36.8219)
 
     assert len(dao.notifications) == 1
 
 
 def test_bus_approaching_skips_passed_stops(service: PushService, dao: FakePushDao) -> None:
-    dao.active_run = {**RUN, "stops_completed": 1}
+    run = {**RUN, "stops_completed": 1}
     dao.stops = [
         {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
          "student_name": "Leila", "student_status": "at-school"},
     ]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
-    service.notify_bus_position("driver-1", -1.2921, 36.8219)
+    service.notify_bus_position(run, -1.2921, 36.8219)
 
     assert dao.notifications == []
 
@@ -264,3 +284,18 @@ def test_push_failures_never_raise(service: PushService, dao: FakePushDao) -> No
     service.notify_run_started(RUN)  # must not raise
 
     assert dao.notifications == []
+
+
+def test_push_endpoint_ssrf_guard() -> None:
+    assert is_safe_push_endpoint("https://fcm.googleapis.com/fcm/send/abc")
+    assert is_safe_push_endpoint("https://updates.push.services.mozilla.com/wpush/v2/x")
+
+    assert not is_safe_push_endpoint("http://fcm.googleapis.com/insecure")
+    assert not is_safe_push_endpoint("https://localhost/push")
+    assert not is_safe_push_endpoint("https://127.0.0.1/push")
+    assert not is_safe_push_endpoint("https://10.0.0.5/push")
+    assert not is_safe_push_endpoint("https://192.168.1.1/push")
+    assert not is_safe_push_endpoint("https://169.254.169.254/latest/meta-data")
+    assert not is_safe_push_endpoint("https://internal.local/push")
+    assert not is_safe_push_endpoint("ftp://example.com/x")
+    assert not is_safe_push_endpoint("not a url")

@@ -58,6 +58,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(async () => {
+    // Release this device's push registration first (it needs the session):
+    // the next user on a shared device must not receive this user's child
+    // alerts or inherit a "subscribed" push state.
+    try {
+      const { disablePush } = await import("@/lib/push");
+      await disablePush();
+    } catch {
+      // best effort; localStorage push mode is cleared inside disablePush
+    }
     try {
       await api.post("/api/auth/logout");
     } catch {

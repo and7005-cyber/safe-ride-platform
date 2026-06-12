@@ -16,18 +16,29 @@ from app.core.errors import TooManyRequestsError
 
 
 class SlidingWindowLimiter:
-    """Counts attempts per key inside a sliding time window."""
+    """Counts attempts per key inside a sliding time window.
 
-    def __init__(self, max_attempts: int, window_seconds: float) -> None:
+    Keys are attacker-influenced strings (emails, IPs), so they are truncated
+    and the table self-prunes once it grows past `max_keys` — memory stays
+    bounded under junk-key floods.
+    """
+
+    MAX_KEY_LENGTH = 256
+
+    def __init__(self, max_attempts: int, window_seconds: float, max_keys: int = 10_000) -> None:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
+        self.max_keys = max_keys
         self._attempts: dict[str, list[float]] = defaultdict(list)
         self._lock = Lock()
 
     def check(self, key: str, message: str = "Too many attempts. Try again shortly.") -> None:
         """Record one attempt for `key`, raising TooManyRequestsError over budget."""
+        key = key[: self.MAX_KEY_LENGTH]
         now = time.monotonic()
         with self._lock:
+            if len(self._attempts) > self.max_keys:
+                self._prune(now)
             recent = [t for t in self._attempts[key] if now - t < self.window_seconds]
             if len(recent) >= self.max_attempts:
                 self._attempts[key] = recent
@@ -35,10 +46,20 @@ class SlidingWindowLimiter:
             recent.append(now)
             self._attempts[key] = recent
 
+    def _prune(self, now: float) -> None:
+        """Drop keys whose attempts have all left the window (lock held)."""
+        expired = [
+            key
+            for key, attempts in self._attempts.items()
+            if not attempts or now - attempts[-1] >= self.window_seconds
+        ]
+        for key in expired:
+            del self._attempts[key]
+
     def clear(self, key: str) -> None:
         """Drop the budget for `key` (e.g. after a successful login)."""
         with self._lock:
-            self._attempts.pop(key, None)
+            self._attempts.pop(key[: self.MAX_KEY_LENGTH], None)
 
     def reset(self) -> None:
         """Drop all state. Intended for tests."""

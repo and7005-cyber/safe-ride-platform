@@ -140,19 +140,20 @@ export async function isPushActive(): Promise<boolean> {
   }
 }
 
-/** Foreground FCM messages (page focused): surface via callback. */
+/** Foreground push messages (page focused): the service worker relays every
+ * push it receives via postMessage (works for both FCM and raw web push). */
 export async function listenForegroundMessages(
   onNotification: (payload: { title: string; body: string }) => void,
 ): Promise<() => void> {
-  const config = await fetchPushConfig();
-  if (!config.firebase) return () => {};
-  const { messaging } = await firebaseMessaging(config);
-  const { onMessage } = await import("firebase/messaging");
-  return onMessage(messaging, (message) => {
-    const notification = message.notification ?? {};
+  if (!("serviceWorker" in navigator)) return () => {};
+  const handler = (event: MessageEvent) => {
+    if (event.data?.type !== "SAFERIDE_PUSH") return;
+    const payload = event.data.payload ?? {};
     onNotification({
-      title: notification.title ?? "SafeRide",
-      body: notification.body ?? "",
+      title: payload.title ?? "SafeRide",
+      body: payload.body ?? "",
     });
-  });
+  };
+  navigator.serviceWorker.addEventListener("message", handler);
+  return () => navigator.serviceWorker.removeEventListener("message", handler);
 }

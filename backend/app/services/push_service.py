@@ -6,20 +6,27 @@ the same notification goes out through FCM to registered device tokens; when
 VAPID keys are configured, raw Web Push subscriptions get it too. With neither
 configured (local dev default) delivery is simulated via a log line.
 
+Delivery runs on a small dedicated thread pool so request worker threads are
+never tied up by push-service HTTP calls, and every outbound call carries a
+timeout.
+
 Notification types:
   run-started      morning run began — get the child ready for pickup
   student-boarded  driver marked the child as on the bus
   bus-approaching  bus GPS is within BUS_APPROACHING_RADIUS_M of the child's stop
-  reached-school   bus arrived at the school gate (morning)
+  reached-school   bus arrived at the school gate (morning, boarded students)
   on-way-home      afternoon run began — child is heading home
-  dropped-off      afternoon run ended — child dropped at their stop
+  dropped-off      afternoon run ended (boarded students)
   incident         driver reported an issue on the child's bus
 """
 
+import ipaddress
 import json
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+from urllib.parse import urlparse
 
 from app.core.config import get_settings
 from app.dao.push_dao import PushDao
@@ -27,6 +34,8 @@ from app.dao.push_dao import PushDao
 logger = logging.getLogger("saferide.push")
 
 NOTIFICATIONS_URL = "/parent/alerts"
+SEND_TIMEOUT_SECONDS = 10
+WEB_PUSH_TTL_SECONDS = 3600
 
 INCIDENT_TITLES = {
     "breakdown": "Vehicle breakdown",
@@ -35,6 +44,10 @@ INCIDENT_TITLES = {
     "traffic": "Traffic delay",
     "other": "Notice from the bus",
 }
+
+# Shared across service instances: delivery must not monopolize the request
+# thread pool, and a slow push provider must not back up driver requests.
+_send_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="saferide-push")
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -47,10 +60,29 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * radius * math.asin(math.sqrt(a))
 
 
+def is_safe_push_endpoint(url: str) -> bool:
+    """Web push endpoints must be public HTTPS origins (SSRF guard)."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    if host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # hostname, not an IP literal
+    return False if address.is_private or address.is_loopback or address.is_link_local else address.is_global
+
+
 class PushService:
     def __init__(self, dao: PushDao | None = None) -> None:
         self.dao = dao or PushDao()
         self._firebase_app: Any = None
+        self._firebase_failed = False
 
     # Event entry points (called from routers via BackgroundTasks) ------------
 
@@ -83,11 +115,8 @@ class PushService:
         except Exception:
             logger.exception("notify_run_started failed")
 
-    def notify_student_boarded(self, driver_id: str, student_id: str) -> None:
+    def notify_student_boarded(self, run: dict, student_id: str) -> None:
         try:
-            run = self.dao_active_run(driver_id)
-            if not run:
-                return
             bus = self._bus_label(run.get("bus_id"))
             for link in self.dao.parents_of_students([student_id]):
                 self._notify(
@@ -103,12 +132,16 @@ class PushService:
             logger.exception("notify_student_boarded failed")
 
     def notify_reached_school(self, run: dict) -> None:
-        """Morning arrival at the school gate (or morning run end)."""
+        """Morning arrival at the school gate (or morning run end).
+
+        Only parents of students actually on the bus are told their child
+        reached school — a child who missed the bus must never generate a
+        false safety assertion.
+        """
         try:
             if run.get("type") != "morning":
                 return
-            students = self.dao.students_on_run(str(run["id"]))
-            for link in self.dao.parents_of_students([s["id"] for s in students]):
+            for link in self._boarded_links(run):
                 self._notify(
                     link["parent_id"],
                     type="reached-school",
@@ -122,13 +155,12 @@ class PushService:
             logger.exception("notify_reached_school failed")
 
     def notify_run_ended(self, run: dict) -> None:
-        """Afternoon: every non-absent student on the roster was dropped off."""
+        """Afternoon: every boarded student was dropped off."""
         try:
             if run.get("type") == "morning":
                 self.notify_reached_school(run)
                 return
-            students = self.dao.students_on_run(str(run["id"]))
-            for link in self.dao.parents_of_students([s["id"] for s in students]):
+            for link in self._boarded_links(run):
                 self._notify(
                     link["parent_id"],
                     type="dropped-off",
@@ -147,9 +179,16 @@ class PushService:
                 return
             title = INCIDENT_TITLES.get(incident.get("type", ""), "Notice from the bus")
             body = incident.get("description") or f"Reported on {incident.get('bus_name') or 'the bus'}."
+            # One notification per parent, however many children they have on
+            # the bus — the message never references a specific child.
+            notified: set[str] = set()
             for link in self.dao.parents_of_bus(str(incident["bus_id"])):
+                parent_id = str(link["parent_id"])
+                if parent_id in notified:
+                    continue
+                notified.add(parent_id)
                 self._notify(
-                    link["parent_id"],
+                    parent_id,
                     type="incident",
                     title=title,
                     body=body,
@@ -160,12 +199,9 @@ class PushService:
         except Exception:
             logger.exception("notify_incident failed")
 
-    def notify_bus_position(self, driver_id: str, lat: float, lng: float) -> None:
+    def notify_bus_position(self, run: dict, lat: float, lng: float) -> None:
         """Bus-approaching alerts for upcoming stops within the radius."""
         try:
-            run = self.dao_active_run(driver_id)
-            if not run:
-                return
             radius = get_settings().bus_approaching_radius_m
             bus = self._bus_label(run.get("bus_id"))
             stops = self.dao.remaining_student_stops(str(run["id"]), run["stops_completed"])
@@ -189,8 +225,17 @@ class PushService:
 
     # Internals ----------------------------------------------------------------
 
-    def dao_active_run(self, driver_id: str) -> dict | None:
-        return self.dao.active_run_for_driver(driver_id)
+    def _boarded_links(self, run: dict) -> list[dict]:
+        """Parent links for students who actually boarded this run.
+
+        end_run snapshots the pre-sweep on-bus roster into
+        run["boarded_student_ids"]; gate arrivals read live statuses.
+        """
+        boarded_ids = run.get("boarded_student_ids")
+        if boarded_ids is None:
+            students = self.dao.students_on_run(str(run["id"]))
+            boarded_ids = [s["id"] for s in students if s.get("status") == "on-bus"]
+        return self.dao.parents_of_students(list(boarded_ids))
 
     def _bus_label(self, bus_id: str | None) -> str:
         if not bus_id:
@@ -222,17 +267,28 @@ class PushService:
         self.send_to_user(str(parent_id), title, body, type)
 
     def send_to_user(self, user_id: str, title: str, body: str, type: str) -> None:
-        """Best-effort delivery through every configured channel."""
-        delivered = 0
-        delivered += self._send_fcm(user_id, title, body, type)
-        delivered += self._send_web_push(user_id, title, body, type)
-        if delivered == 0:
+        """Queue best-effort delivery through every configured channel."""
+        settings = get_settings()
+        fcm_enabled = bool(settings.firebase_service_account_json.strip()) and not self._firebase_failed
+        webpush_enabled = bool(settings.vapid_private_key and settings.vapid_public_key)
+        if not fcm_enabled and not webpush_enabled:
             logger.info("push (simulated) -> user=%s type=%s title=%r", user_id, type, title)
+            return
+        _send_executor.submit(self._deliver, user_id, title, body, type)
+
+    def _deliver(self, user_id: str, title: str, body: str, type: str) -> None:
+        try:
+            delivered = self._send_fcm(user_id, title, body, type)
+            delivered += self._send_web_push(user_id, title, body, type)
+            if delivered == 0:
+                logger.info("push (no devices) -> user=%s type=%s", user_id, type)
+        except Exception:
+            logger.exception("push delivery failed for user %s", user_id)
 
     # FCM ----------------------------------------------------------------------
 
     def _firebase(self) -> Any:
-        if self._firebase_app is not None:
+        if self._firebase_app is not None or self._firebase_failed:
             return self._firebase_app
         raw = get_settings().firebase_service_account_json.strip()
         if not raw:
@@ -245,9 +301,14 @@ class PushService:
             try:
                 self._firebase_app = firebase_admin.get_app("saferide")
             except ValueError:
-                self._firebase_app = firebase_admin.initialize_app(cred, name="saferide")
+                self._firebase_app = firebase_admin.initialize_app(
+                    cred, {"httpTimeout": SEND_TIMEOUT_SECONDS}, name="saferide"
+                )
         except Exception:
-            logger.exception("Firebase initialization failed; FCM disabled")
+            # Bad credentials will not heal on retry: disable FCM for this
+            # process and say so once instead of stack-tracing every send.
+            logger.exception("Firebase initialization failed; FCM disabled for this process")
+            self._firebase_failed = True
             self._firebase_app = None
         return self._firebase_app
 
@@ -301,6 +362,9 @@ class PushService:
         )
         sent = 0
         for sub in subscriptions:
+            if not is_safe_push_endpoint(sub["endpoint"]):
+                self.dao.delete_web_push_subscription(sub["endpoint"])
+                continue
             try:
                 webpush(
                     subscription_info={
@@ -310,6 +374,8 @@ class PushService:
                     data=payload,
                     vapid_private_key=settings.vapid_private_key,
                     vapid_claims={"sub": settings.vapid_subject},
+                    ttl=WEB_PUSH_TTL_SECONDS,
+                    timeout=SEND_TIMEOUT_SECONDS,
                 )
                 sent += 1
             except WebPushException as error:

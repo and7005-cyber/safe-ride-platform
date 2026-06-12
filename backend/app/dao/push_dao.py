@@ -78,7 +78,11 @@ class PushDao:
             )
 
     def active_run_for_driver(self, driver_id: str) -> dict | None:
-        """Today's in-progress run for the driver's bus, if any."""
+        """Today's active run for the driver's bus, if any.
+
+        Mirrors RunDao.find_active_run_today: anything not completed counts
+        (an admin marking a run 'delayed' must not mute its notifications).
+        """
         with get_connection() as conn:
             row = conn.execute(
                 """
@@ -86,7 +90,7 @@ class PushDao:
                 join live_buses b on b.id = r.bus_id
                 where b.driver_id = %s
                   and r.date = (now() at time zone 'Africa/Nairobi')::date
-                  and r.status = 'in-progress'
+                  and r.status <> 'completed'
                 order by r.created_at desc
                 limit 1
                 """,

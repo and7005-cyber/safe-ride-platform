@@ -53,6 +53,29 @@ def test_limiter_clear_resets_budget() -> None:
     limiter.check("key")  # does not raise
 
 
+def test_limiter_truncates_oversized_keys() -> None:
+    limiter = SlidingWindowLimiter(max_attempts=1, window_seconds=60)
+    huge = "x" * 10_000
+
+    limiter.check(huge)
+
+    with pytest.raises(TooManyRequestsError):
+        limiter.check(huge + "different-suffix-beyond-truncation")
+
+
+def test_limiter_prunes_expired_keys_to_bound_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(rate_limit.time, "monotonic", lambda: clock["now"])
+    limiter = SlidingWindowLimiter(max_attempts=2, window_seconds=10, max_keys=5)
+
+    for i in range(6):
+        limiter.check(f"junk-{i}")
+    clock["now"] += 11  # everything expires
+    limiter.check("fresh")  # insert above max_keys triggers the prune
+
+    assert len(limiter._attempts) <= 2  # the expired junk keys are gone
+
+
 def test_client_ip_uses_socket_host_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         rate_limit, "get_settings", lambda: Settings(TRUST_PROXY_HEADERS=False, _env_file=None)

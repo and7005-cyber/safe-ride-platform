@@ -66,7 +66,10 @@ def signup(request: SignupRequest, http_request: Request):
 @router.post("/login")
 def login(request: LoginRequest, http_request: Request):
     ip = client_ip(http_request)
-    account_key = request.email.strip().lower()
+    # The account budget is scoped per caller IP so a remote attacker cannot
+    # lock a victim's account by spamming failures from elsewhere; the
+    # blanket per-IP budget still caps one source probing many accounts.
+    account_key = f"{ip}|{request.email.strip().lower()}"
     login_ip_limiter.check(ip, _LOGIN_LIMIT_MESSAGE)
     login_account_limiter.check(account_key, _LOGIN_LIMIT_MESSAGE)
     result = safe_call(lambda: service.login(request.email, request.password))

@@ -108,16 +108,20 @@ def end_run(
 def write_position(
     payload: PositionPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
 ):
-    result = safe_call(lambda: (dao.write_position(user["id"], payload.lat, payload.lng), {"ok": True})[1])
-    background_tasks.add_task(push_service.notify_bus_position, user["id"], payload.lat, payload.lng)
-    return result
+    # The run snapshot is captured at request time so the notification task
+    # never races a subsequent arrive/end request re-reading run state.
+    run = safe_call(lambda: dao.write_position(user["id"], payload.lat, payload.lng))
+    background_tasks.add_task(push_service.notify_bus_position, run, payload.lat, payload.lng)
+    return {"ok": True}
 
 
 @router.post("/driver/boarding")
 def toggle_boarding(
     payload: BoardingPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
 ):
-    student = safe_call(lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus))
+    student, run = safe_call(
+        lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus)
+    )
     if payload.on_bus:
-        background_tasks.add_task(push_service.notify_student_boarded, user["id"], payload.student_id)
+        background_tasks.add_task(push_service.notify_student_boarded, run, payload.student_id)
     return student

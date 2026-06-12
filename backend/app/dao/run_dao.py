@@ -222,6 +222,16 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
+            # Capture who was actually on the bus before the sweep wipes it;
+            # notifications must only assert arrival for boarded students.
+            boarded = conn.execute(
+                """
+                select distinct s.id from live_students s
+                where s.id in (select student_id from run_stops where run_id = %s and student_id is not null)
+                  and s.status = 'on-bus'
+                """,
+                (run_id,),
+            ).fetchall()
             conn.execute(
                 "update live_runs set status='completed', stops_completed=total_stops, "
                 "end_time=to_char(now() at time zone 'Africa/Nairobi','HH24:MI') where id=%s",
@@ -243,9 +253,12 @@ class RunDao:
                 (run["bus_id"],),
             )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
-        return dict(updated)
+        result = dict(updated)
+        result["boarded_student_ids"] = [str(b["id"]) for b in boarded]
+        return result
 
-    def write_position(self, driver_id: str, lat: float, lng: float) -> None:
+    def write_position(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
+        """Record the bus position; returns the active run snapshot."""
         from app.core.errors import ForbiddenError
 
         with get_connection() as conn:
@@ -256,8 +269,12 @@ class RunDao:
                 "update live_buses set current_lat = %s, current_lng = %s where id = %s",
                 (lat, lng, run["bus_id"]),
             )
+        return dict(run)
 
-    def toggle_boarding(self, driver_id: str, student_id: str, on_bus: bool) -> dict[str, Any]:
+    def toggle_boarding(
+        self, driver_id: str, student_id: str, on_bus: bool
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Toggle a student's boarding state; returns (student, run snapshot)."""
         from app.core.errors import ConflictError, ForbiddenError
 
         with get_connection() as conn:
@@ -278,7 +295,7 @@ class RunDao:
                 "update live_students set status = %s where id = %s returning *",
                 (new_status, student_id),
             ).fetchone()
-        return dict(row)
+        return dict(row), dict(run)
 
     def _bus_id_for_driver(self, conn, driver_id: str) -> str | None:
         row = conn.execute(

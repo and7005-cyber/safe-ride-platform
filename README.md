@@ -35,7 +35,8 @@ scripts/               Local stack helpers
 - npm, pnpm, or yarn.
 - Docker Compose.
 - Python 3.11+ when running backend tests outside Docker.
-- Africa's Talking SMS credentials only when real SMS delivery is enabled.
+- Firebase Cloud Messaging credentials only when real push delivery is enabled
+  (see [docs/push-notifications.md](docs/push-notifications.md)).
 
 ## Environment Variables
 
@@ -49,8 +50,6 @@ The root template is used by Docker Compose and backend local defaults:
 
 ```bash
 DATABASE_URL=postgresql://saferide:saferide@localhost:5432/saferide
-AFRICAS_TALKING_API_KEY=
-AFRICAS_TALKING_USERNAME=
 ```
 
 The frontend defaults to `http://localhost:9001`. If you need to override it, create a frontend env file:
@@ -59,7 +58,8 @@ The frontend defaults to `http://localhost:9001`. If you need to override it, cr
 cp frontend/.env.local.example frontend/.env.local
 ```
 
-When Africa's Talking credentials are blank, local notification processing simulates SMS delivery.
+When no push credentials are configured, notification delivery is simulated
+locally and the in-app parent alerts feed still works.
 
 ## Install And Run
 
@@ -75,13 +75,11 @@ Open the local Vite URL shown in the terminal. Start the local FastAPI/Postgres 
 
 Main routes:
 
-- `/` - admin live fleet
-- `/admin/setup` - school setup
-- `/admin/attendance` - daily attendance
-- `/admin/history` - completed trip history and corrections
-- `/driver` - driver PIN login
-- `/driver/trips` - assigned driver trips
-- `/p/:token` - parent trip progress link
+- `/` - admin dashboard (fleet map, buses, routes, students, runs, schools,
+  parents, drivers, alerts under the admin console)
+- `/auth` - email/password and driver-PIN sign in
+- `/driver` - driver home (run, boarding, incident tabs)
+- `/parent` - parent home (track, alerts, profile tabs)
 
 ## Local FastAPI/Postgres Stack
 
@@ -117,11 +115,11 @@ The API runs at `http://localhost:9001`. The frontend should use:
 VITE_API_BASE_URL=http://localhost:9001
 ```
 
-Demo values:
+Demo logins (local seed only):
 
-- School ID: `11111111-1111-1111-1111-111111111111`
-- Driver PIN: `1234`
-- Parent token: `demo-parent-token-00000000000000000001`
+- Admin: `admin@test.com` / `test1234.`
+- Parent: `and7005@gmail.com` / `Test1234`
+- Driver: `and7005@yahoo.it` / `Test1234`, PIN `1234`
 
 ### Demo seed safety
 
@@ -137,14 +135,14 @@ Before any public or production deployment, provision real accounts through the
 signup/admin flows and never apply these seed files; rotate any credential that may
 have been exposed.
 
-## Verified Local Migration Flow
+## Verified Local Flow
 
 The local FastAPI/Postgres stack is ready when:
 
 - `curl http://localhost:9001/api/health` returns `{"status":"ok"}`.
-- The seeded driver PIN `1234` opens the driver trip list.
-- The seeded parent token `/p/demo-parent-token-00000000000000000001` shows only the parent's child by name.
-- Frontend `npm run build`, frontend `npm test`, backend `pytest`, and frontend `npm run e2e` pass.
+- The seeded driver PIN `1234` opens the driver home at `/driver`.
+- The seeded parent login lands on `/parent` and shows only their children.
+- `scripts/certify.sh` passes (or the individual suites under Testing below).
 
 ## Legacy Supabase Reference
 

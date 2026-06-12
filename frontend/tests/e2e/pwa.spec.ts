@@ -52,14 +52,28 @@ test("the service worker registers and activates", async ({ page }) => {
   expect(["activated", "activating"]).toContain(state);
 });
 
-test("the service worker handles push payloads in both FCM and raw shapes", async ({
+test("the service worker wires up push display and the shared payload parser", async ({
   request,
   baseURL,
+  page,
 }) => {
   const sw = await (await request.get(`${baseURL}/sw.js`)).text();
   expect(sw).toContain('addEventListener("push"');
   expect(sw).toContain('addEventListener("notificationclick"');
-  // Tolerates both raw {title, body} and FCM {notification: {...}} payloads.
-  expect(sw).toContain("raw.notification");
-  expect(sw).toContain("raw.title");
+  expect(sw).toContain('importScripts("/push-payload.js")');
+
+  // The payload module itself is served and behaves correctly for both
+  // delivery shapes (full matrix covered by the vitest unit suite).
+  const moduleSource = await (await request.get(`${baseURL}/push-payload.js`)).text();
+  await page.goto("/auth");
+  const parsed = await page.evaluate((source) => {
+    const sandbox: any = {};
+    new Function("self", source)(sandbox);
+    return [
+      sandbox.parsePushPayload({ title: "raw", body: "b", url: "/u", type: "t" }),
+      sandbox.parsePushPayload({ notification: { title: "fcm", body: "b2" }, data: { url: "/u2", type: "t2" } }),
+    ];
+  }, moduleSource);
+  expect(parsed[0]).toEqual({ title: "raw", body: "b", url: "/u", type: "t" });
+  expect(parsed[1]).toEqual({ title: "fcm", body: "b2", url: "/u2", type: "t2" });
 });

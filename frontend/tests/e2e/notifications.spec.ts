@@ -75,12 +75,21 @@ test("opening the alerts page marks notifications as read", async ({ page, reque
   await startMorningRun(request); // generates fresh unread notifications
   const parentToken = await apiToken(request, PARENT.email, PARENT.password);
 
-  const before = await (
-    await request.get(`${API_URL}/api/push/notifications/unread-count`, {
-      headers: authHeaders(parentToken),
-    })
-  ).json();
-  expect(before.count).toBeGreaterThan(0);
+  // The run-started rows are written by a BackgroundTask after the start
+  // response, so poll instead of asserting a single snapshot.
+  await expect
+    .poll(
+      async () => {
+        const before = await (
+          await request.get(`${API_URL}/api/push/notifications/unread-count`, {
+            headers: authHeaders(parentToken),
+          })
+        ).json();
+        return before.count;
+      },
+      { timeout: 10_000, message: "run-started notifications should arrive" },
+    )
+    .toBeGreaterThan(0);
 
   await emailLogin(page, PARENT.email, PARENT.password);
   await page.goto("/parent/alerts");

@@ -1,9 +1,10 @@
 // SafeRide service worker: PWA app shell + push notifications.
-// Push payloads arrive in two shapes and both are handled:
-//   raw web push: {title, body, url, type}
-//   FCM webpush:  {notification: {title, body, icon}, data: {url, type}}
+// Payload parsing lives in push-payload.js (unit-tested) and handles both
+// raw web-push and FCM webpush shapes.
 
-const CACHE_NAME = "saferide-shell-v1";
+importScripts("/push-payload.js");
+
+const CACHE_NAME = "saferide-shell-v2";
 const SHELL_URLS = ["/", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png"];
 const DEFAULT_URL = "/parent/alerts";
 
@@ -35,13 +36,18 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return; // never touch API calls
   if (url.pathname.startsWith("/api/")) return;
 
-  // Navigations: network first, cached shell as the offline fallback.
+  // Navigations: network first, cached shell as the offline fallback. Only a
+  // healthy HTML document may overwrite the cached shell — error pages and
+  // non-HTML responses must never become the offline app.
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request)
         .then((response) => {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put("/", copy)).catch(() => {});
+          const contentType = response.headers.get("content-type") || "";
+          if (response.ok && contentType.includes("text/html")) {
+            const copy = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put("/", copy)).catch(() => {});
+          }
           return response;
         })
         .catch(() => caches.match("/")),
@@ -49,51 +55,61 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static assets: cache first, then network.
-  event.respondWith(
-    caches.match(request).then(
-      (cached) =>
-        cached ||
-        fetch(request).then((response) => {
-          if (response.ok && (url.pathname.startsWith("/icons/") || url.pathname.startsWith("/assets/"))) {
-            const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, copy)).catch(() => {});
-          }
-          return response;
-        }),
-    ),
-  );
+  // Icons and the manifest: stale-while-revalidate, so app icon / manifest
+  // updates reach installed clients on the next load.
+  if (url.pathname.startsWith("/icons/") || url.pathname === "/manifest.webmanifest") {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        const refresh = fetch(request)
+          .then((response) => {
+            if (response.ok) {
+              const copy = response.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(request, copy)).catch(() => {});
+            }
+            return response;
+          })
+          .catch(() => cached);
+        return cached || refresh;
+      }),
+    );
+  }
+  // Hashed bundles (/assets/) are deliberately not cached here: their names
+  // change every deploy and caching them would only accumulate dead entries.
 });
 
-function parsePushPayload(event) {
-  const fallback = { title: "SafeRide", body: "", url: DEFAULT_URL, type: "custom" };
-  if (!event.data) return fallback;
-  let raw;
+function readPushPayload(event) {
+  if (!event.data) return self.parsePushPayload(null);
   try {
-    raw = event.data.json();
+    return self.parsePushPayload(event.data.json());
   } catch (_e) {
-    return { ...fallback, body: event.data.text() };
+    const payload = self.parsePushPayload(null);
+    payload.body = event.data.text();
+    return payload;
   }
-  const notification = raw.notification ?? {};
-  const data = raw.data ?? {};
-  return {
-    title: notification.title ?? raw.title ?? fallback.title,
-    body: notification.body ?? raw.body ?? fallback.body,
-    url: data.url ?? raw.url ?? raw.fcmOptions?.link ?? fallback.url,
-    type: data.type ?? raw.type ?? fallback.type,
-  };
 }
 
 self.addEventListener("push", (event) => {
-  const payload = parsePushPayload(event);
+  const payload = readPushPayload(event);
   event.waitUntil(
-    self.registration.showNotification(payload.title, {
-      body: payload.body,
-      icon: "/icons/icon-192.png",
-      badge: "/icons/icon-192.png",
-      tag: `saferide-${payload.type}`,
-      data: { url: payload.url },
-    }),
+    Promise.all([
+      // No tag: each notification stands alone, so multi-child updates never
+      // overwrite each other in the notification tray.
+      self.registration.showNotification(payload.title, {
+        body: payload.body,
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        data: { url: payload.url, type: payload.type },
+      }),
+      // Tell any open app windows so they can toast + refresh feeds.
+      self.clients
+        .matchAll({ type: "window", includeUncontrolled: true })
+        .then((clients) => {
+          for (const client of clients) {
+            client.postMessage({ type: "SAFERIDE_PUSH", payload });
+          }
+        })
+        .catch(() => {}),
+    ]),
   );
 });
 
