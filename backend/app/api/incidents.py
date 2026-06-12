@@ -1,12 +1,14 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
 from app.dao.incident_dao import IncidentDao
+from app.services.push_service import PushService
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
 dao = IncidentDao()
+push_service = PushService()
 admin_only = require_role("admin")
 driver_only = require_role("driver")
 
@@ -32,10 +34,16 @@ def today_count(user: dict = Depends(get_current_user)):
 
 
 @router.post("/driver")
-def report_incident(payload: DriverIncidentPayload, user: dict = Depends(driver_only)):
-    return safe_call(
+def report_incident(
+    payload: DriverIncidentPayload,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(driver_only),
+):
+    incident = safe_call(
         lambda: dao.create_driver_incident(user["id"], payload.type, payload.description or "")
     )
+    background_tasks.add_task(push_service.notify_incident, incident)
+    return incident
 
 
 @router.post("/{incident_id}/acknowledge")

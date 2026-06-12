@@ -26,7 +26,7 @@ test("admin sees the dashboard and can navigate the shell", async ({ page }) => 
 
   // Alerts page uses the admin-side type label.
   await page.goto("/alerts");
-  await expect(page.getByText("Heavy Traffic / Delay")).toBeVisible();
+  await expect(page.getByText("Heavy Traffic / Delay").first()).toBeVisible();
 
   // Routes page shows configured routes with stops (no zero-state when present).
   await page.goto("/routes");
@@ -68,5 +68,5 @@ test("parent sees their children and bus-less child has no driver actions", asyn
 
   // Parent alerts use the parent-side label and are scoped to their buses.
   await page.goto("/parent/alerts");
-  await expect(page.getByText("Traffic Delay")).toBeVisible();
+  await expect(page.getByText("Traffic Delay").first()).toBeVisible();
 });

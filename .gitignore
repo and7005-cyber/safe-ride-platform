@@ -13,3 +13,5 @@ __pycache__/
 .venv312/
 backend/.venv/
 backend/**/*.pyc
+test-results/
+playwright-report/

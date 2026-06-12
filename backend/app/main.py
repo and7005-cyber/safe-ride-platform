@@ -1,16 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api import (
     accounts,
-    admin,
     auth,
-    driver,
     fleet,
     health,
     incidents,
-    notifications,
-    parent,
     parent_portal,
     push,
     runs_live,
@@ -18,6 +15,7 @@ from app.api import (
 )
 from app.core.config import get_settings
 from app.core.db import close_pool
+from app.core.errors import SafeRideError, to_http_exception
 
 
 def create_app() -> FastAPI:
@@ -32,13 +30,14 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.exception_handler(SafeRideError)
+    def saferide_error_handler(request: Request, error: SafeRideError) -> JSONResponse:
+        http_error = to_http_exception(error)
+        return JSONResponse(
+            status_code=http_error.status_code, content={"detail": http_error.detail}
+        )
+
     app.include_router(health.router)
-    # Legacy routers (kept for compatibility; not driving the new UI).
-    app.include_router(admin.router)
-    app.include_router(driver.router)
-    app.include_router(parent.router)
-    app.include_router(notifications.router)
-    # Live-model routers.
     app.include_router(auth.router)
     app.include_router(fleet.router)
     app.include_router(students_live.router)

@@ -4,6 +4,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { AuthProvider } from "@/lib/auth";
+import { PushForegroundListener } from "@/lib/PushForegroundListener";
 import { router } from "./routes";
 
 const queryClient = new QueryClient();
@@ -16,6 +17,7 @@ export function App() {
           <RouterProvider router={router} />
           <Toaster />
           <Sonner />
+          <PushForegroundListener />
         </TooltipProvider>
       </AuthProvider>
     </QueryClientProvider>

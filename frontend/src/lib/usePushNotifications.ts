@@ -1,8 +1,16 @@
 import { useEffect, useState } from "react";
-import { api } from "@/lib/apiClient";
+import {
+  disablePush,
+  enablePush,
+  fetchPushConfig,
+  isPushActive,
+  registerServiceWorker,
+} from "@/lib/push";
 
 interface PushState {
   supported: boolean;
+  /** Server has at least one push channel (FCM or VAPID) configured. */
+  configured: boolean;
   permission: NotificationPermission | "unsupported";
   subscribed: boolean;
   subscribe: () => Promise<void>;
@@ -19,15 +27,18 @@ export function usePushNotifications(): PushState {
   const [permission, setPermission] = useState<NotificationPermission | "unsupported">(
     supported ? Notification.permission : "unsupported",
   );
+  const [configured, setConfigured] = useState(true);
   const [subscribed, setSubscribed] = useState(false);
 
   useEffect(() => {
     if (!supported) return;
-    navigator.serviceWorker
-      .register("/sw.js")
-      .then((reg) => reg.pushManager.getSubscription())
-      .then((sub) => setSubscribed(Boolean(sub)))
-      .catch(() => {});
+    registerServiceWorker();
+    fetchPushConfig()
+      .then((config) =>
+        setConfigured(Boolean((config.firebase && config.firebaseVapidKey) || config.vapidPublicKey)),
+      )
+      .catch(() => setConfigured(false));
+    isPushActive().then(setSubscribed).catch(() => {});
   }, [supported]);
 
   const subscribe = async () => {
@@ -36,33 +47,18 @@ export function usePushNotifications(): PushState {
     setPermission(result);
     if (result !== "granted") return;
     try {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true });
-      const json = sub.toJSON();
-      await api.post("/api/push/subscribe", {
-        endpoint: sub.endpoint,
-        p256dh: json.keys?.p256dh ?? null,
-        auth: json.keys?.auth ?? null,
-        user_agent: navigator.userAgent,
-      });
-      setSubscribed(true);
+      const mode = await enablePush();
+      setSubscribed(mode !== null);
     } catch {
-      // Without a configured VAPID key the browser may refuse to subscribe;
-      // permission is still granted, but no subscription is stored.
       setSubscribed(false);
     }
   };
 
   const unsubscribe = async () => {
     if (!supported) return;
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.getSubscription();
-    if (sub) {
-      await api.post("/api/push/unsubscribe", { endpoint: sub.endpoint }).catch(() => {});
-      await sub.unsubscribe();
-    }
+    await disablePush();
     setSubscribed(false);
   };
 
-  return { supported, permission, subscribed, subscribe, unsubscribe };
+  return { supported, configured, permission, subscribed, subscribe, unsubscribe };
 }

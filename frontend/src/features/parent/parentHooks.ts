@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Home, MapPin, Bell, User, type LucideIcon } from "lucide-react";
 import { api } from "@/lib/apiClient";
 import { POLL_LIVE } from "@/lib/queries";
@@ -23,6 +23,24 @@ export function useParentAlerts() {
     queryKey: ["parent-alerts"],
     queryFn: () => api.get("/api/parent-portal/alerts"),
     refetchInterval: POLL_LIVE,
+  });
+}
+
+export function useParentNotifications() {
+  return useQuery({
+    queryKey: ["parent-notifications"],
+    queryFn: () => api.get("/api/push/notifications"),
+    refetchInterval: POLL_LIVE,
+  });
+}
+
+export function useMarkNotificationsRead() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post("/api/push/notifications/mark-read"),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["parent-notifications"] });
+    },
   });
 }
 

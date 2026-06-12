@@ -1,3 +1,13 @@
+-- DEMO SEED — LOCAL DEV ONLY. Guarded so it can never run against a database
+-- unless the session explicitly opts in (the local scripts do this for you):
+--   set saferide.allow_demo_seed = 'yes';
+do $$
+begin
+  if coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' then
+    raise exception 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  end if;
+end $$;
+
 insert into schools (
   id,
   name,

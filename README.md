@@ -123,6 +123,20 @@ Demo values:
 - Driver PIN: `1234`
 - Parent token: `demo-parent-token-00000000000000000001`
 
+### Demo seed safety
+
+The demo seeds under `backend/db/seeds/` contain well-known test credentials and are
+**local-development only**. Two guards keep them out of real environments:
+
+- The seed scripts (`scripts/start-local.sh`, `scripts/reset-local-db.sh`) refuse to
+  run unless `APP_ENV=local` in `backend/.env`.
+- Each seed file opens with a SQL guard that aborts unless the session has set
+  `saferide.allow_demo_seed = 'yes'` (the scripts set this for you).
+
+Before any public or production deployment, provision real accounts through the
+signup/admin flows and never apply these seed files; rotate any credential that may
+have been exposed.
+
 ## Verified Local Migration Flow
 
 The local FastAPI/Postgres stack is ready when:
@@ -162,38 +176,48 @@ The migrations create:
 
 ## Testing
 
+One command certifies the whole app (requires the running local stack):
+
 ```bash
-cd backend
-pytest -v
-cd ../frontend
-npm run build
-npm test
-npm run e2e
+scripts/certify.sh
 ```
 
-Current workspace note: Docker is required for the full local stack and e2e flow. Frontend and backend unit checks can run from their respective folders.
+It runs, in order: backend unit tests (pytest), backend API integration tests
+against the live stack, the frontend typecheck, frontend unit tests (vitest),
+the production build, and the full Playwright end-to-end browser suite
+(auth, role access, admin CRUD, driver run lifecycle, parent portal,
+notifications pipeline, PWA installability) — then restores the canonical
+demo seed.
 
-## Beta Setup Flow
+Individual suites:
 
-1. Start the local FastAPI/Postgres stack with `scripts/start-local.sh`.
-2. Use the seeded school ID or `/admin/setup` to add buses, drivers, students, parent contacts, parent links, trips, and student stops.
-3. Use `/admin/attendance` each day to mark absent students or alternative transport.
-4. Drivers log in at `/driver` with their PIN and operate assigned trips.
-5. Parents open their generated `/p/:token` link to see trip progress for their child.
-6. Process pending notification rows with `POST /api/notifications/process`.
+```bash
+cd backend && pytest -q                                  # unit (no stack needed)
+cd backend && RUN_INTEGRATION=1 pytest tests/integration # API integration (stack up)
+cd frontend && npm test                                  # vitest unit tests
+cd frontend && npm run e2e                               # Playwright e2e (stack up)
+```
+
+The e2e suites mutate the database (runs, notifications, CRUD fixtures with an
+"E2E" prefix). They clean up after themselves; run `scripts/reset-local-db.sh`
+to restore pristine demo state at any time.
+
+## Push Notifications & PWA
+
+The app installs as a PWA (manifest + service worker + icons) and notifies
+parents about bus events: run started, child boarded, bus approaching,
+arrived at school, on the way home, dropped off, and driver incidents. The
+notification feed always works in-app; real device push activates when
+Firebase Cloud Messaging (or plain VAPID web push) credentials are configured.
+See [docs/push-notifications.md](docs/push-notifications.md) for the full
+setup guide and architecture.
 
 ## Security Notes
 
-- Driver PINs are hashed by the Python backend before they are stored.
-- Driver sessions store only SHA-256 token hashes and expire after 16 hours.
-- Parent links are revokable and token-scoped.
-- Parent progress hides other students names and addresses.
-- Admin endpoints are intentionally login-free for this local migration stage and accept `school_id` from the frontend. Add admin authentication after the migrated stack is verified.
-
-## Known Follow-Ups
-
-- Add a proper seeded school/admin bootstrap script.
-- Replace manual UUID entry in admin screens with searchable selects.
-- Add richer run history details for per-passenger timestamps and issues.
-- Add SMS scheduling infrastructure for recurring outbox processing.
-- Add browser/device QA once the local app can be installed and run.
+- Passwords are PBKDF2-hashed; driver PINs are HMAC-peppered and unique.
+- Sessions store only SHA-256 token hashes and slide-expire after 16 hours.
+- All API endpoints require a bearer token and enforce roles server-side
+  (admin / driver / parent); parents can only read their own children.
+- Credential endpoints are rate-limited per IP and per account (reverse-proxy
+  aware via `TRUST_PROXY_HEADERS`).
+- Demo seeds are double-gated and refuse to run outside local dev.

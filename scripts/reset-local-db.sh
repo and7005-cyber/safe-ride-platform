@@ -63,6 +63,12 @@ for migration_path in "$MIGRATIONS_DIR"/*.sql; do
   docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$migration_path"
 done
 
+if [ "${APP_ENV:-}" != "local" ]; then
+  echo "Refusing to apply demo seeds: APP_ENV is '${APP_ENV:-unset}', not 'local'." >&2
+  echo "Demo credentials must never reach a non-local environment." >&2
+  exit 1
+fi
+
 for seed_path in "$SEEDS_DIR"/*.sql; do
   if [ ! -f "$seed_path" ]; then
     echo "No seed files found in $SEEDS_DIR." >&2
@@ -70,7 +76,8 @@ for seed_path in "$SEEDS_DIR"/*.sql; do
   fi
 
   echo "Seeding $(basename "$seed_path")..."
-  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$seed_path"
+  { echo "set saferide.allow_demo_seed = 'yes';"; cat "$seed_path"; } | \
+    docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1
 done
 
 docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL

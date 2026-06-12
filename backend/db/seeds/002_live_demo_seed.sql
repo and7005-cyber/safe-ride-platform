@@ -10,6 +10,16 @@
 -- Password/PIN hashes below were generated with app.core.security helpers and
 -- the local PIN_PEPPER 'saferide-local-pin-pepper'.
 
+-- DEMO SEED — LOCAL DEV ONLY. Guarded so it can never run against a database
+-- unless the session explicitly opts in (the local scripts do this for you):
+--   set saferide.allow_demo_seed = 'yes';
+do $$
+begin
+  if coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' then
+    raise exception 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  end if;
+end $$;
+
 -- Identity -----------------------------------------------------------------
 
 insert into app_users (id, email, password_hash, full_name, phone, pin_hash) values

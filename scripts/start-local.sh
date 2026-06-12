@@ -136,6 +136,12 @@ SQL
 }
 
 apply_seed() {
+  if [ "${APP_ENV:-}" != "local" ]; then
+    echo "Refusing to apply demo seeds: APP_ENV is '${APP_ENV:-unset}', not 'local'." >&2
+    echo "Demo credentials must never reach a non-local environment." >&2
+    exit 1
+  fi
+
   if [ ! -d "$SEEDS_DIR" ]; then
     echo "Cannot initialize local database: seeds directory is missing at $SEEDS_DIR." >&2
     exit 1
@@ -148,7 +154,8 @@ apply_seed() {
     fi
 
     echo "Applying local database seed $(basename "$seed_path")..."
-    docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$seed_path"
+    { echo "set saferide.allow_demo_seed = 'yes';"; cat "$seed_path"; } | \
+      docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1
   done
 }
 

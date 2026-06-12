@@ -22,6 +22,7 @@ export function ParentProfilePage() {
 
   const pushLabel = () => {
     if (!push.supported) return "Push not supported on this device";
+    if (!push.configured) return "Push not configured on this server";
     if (push.permission === "denied") return "Notifications blocked in browser";
     if (push.subscribed) return "Disable Push Notifications";
     return "Enable Push Notifications";
@@ -86,7 +87,7 @@ export function ParentProfilePage() {
         <Button
           variant="outline"
           className="w-full justify-start gap-2"
-          disabled={!push.supported || push.permission === "denied"}
+          disabled={!push.supported || !push.configured || push.permission === "denied"}
           onClick={() => (push.subscribed ? push.unsubscribe() : push.subscribe())}
         >
           {push.subscribed ? <BellOff className="h-4 w-4" /> : <Bell className="h-4 w-4" />}

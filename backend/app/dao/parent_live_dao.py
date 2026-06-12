@@ -71,6 +71,16 @@ class ParentLiveDao:
                     "select * from live_route_stops where route_id = %s order by stop_order asc, name asc",
                     (route["id"],),
                 ).fetchall()
+                # Siblings can share a stop_order (one row per student): prefer
+                # the requesting student's own row so is_own survives the dedup.
+                raw = sorted(
+                    raw,
+                    key=lambda r: (
+                        r["stop_order"],
+                        str(r["student_id"]) != str(student_id),
+                        r["name"] or "",
+                    ),
+                )
                 seen_orders = set()
                 for s in raw:
                     if s["stop_order"] in seen_orders:

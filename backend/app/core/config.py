@@ -22,6 +22,18 @@ class Settings(BaseSettings):
     )
     africas_talking_api_key: str = Field(default="", alias="AFRICAS_TALKING_API_KEY")
     africas_talking_username: str = Field(default="", alias="AFRICAS_TALKING_USERNAME")
+    trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    # Firebase Cloud Messaging. Service account JSON (inline or a file path)
+    # enables backend sends; the web config + VAPID key are served to the
+    # frontend so browsers can register device tokens.
+    firebase_service_account_json: str = Field(default="", alias="FIREBASE_SERVICE_ACCOUNT_JSON")
+    firebase_web_config_json: str = Field(default="", alias="FIREBASE_WEB_CONFIG_JSON")
+    firebase_vapid_key: str = Field(default="", alias="FIREBASE_VAPID_KEY")
+    # Plain Web Push (VAPID) fallback, independent of Firebase.
+    vapid_public_key: str = Field(default="", alias="VAPID_PUBLIC_KEY")
+    vapid_private_key: str = Field(default="", alias="VAPID_PRIVATE_KEY")
+    vapid_subject: str = Field(default="mailto:admin@saferidekenya.com", alias="VAPID_SUBJECT")
+    bus_approaching_radius_m: int = Field(default=1000, alias="BUS_APPROACHING_RADIUS_M")
 
     model_config = SettingsConfigDict(env_file=(".env", ".env.local"), extra="ignore")
 

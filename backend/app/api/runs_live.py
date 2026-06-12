@@ -1,12 +1,14 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
 from app.dao.run_dao import RunDao
+from app.services.push_service import PushService
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 dao = RunDao()
+push_service = PushService()
 admin_only = require_role("admin")
 driver_only = require_role("driver")
 
@@ -75,25 +77,47 @@ def driver_context(user: dict = Depends(driver_only)):
 
 
 @router.post("/driver/start")
-def start_run(payload: StartRunPayload, user: dict = Depends(driver_only)):
-    return safe_call(lambda: dao.start_run(user["id"], payload.route_id))
+def start_run(
+    payload: StartRunPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    run = safe_call(lambda: dao.start_run(user["id"], payload.route_id))
+    background_tasks.add_task(push_service.notify_run_started, run)
+    return run
 
 
 @router.post("/driver/arrive")
-def arrive(payload: RunIdPayload, user: dict = Depends(driver_only)):
-    return safe_call(lambda: dao.arrive_next_stop(user["id"], payload.run_id))
+def arrive(
+    payload: RunIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    result = safe_call(lambda: dao.arrive_next_stop(user["id"], payload.run_id))
+    if result.get("arrival_incident"):
+        background_tasks.add_task(push_service.notify_reached_school, result["run"])
+    return result
 
 
 @router.post("/driver/end")
-def end_run(payload: RunIdPayload, user: dict = Depends(driver_only)):
-    return safe_call(lambda: dao.end_run(user["id"], payload.run_id))
+def end_run(
+    payload: RunIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    run = safe_call(lambda: dao.end_run(user["id"], payload.run_id))
+    background_tasks.add_task(push_service.notify_run_ended, run)
+    return run
 
 
 @router.post("/driver/position")
-def write_position(payload: PositionPayload, user: dict = Depends(driver_only)):
-    return safe_call(lambda: (dao.write_position(user["id"], payload.lat, payload.lng), {"ok": True})[1])
+def write_position(
+    payload: PositionPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    result = safe_call(lambda: (dao.write_position(user["id"], payload.lat, payload.lng), {"ok": True})[1])
+    background_tasks.add_task(push_service.notify_bus_position, user["id"], payload.lat, payload.lng)
+    return result
 
 
 @router.post("/driver/boarding")
-def toggle_boarding(payload: BoardingPayload, user: dict = Depends(driver_only)):
-    return safe_call(lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus))
+def toggle_boarding(
+    payload: BoardingPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    student = safe_call(lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus))
+    if payload.on_bus:
+        background_tasks.add_task(push_service.notify_student_boarded, user["id"], payload.student_id)
+    return student
