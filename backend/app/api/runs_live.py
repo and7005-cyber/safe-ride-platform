@@ -1,0 +1,99 @@
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from app.api._helpers import safe_call
+from app.core.auth import get_current_user, require_role
+from app.dao.run_dao import RunDao
+
+router = APIRouter(prefix="/api/runs", tags=["runs"])
+dao = RunDao()
+admin_only = require_role("admin")
+driver_only = require_role("driver")
+
+
+class RunPayload(BaseModel):
+    bus_id: str | None = None
+    route_id: str | None = None
+    school_id: str | None = None
+    type: str | None = "morning"
+    date: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    status: str | None = "in-progress"
+    total_stops: int | None = 0
+    stops_completed: int | None = 0
+    total_students: int | None = 0
+    students_boarded: int | None = 0
+    incidents: int | None = 0
+
+
+class StartRunPayload(BaseModel):
+    route_id: str
+
+
+class RunIdPayload(BaseModel):
+    run_id: str
+
+
+class PositionPayload(BaseModel):
+    lat: float
+    lng: float
+
+
+class BoardingPayload(BaseModel):
+    student_id: str
+    on_bus: bool
+
+
+# Admin run CRUD -------------------------------------------------------------
+
+@router.get("")
+def list_runs(user: dict = Depends(get_current_user)):
+    return safe_call(dao.list_runs)
+
+
+@router.post("")
+def create_run(payload: RunPayload, user: dict = Depends(admin_only)):
+    return safe_call(lambda: dao.create_run(payload.model_dump()))
+
+
+@router.put("/{run_id}")
+def update_run(run_id: str, payload: RunPayload, user: dict = Depends(admin_only)):
+    return safe_call(lambda: dao.update_run(run_id, payload.model_dump()))
+
+
+@router.delete("/{run_id}")
+def delete_run(run_id: str, user: dict = Depends(admin_only)):
+    return safe_call(lambda: (dao.delete_run(run_id), {"ok": True})[1])
+
+
+# Driver run lifecycle -------------------------------------------------------
+
+@router.get("/driver/context")
+def driver_context(user: dict = Depends(driver_only)):
+    return safe_call(lambda: dao.get_driver_context(user["id"]))
+
+
+@router.post("/driver/start")
+def start_run(payload: StartRunPayload, user: dict = Depends(driver_only)):
+    return safe_call(lambda: dao.start_run(user["id"], payload.route_id))
+
+
+@router.post("/driver/arrive")
+def arrive(payload: RunIdPayload, user: dict = Depends(driver_only)):
+    return safe_call(lambda: dao.arrive_next_stop(user["id"], payload.run_id))
+
+
+@router.post("/driver/end")
+def end_run(payload: RunIdPayload, user: dict = Depends(driver_only)):
+    return safe_call(lambda: dao.end_run(user["id"], payload.run_id))
+
+
+@router.post("/driver/position")
+def write_position(payload: PositionPayload, user: dict = Depends(driver_only)):
+    return safe_call(lambda: (dao.write_position(user["id"], payload.lat, payload.lng), {"ok": True})[1])
+
+
+@router.post("/driver/boarding")
+def toggle_boarding(payload: BoardingPayload, user: dict = Depends(driver_only)):
+    return safe_call(lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus))

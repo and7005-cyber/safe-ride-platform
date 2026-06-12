@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.local
+.superpowers/
+.local/
+.tools/
+node_modules/
+dist/
+coverage/
+__pycache__/
+.pytest_cache/
+.venv/
+.venv312/
+backend/.venv/
+backend/**/*.pyc
