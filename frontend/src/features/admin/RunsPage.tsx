@@ -29,6 +29,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
@@ -57,6 +58,7 @@ const EMPTY = { bus_id: "none", route_id: "none", type: "morning", date: "", sta
 export function RunsPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: runs = [] } = useRuns();
   const { data: buses = [] } = useBuses();
   const { data: routes = [] } = useRoutes();
@@ -107,6 +109,11 @@ export function RunsPage() {
   };
 
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this run?",
+      description: "This permanently removes the run record.",
+      confirmLabel: "Delete run",
+    }))) return;
     await api.del(`/api/runs/${id}`);
     await qc.invalidateQueries({ queryKey: ["runs"] });
   };

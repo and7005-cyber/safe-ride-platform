@@ -164,13 +164,13 @@ def test_school_route_and_student_crud(client, admin_headers):
     marker = uuid.uuid4().hex[:6]
     school = client.post(
         "/api/fleet/schools",
-        json={"name": f"IT School {marker}", "address": "Test Rd", "phone": "+254700", "lat": -1.30, "lng": 36.80},
+        json={"name": f"IT School {marker}", "address": "Test Rd", "phone": "+254700000000", "lat": -1.30, "lng": 36.80},
         headers=admin_headers,
     ).json()
     student = client.post(
         "/api/students",
         json={"name": f"IT Student {marker}", "grade": "G1", "home_lat": -1.29, "home_lng": 36.81,
-              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711"},
+              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711000000"},
         headers=admin_headers,
     ).json()
     route = client.post(
@@ -202,7 +202,7 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
     driver = client.post(
         "/api/accounts/drivers",
         json={"full_name": f"IT Driver {marker}", "email": f"it-driver-{marker}@test.local",
-              "password": "DriverPass1!", "phone": "+254722", "pin": ""},
+              "password": "DriverPass1!", "phone": "+254722000000", "pin": ""},
         headers=admin_headers,
     )
     assert driver.status_code == 200, driver.text
@@ -244,6 +244,247 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver_id}", headers=admin_headers)
         client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+
+
+# Validation, stops, absences, run uniqueness (June 2026 buglist) -------------
+
+def test_phone_validation_rejects_bad_numbers(client, admin_headers):
+    bad_school = client.post(
+        "/api/fleet/schools",
+        json={"name": "Bad Phone School", "phone": "12345"},
+        headers=admin_headers,
+    )
+    assert bad_school.status_code == 400
+    bad_driver = client.post(
+        "/api/accounts/drivers",
+        json={"full_name": "Bad", "email": "bad-phone@test.local",
+              "password": "DriverPass1!", "phone": "0812345678"},
+        headers=admin_headers,
+    )
+    assert bad_driver.status_code == 400
+
+
+def test_route_stops_named_by_address_and_directional(client, admin_headers):
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"Dir School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+    morning = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Dir AM {marker}", "type": "morning", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    afternoon = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Dir PM {marker}", "type": "afternoon", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    early = client.post(
+        "/api/students",
+        json={"name": f"Early {marker}", "home_address": "12 Early Lane",
+              "home_lat": -1.28, "home_lng": 36.80, "pickup_time": "06:30",
+              "route_ids": [morning["id"], afternoon["id"]]},
+        headers=admin_headers,
+    ).json()
+    late = client.post(
+        "/api/students",
+        json={"name": f"Late {marker}", "home_address": "99 Late Road",
+              "home_lat": -1.29, "home_lng": 36.81, "pickup_time": "06:50",
+              "route_ids": [morning["id"], afternoon["id"]]},
+        headers=admin_headers,
+    ).json()
+    try:
+        routes = client.get("/api/fleet/routes", headers=admin_headers).json()
+
+        am = next(r for r in routes if r["id"] == morning["id"])
+        am_stops = sorted(am["route_stops"], key=lambda s: s["stop_order"])
+        # Stops are named by home address, ordered by pickup time, gate last.
+        assert am_stops[0]["name"] == "12 Early Lane"
+        assert am_stops[1]["name"] == "99 Late Road"
+        assert am_stops[-1]["is_school_gate"] is True
+
+        pm = next(r for r in routes if r["id"] == afternoon["id"])
+        pm_stops = sorted(pm["route_stops"], key=lambda s: s["stop_order"])
+        # Afternoon: school first, then reverse pickup order.
+        assert pm_stops[0]["is_school_gate"] is True
+        assert pm_stops[1]["name"] == "99 Late Road"
+        assert pm_stops[2]["name"] == "12 Early Lane"
+
+        # Cancelling a student cancels their stop on the route (#1/#6 cascade).
+        client.delete(f"/api/students/{late['id']}", headers=admin_headers)
+        routes = client.get("/api/fleet/routes", headers=admin_headers).json()
+        am = next(r for r in routes if r["id"] == morning["id"])
+        names = {s["name"] for s in am["route_stops"]}
+        assert "99 Late Road" not in names
+        assert "12 Early Lane" in names
+    finally:
+        client.delete(f"/api/students/{early['id']}", headers=admin_headers)
+        client.delete(f"/api/students/{late['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{morning['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{afternoon['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
+    """A student with an address but no coordinates still gets their own stop
+    named by that address — never collapsed into a generic 'School Pickup' (#4)."""
+    marker = uuid.uuid4().hex[:6]
+    address = f"Pickup Point {marker}, Nairobi"
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"Addr School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+    route = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Addr Route {marker}", "type": "morning", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    student = client.post(
+        "/api/students",
+        json={"name": f"NoCoords {marker}", "home_address": address, "pickup_time": "06:45",
+              "route_ids": [route["id"]]},
+        headers=admin_headers,
+    ).json()
+    try:
+        r = next(x for x in client.get("/api/fleet/routes", headers=admin_headers).json()
+                 if x["id"] == route["id"])
+        names = [s["name"] for s in r["route_stops"]]
+        assert address in names, names
+        assert "School Pickup" not in names, names
+    finally:
+        client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_route_options_orders_stops(client, admin_headers):
+    body = {
+        "type": "morning",
+        "stops": [
+            {"label": "Far", "lat": -1.33, "lng": 36.86, "pickup_time": "06:20"},
+            {"label": "Near", "lat": -1.31, "lng": 36.83, "pickup_time": "06:50"},
+        ],
+    }
+    resp = client.post("/api/fleet/route-options", json=body, headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["options"]) == 2
+    assert all("stops" in o and o["stops"] for o in data["options"])
+    by_time = next(o for o in data["options"] if o["strategy"] == "By pickup time")
+    assert [s["label"] for s in by_time["stops"]] == ["Far", "Near"]
+
+
+def test_student_keeps_both_routes_on_update(client, admin_headers):
+    """A student keeps both a morning and an afternoon route across edits (#5).
+
+    Regression: _sync_routes compared incoming string ids against psycopg UUID
+    keys, so editing a student deleted the route that was already saved.
+    """
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools", json={"name": f"Both School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+    morning = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Both AM {marker}", "type": "morning", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    afternoon = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Both PM {marker}", "type": "afternoon", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    # Created with only the morning route, mirroring the reported flow.
+    student = client.post(
+        "/api/students",
+        json={"name": f"Both Kid {marker}", "route_ids": [morning["id"]]},
+        headers=admin_headers,
+    ).json()
+
+    def route_ids() -> set:
+        s = next(x for x in client.get("/api/students", headers=admin_headers).json() if x["id"] == student["id"])
+        return set(s["route_ids"])
+
+    try:
+        assert route_ids() == {morning["id"]}
+
+        # Edit to add the afternoon route while keeping the morning one.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [morning["id"], afternoon["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {morning["id"], afternoon["id"]}
+
+        # Idempotent re-save with both already present must not drop either.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"], morning["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {morning["id"], afternoon["id"]}
+
+        # Removing one still works.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {afternoon["id"]}
+    finally:
+        client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{morning['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{afternoon['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
+    marker = uuid.uuid4().hex[:6]
+    bus = client.post(
+        "/api/fleet/buses", json={"name": f"Dup Bus {marker}"}, headers=admin_headers
+    ).json()
+    run1 = client.post(
+        "/api/runs", json={"bus_id": bus["id"], "type": "morning", "status": "in-progress"},
+        headers=admin_headers,
+    )
+    assert run1.status_code == 200, run1.text
+    run2 = client.post(
+        "/api/runs", json={"bus_id": bus["id"], "type": "morning", "status": "in-progress"},
+        headers=admin_headers,
+    )
+    assert run2.status_code == 409
+    client.delete(f"/api/runs/{run1.json()['id']}", headers=admin_headers)
+    client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+
+
+def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, no_active_run):
+    students = client.get("/api/students", headers=admin_headers).json()
+    brian = next(s for s in students if s["name"] == "Brian Achieng")
+    marked = client.post(
+        "/api/students/absences", json={"student_id": brian["id"]}, headers=admin_headers
+    )
+    assert marked.status_code == 200, marked.text
+    try:
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        morning = next(r for r in context["routes"] if r["type"] == "morning")
+        run = client.post(
+            "/api/runs/driver/start", json={"route_id": morning["id"]}, headers=driver_headers
+        )
+        assert run.status_code == 200, run.text
+        ctx = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        stop_student_ids = {s["student_id"] for s in ctx["run_stops"]}
+        assert brian["id"] not in stop_student_ids
+    finally:
+        absences = client.get(
+            "/api/students/absences", headers=admin_headers
+        ).json()
+        for a in absences:
+            if a["student_id"] == brian["id"]:
+                client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
 
 
 # Driver lifecycle & notification pipeline -------------------------------------

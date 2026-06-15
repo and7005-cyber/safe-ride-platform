@@ -22,8 +22,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { emailError, phoneError } from "@/lib/validation";
 import { useDrivers } from "@/lib/queries";
 
 const EMPTY = { full_name: "", email: "", password: "", phone: "", pin: "" };
@@ -31,6 +33,7 @@ const EMPTY = { full_name: "", email: "", password: "", phone: "", pin: "" };
 export function DriversPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: drivers = [] } = useDrivers();
   const [open, setOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
@@ -76,10 +79,18 @@ export function DriversPage() {
   };
 
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this driver?",
+      description: "This permanently removes the driver account and unassigns their bus.",
+      confirmLabel: "Delete driver",
+    }))) return;
     await api.del(`/api/accounts/drivers/${id}`);
     await qc.invalidateQueries({ queryKey: ["accounts-drivers"] });
     await qc.invalidateQueries({ queryKey: ["buses"] });
   };
+
+  const emailErr = emailError(form.email, true);
+  const phoneErr = phoneError(form.phone);
 
   return (
     <div className="space-y-6">
@@ -128,11 +139,19 @@ export function DriversPage() {
           <DialogHeader><DialogTitle>{editId ? "Edit Driver" : "Add Driver"}</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2"><Label>Full name</Label><Input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} /></div>
-            <div className="space-y-2"><Label>Email</Label><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></div>
+            <div className="space-y-2">
+              <Label>Email</Label>
+              <Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              {emailErr && <p className="text-xs text-destructive">{emailErr}</p>}
+            </div>
             {!editId && (
               <div className="space-y-2"><Label>Password</Label><Input type="password" minLength={6} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></div>
             )}
-            <div className="space-y-2"><Label>Phone</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
+            <div className="space-y-2">
+              <Label>Phone</Label>
+              <Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+              {phoneErr && <p className="text-xs text-destructive">{phoneErr}</p>}
+            </div>
             <div className="space-y-2">
               <Label>Driver PIN {editId && <span className="text-xs text-muted-foreground">(leave blank to keep existing)</span>}</Label>
               <div className="flex gap-2">
@@ -143,7 +162,7 @@ export function DriversPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save} disabled={saving || !form.full_name || !form.email || (!editId && form.password.length < 6)}>
+            <Button onClick={save} disabled={saving || !form.full_name || !!emailErr || !!phoneErr || (!editId && form.password.length < 6)}>
               {saving ? "Saving…" : "Save"}
             </Button>
           </DialogFooter>

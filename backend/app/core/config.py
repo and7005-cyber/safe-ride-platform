@@ -21,6 +21,11 @@ class Settings(BaseSettings):
         alias="DEMO_SCHOOL_ID",
     )
     trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    # Maps provider for geocoding + route optimisation (#4, #9). When neither
+    # key is set the app falls back to free OSM Nominatim geocoding and an
+    # offline nearest-neighbour optimiser.
+    google_maps_api_key: str = Field(default="", alias="GOOGLE_MAPS_API_KEY")
+    mapbox_token: str = Field(default="", alias="MAPBOX_TOKEN")
     # Firebase Cloud Messaging. Service account JSON (inline or a file path)
     # enables backend sends; the web config + VAPID key are served to the
     # frontend so browsers can register device tokens.

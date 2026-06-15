@@ -19,6 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { StatCard } from "@/features/admin/components/StatCard";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
@@ -28,6 +29,7 @@ import { Users } from "lucide-react";
 export function ParentAssignmentsPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: links = [] } = useParentStudents();
   const { data: parents = [] } = useParents();
   const { data: students = [] } = useStudents();
@@ -51,6 +53,11 @@ export function ParentAssignmentsPage() {
   };
 
   const unlink = async (id: string) => {
+    if (!(await confirm({
+      title: "Remove this assignment?",
+      description: "The parent will no longer see this child.",
+      confirmLabel: "Remove",
+    }))) return;
     await api.del(`/api/accounts/parent-students/${id}`);
     await qc.invalidateQueries({ queryKey: ["parent-students"] });
   };

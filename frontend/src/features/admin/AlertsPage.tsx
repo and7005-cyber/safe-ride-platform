@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/features/admin/components/PageHeader";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/apiClient";
 import { useIncidents } from "@/lib/queries";
 
@@ -29,6 +30,7 @@ const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "su
 
 export function AlertsPage() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const { data: incidents = [] } = useIncidents();
   const unacked = incidents.filter((i: any) => !i.acknowledged).length;
 
@@ -38,8 +40,12 @@ export function AlertsPage() {
     await qc.invalidateQueries({ queryKey: ["unread-alerts"] });
   };
 
-  // No confirmation dialog and no success toast (live parity).
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this alert?",
+      description: "This permanently removes the alert from the feed.",
+      confirmLabel: "Delete alert",
+    }))) return;
     await api.del(`/api/incidents/${id}`);
     await qc.invalidateQueries({ queryKey: ["incidents"] });
     await qc.invalidateQueries({ queryKey: ["unread-alerts"] });

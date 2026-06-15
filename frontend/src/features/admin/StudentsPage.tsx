@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, Upload } from "lucide-react";
+import { Pencil, Plus, Trash2, Upload, UserCheck, UserX } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -29,12 +29,14 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { BulkUploadDialog } from "@/features/admin/components/BulkUploadDialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { MapPicker } from "@/features/admin/components/MapPicker";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
-import { useBuses, useRoutes, useStudents } from "@/lib/queries";
+import { emailError, phoneError } from "@/lib/validation";
+import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
 
 const STUDENT_STATUS_FILTERS = [
   { value: "all", label: "All statuses" },
@@ -67,7 +69,7 @@ const EMPTY = {
   home_lng: null as number | null,
   pickup_time: "",
   status: "at-school",
-  bus_id: "none",
+  school_id: "none",
   morning_route: "none",
   afternoon_route: "none",
 };
@@ -75,44 +77,56 @@ const EMPTY = {
 export function StudentsPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: students = [] } = useStudents();
   const { data: routes = [] } = useRoutes();
-  const { data: buses = [] } = useBuses();
+  const { data: schools = [] } = useSchools();
+  const { data: absences = [] } = useAbsences();
   const [open, setOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
   const [saving, setSaving] = useState(false);
+  const [geocoding, setGeocoding] = useState(false);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
-  const [busFilter, setBusFilter] = useState("all");
+  const [schoolFilter, setSchoolFilter] = useState("all");
 
   const morningRoutes = useMemo(() => routes.filter((r: any) => r.type === "morning"), [routes]);
   const afternoonRoutes = useMemo(() => routes.filter((r: any) => r.type === "afternoon"), [routes]);
   const routeName = (id: string) => (routes as any[]).find((r) => r.id === id)?.name;
-  const busFilters = useMemo(
+  const schoolName = (id: string | null) =>
+    (schools as any[]).find((s) => s.id === id)?.name ?? "—";
+
+  const absenceByStudent = useMemo(() => {
+    const m = new Map<string, string>();
+    (absences as any[]).forEach((a) => m.set(a.student_id, a.id));
+    return m;
+  }, [absences]);
+
+  const schoolFilters = useMemo(
     () => [
-      { value: "all", label: "All buses" },
-      ...(buses as any[]).map((b) => ({ value: b.id, label: b.name })),
+      { value: "all", label: "All schools" },
+      ...(schools as any[]).map((s) => ({ value: s.id, label: s.name })),
     ],
-    [buses],
+    [schools],
   );
 
   const filtered = useMemo(
     () =>
       (students as any[]).filter((s) => {
         const matchesStatus = statusFilter === "all" || s.status === statusFilter;
-        const matchesBus = busFilter === "all" || s.bus_id === busFilter;
+        const matchesSchool = schoolFilter === "all" || s.school_id === schoolFilter;
         const q = search.toLowerCase();
         const matchesSearch =
           !q ||
           [s.name, s.parent_name, s.parent_phone].some((v: string) =>
             (v ?? "").toLowerCase().includes(q),
           );
-        return matchesStatus && matchesBus && matchesSearch;
+        return matchesStatus && matchesSchool && matchesSearch;
       }),
-    [students, search, statusFilter, busFilter],
+    [students, search, statusFilter, schoolFilter],
   );
 
   const startCreate = () => { setEditId(null); setForm({ ...EMPTY }); setOpen(true); };
@@ -124,23 +138,51 @@ export function StudentsPage() {
       parent_phone: s.parent_phone ?? "", parent_phone2: s.parent_phone2 ?? "",
       parent_email: s.parent_email ?? "", home_address: s.home_address ?? "",
       home_lat: s.home_lat, home_lng: s.home_lng, pickup_time: s.pickup_time ?? "",
-      status: s.status ?? "at-school", bus_id: s.bus_id ?? "none",
+      status: s.status ?? "at-school", school_id: s.school_id ?? "none",
       morning_route: morningRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
       afternoon_route: afternoonRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
     });
     setOpen(true);
   };
 
+  const parentPhoneErr = phoneError(form.parent_phone);
+  const parentPhone2Err = phoneError(form.parent_phone2);
+  const parentEmailErr = emailError(form.parent_email);
+
+  const geocodeAddress = async () => {
+    if (!form.home_address.trim()) return;
+    setGeocoding(true);
+    try {
+      const res = await api.post("/api/fleet/geocode", { address: form.home_address });
+      if (res.found) {
+        setForm((f) => ({ ...f, home_lat: res.lat, home_lng: res.lng }));
+        toast({ title: "Address located", description: res.label ?? "Pin placed on the map." });
+      } else {
+        toast({
+          title: "Address not found",
+          description: "Try a more specific address, or set the pin manually on the map.",
+          variant: "destructive",
+        });
+      }
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setGeocoding(false);
+    }
+  };
+
   const save = async () => {
     setSaving(true);
     try {
+      // Both morning and afternoon routes are sent in one payload so editing
+      // one never drops the other (#5).
       const route_ids = [form.morning_route, form.afternoon_route].filter((r) => r !== "none");
       const payload = {
         name: form.name, grade: form.grade || null, parent_name: form.parent_name || null,
         parent_phone: form.parent_phone || null, parent_phone2: form.parent_phone2 || null,
         parent_email: form.parent_email || null, home_address: form.home_address || null,
         home_lat: form.home_lat, home_lng: form.home_lng, pickup_time: form.pickup_time || null,
-        status: form.status, bus_id: form.bus_id === "none" ? null : form.bus_id, route_ids,
+        status: form.status, school_id: form.school_id === "none" ? null : form.school_id, route_ids,
       };
       if (editId) await api.put(`/api/students/${editId}`, payload);
       else await api.post("/api/students", payload);
@@ -154,9 +196,32 @@ export function StudentsPage() {
     }
   };
 
-  const remove = async (id: string) => {
-    await api.del(`/api/students/${id}`);
+  const remove = async (s: any) => {
+    if (!(await confirm({
+      title: `Delete ${s.name}?`,
+      description: "This removes the student and cancels their stop on every route.",
+      confirmLabel: "Delete student",
+    }))) return;
+    await api.del(`/api/students/${s.id}`);
     await qc.invalidateQueries({ queryKey: ["students"] });
+    await qc.invalidateQueries({ queryKey: ["routes"] });
+  };
+
+  const toggleAbsence = async (s: any) => {
+    const existing = absenceByStudent.get(s.id);
+    if (existing) {
+      await api.del(`/api/students/absences/${existing}`);
+    } else {
+      if (!(await confirm({
+        title: `Mark ${s.name} absent today?`,
+        description: "The bus won't stop at this student's stop today.",
+        confirmLabel: "Mark absent",
+        cancelLabel: "Cancel",
+        destructive: false,
+      }))) return;
+      await api.post("/api/students/absences", { student_id: s.id });
+    }
+    await qc.invalidateQueries({ queryKey: ["absences"] });
   };
 
   return (
@@ -169,7 +234,7 @@ export function StudentsPage() {
         placeholder="Search students, parents…"
         filters={[
           { value: statusFilter, onChange: setStatusFilter, options: STUDENT_STATUS_FILTERS },
-          { value: busFilter, onChange: setBusFilter, options: busFilters },
+          { value: schoolFilter, onChange: setSchoolFilter, options: schoolFilters },
         ]}
         actions={
           <>
@@ -189,6 +254,7 @@ export function StudentsPage() {
             <TableRow>
               <TableHead>Student</TableHead>
               <TableHead>Grade</TableHead>
+              <TableHead>School</TableHead>
               <TableHead>Routes</TableHead>
               <TableHead>Home Address</TableHead>
               <TableHead>Pickup</TableHead>
@@ -199,10 +265,11 @@ export function StudentsPage() {
           </TableHeader>
           <TableBody>
             {filtered.length === 0 ? (
-              <TableRow><TableCell colSpan={8} className="text-center text-muted-foreground">No students match your filters.</TableCell></TableRow>
+              <TableRow><TableCell colSpan={9} className="text-center text-muted-foreground">No students match your filters.</TableCell></TableRow>
             ) : (
               filtered.map((s: any) => {
                 const names = (s.route_ids ?? []).map(routeName).filter(Boolean);
+                const absentToday = absenceByStudent.has(s.id);
                 return (
                   <TableRow key={s.id}>
                     <TableCell>
@@ -211,9 +278,11 @@ export function StudentsPage() {
                           {initials(s.name)}
                         </span>
                         <span className="font-medium">{s.name}</span>
+                        {absentToday && <Badge variant="destructive" className="ml-1">Absent today</Badge>}
                       </div>
                     </TableCell>
                     <TableCell>{s.grade ?? "—"}</TableCell>
+                    <TableCell className="text-muted-foreground">{schoolName(s.school_id)}</TableCell>
                     <TableCell className="text-muted-foreground">{names.length ? names.join(", ") : "—"}</TableCell>
                     <TableCell className="text-muted-foreground">{s.home_address ?? "—"}</TableCell>
                     <TableCell>{s.pickup_time ?? "—"}</TableCell>
@@ -225,8 +294,16 @@ export function StudentsPage() {
                     </TableCell>
                     <TableCell><Badge variant={STATUS_VARIANT[s.status] ?? "secondary"}>{s.status}</Badge></TableCell>
                     <TableCell className="text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title={absentToday ? "Mark present today" : "Mark absent today"}
+                        onClick={() => toggleAbsence(s)}
+                      >
+                        {absentToday ? <UserCheck className="h-4 w-4 text-success" /> : <UserX className="h-4 w-4" />}
+                      </Button>
                       <Button variant="ghost" size="icon" onClick={() => startEdit(s)}><Pencil className="h-4 w-4" /></Button>
-                      <Button variant="ghost" size="icon" onClick={() => remove(s.id)}><Trash2 className="h-4 w-4" /></Button>
+                      <Button variant="ghost" size="icon" onClick={() => remove(s)}><Trash2 className="h-4 w-4" /></Button>
                     </TableCell>
                   </TableRow>
                 );
@@ -246,28 +323,49 @@ export function StudentsPage() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2"><Label>Parent name</Label><Input value={form.parent_name} onChange={(e) => setForm({ ...form, parent_name: e.target.value })} /></div>
-              <div className="space-y-2"><Label>Parent phone</Label><Input value={form.parent_phone} onChange={(e) => setForm({ ...form, parent_phone: e.target.value })} /></div>
+              <div className="space-y-2">
+                <Label>Parent phone</Label>
+                <Input value={form.parent_phone} onChange={(e) => setForm({ ...form, parent_phone: e.target.value })} />
+                {parentPhoneErr && <p className="text-xs text-destructive">{parentPhoneErr}</p>}
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2"><Label>Second phone</Label><Input value={form.parent_phone2} onChange={(e) => setForm({ ...form, parent_phone2: e.target.value })} /></div>
-              <div className="space-y-2"><Label>Parent email</Label><Input value={form.parent_email} onChange={(e) => setForm({ ...form, parent_email: e.target.value })} /></div>
+              <div className="space-y-2">
+                <Label>Second phone</Label>
+                <Input value={form.parent_phone2} onChange={(e) => setForm({ ...form, parent_phone2: e.target.value })} />
+                {parentPhone2Err && <p className="text-xs text-destructive">{parentPhone2Err}</p>}
+              </div>
+              <div className="space-y-2">
+                <Label>Parent email</Label>
+                <Input value={form.parent_email} onChange={(e) => setForm({ ...form, parent_email: e.target.value })} />
+                {parentEmailErr && <p className="text-xs text-destructive">{parentEmailErr}</p>}
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2"><Label>Home address</Label><Input value={form.home_address} onChange={(e) => setForm({ ...form, home_address: e.target.value })} /></div>
+              <div className="space-y-2">
+                <Label>Home address</Label>
+                <div className="flex gap-2">
+                  <Input value={form.home_address} onChange={(e) => setForm({ ...form, home_address: e.target.value })} />
+                  <Button type="button" variant="outline" onClick={geocodeAddress} disabled={geocoding || !form.home_address.trim()}>
+                    {geocoding ? "Locating…" : "Locate"}
+                  </Button>
+                </div>
+              </div>
               <div className="space-y-2"><Label>Pickup time</Label><Input placeholder="06:45" value={form.pickup_time} onChange={(e) => setForm({ ...form, pickup_time: e.target.value })} /></div>
             </div>
             <div className="space-y-2">
               <Label>Home location {form.home_lat != null && <span className="text-xs text-muted-foreground">({form.home_lat}, {form.home_lng})</span>}</Label>
               <MapPicker lat={form.home_lat} lng={form.home_lng} onPick={(lat, lng) => setForm({ ...form, home_lat: lat, home_lng: lng })} />
+              <p className="text-xs text-muted-foreground">Type an address and click Locate, or click the map to set the pickup point.</p>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2">
-                <Label>Bus</Label>
-                <Select value={form.bus_id} onValueChange={(v) => setForm({ ...form, bus_id: v })}>
+                <Label>School</Label>
+                <Select value={form.school_id} onValueChange={(v) => setForm({ ...form, school_id: v })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">— None —</SelectItem>
-                    {buses.map((b: any) => <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>)}
+                    {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </div>
@@ -306,10 +404,18 @@ export function StudentsPage() {
                 </Select>
               </div>
             </div>
+            <p className="text-xs text-muted-foreground">
+              Students are assigned to routes; the bus is whatever bus runs the route.
+            </p>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save} disabled={saving || !form.name}>{saving ? "Saving…" : "Save"}</Button>
+            <Button
+              onClick={save}
+              disabled={saving || !form.name || !!parentPhoneErr || !!parentPhone2Err || !!parentEmailErr}
+            >
+              {saving ? "Saving…" : "Save"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

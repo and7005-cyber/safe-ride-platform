@@ -17,7 +17,8 @@ test("parent track page shows the route map with own stop highlighted", async ({
   await page.goto("/parent/track");
 
   await expect(page.locator(".leaflet-container")).toBeVisible();
-  await expect(page.getByText("Kilimani Stop")).toBeVisible();
+  // Stops are now named by home address (#14); the parent's own stop is shown unmasked.
+  await expect(page.getByText(/Kilimani/).first()).toBeVisible();
   await expect(page.getByText("Your stop").first()).toBeVisible();
   await expect(page.getByText("School", { exact: true }).first()).toBeVisible();
 });

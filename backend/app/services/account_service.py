@@ -1,6 +1,7 @@
 from app.core.config import get_settings
 from app.core.errors import BadRequestError, ConflictError
 from app.core.security import hash_password, hash_pin_hmac
+from app.core.validation import clean_email, clean_phone
 from app.dao.account_dao import AccountDao
 
 
@@ -13,6 +14,8 @@ class AccountService:
         return self.dao.list_drivers()
 
     def create_driver(self, email, password, full_name, phone, pin):
+        email = clean_email(email, required=True)
+        phone = clean_phone(phone, field="driver phone")
         if self.dao.email_exists(email):
             raise BadRequestError("An account with this email already exists")
         if not password or len(password) < 6:
@@ -26,6 +29,8 @@ class AccountService:
             raise
 
     def update_driver(self, driver_id, full_name, email, phone, pin):
+        email = clean_email(email, required=True)
+        phone = clean_phone(phone, field="driver phone")
         # Blank PIN keeps the existing PIN; a 4-digit value replaces it.
         pin_hash = hash_pin_hmac(pin, self.pepper) if pin else None
         try:
@@ -42,6 +47,8 @@ class AccountService:
         return self.dao.list_parents()
 
     def update_parent(self, parent_id, full_name, email, phone):
+        email = clean_email(email, required=True)
+        phone = clean_phone(phone, field="parent phone")
         return self.dao.update_parent(parent_id, full_name, email, phone)
 
     def delete_parent(self, parent_id):
