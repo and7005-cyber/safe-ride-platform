@@ -14,15 +14,19 @@ absence_dao = AbsenceDao()
 admin_only = require_role("admin")
 
 
-def _clean_student(data: dict) -> dict:
+def _clean_student(data: dict, *, geocode_fallback: bool = True) -> dict:
     """Validate phones/email and best-effort geocode a typed address so a
-    student lands on a real route stop without needing a manual map pin (#4, #13)."""
+    student lands on a real route stop without needing a manual map pin (#4, #13).
+
+    Single saves allow the free OSM fallback (so addresses get coordinates even
+    with no maps key); bulk upload passes ``geocode_fallback=False`` to avoid
+    hammering the free service's rate limit row-by-row.
+    """
     data["parent_phone"] = clean_phone(data.get("parent_phone"), field="parent phone")
     data["parent_phone2"] = clean_phone(data.get("parent_phone2"), field="second phone")
     data["parent_email"] = clean_email(data.get("parent_email"), field="parent email")
     if data.get("home_address") and (data.get("home_lat") is None or data.get("home_lng") is None):
-        # allow_fallback=False → no network call unless a maps key is configured.
-        hit = geo_service.geocode(data["home_address"], allow_fallback=False)
+        hit = geo_service.geocode(data["home_address"], allow_fallback=geocode_fallback)
         if hit:
             data["home_lat"], data["home_lng"] = hit["lat"], hit["lng"]
     return data
@@ -99,7 +103,7 @@ def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
                 errors.append(f"{label}: missing required field (name, grade, parent name, parent phone)")
                 continue
             try:
-                assignments += dao.insert_bulk_student(_clean_student(row.model_dump()))
+                assignments += dao.insert_bulk_student(_clean_student(row.model_dump(), geocode_fallback=False))
                 inserted += 1
             except Exception as exc:  # noqa: BLE001 - surfaced per-row to the client
                 errors.append(f"{label}: {exc}")

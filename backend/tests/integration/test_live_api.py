@@ -327,6 +327,39 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
+def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
+    """A student with an address but no coordinates still gets their own stop
+    named by that address — never collapsed into a generic 'School Pickup' (#4)."""
+    marker = uuid.uuid4().hex[:6]
+    address = f"Pickup Point {marker}, Nairobi"
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"Addr School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+    route = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Addr Route {marker}", "type": "morning", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    student = client.post(
+        "/api/students",
+        json={"name": f"NoCoords {marker}", "home_address": address, "pickup_time": "06:45",
+              "route_ids": [route["id"]]},
+        headers=admin_headers,
+    ).json()
+    try:
+        r = next(x for x in client.get("/api/fleet/routes", headers=admin_headers).json()
+                 if x["id"] == route["id"])
+        names = [s["name"] for s in r["route_stops"]]
+        assert address in names, names
+        assert "School Pickup" not in names, names
+    finally:
+        client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
 def test_route_options_orders_stops(client, admin_headers):
     body = {
         "type": "morning",

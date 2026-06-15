@@ -23,8 +23,10 @@ def regenerate_route_stops(conn, route_id: str) -> None:
     - **Afternoon** routes start at the school and then visit the student
       stops in reverse pickup order (the morning route, run backwards).
 
-    Students with no coordinates collapse onto a single "School Pickup" stop.
-    A route with no school generates no gate stop.
+    A student with no coordinates still gets their own stop, labelled by home
+    address (so it shows in lists even without a map position) rather than
+    collapsing into a generic "School Pickup". A route with no school
+    generates no gate stop.
     """
     route = conn.execute(
         "select r.id, r.type, r.school_id, s.name as school_name, s.lat as school_lat, s.lng as school_lng "
@@ -55,7 +57,11 @@ def regenerate_route_stops(conn, route_id: str) -> None:
     by_key: dict[str, list[dict]] = {}
     for st in students:
         if st["home_lat"] is None or st["home_lng"] is None:
-            key = "school"
+            # No map coordinates: key by address so each distinct pickup point
+            # keeps its own stop (labelled by address) instead of collapsing
+            # into one generic stop. Falls back to a per-student key.
+            addr = (st.get("home_address") or "").strip().lower()
+            key = f"addr:{addr}" if addr else f"student:{st['id']}"
         else:
             key = f"{st['home_lat']:.6f},{st['home_lng']:.6f}"
         if key not in by_key:
@@ -79,11 +85,10 @@ def regenerate_route_stops(conn, route_id: str) -> None:
     for idx, key in enumerate(location_keys):
         order = location_order(idx)
         for st in by_key[key]:
-            if key == "school":
-                lat, lng, name = route["school_lat"], route["school_lng"], "School Pickup"
-            else:
-                lat, lng, name = st["home_lat"], st["home_lng"], _stop_label(st)
-            rows.append((route_id, name, order, st["pickup_time"], lat, lng, False, st["id"]))
+            # Labelled by home address; coordinate-less students simply have no
+            # map point (lat/lng stay null) but still appear as a named stop.
+            name = _stop_label(st)
+            rows.append((route_id, name, order, st["pickup_time"], st["home_lat"], st["home_lng"], False, st["id"]))
 
     for row in rows:
         conn.execute(
