@@ -7,6 +7,7 @@ from app.core.security import (
     verify_password,
     verify_pin_hmac,
 )
+from app.core.validation import clean_email
 from app.dao.auth_dao import AuthDao
 
 SIGNUP_ROLES = {"driver", "parent"}
@@ -42,6 +43,7 @@ class AuthService:
     def signup(self, email: str, password: str, full_name: str, role: str) -> dict:
         if role not in SIGNUP_ROLES:
             raise BadRequestError("Role must be driver or parent")
+        email = clean_email(email, required=True)
         if self.dao.get_user_by_email(email):
             raise BadRequestError("An account with this email already exists")
         user = self.dao.create_user(email, hash_password(password), full_name, role)

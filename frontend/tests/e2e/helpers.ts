@@ -89,3 +89,10 @@ export function cardContaining(page: Page, text: string | RegExp): Locator {
   return page.locator("div[class*='bg-card']").filter({ hasText: text }).first();
 }
 
+/** Confirm a destructive action in the shared "are you sure?" dialog (#6). */
+export async function confirmDelete(page: Page) {
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: /Delete|Remove|Yes/ }).click();
+  await expect(dialog).toHaveCount(0);
+}
+

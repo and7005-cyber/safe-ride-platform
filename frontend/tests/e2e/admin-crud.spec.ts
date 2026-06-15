@@ -5,6 +5,7 @@ import {
   apiToken,
   authHeaders,
   cardContaining,
+  confirmDelete,
   emailLogin,
   fieldInput,
   pickSelectOption,
@@ -71,6 +72,7 @@ test("admin can create, edit, search, and delete a bus", async ({ page }) => {
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
 
   await page.getByRole("row", { name: new RegExp(renamed) }).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
@@ -88,6 +90,7 @@ test("admin can create and delete a school with a map location", async ({ page }
   await expect(page.getByText(name)).toBeVisible();
 
   await cardContaining(page, name).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByText(name)).toHaveCount(0);
 });
 
@@ -106,6 +109,7 @@ test("admin can create and delete a route attached to a bus and school", async (
 
   // Routes render as cards; the trash button is the card's last icon button.
   await cardContaining(page, name).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByText(name)).toHaveCount(0);
 });
 
@@ -124,12 +128,14 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
   const row = page.getByRole("row", { name: new RegExp(name) });
-  await row.getByRole("button").first().click();
+  // Actions are [mark-absent, edit, delete]; the pencil is the second button.
+  await row.getByRole("button").nth(1).click();
   await fieldInput(dialog(page), "Name").fill(renamed);
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
 
   await page.getByRole("row", { name: new RegExp(renamed) }).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
@@ -148,6 +154,7 @@ test("admin can create and delete a driver account with a PIN", async ({ page })
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
   await page.getByRole("row", { name: new RegExp(name) }).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByRole("row", { name: new RegExp(name) })).toHaveCount(0);
 });
 
@@ -171,6 +178,7 @@ test("admin can edit and delete a registered parent account", async ({ page, req
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
 
   await page.getByRole("row", { name: new RegExp(renamed) }).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
@@ -197,6 +205,7 @@ test("admin can link and unlink a parent-student assignment", async ({ page, req
     await expect(page.getByRole("row", { name: new RegExp(studentName) })).toBeVisible();
 
     await page.getByRole("row", { name: new RegExp(studentName) }).getByRole("button").last().click();
+    await confirmDelete(page);
     await expect(page.getByRole("row", { name: new RegExp(studentName) })).toHaveCount(0);
   } finally {
     await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
@@ -217,6 +226,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
   const row = page.getByRole("row", { name: /2030-01-01/ });
   await expect(row).toBeVisible();
   await row.getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByRole("row", { name: /2030-01-01/ })).toHaveCount(0);
 });
 
@@ -242,6 +252,7 @@ test("admin can acknowledge and delete a driver incident", async ({ page, reques
   await expect(cardContaining(page, marker).getByText("Acknowledged")).toBeVisible();
 
   await cardContaining(page, marker).getByRole("button").last().click();
+  await confirmDelete(page);
   await expect(page.getByText(marker)).toHaveCount(0);
 });
 

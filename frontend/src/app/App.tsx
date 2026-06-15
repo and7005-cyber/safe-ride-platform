@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { AuthProvider } from "@/lib/auth";
@@ -14,10 +15,12 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <TooltipProvider>
-          <RouterProvider router={router} />
-          <Toaster />
-          <Sonner />
-          <PushForegroundListener />
+          <ConfirmProvider>
+            <RouterProvider router={router} />
+            <Toaster />
+            <Sonner />
+            <PushForegroundListener />
+          </ConfirmProvider>
         </TooltipProvider>
       </AuthProvider>
     </QueryClientProvider>

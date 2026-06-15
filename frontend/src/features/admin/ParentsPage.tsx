@@ -22,13 +22,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { emailError, phoneError } from "@/lib/validation";
 import { useParents } from "@/lib/queries";
 
 export function ParentsPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: parents = [] } = useParents();
   const [open, setOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
@@ -52,9 +55,17 @@ export function ParentsPage() {
   };
 
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this parent?",
+      description: "This removes the parent account and its student links.",
+      confirmLabel: "Delete parent",
+    }))) return;
     await api.del(`/api/accounts/parents/${id}`);
     await qc.invalidateQueries({ queryKey: ["accounts-parents"] });
   };
+
+  const emailErr = emailError(form.email, true);
+  const phoneErr = phoneError(form.phone);
 
   return (
     <div className="space-y-6">
@@ -105,12 +116,20 @@ export function ParentsPage() {
           <DialogHeader><DialogTitle>Edit Parent</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2"><Label>Full name</Label><Input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} /></div>
-            <div className="space-y-2"><Label>Email</Label><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></div>
-            <div className="space-y-2"><Label>Phone</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
+            <div className="space-y-2">
+              <Label>Email</Label>
+              <Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              {emailErr && <p className="text-xs text-destructive">{emailErr}</p>}
+            </div>
+            <div className="space-y-2">
+              <Label>Phone</Label>
+              <Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+              {phoneErr && <p className="text-xs text-destructive">{phoneErr}</p>}
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save}>Save</Button>
+            <Button onClick={save} disabled={!!emailErr || !!phoneErr}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

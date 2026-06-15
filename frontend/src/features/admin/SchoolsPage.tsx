@@ -13,9 +13,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { MapPicker } from "@/features/admin/components/MapPicker";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { phoneError } from "@/lib/validation";
 import { useSchools } from "@/lib/queries";
 
 const EMPTY = { name: "", address: "", phone: "", lat: null as number | null, lng: null as number | null };
@@ -23,6 +25,7 @@ const EMPTY = { name: "", address: "", phone: "", lat: null as number | null, ln
 export function SchoolsPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: schools = [] } = useSchools();
   const [open, setOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
@@ -56,9 +59,16 @@ export function SchoolsPage() {
   };
 
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this school?",
+      description: "Routes pointing at this school will lose their destination.",
+      confirmLabel: "Delete school",
+    }))) return;
     await api.del(`/api/fleet/schools/${id}`);
     await qc.invalidateQueries({ queryKey: ["schools"] });
   };
+
+  const phoneErr = phoneError(form.phone, { allowLandline: true });
 
   return (
     <div className="space-y-6">
@@ -91,7 +101,11 @@ export function SchoolsPage() {
           <div className="space-y-4">
             <div className="space-y-2"><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
             <div className="space-y-2"><Label>Address</Label><Input value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} /></div>
-            <div className="space-y-2"><Label>Phone</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
+            <div className="space-y-2">
+              <Label>Phone</Label>
+              <Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+              {phoneErr && <p className="text-xs text-destructive">{phoneErr}</p>}
+            </div>
             <div className="space-y-2">
               <Label>Location {form.lat != null && <span className="text-xs text-muted-foreground">({form.lat}, {form.lng})</span>}</Label>
               <MapPicker lat={form.lat} lng={form.lng} onPick={(lat, lng) => setForm({ ...form, lat, lng })} />
@@ -100,7 +114,7 @@ export function SchoolsPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save} disabled={saving || !form.name}>{saving ? "Saving…" : "Save"}</Button>
+            <Button onClick={save} disabled={saving || !form.name || !!phoneErr}>{saving ? "Saving…" : "Save"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

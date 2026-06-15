@@ -3,15 +3,31 @@ from typing import Any
 from app.core.db import get_connection
 
 
+def _stop_label(st: dict) -> str:
+    """A stop is labelled by the student's home address (#1, #14); fall back to
+    a surname-based label only when no address is recorded."""
+    address = (st.get("home_address") or "").strip()
+    if address:
+        return address
+    return (st["name"].split()[-1] + " Stop") if st.get("name") else "Stop"
+
+
 def regenerate_route_stops(conn, route_id: str) -> None:
     """Rebuild a route's stops from its assigned students + the school gate.
 
-    One stop per unique home location (siblings share an order); students with
-    no coordinates get a stop at the school; the school gate is always last.
+    One stop per unique home location (siblings share an order). Stops are
+    named by home address. Direction matters:
+
+    - **Morning** routes are ordered by pickup time, with the selected school
+      as the final stop.
+    - **Afternoon** routes start at the school and then visit the student
+      stops in reverse pickup order (the morning route, run backwards).
+
+    Students with no coordinates collapse onto a single "School Pickup" stop.
     A route with no school generates no gate stop.
     """
     route = conn.execute(
-        "select r.id, r.school_id, s.name as school_name, s.lat as school_lat, s.lng as school_lng "
+        "select r.id, r.type, r.school_id, s.name as school_name, s.lat as school_lat, s.lng as school_lng "
         "from live_routes r left join live_schools s on s.id = r.school_id where r.id = %s",
         (route_id,),
     ).fetchone()
@@ -20,7 +36,7 @@ def regenerate_route_stops(conn, route_id: str) -> None:
 
     students = conn.execute(
         """
-        select st.id, st.name, st.home_lat, st.home_lng, st.pickup_time
+        select st.id, st.name, st.home_address, st.home_lat, st.home_lng, st.pickup_time
         from live_student_routes sr
         join live_students st on st.id = sr.student_id
         where sr.route_id = %s
@@ -31,26 +47,43 @@ def regenerate_route_stops(conn, route_id: str) -> None:
 
     conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
 
-    # Group students into ordered stops by location key (coords, or 'school'
-    # for coordinate-less students).
-    order_by_key: dict[str, int] = {}
-    next_order = 0
-    rows: list[tuple] = []
+    is_afternoon = route["type"] == "afternoon"
+    has_gate = route["school_id"] is not None
+
+    # Group students by location, preserving morning pickup order.
+    location_keys: list[str] = []
+    by_key: dict[str, list[dict]] = {}
     for st in students:
         if st["home_lat"] is None or st["home_lng"] is None:
             key = "school"
-            lat, lng = route["school_lat"], route["school_lng"]
-            name = "School Pickup"
         else:
             key = f"{st['home_lat']:.6f},{st['home_lng']:.6f}"
-            lat, lng = st["home_lat"], st["home_lng"]
-            name = (st["name"].split()[-1] + " Stop") if st["name"] else "Stop"
-        if key not in order_by_key:
-            next_order += 1
-            order_by_key[key] = next_order
-        rows.append(
-            (route_id, name, order_by_key[key], st["pickup_time"], lat, lng, False, st["id"])
-        )
+        if key not in by_key:
+            by_key[key] = []
+            location_keys.append(key)
+        by_key[key].append(dict(st))
+
+    n_locations = len(location_keys)
+    # Reserve order 1 for the school gate on afternoon routes; otherwise the
+    # gate trails the student stops.
+    student_base = 2 if (is_afternoon and has_gate) else 1
+    gate_order = 1 if (is_afternoon and has_gate) else (n_locations + 1 if has_gate else None)
+
+    def location_order(idx: int) -> int:
+        if is_afternoon:
+            # Reverse the morning order: first morning pickup is dropped last.
+            return student_base + (n_locations - 1 - idx)
+        return student_base + idx
+
+    rows: list[tuple] = []
+    for idx, key in enumerate(location_keys):
+        order = location_order(idx)
+        for st in by_key[key]:
+            if key == "school":
+                lat, lng, name = route["school_lat"], route["school_lng"], "School Pickup"
+            else:
+                lat, lng, name = st["home_lat"], st["home_lng"], _stop_label(st)
+            rows.append((route_id, name, order, st["pickup_time"], lat, lng, False, st["id"]))
 
     for row in rows:
         conn.execute(
@@ -59,8 +92,7 @@ def regenerate_route_stops(conn, route_id: str) -> None:
             row,
         )
 
-    if route["school_id"] is not None:
-        gate_order = next_order + 1
+    if has_gate:
         conn.execute(
             "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
             "values (%s, %s, %s, %s, %s, %s, true, null)",
@@ -182,3 +214,34 @@ class FleetDao:
     def delete_route(self, route_id: str) -> None:
         with get_connection() as conn:
             conn.execute("delete from live_routes where id = %s", (route_id,))
+
+    # --- stop-level edits (#1) --------------------------------------------
+
+    def remove_student_from_route(self, route_id: str, student_id: str) -> None:
+        """Cancel a stop by removing its student from the route, then rebuild."""
+        from app.dao.student_live_dao import _derive_student_bus
+
+        with get_connection() as conn:
+            conn.execute(
+                "delete from live_student_routes where route_id = %s and student_id = %s",
+                (route_id, student_id),
+            )
+            regenerate_route_stops(conn, route_id)
+            _derive_student_bus(conn, student_id)
+
+    def set_student_pickup_time(self, student_id: str, pickup_time: str | None) -> None:
+        """Edit a stop's pickup time (a student attribute); reorder every route
+        the student is on, since ordering is by pickup time."""
+        with get_connection() as conn:
+            conn.execute(
+                "update live_students set pickup_time = %s where id = %s",
+                (pickup_time, student_id),
+            )
+            route_ids = [
+                r["route_id"]
+                for r in conn.execute(
+                    "select route_id from live_student_routes where student_id = %s", (student_id,)
+                ).fetchall()
+            ]
+            for route_id in route_ids:
+                regenerate_route_stops(conn, route_id)

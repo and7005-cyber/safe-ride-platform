@@ -29,9 +29,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { phoneError } from "@/lib/validation";
 import { useBuses, useDrivers } from "@/lib/queries";
 
 const STATUS_FILTERS = [
@@ -62,6 +64,7 @@ const EMPTY = {
 export function BusesPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: buses = [], isLoading } = useBuses();
   const { data: drivers = [] } = useDrivers();
   const [open, setOpen] = useState(false);
@@ -140,6 +143,11 @@ export function BusesPage() {
   };
 
   const remove = async (id: string) => {
+    if (!(await confirm({
+      title: "Delete this bus?",
+      description: "This removes the bus from the fleet.",
+      confirmLabel: "Delete bus",
+    }))) return;
     try {
       await api.del(`/api/fleet/buses/${id}`);
       await qc.invalidateQueries({ queryKey: ["buses"] });
@@ -149,6 +157,9 @@ export function BusesPage() {
   };
 
   const driverSelected = form.driver_id !== "none";
+  // Only the manually-typed driver phone needs validating; a synced one is
+  // already normalised on the driver's own record.
+  const driverPhoneErr = driverSelected ? null : phoneError(form.driver_phone);
 
   return (
     <div className="space-y-6">
@@ -243,6 +254,7 @@ export function BusesPage() {
               <div className="space-y-2">
                 <Label>Driver phone</Label>
                 <Input value={form.driver_phone} readOnly={driverSelected} className={driverSelected ? "bg-muted" : ""} onChange={(e) => setForm({ ...form, driver_phone: e.target.value })} />
+                {driverPhoneErr && <p className="text-xs text-destructive">{driverPhoneErr}</p>}
               </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -266,7 +278,7 @@ export function BusesPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save} disabled={saving || !form.name}>{saving ? "Saving…" : "Save"}</Button>
+            <Button onClick={save} disabled={saving || !form.name || !!driverPhoneErr}>{saving ? "Saving…" : "Save"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

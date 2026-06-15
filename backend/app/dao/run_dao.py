@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.absence_dao import absent_student_ids
 
 
 class RunDao:
@@ -20,7 +21,22 @@ class RunDao:
         return [dict(r) for r in rows]
 
     def create_run(self, data: dict) -> dict[str, Any]:
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
+            # No two non-completed runs for the same bus on the same date (#12).
+            if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
+                existing = conn.execute(
+                    """
+                    select 1 from live_runs
+                    where bus_id = %s and status <> 'completed'
+                      and date = coalesce(%s::date, (now() at time zone 'Africa/Nairobi')::date)
+                    limit 1
+                    """,
+                    (data["bus_id"], data.get("date")),
+                ).fetchone()
+                if existing:
+                    raise ConflictError("This bus already has an active run on that date")
             row = conn.execute(
                 """
                 insert into live_runs
@@ -86,10 +102,21 @@ class RunDao:
             active_dict = dict(active) if active else None
             run_stops = []
             if active_dict:
+                # Skip stops for students marked absent today so the driver
+                # doesn't stop for them (#7). The school gate (student_id null)
+                # always remains.
                 run_stops = [
                     dict(s)
                     for s in conn.execute(
-                        "select * from run_stops where run_id = %s order by stop_order asc",
+                        """
+                        select rs.* from run_stops rs
+                        where rs.run_id = %s
+                          and (rs.student_id is null or rs.student_id not in (
+                              select student_id from live_student_absences
+                              where absence_date = (now() at time zone 'Africa/Nairobi')::date
+                          ))
+                        order by rs.stop_order asc
+                        """,
                         (active_dict["id"],),
                     ).fetchall()
                 ]
@@ -133,15 +160,31 @@ class RunDao:
             if self.find_active_run_today(conn, bus["id"]):
                 raise ConflictError("A run is already in progress for this bus today")
 
-            stops = conn.execute(
+            all_stops = conn.execute(
                 "select * from live_route_stops where route_id = %s order by stop_order asc, name asc",
                 (route_id,),
             ).fetchall()
-            distinct_orders = sorted({s["stop_order"] for s in stops})
+            # Drop stops for students marked absent today (#7), then renumber so
+            # the snapshot's stop_orders stay contiguous (arrive_next_stop walks
+            # them one at a time).
+            absent = absent_student_ids(conn)
+            kept = [
+                s for s in all_stops
+                if s["student_id"] is None or str(s["student_id"]) not in absent
+            ]
+            distinct_orders = sorted({s["stop_order"] for s in kept})
             if not distinct_orders:
                 raise ConflictError("Route has no stops")
+            order_map = {orig: i + 1 for i, orig in enumerate(distinct_orders)}
             students = conn.execute(
-                "select count(*) as n from live_students where bus_id = %s", (bus["id"],)
+                """
+                select count(*) as n from live_students
+                where bus_id = %s and id not in (
+                    select student_id from live_student_absences
+                    where absence_date = (now() at time zone 'Africa/Nairobi')::date
+                )
+                """,
+                (bus["id"],),
             ).fetchone()
 
             run = conn.execute(
@@ -158,12 +201,12 @@ class RunDao:
                 (bus["id"], route_id, route["school_id"], driver_id, route["type"],
                  len(distinct_orders), students["n"]),
             ).fetchone()
-            for s in stops:
+            for s in kept:
                 conn.execute(
                     "insert into run_stops (run_id, stop_order, name, scheduled_time, lat, lng, is_school_gate, student_id) "
                     "values (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (run["id"], s["stop_order"], s["name"], s["scheduled_time"], s["lat"], s["lng"],
-                     s["is_school_gate"], s["student_id"]),
+                    (run["id"], order_map[s["stop_order"]], s["name"], s["scheduled_time"], s["lat"],
+                     s["lng"], s["is_school_gate"], s["student_id"]),
                 )
         return dict(run)
 

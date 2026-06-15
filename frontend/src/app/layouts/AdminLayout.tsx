@@ -18,6 +18,14 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth";
 import { useUnreadAlerts } from "@/lib/queries";
@@ -122,7 +130,12 @@ export function AdminLayout({ children }: { children: ReactNode }) {
             <Menu className="h-5 w-5" />
           </Button>
           <div className="flex-1" />
-          <button className="relative" aria-label="Notifications">
+          <button
+            className="relative"
+            aria-label="Notifications"
+            title="View alerts"
+            onClick={() => navigate("/alerts")}
+          >
             <Bell className="h-5 w-5 text-muted-foreground" />
             {unreadCount > 0 && (
               <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] text-destructive-foreground">
@@ -130,11 +143,29 @@ export function AdminLayout({ children }: { children: ReactNode }) {
               </span>
             )}
           </button>
-          <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">
-              {(user?.fullName ?? user?.email ?? "A").slice(0, 2).toUpperCase()}
-            </div>
-          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground"
+                title={user?.fullName ?? user?.email ?? "Account"}
+                aria-label="Account menu"
+              >
+                {(user?.fullName ?? user?.email ?? "A").slice(0, 2).toUpperCase()}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuLabel>
+                <p className="text-sm font-semibold leading-tight">{user?.fullName ?? "Account"}</p>
+                {user?.email && (
+                  <p className="text-xs font-normal text-muted-foreground">{user.email}</p>
+                )}
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={handleSignOut}>
+                <LogOut className="h-4 w-4" /> Sign Out
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </header>
         <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>
