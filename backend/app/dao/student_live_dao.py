@@ -34,8 +34,11 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
     existing = conn.execute(
         "select id, route_id from live_student_routes where student_id = %s", (student_id,)
     ).fetchall()
-    existing_by_route = {r["route_id"]: r["id"] for r in existing}
-    wanted = {rid for rid in route_ids if rid}
+    # route_id comes back from psycopg as a uuid.UUID, but route_ids arrive as
+    # strings from the API. Compare on str so an update never mistakes an
+    # existing link for a removed one and deletes it (#5).
+    existing_by_route = {str(r["route_id"]): r["id"] for r in existing}
+    wanted = {str(rid) for rid in route_ids if rid}
 
     affected: set[str] = set()
     for route_id in wanted - set(existing_by_route):

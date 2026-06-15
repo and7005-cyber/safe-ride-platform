@@ -344,6 +344,71 @@ def test_route_options_orders_stops(client, admin_headers):
     assert [s["label"] for s in by_time["stops"]] == ["Far", "Near"]
 
 
+def test_student_keeps_both_routes_on_update(client, admin_headers):
+    """A student keeps both a morning and an afternoon route across edits (#5).
+
+    Regression: _sync_routes compared incoming string ids against psycopg UUID
+    keys, so editing a student deleted the route that was already saved.
+    """
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools", json={"name": f"Both School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+    morning = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Both AM {marker}", "type": "morning", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    afternoon = client.post(
+        "/api/fleet/routes",
+        json={"name": f"Both PM {marker}", "type": "afternoon", "school_id": school["id"]},
+        headers=admin_headers,
+    ).json()
+    # Created with only the morning route, mirroring the reported flow.
+    student = client.post(
+        "/api/students",
+        json={"name": f"Both Kid {marker}", "route_ids": [morning["id"]]},
+        headers=admin_headers,
+    ).json()
+
+    def route_ids() -> set:
+        s = next(x for x in client.get("/api/students", headers=admin_headers).json() if x["id"] == student["id"])
+        return set(s["route_ids"])
+
+    try:
+        assert route_ids() == {morning["id"]}
+
+        # Edit to add the afternoon route while keeping the morning one.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [morning["id"], afternoon["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {morning["id"], afternoon["id"]}
+
+        # Idempotent re-save with both already present must not drop either.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"], morning["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {morning["id"], afternoon["id"]}
+
+        # Removing one still works.
+        client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"]]},
+            headers=admin_headers,
+        )
+        assert route_ids() == {afternoon["id"]}
+    finally:
+        client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{morning['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{afternoon['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
 def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
     marker = uuid.uuid4().hex[:6]
     bus = client.post(
