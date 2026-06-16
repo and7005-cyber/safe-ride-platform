@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -39,6 +39,18 @@ export function DriversPage() {
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
   const [saving, setSaving] = useState(false);
+  // After a PIN is set/reset, reveal it once so the admin can share it — the
+  // backend hashes it and can never show it again.
+  const [pinReveal, setPinReveal] = useState<{ name: string; pin: string } | null>(null);
+
+  const copyPin = async (pin: string) => {
+    try {
+      await navigator.clipboard.writeText(pin);
+      toast({ title: "PIN copied" });
+    } catch {
+      toast({ title: "Copy failed", description: "Copy the PIN manually.", variant: "destructive" });
+    }
+  };
 
   const startCreate = () => { setEditId(null); setForm({ ...EMPTY }); setOpen(true); };
   const startEdit = (d: any) => {
@@ -70,7 +82,11 @@ export function DriversPage() {
       }
       await qc.invalidateQueries({ queryKey: ["accounts-drivers"] });
       await qc.invalidateQueries({ queryKey: ["buses"] });
+      const newPin = form.pin;
+      const driverName = form.full_name;
       setOpen(false);
+      // A non-empty PIN means it was just set or reset — reveal it once.
+      if (newPin) setPinReveal({ name: driverName, pin: newPin });
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
@@ -153,11 +169,17 @@ export function DriversPage() {
               {phoneErr && <p className="text-xs text-destructive">{phoneErr}</p>}
             </div>
             <div className="space-y-2">
-              <Label>Driver PIN {editId && <span className="text-xs text-muted-foreground">(leave blank to keep existing)</span>}</Label>
+              <Label>
+                {editId ? "Reset PIN" : "Driver PIN"}
+                {editId && <span className="ml-1 text-xs text-muted-foreground">(leave blank to keep the current PIN)</span>}
+              </Label>
               <div className="flex gap-2">
                 <Input inputMode="numeric" maxLength={4} placeholder="4 digits" value={form.pin} onChange={(e) => setForm({ ...form, pin: e.target.value.replace(/\D/g, "").slice(0, 4) })} />
                 <Button type="button" variant="outline" onClick={generatePin}>Generate</Button>
               </div>
+              <p className="text-xs text-muted-foreground">
+                You'll see the PIN once after saving — it's stored encrypted and can't be shown again.
+              </p>
             </div>
           </div>
           <DialogFooter>
@@ -165,6 +187,30 @@ export function DriversPage() {
             <Button onClick={save} disabled={saving || !form.full_name || !!emailErr || !!phoneErr || (!editId && form.password.length < 6)}>
               {saving ? "Saving…" : "Save"}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!pinReveal} onOpenChange={(o) => (o ? null : setPinReveal(null))}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader><DialogTitle>Driver PIN set</DialogTitle></DialogHeader>
+          {pinReveal && (
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                Share this PIN with {pinReveal.name || "the driver"} now — they sign in on the
+                <span className="font-medium"> Driver PIN</span> tab. For security it's stored
+                encrypted and can't be shown again.
+              </p>
+              <div className="flex items-center justify-between rounded-md border bg-muted px-4 py-3">
+                <span className="font-mono text-2xl font-semibold tracking-[0.3em]">{pinReveal.pin}</span>
+                <Button variant="outline" size="sm" onClick={() => copyPin(pinReveal.pin)}>
+                  <Copy className="h-4 w-4" /> Copy
+                </Button>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button onClick={() => setPinReveal(null)}>Done</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

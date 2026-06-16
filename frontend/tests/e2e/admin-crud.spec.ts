@@ -151,6 +151,12 @@ test("admin can create and delete a driver account with a PIN", async ({ page })
   await fieldInput(dialog(page), "Password").fill("DriverPass1!");
   await dialog(page).getByRole("button", { name: "Generate" }).click();
   await dialog(page).getByRole("button", { name: "Save" }).click();
+
+  // The PIN is revealed once after saving so the admin can share it.
+  const reveal = page.getByRole("dialog");
+  await expect(reveal.getByText("Driver PIN set")).toBeVisible();
+  await reveal.getByRole("button", { name: "Done" }).click();
+
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
   await page.getByRole("row", { name: new RegExp(name) }).getByRole("button").last().click();
