@@ -13,7 +13,7 @@ timeout.
 Notification types:
   run-started      morning run began — get the child ready for pickup
   student-boarded  driver marked the child as on the bus
-  bus-approaching  bus GPS is within BUS_APPROACHING_RADIUS_M of the child's stop
+  bus-approaching  bus arrived at the stop just before the child's stop
   reached-school   bus arrived at the school gate (morning, boarded students)
   on-way-home      afternoon run began — child is heading home
   dropped-off      afternoon run ended (boarded students)
@@ -199,8 +199,35 @@ class PushService:
         except Exception:
             logger.exception("notify_incident failed")
 
+    def notify_bus_approaching(self, run: dict) -> None:
+        """Stop-based 'bus-approaching': the instant the driver arrives at a
+        stop, alert the parents whose child's stop is the *next* one. No GPS —
+        the run's stops_completed (already advanced by arrive_next_stop) tells
+        us which stop is coming up. Run-scoped dedup means a parent is alerted
+        at most once per run."""
+        try:
+            next_order = (run.get("stops_completed") or 0) + 1
+            bus = self._bus_label(run.get("bus_id"))
+            students = [
+                s for s in self.dao.students_at_stop(str(run["id"]), next_order)
+                if s["student_status"] != "absent"
+            ]
+            for link in self.dao.parents_of_students([s["student_id"] for s in students]):
+                self._notify(
+                    link["parent_id"],
+                    type="bus-approaching",
+                    title="Bus approaching",
+                    body=f"{bus} is approaching {link['student_name']}'s stop — it's the next stop.",
+                    student_id=link["student_id"],
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                )
+        except Exception:
+            logger.exception("notify_bus_approaching failed")
+
     def notify_bus_position(self, run: dict, lat: float, lng: float) -> None:
-        """Bus-approaching alerts for upcoming stops within the radius."""
+        """Deprecated GPS-proximity variant (no longer wired — kept for API
+        back-compat). Bus-approaching now fires from notify_bus_approaching."""
         try:
             radius = get_settings().bus_approaching_radius_m
             bus = self._bus_label(run.get("bus_id"))
