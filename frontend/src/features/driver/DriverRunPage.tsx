@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Flag, MapPin, Play } from "lucide-react";
@@ -31,7 +31,6 @@ export function DriverRunPage() {
   const { data } = useDriverContext();
   const [routeId, setRouteId] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const watchRef = useRef<number | null>(null);
 
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
@@ -41,25 +40,8 @@ export function DriverRunPage() {
     if (!routeId && routes.length > 0) setRouteId(morningFirst(routes)[0].id);
   }, [routes, routeId]);
 
-  // Stream GPS while a run is active; silent degradation if denied.
-  useEffect(() => {
-    if (activeRun && "geolocation" in navigator) {
-      watchRef.current = navigator.geolocation.watchPosition(
-        (pos) => {
-          void api.post("/api/runs/driver/position", {
-            lat: Number(pos.coords.latitude.toFixed(6)),
-            lng: Number(pos.coords.longitude.toFixed(6)),
-          }).catch(() => {});
-        },
-        () => {},
-        { enableHighAccuracy: true, maximumAge: 10000 },
-      );
-    }
-    return () => {
-      if (watchRef.current != null) navigator.geolocation.clearWatch(watchRef.current);
-      watchRef.current = null;
-    };
-  }, [activeRun]);
+  // Bus position is derived from stop arrivals on the backend (no device GPS):
+  // the admin's/driver's device location must never become the bus position.
 
   const refresh = () => qc.invalidateQueries({ queryKey: ["driver-context"] });
 
