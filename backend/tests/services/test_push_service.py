@@ -44,6 +44,9 @@ class FakePushDao:
     def remaining_student_stops(self, run_id, stops_completed):
         return [s for s in self.stops if s["stop_order"] > stops_completed]
 
+    def students_at_stop(self, run_id, stop_order):
+        return [s for s in self.stops if s["stop_order"] == stop_order]
+
     def bus_name(self, bus_id):
         return "Kifaru Bus"
 
@@ -266,6 +269,39 @@ def test_bus_approaching_skips_passed_stops(service: PushService, dao: FakePushD
 
     service.notify_bus_position(run, -1.2921, 36.8219)
 
+    assert dao.notifications == []
+
+
+def test_bus_approaching_fires_for_next_stop_only(service: PushService, dao: FakePushDao) -> None:
+    # Bus just arrived at stop 1; only the NEXT stop (2) gets "approaching".
+    run = {**RUN, "stops_completed": 1}
+    dao.stops = [
+        {"stop_order": 2, "student_id": "s2", "student_name": "Baraka", "student_status": "at-school"},
+        {"stop_order": 3, "student_id": "s3", "student_name": "Wanjiru", "student_status": "at-school"},
+    ]
+    dao.parents = {"s2": [link("p2", "s2", "Baraka")], "s3": [link("p3", "s3", "Wanjiru")]}
+
+    service.notify_bus_approaching(run)
+    assert [n["type"] for n in dao.notifications] == ["bus-approaching"]
+    assert dao.notifications[0]["user_id"] == "p2"
+
+    service.notify_bus_approaching(run)  # arriving again must not re-alert
+    assert len(dao.notifications) == 1
+
+
+def test_bus_approaching_skips_absent_and_gate(service: PushService, dao: FakePushDao) -> None:
+    # Next stop's only child is absent → no alert.
+    run = {**RUN, "stops_completed": 0}  # next is stop 1
+    dao.stops = [
+        {"stop_order": 1, "student_id": "s1", "student_name": "Leila", "student_status": "absent"},
+    ]
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+    service.notify_bus_approaching(run)
+    assert dao.notifications == []
+
+    # No student at the next stop (e.g. the school gate is next) → no alert.
+    gate_run = {**RUN, "stops_completed": 5}
+    service.notify_bus_approaching(gate_run)
     assert dao.notifications == []
 
 

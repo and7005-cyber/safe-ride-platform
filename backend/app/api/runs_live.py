@@ -92,6 +92,8 @@ def arrive(
     result = safe_call(lambda: dao.arrive_next_stop(user["id"], payload.run_id))
     if result.get("arrival_incident"):
         background_tasks.add_task(push_service.notify_reached_school, result["run"])
+    # Arriving a stop means the next stop's children should get ready.
+    background_tasks.add_task(push_service.notify_bus_approaching, result["run"])
     return result
 
 

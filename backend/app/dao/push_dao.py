@@ -150,6 +150,22 @@ class PushDao:
             return students
         return [s for s in students if s["status"] != "absent"]
 
+    def students_at_stop(self, run_id: str, stop_order: int) -> list[dict]:
+        """Students whose stop sits at the given order on the run (coordinates
+        not required — 'approaching' is stop-order based, not GPS based)."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                select rs.student_id, s.name as student_name, s.status as student_status
+                from run_stops rs
+                join live_students s on s.id = rs.student_id
+                where rs.run_id = %s and rs.stop_order = %s
+                  and rs.is_school_gate = false and rs.student_id is not null
+                """,
+                (run_id, stop_order),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def remaining_student_stops(self, run_id: str, stops_completed: int) -> list[dict]:
         """Upcoming (not yet reached) student stops for a run, with coordinates."""
         with get_connection() as conn:
