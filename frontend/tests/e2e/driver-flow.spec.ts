@@ -16,15 +16,15 @@ test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
   await expect(page.getByText("Depart")).toBeVisible();
 });
 
-test("driver completes a full run: start, GPS, arrive, board, end", async ({ page, request }) => {
+test("driver completes a full run: start, position, arrive, board, end", async ({ page, request }) => {
   await pinLogin(page, DRIVER.pin);
 
   await page.goto("/driver/run");
   await page.getByRole("button", { name: "Start Run" }).click();
   await expect(page.getByText("Run in progress")).toBeVisible();
 
-  // Browser geolocation (granted in playwright.config) streams positions to
-  // the backend; the bus becomes live on the admin fleet map.
+  // No device GPS: starting a run pins the bus at the school, and each arrival
+  // moves it to that stop. The bus becomes live on the admin fleet map.
   await expect
     .poll(
       async () => {
@@ -34,7 +34,7 @@ test("driver completes a full run: start, GPS, arrive, board, end", async ({ pag
         });
         return (await context.json()).bus?.current_lat;
       },
-      { timeout: 15_000, message: "driver GPS should reach the backend" },
+      { timeout: 15_000, message: "starting a run should pin the bus at the school" },
     )
     .not.toBeNull();
 

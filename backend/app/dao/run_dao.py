@@ -208,6 +208,16 @@ class RunDao:
                     (run["id"], order_map[s["stop_order"]], s["name"], s["scheduled_time"], s["lat"],
                      s["lng"], s["is_school_gate"], s["student_id"]),
                 )
+            # Position the bus at the school when the run starts; from here the
+            # position is the last stop the driver arrives at (no device GPS).
+            school = conn.execute(
+                "select lat, lng from live_schools where id = %s", (route["school_id"],)
+            ).fetchone()
+            if school and school["lat"] is not None and school["lng"] is not None:
+                conn.execute(
+                    "update live_buses set current_lat = %s, current_lng = %s where id = %s",
+                    (school["lat"], school["lng"], bus["id"]),
+                )
         return dict(run)
 
     def arrive_next_stop(self, driver_id: str, run_id: str) -> dict[str, Any]:
@@ -228,6 +238,13 @@ class RunDao:
                 "select * from run_stops where run_id = %s and stop_order = %s order by is_school_gate desc limit 1",
                 (run_id, new_completed),
             ).fetchone()
+            # The bus's live position is the stop it just arrived at (no GPS).
+            # Coordinate-less stops leave the position at the previous stop.
+            if gate and gate["lat"] is not None and gate["lng"] is not None:
+                conn.execute(
+                    "update live_buses set current_lat = %s, current_lng = %s where id = %s",
+                    (gate["lat"], gate["lng"], run["bus_id"]),
+                )
             is_last = new_completed >= run["total_stops"]
             if gate and (gate["is_school_gate"] or is_last):
                 # Idempotent per run: only the first arrival at the gate emits.

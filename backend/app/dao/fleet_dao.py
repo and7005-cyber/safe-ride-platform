@@ -111,7 +111,45 @@ class FleetDao:
     def list_buses(self) -> list[dict[str, Any]]:
         with get_connection() as conn:
             rows = conn.execute("select * from live_buses order by name asc").fetchall()
-        return [dict(r) for r in rows]
+            buses = [dict(r) for r in rows]
+            # Derive a live position status from the bus's active run (no GPS):
+            # at-school / at-stop / starting. Position itself lives in
+            # current_lat/lng, set on start (school) and each arrival (stop).
+            for b in buses:
+                b["position_state"] = "idle"
+                b["position_label"] = None
+                run = conn.execute(
+                    """
+                    select id, stops_completed, total_stops from live_runs
+                    where bus_id = %s and status <> 'completed'
+                      and date = (now() at time zone 'Africa/Nairobi')::date
+                    order by created_at desc limit 1
+                    """,
+                    (b["id"],),
+                ).fetchone()
+                if not run:
+                    continue
+                completed = run["stops_completed"] or 0
+                if completed <= 0:
+                    b["position_state"] = "starting"
+                    b["position_label"] = "Starting — at school"
+                    continue
+                stop = conn.execute(
+                    "select name, is_school_gate from run_stops "
+                    "where run_id = %s and stop_order = %s order by is_school_gate desc limit 1",
+                    (run["id"], completed),
+                ).fetchone()
+                if stop and stop["is_school_gate"]:
+                    b["position_state"] = "at-school"
+                    b["position_label"] = "At school"
+                elif stop:
+                    nxt = conn.execute(
+                        "select 1 from run_stops where run_id = %s and stop_order = %s limit 1",
+                        (run["id"], completed + 1),
+                    ).fetchone()
+                    b["position_state"] = "at-stop"
+                    b["position_label"] = f"At {stop['name']}" + (" · en route to next" if nxt else "")
+        return buses
 
     def create_bus(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:

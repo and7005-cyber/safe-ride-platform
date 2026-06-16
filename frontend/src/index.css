@@ -66,3 +66,9 @@
 .leaflet-container {
   z-index: 0;
 }
+
+/* Custom bus markers: drop Leaflet's default white box behind the divIcon. */
+.leaflet-div-icon.saferide-bus-marker {
+  background: transparent;
+  border: none;
+}
