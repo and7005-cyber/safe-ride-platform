@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SafeRide backend - FastAPI on Lambda (Mangum) behind an HTTP API Gateway,
+  with RDS PostgreSQL in an isolated VPC. The app's existing in-app bearer
+  auth is preserved as-is; API Gateway is a transparent proxy.
+
+Parameters:
+  DbMasterUsername:
+    Type: String
+    Default: saferide
+    Description: RDS master username.
+  DbMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: RDS master password (URL-safe; injected at deploy time).
+  PinPepper:
+    Type: String
+    NoEcho: true
+    Description: HMAC pepper for driver PIN hashing.
+  CorsOrigins:
+    Type: String
+    Default: https://saferidelive.co.ke,https://www.saferidelive.co.ke
+    Description: Comma-separated allowed CORS origins for the API.
+  AppBaseUrl:
+    Type: String
+    Default: https://saferidelive.co.ke
+    Description: Public base URL of the frontend (used in password-reset links).
+  ApiDomainName:
+    Type: String
+    Default: api.saferidelive.co.ke
+    Description: Custom domain for the API.
+  ApiCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ACM certificate ARN (in THIS region) for ApiDomainName. Leave empty to
+      deploy without the custom domain; set it once the cert is issued.
+  HostedZoneId:
+    Type: String
+    Default: Z0459820URO1AH08IO8T
+    Description: Route 53 hosted zone ID for saferidelive.co.ke.
+  DbEngineVersion:
+    Type: String
+    Default: "16.14"
+    Description: PostgreSQL major.minor version for RDS (auto minor upgrades on).
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+
+Conditions:
+  HasApiCert: !Not [!Equals [!Ref ApiCertificateArn, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 512
+
+Resources:
+  # ---------------------------------------------------------------- Networking
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: saferide-backend
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: saferide-private-a
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: saferide-private-b
+
+  # Isolated subnets: the default route table has only the local route, so
+  # there is no internet egress and therefore no NAT/IGW cost. Lambda reaches
+  # RDS over private VPC networking; API Gateway invokes Lambda out-of-band.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SafeRide Lambda functions
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: saferide-lambda-sg
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SafeRide RDS PostgreSQL
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Postgres from Lambda
+      Tags:
+        - Key: Name
+          Value: saferide-db-sg
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SafeRide RDS subnets
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  # ---------------------------------------------------------------- Database
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: saferide
+      MasterUsername: !Ref DbMasterUsername
+      MasterUserPassword: !Ref DbMasterPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: saferide
+
+  # ---------------------------------------------------------------- HTTP API
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # CORS is handled by the FastAPI app (CORSMiddleware), so it is left off
+      # here to avoid duplicate/ conflicting headers.
+      Description: SafeRide API
+
+  # ---------------------------------------------------------------- Functions
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend
+      Handler: app.lambda_handler.handler
+      # No ReservedConcurrentExecutions: af-south-1 starts with an account
+      # concurrency limit of 10, so reserving any would drop unreserved below
+      # the minimum. The function shares the unreserved pool. Request a Lambda
+      # concurrency quota increase before scaling up.
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Environment:
+        Variables:
+          APP_ENV: production
+          DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+          CORS_ORIGINS: !Ref CorsOrigins
+          PIN_PEPPER: !Ref PinPepper
+          APP_BASE_URL: !Ref AppBaseUrl
+      Events:
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+
+  MigrateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend
+      Handler: app.migrate_handler.handler
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Environment:
+        Variables:
+          DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+
+  # ---------------------------------------------------- Custom domain (gated)
+  ApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasApiCert
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref ApiCertificateArn
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasApiCert
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomain
+      Stage: $default
+
+  ApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasApiCert
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+Outputs:
+  HttpApiUrl:
+    Description: Default invoke URL for the HTTP API.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  ApiCustomDomainUrl:
+    Condition: HasApiCert
+    Description: Custom-domain URL for the API.
+    Value: !Sub "https://${ApiDomainName}"
+  ApiFunctionName:
+    Value: !Ref ApiFunction
+  MigrateFunctionName:
+    Value: !Ref MigrateFunction
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address

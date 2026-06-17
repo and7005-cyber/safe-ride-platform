@@ -1,0 +1,20 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "saferide-backend"
+
+[default.build.parameters]
+# Build inside a Lambda-like container so psycopg's binary wheels match the
+# arm64 Linux runtime (the local macOS wheels would not load on Lambda).
+use_container = true
+build_image = "public.ecr.aws/sam/build-python3.12:latest-arm64"
+
+[default.deploy.parameters]
+stack_name = "saferide-backend"
+region = "af-south-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+resolve_s3 = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+# Secret parameters (DbMasterPassword, PinPepper) and the cert ARN are passed
+# on the CLI by infra/scripts/deploy-backend.sh, never committed here.
