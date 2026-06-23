@@ -1,6 +1,5 @@
-import "leaflet/dist/leaflet.css";
 import { useEffect, useState } from "react";
-import { MapContainer, Marker, Polyline, TileLayer } from "react-leaflet";
+import { AdvancedMarker, Map } from "@vis.gl/react-google-maps";
 import { CheckCircle2, MapPin } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -12,7 +11,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
-import { NAIROBI } from "@/lib/leafletSetup";
+import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
+import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { PARENT_NAV, useChildren, useTrack } from "@/features/parent/parentHooks";
 
 export function ParentTrackPage() {
@@ -28,9 +28,9 @@ export function ParentTrackPage() {
   const run = track?.run;
   const completed = run?.stops_completed ?? 0;
   const busLive = track?.student?.bus_current_lat != null;
-  const points: [number, number][] = stops
+  const points: LatLng[] = stops
     .filter((s: any) => s.lat != null && s.lng != null)
-    .map((s: any) => [s.lat, s.lng]);
+    .map((s: any) => ({ lat: s.lat, lng: s.lng }));
 
   return (
     <RoleMobileLayout nav={PARENT_NAV} variant="accent" title="Track Bus">
@@ -48,12 +48,29 @@ export function ParentTrackPage() {
         </div>
 
         <Card className="overflow-hidden">
-          <div className="h-56 w-full">
-            <MapContainer center={points[0] ?? NAIROBI} zoom={13} className="h-full w-full" scrollWheelZoom>
-              <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-              {points.length > 1 && <Polyline positions={points} pathOptions={{ color: "#206F4A" }} />}
-              {points.map((p, i) => <Marker key={i} position={p} />)}
-            </MapContainer>
+          <div className="h-56 w-full" data-testid="track-map">
+            <Map
+              mapId={MAP_ID}
+              defaultCenter={points[0] ?? NAIROBI}
+              defaultZoom={13}
+              gestureHandling="greedy"
+              className="h-full w-full"
+            >
+              <FitBounds
+                points={points}
+                focusKey={`track:${points.map((p) => `${p.lat},${p.lng}`).join("|")}`}
+              />
+              {points.length > 1 && <RoutePolyline path={points} color="#206F4A" />}
+              {points.map((p, i) => (
+                <AdvancedMarker key={i} position={p}>
+                  <span
+                    className={`block h-3.5 w-3.5 rounded-full border-2 border-white shadow ${
+                      i < completed ? "bg-emerald-600" : "bg-slate-500"
+                    }`}
+                  />
+                </AdvancedMarker>
+              ))}
+            </Map>
           </div>
           {/* Live badge only — the bus position is NOT plotted on the map (live parity). */}
           {busLive && (

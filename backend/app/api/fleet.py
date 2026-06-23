@@ -1,3 +1,5 @@
+import datetime as dt
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
@@ -145,12 +147,16 @@ class PlanStop(BaseModel):
     lat: float | None = None
     lng: float | None = None
     pickup_time: str | None = None
+    is_school: bool = False
 
 
 class RouteOptionsPayload(BaseModel):
     stops: list[PlanStop]
     type: str | None = "morning"
     school_id: str | None = None
+    # When true the stops are used in the exact order given (drag-to-reorder):
+    # no re-optimisation, just road geometry + ETAs for that sequence.
+    preserve_order: bool = False
 
 
 @router.post("/geocode")
@@ -161,13 +167,31 @@ def geocode_address(payload: GeocodePayload, user: dict = Depends(admin_only)):
     return {"found": True, **hit}
 
 
+@router.get("/places/suggest")
+def places_suggest(q: str = "", user: dict = Depends(admin_only)):
+    """Nairobi-biased address autocomplete (Places API New, server-side)."""
+    return {"suggestions": geo_service.places_autocomplete(q)}
+
+
+@router.get("/places/details")
+def places_details(place_id: str, user: dict = Depends(admin_only)):
+    """Resolve a Places place_id to coordinates for a selected suggestion."""
+    hit = geo_service.place_details(place_id)
+    if not hit:
+        return {"found": False}
+    return {"found": True, **hit}
+
+
 @router.post("/route-options")
 def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)):
-    """Geocode a list of addresses + pickup times and return ordered route
-    options (optimised by distance, and chronological by pickup time)."""
+    """Geocode addresses + pickup times and return route options enriched with
+    the real road polyline, total distance/time, and traffic-aware per-stop
+    ETAs (via the Google Routes API, with an offline straight-line fallback)."""
 
     def run() -> dict:
         is_afternoon = payload.type == "afternoon"
+        default_anchor = "15:30" if is_afternoon else "07:00"
+
         school = None
         if payload.school_id:
             row = next((s for s in dao.list_schools() if str(s["id"]) == payload.school_id), None)
@@ -187,34 +211,83 @@ def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)
             if lat is None or lng is None:
                 unresolved.append(label)
                 continue
-            located.append({"label": label, "lat": lat, "lng": lng, "pickup_time": st.pickup_time})
+            located.append(
+                {"label": label, "lat": lat, "lng": lng, "pickup_time": st.pickup_time, "is_school": bool(st.is_school)}
+            )
 
-        # Optimised-by-distance option, anchored on the school.
-        opt = geo_service.optimize_route(located, start=school)
-        nn_ordered = opt["ordered"]
+        def build_option(strategy: str, sequence: list[dict]) -> dict:
+            seq = [s for s in sequence if s]
+            anchor = next((s.get("pickup_time") for s in seq if s.get("pickup_time")), None)
+            departure = geo_service.next_departure(anchor, default=default_anchor)
+            geom = geo_service.route_geometry(seq, departure=departure)
+            legs = geom["legs"]
+            stops_out: list[dict] = []
+            cumulative = 0
+            for i, s in enumerate(seq):
+                if i > 0 and i - 1 < len(legs):
+                    leg = legs[i - 1]
+                    cumulative += leg.get("duration_s") or 0
+                    leg_distance = leg.get("distance_m")
+                    leg_duration = leg.get("duration_s")
+                else:
+                    leg_distance = leg_duration = None
+                eta = (departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M")
+                stops_out.append(
+                    {
+                        "seq": i + 1,
+                        "label": s["label"],
+                        "lat": s["lat"],
+                        "lng": s["lng"],
+                        "pickup_time": s.get("pickup_time"),
+                        "is_school": bool(s.get("is_school")),
+                        "eta": eta,
+                        "leg_distance_m": leg_distance,
+                        "leg_duration_s": leg_duration,
+                    }
+                )
+            return {
+                "strategy": strategy,
+                "polyline": geom["polyline"],
+                "provider": geom["provider"],
+                "total_distance_m": geom["total_distance_m"],
+                "total_duration_s": geom["total_duration_s"],
+                "stops": stops_out,
+            }
+
+        # Drag-to-reorder: caller already fixed the order (school included inline).
+        if payload.preserve_order:
+            option = build_option("Custom order", located)
+            return {
+                "provider": option["provider"],
+                "type": payload.type,
+                "unresolved": unresolved,
+                "options": [option],
+            }
+
+        students = [s for s in located if not s["is_school"]]
+
+        # Option A — efficient road order (Routes API waypoint optimiser).
+        ordered = geo_service.optimized_order(students, school)
         if is_afternoon:
-            distance_stops = ([school] if school else []) + nn_ordered
+            seq_a = ([school] if school else []) + ordered
         else:
-            distance_stops = list(reversed(nn_ordered)) + ([school] if school else [])
+            seq_a = ordered + ([school] if school else [])
 
-        # Chronological-by-pickup-time option (reversed for afternoon).
-        by_time = sorted(located, key=lambda p: p.get("pickup_time") or "99:99")
+        # Option B — chronological by pickup time (reversed for afternoon).
+        by_time = sorted(students, key=lambda p: p.get("pickup_time") or "99:99")
         if is_afternoon:
-            time_stops = ([school] if school else []) + list(reversed(by_time))
+            seq_b = ([school] if school else []) + list(reversed(by_time))
         else:
-            time_stops = by_time + ([school] if school else [])
+            seq_b = by_time + ([school] if school else [])
 
-        def numbered(stops: list[dict]) -> list[dict]:
-            return [{"seq": i + 1, **s} for i, s in enumerate(stops) if s]
+        option_a = build_option("Optimised (traffic-aware)", seq_a)
+        option_b = build_option("By pickup time", seq_b)
 
         return {
-            "provider": opt["provider"],
+            "provider": option_a["provider"],
             "type": payload.type,
             "unresolved": unresolved,
-            "options": [
-                {"strategy": "Optimised (shortest path)", "stops": numbered(distance_stops)},
-                {"strategy": "By pickup time", "stops": numbered(time_stops)},
-            ],
+            "options": [option_a, option_b],
         }
 
     return safe_call(run)

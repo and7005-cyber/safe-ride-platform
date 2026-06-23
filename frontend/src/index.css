@@ -56,19 +56,8 @@
   }
 }
 
-/* Leaflet maps must render below shadcn overlays */
-.leaflet-pane,
-.leaflet-top,
-.leaflet-bottom,
-.leaflet-control {
-  z-index: 1 !important;
-}
-.leaflet-container {
+/* Google Maps (gm-style) should sit below shadcn dialogs/toasts, which render
+   in high-z-index portals — the map keeps its own internal stacking. */
+.gm-style {
   z-index: 0;
-}
-
-/* Custom bus markers: drop Leaflet's default white box behind the divIcon. */
-.leaflet-div-icon.saferide-bus-marker {
-  background: transparent;
-  border: none;
 }
