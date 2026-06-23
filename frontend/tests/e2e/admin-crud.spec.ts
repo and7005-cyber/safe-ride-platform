@@ -85,7 +85,7 @@ test("admin can create and delete a school with a map location", async ({ page }
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Address").fill("1 Test Lane, Nairobi");
   await fieldInput(dialog(page), "Phone").fill("+254700999999");
-  await dialog(page).locator(".leaflet-container").click({ position: { x: 150, y: 120 } });
+  await dialog(page).getByTestId("map-picker").click({ position: { x: 150, y: 120 } });
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
 
@@ -270,5 +270,30 @@ test("dashboard and fleet map render live fleet data", async ({ page }) => {
 
   await page.goto("/fleet-map");
   await expect(page.getByText("Live bus positions")).toBeVisible();
-  await expect(page.locator(".leaflet-container")).toBeVisible();
+  // Embedded Google Map renders (container + Google's own .gm-style wrapper).
+  await expect(page.getByTestId("fleet-map")).toBeVisible();
+  await expect(page.locator(".gm-style").first()).toBeVisible({ timeout: 15_000 });
+});
+
+test("route planner returns a Google traffic-aware route", async ({ page }) => {
+  await adminLogin(page);
+  await page.goto("/fleet-map");
+  await expect(page.getByText("Route planner")).toBeVisible();
+
+  // Two real Nairobi addresses (free text — the backend geocodes them).
+  await page.getByTestId("address-input-0").fill("Yaya Centre, Nairobi");
+  await page.getByRole("button", { name: "Add stop" }).click();
+  await page.getByTestId("address-input-1").fill("Sarit Centre, Westlands, Nairobi");
+
+  await page.getByTestId("get-route-options").click();
+
+  // An ordered, enriched route comes back with totals and stops.
+  await expect(page.getByTestId("route-result")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("button", { name: "Optimised (traffic-aware)" })).toBeVisible();
+  await expect(page.getByTestId("route-distance")).not.toHaveText("—");
+  await expect(page.getByTestId("route-stops").locator("li")).toHaveCount(2);
+
+  // Reorder (drag-to-reorder uses the same backend path) recomputes the route.
+  await page.getByRole("button", { name: "Move down" }).first().click();
+  await expect(page.getByTestId("route-distance")).not.toHaveText("—");
 });

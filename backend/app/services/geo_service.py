@@ -13,6 +13,7 @@ never breaks a save or a request.
 """
 from __future__ import annotations
 
+import datetime as dt
 import math
 from typing import Any
 
@@ -20,8 +21,25 @@ import httpx
 
 from app.core.config import get_settings
 
-_TIMEOUT = httpx.Timeout(6.0)
+_TIMEOUT = httpx.Timeout(8.0)
 _USER_AGENT = "SafeRideKenya/1.0 (admin geocoding)"
+
+# Routes API v2 (the modern replacement for the Directions API): one call gives
+# an optimised stop order, the encoded road polyline, and per-leg traffic-aware
+# durations. See compute helpers below.
+_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+_PLACES_URL = "https://places.googleapis.com/v1"
+# Kenya is UTC+3 year-round (no DST), so a fixed offset is exact.
+_EAT = dt.timezone(dt.timedelta(hours=3))
+# Loose bounding box around greater Nairobi to bias address autocomplete.
+_NAIROBI_BIAS = {
+    "rectangle": {
+        "low": {"latitude": -1.45, "longitude": 36.60},
+        "high": {"latitude": -1.10, "longitude": 37.10},
+    }
+}
+# Average urban bus speed (m/s) used to estimate leg durations when offline.
+_OFFLINE_SPEED_MS = 25 * 1000 / 3600  # ~25 km/h
 
 
 def _provider() -> str:
@@ -171,3 +189,225 @@ def optimize_route(
     except Exception:  # noqa: BLE001 - fall back to offline ordering
         pass
     return {"ordered": _nearest_neighbour(located, start), "provider": "nearest-neighbour"}
+
+
+# --- Routes API v2: order + road geometry + traffic-aware ETAs ---------------
+
+def _dur_s(value: Any) -> int | None:
+    """Routes API durations are strings like ``"456s"`` — coerce to int seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.endswith("s"):
+        try:
+            return int(round(float(value[:-1])))
+        except ValueError:
+            return None
+    return None
+
+
+def _latlng(p: dict) -> dict:
+    return {"location": {"latLng": {"latitude": p["lat"], "longitude": p["lng"]}}}
+
+
+def next_departure(anchor_hhmm: str | None, *, default: str) -> dt.datetime:
+    """Next future occurrence (Africa/Nairobi) of ``anchor_hhmm`` (or ``default``).
+
+    Used both as the Routes API ``departureTime`` for predictive traffic and as
+    the baseline clock for per-stop ETAs. Routes API requires a future time, so
+    if today's slot has passed we roll to tomorrow.
+    """
+    hhmm = anchor_hhmm or default
+    try:
+        h, m = (int(x) for x in hhmm.split(":")[:2])
+    except (ValueError, AttributeError):
+        h, m = (int(x) for x in default.split(":"))
+    now = dt.datetime.now(tz=_EAT)
+    cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if cand <= now + dt.timedelta(seconds=30):
+        cand += dt.timedelta(days=1)
+    return cand
+
+
+def _to_rfc3339(when: dt.datetime) -> str:
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _routes_call(
+    origin: dict,
+    destination: dict,
+    intermediates: list[dict],
+    key: str,
+    *,
+    optimize: bool,
+    departure: dt.datetime | None,
+) -> dict | None:
+    body: dict[str, Any] = {
+        "origin": _latlng(origin),
+        "destination": _latlng(destination),
+        "travelMode": "DRIVE",
+    }
+    if intermediates:
+        body["intermediates"] = [_latlng(p) for p in intermediates]
+        if optimize:
+            body["optimizeWaypointOrder"] = True
+    if departure is not None:
+        # TRAFFIC_AWARE (not _OPTIMAL) is the only traffic mode compatible with
+        # optimizeWaypointOrder, and it still factors predictive congestion.
+        body["routingPreference"] = "TRAFFIC_AWARE"
+        body["departureTime"] = _to_rfc3339(departure)
+    else:
+        body["routingPreference"] = "TRAFFIC_UNAWARE"
+    fields = (
+        "routes.optimizedIntermediateWaypointIndex,"
+        "routes.polyline.encodedPolyline,"
+        "routes.distanceMeters,routes.duration,"
+        "routes.legs.distanceMeters,routes.legs.duration"
+    )
+    resp = httpx.post(
+        _ROUTES_URL,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": key,
+            "X-Goog-FieldMask": fields,
+        },
+        json=body,
+        timeout=_TIMEOUT,
+    )
+    routes = resp.json().get("routes") or []
+    return routes[0] if routes else None
+
+
+def optimized_order(students: list[dict], school: dict | None) -> list[dict]:
+    """Return ``students`` re-sequenced into an efficient visiting order.
+
+    Uses the Routes API waypoint optimiser anchored on the school (a round trip
+    used purely to derive the order), falling back to the offline
+    nearest-neighbour heuristic when there is no key or the call fails.
+    """
+    located = [p for p in students if p.get("lat") is not None and p.get("lng") is not None]
+    if len(located) <= 1:
+        return located
+    s = get_settings()
+    if s.google_maps_api_key and school and len(located) >= 2:
+        try:
+            rt = _routes_call(
+                school, school, located, s.google_maps_api_key, optimize=True, departure=None
+            )
+            order = rt.get("optimizedIntermediateWaypointIndex") if rt else None
+            if order is not None and len(order) == len(located):
+                return [located[i] for i in order]
+        except Exception:  # noqa: BLE001 - fall back to offline ordering
+            pass
+    return _nearest_neighbour(located, school or located[0])
+
+
+def route_geometry(sequence: list[dict], *, departure: dt.datetime | None = None) -> dict[str, Any]:
+    """Road geometry + per-leg metrics for a FIXED ordered ``sequence``.
+
+    Returns ``{polyline, total_distance_m, total_duration_s, legs, provider}``
+    where ``legs[i]`` is the trip from ``sequence[i]`` to ``sequence[i+1]``
+    (so ``len(legs) == len(sequence) - 1``). With the Google key set this is the
+    real road route with traffic-aware durations; otherwise it degrades to
+    straight-line haversine distances and a flat speed estimate.
+    """
+    pts = [p for p in sequence if p.get("lat") is not None and p.get("lng") is not None]
+    if len(pts) < 2:
+        return {
+            "polyline": None,
+            "total_distance_m": 0,
+            "total_duration_s": 0,
+            "legs": [],
+            "provider": "trivial",
+        }
+    s = get_settings()
+    if s.google_maps_api_key:
+        try:
+            rt = _routes_call(
+                pts[0], pts[-1], pts[1:-1], s.google_maps_api_key,
+                optimize=False, departure=departure,
+            )
+            if rt:
+                legs = [
+                    {"distance_m": leg.get("distanceMeters") or 0, "duration_s": _dur_s(leg.get("duration"))}
+                    for leg in (rt.get("legs") or [])
+                ]
+                return {
+                    "polyline": (rt.get("polyline") or {}).get("encodedPolyline"),
+                    "total_distance_m": rt.get("distanceMeters") or 0,
+                    "total_duration_s": _dur_s(rt.get("duration")) or 0,
+                    "legs": legs,
+                    "provider": "google-routes",
+                }
+        except Exception:  # noqa: BLE001 - fall back to straight-line estimate
+            pass
+    legs = []
+    for a, b in zip(pts, pts[1:]):
+        dist = haversine_m((a["lat"], a["lng"]), (b["lat"], b["lng"]))
+        legs.append({"distance_m": int(dist), "duration_s": int(dist / _OFFLINE_SPEED_MS)})
+    return {
+        "polyline": None,
+        "total_distance_m": int(sum(leg["distance_m"] for leg in legs)),
+        "total_duration_s": int(sum(leg["duration_s"] for leg in legs)),
+        "legs": legs,
+        "provider": "offline",
+    }
+
+
+# --- Places autocomplete (New) ----------------------------------------------
+
+def places_autocomplete(query: str | None) -> list[dict]:
+    """Address suggestions biased to Nairobi via the Places API (New).
+
+    Returns ``[{place_id, description, primary, secondary}]``. Empty without a
+    key or query — the planner still accepts free-typed addresses (geocoded on
+    submit), so autocomplete is a pure enhancement.
+    """
+    s = get_settings()
+    if not query or not query.strip() or not s.google_maps_api_key:
+        return []
+    try:
+        resp = httpx.post(
+            f"{_PLACES_URL}/places:autocomplete",
+            headers={"Content-Type": "application/json", "X-Goog-Api-Key": s.google_maps_api_key},
+            json={"input": query.strip(), "includedRegionCodes": ["ke"], "locationBias": _NAIROBI_BIAS},
+            timeout=_TIMEOUT,
+        )
+        out = []
+        for sug in resp.json().get("suggestions") or []:
+            pred = sug.get("placePrediction") or {}
+            pid = pred.get("placeId")
+            text = (pred.get("text") or {}).get("text")
+            fmt = pred.get("structuredFormat") or {}
+            primary = (fmt.get("mainText") or {}).get("text") or text
+            secondary = (fmt.get("secondaryText") or {}).get("text")
+            if pid and text:
+                out.append({"place_id": pid, "description": text, "primary": primary, "secondary": secondary})
+        return out
+    except Exception:  # noqa: BLE001 - autocomplete is best-effort
+        return []
+
+
+def place_details(place_id: str | None) -> dict | None:
+    """Resolve a Places ``place_id`` to ``{lat, lng, label}`` via Place Details (New)."""
+    s = get_settings()
+    if not place_id or not s.google_maps_api_key:
+        return None
+    try:
+        resp = httpx.get(
+            f"{_PLACES_URL}/places/{place_id}",
+            headers={
+                "X-Goog-Api-Key": s.google_maps_api_key,
+                "X-Goog-FieldMask": "location,formattedAddress,displayName",
+            },
+            timeout=_TIMEOUT,
+        )
+        data = resp.json()
+        loc = data.get("location") or {}
+        if loc.get("latitude") is None:
+            return None
+        label = data.get("formattedAddress") or (data.get("displayName") or {}).get("text") or ""
+        return {"lat": loc["latitude"], "lng": loc["longitude"], "label": label}
+    except Exception:  # noqa: BLE001 - best-effort
+        return None

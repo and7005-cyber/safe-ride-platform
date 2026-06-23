@@ -1,8 +1,6 @@
-import "leaflet/dist/leaflet.css";
-import { useEffect, useMemo, useState } from "react";
-import L from "leaflet";
-import { MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from "react-leaflet";
-import { Plus, Route as RouteIcon, Trash2, Wand2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { AdvancedMarker, InfoWindow, Map } from "@vis.gl/react-google-maps";
+import { ArrowDown, ArrowUp, GripVertical, Plus, Route as RouteIcon, Trash2, Wand2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -16,7 +14,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
-import { NAIROBI } from "@/lib/leafletSetup";
+import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
+import { AddressAutocomplete } from "@/features/admin/components/AddressAutocomplete";
+import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
 import { useBuses, useSchools } from "@/lib/queries";
 
@@ -29,46 +29,54 @@ const PALETTE = [
 const BUS_PATH =
   "M4 16c0 .88.39 1.67 1 2.22V20c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h8v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1.78c.61-.55 1-1.34 1-2.22V6c0-3.5-3.58-4-8-4s-8 .5-8 4v10zm3.5 1c-.83 0-1.5-.67-1.5-1.5S6.67 14 7.5 14s1.5.67 1.5 1.5S8.33 17 7.5 17zm9 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm1.5-6H6V6h12v5z";
 
-function busIcon(color: string) {
-  const svg = `<svg viewBox="0 0 24 24" width="18" height="18" fill="#ffffff" aria-hidden="true"><path d="${BUS_PATH}"/></svg>`;
-  const html =
-    `<div style="background:${color};width:30px;height:30px;border-radius:9999px;` +
-    `display:flex;align-items:center;justify-content:center;border:2px solid #ffffff;` +
-    `box-shadow:0 1px 4px rgba(0,0,0,.45)">${svg}</div>`;
-  return L.divIcon({
-    html,
-    className: "saferide-bus-marker",
-    iconSize: [34, 34],
-    iconAnchor: [17, 17],
-    popupAnchor: [0, -18],
-  });
+function BusGlyph({ color }: { color: string }) {
+  return (
+    <div
+      style={{ background: color }}
+      className="flex h-[30px] w-[30px] items-center justify-center rounded-full border-2 border-white shadow-[0_1px_4px_rgba(0,0,0,.45)]"
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff" aria-hidden="true">
+        <path d={BUS_PATH} />
+      </svg>
+    </div>
+  );
 }
 
-// Fit the viewport to the live buses (or planned stops). Refits only when the
-// focusKey changes — not on every GPS-free position tick — so it never fights
-// the admin panning the map.
-function FitBounds({ points, focusKey }: { points: [number, number][]; focusKey: string }) {
-  const map = useMap();
-  useEffect(() => {
-    if (points.length === 1) map.setView(points[0], 14);
-    else if (points.length > 1) map.fitBounds(points, { padding: [60, 60], maxZoom: 15 });
-    else map.setView(NAIROBI, 12);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusKey]);
-  return null;
+function StopGlyph({ seq, school }: { seq: number; school?: boolean }) {
+  return (
+    <div
+      className={`flex h-6 w-6 items-center justify-center rounded-full border-2 border-white text-[11px] font-semibold text-white shadow ${
+        school ? "bg-amber-600" : "bg-primary"
+      }`}
+    >
+      {school ? "★" : seq}
+    </div>
+  );
 }
 
-interface PlanStop { address: string; pickup_time: string }
-interface OptionStop { seq: number; label: string; lat: number; lng: number; pickup_time?: string | null; is_school?: boolean }
-interface RouteOption { strategy: string; stops: OptionStop[] }
+interface PlanRow { address: string; pickup_time: string; lat?: number | null; lng?: number | null }
+interface OptionStop {
+  seq: number; label: string; lat: number; lng: number;
+  pickup_time?: string | null; is_school?: boolean;
+  eta?: string | null; leg_distance_m?: number | null; leg_duration_s?: number | null;
+}
+interface RouteOption {
+  strategy: string; stops: OptionStop[];
+  polyline?: string | null; provider?: string;
+  total_distance_m?: number; total_duration_s?: number;
+}
+
+const fmtKm = (m?: number) => (m == null ? "—" : `${(m / 1000).toFixed(1)} km`);
+const fmtMin = (s?: number) => (s == null ? "—" : `${Math.max(1, Math.round(s / 60))} min`);
 
 export function FleetMapPage() {
-  // Live polling so the map keeps up as buses arrive at stops (#8).
+  // Live polling so the map keeps up as buses arrive at stops.
   const { data: buses = [] } = useBuses({ poll: true });
   const { data: schools = [] } = useSchools();
   const { toast } = useToast();
 
   const located = (buses as any[]).filter((b) => b.current_lat != null && b.current_lng != null);
+  const [selectedBus, setSelectedBus] = useState<string | null>(null);
 
   // Stable colour per bus, by sorted id so it doesn't shuffle as data changes.
   const colorMap = useMemo(() => {
@@ -78,8 +86,8 @@ export function FleetMapPage() {
     return m;
   }, [buses]);
 
-  // Route planner state (#9).
-  const [rows, setRows] = useState<PlanStop[]>([{ address: "", pickup_time: "" }]);
+  // Route planner state.
+  const [rows, setRows] = useState<PlanRow[]>([{ address: "", pickup_time: "" }]);
   const [type, setType] = useState("morning");
   const [schoolId, setSchoolId] = useState("none");
   const [options, setOptions] = useState<RouteOption[] | null>(null);
@@ -87,8 +95,10 @@ export function FleetMapPage() {
   const [provider, setProvider] = useState("");
   const [selected, setSelected] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
 
-  const setRow = (i: number, patch: Partial<PlanStop>) =>
+  const setRow = (i: number, patch: Partial<PlanRow>) =>
     setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, { address: "", pickup_time: "" }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i));
@@ -104,7 +114,12 @@ export function FleetMapPage() {
       const res = await api.post("/api/fleet/route-options", {
         type,
         school_id: schoolId === "none" ? null : schoolId,
-        stops: stops.map((s) => ({ address: s.address, pickup_time: s.pickup_time || null })),
+        stops: stops.map((s) => ({
+          address: s.address,
+          pickup_time: s.pickup_time || null,
+          lat: s.lat ?? null,
+          lng: s.lng ?? null,
+        })),
       });
       setOptions(res.options ?? []);
       setUnresolved(res.unresolved ?? []);
@@ -125,12 +140,43 @@ export function FleetMapPage() {
   };
 
   const activeOption = options?.[selected];
-  const planned = activeOption?.stops ?? [];
-  const plannedLine = planned.map((s) => [s.lat, s.lng]) as [number, number][];
 
-  const focusPoints: [number, number][] = planned.length
-    ? plannedLine
-    : located.map((b) => [b.current_lat, b.current_lng] as [number, number]);
+  // Drag-to-reorder: recompute road geometry + ETAs for the new fixed order.
+  const reorder = async (from: number, to: number) => {
+    if (!activeOption) return;
+    const stops = [...activeOption.stops];
+    if (to < 0 || to >= stops.length || from === to) return;
+    const [moved] = stops.splice(from, 1);
+    stops.splice(to, 0, moved);
+    setBusy(true);
+    try {
+      const res = await api.post("/api/fleet/route-options", {
+        type,
+        preserve_order: true,
+        stops: stops.map((s) => ({
+          label: s.label, lat: s.lat, lng: s.lng,
+          pickup_time: s.pickup_time ?? null, is_school: !!s.is_school,
+        })),
+      });
+      const opt = (res.options ?? [])[0];
+      if (opt) {
+        setProvider(res.provider ?? provider);
+        setOptions((prev) => (prev ? prev.map((o, i) => (i === selected ? opt : o)) : prev));
+      }
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setBusy(false);
+      setDragIndex(null);
+    }
+  };
+
+  const planned = activeOption?.stops ?? [];
+  const plannedPath: LatLng[] = planned.map((s) => ({ lat: s.lat, lng: s.lng }));
+
+  const focusPoints: LatLng[] = planned.length
+    ? plannedPath
+    : located.map((b) => ({ lat: b.current_lat, lng: b.current_lng }));
   const focusKey = planned.length
     ? `plan:${planned.map((s) => `${s.lat},${s.lng}`).join("|")}`
     : `buses:${located.map((b) => b.id).sort().join(",")}`;
@@ -146,41 +192,55 @@ export function FleetMapPage() {
 
       <div className="grid gap-6 lg:grid-cols-3">
         <Card className="overflow-hidden lg:col-span-2">
-          <div className="h-[70vh] w-full">
-            <MapContainer center={NAIROBI} zoom={12} className="h-full w-full" scrollWheelZoom>
-              <TileLayer
-                attribution="&copy; OpenStreetMap contributors"
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              />
+          <div className="h-[70vh] w-full" data-testid="fleet-map">
+            <Map
+              mapId={MAP_ID}
+              defaultCenter={NAIROBI}
+              defaultZoom={12}
+              gestureHandling="greedy"
+              disableDefaultUI={false}
+              className="h-full w-full"
+            >
               <FitBounds points={focusPoints} focusKey={focusKey} />
+
               {located.map((bus: any) => (
-                <Marker
+                <AdvancedMarker
                   key={bus.id}
-                  position={[bus.current_lat, bus.current_lng]}
-                  icon={busIcon(colorMap[bus.id] ?? PALETTE[0])}
+                  position={{ lat: bus.current_lat, lng: bus.current_lng }}
+                  onClick={() => setSelectedBus(bus.id)}
                 >
-                  <Popup>
-                    <div className="space-y-1 text-sm">
-                      <p className="font-semibold" style={{ color: colorMap[bus.id] }}>{bus.name}</p>
-                      <p>{bus.position_label ?? "On the move"}</p>
-                      <p>Driver: {bus.driver_name ?? "—"}</p>
-                      <p>Plate: {bus.plate_number ?? "—"}</p>
-                    </div>
-                  </Popup>
-                </Marker>
+                  <BusGlyph color={colorMap[bus.id] ?? PALETTE[0]} />
+                </AdvancedMarker>
               ))}
-              {plannedLine.length > 1 && <Polyline positions={plannedLine} color="#2f6f4f" />}
+
+              {selectedBus &&
+                (() => {
+                  const bus = located.find((b: any) => b.id === selectedBus);
+                  if (!bus) return null;
+                  return (
+                    <InfoWindow
+                      position={{ lat: bus.current_lat, lng: bus.current_lng }}
+                      onCloseClick={() => setSelectedBus(null)}
+                    >
+                      <div className="space-y-1 text-sm">
+                        <p className="font-semibold" style={{ color: colorMap[bus.id] }}>{bus.name}</p>
+                        <p>{bus.position_label ?? "On the move"}</p>
+                        <p>Driver: {bus.driver_name ?? "—"}</p>
+                        <p>Plate: {bus.plate_number ?? "—"}</p>
+                      </div>
+                    </InfoWindow>
+                  );
+                })()}
+
+              {planned.length > 1 && (
+                <RoutePolyline encoded={activeOption?.polyline} path={plannedPath} color="#2f6f4f" />
+              )}
               {planned.map((s, i) => (
-                <Marker key={`plan-${i}`} position={[s.lat, s.lng]}>
-                  <Popup>
-                    <div className="text-sm">
-                      <p className="font-semibold">{s.seq}. {s.label}</p>
-                      {s.pickup_time && <p>Pickup: {s.pickup_time}</p>}
-                    </div>
-                  </Popup>
-                </Marker>
+                <AdvancedMarker key={`plan-${i}`} position={{ lat: s.lat, lng: s.lng }} zIndex={10}>
+                  <StopGlyph seq={s.seq} school={s.is_school} />
+                </AdvancedMarker>
               ))}
-            </MapContainer>
+            </Map>
           </div>
         </Card>
 
@@ -219,16 +279,18 @@ export function FleetMapPage() {
             </CardHeader>
             <CardContent className="space-y-4">
               <p className="text-sm text-muted-foreground">
-                Enter addresses and pickup times to get suggested route orders.
+                Enter addresses and pickup times to get optimised, traffic-aware route options.
               </p>
 
               <div className="space-y-2">
                 {rows.map((r, i) => (
                   <div key={i} className="flex items-center gap-2">
-                    <Input
-                      placeholder="Address"
+                    <AddressAutocomplete
                       value={r.address}
-                      onChange={(e) => setRow(i, { address: e.target.value })}
+                      placeholder="Address"
+                      testId={`address-input-${i}`}
+                      onChange={(address) => setRow(i, { address, lat: null, lng: null })}
+                      onResolve={(address, lat, lng) => setRow(i, { address, lat, lng })}
                     />
                     <Input
                       type="time"
@@ -267,13 +329,12 @@ export function FleetMapPage() {
                 </div>
               </div>
 
-              <Button onClick={plan} disabled={loading} className="w-full">
+              <Button onClick={plan} disabled={loading} className="w-full" data-testid="get-route-options">
                 <Wand2 className="h-4 w-4" /> {loading ? "Planning…" : "Get route options"}
               </Button>
 
               {options && (
-                <div className="space-y-3 pt-2">
-                  {provider && <p className="text-xs text-muted-foreground">Ordered via {provider}</p>}
+                <div className="space-y-3 pt-2" data-testid="route-result">
                   {unresolved.length > 0 && (
                     <p className="text-xs text-destructive">Could not locate: {unresolved.join(", ")}</p>
                   )}
@@ -289,17 +350,72 @@ export function FleetMapPage() {
                       </Button>
                     ))}
                   </div>
+
                   {activeOption && (
-                    <ol className="space-y-1 text-sm">
-                      {activeOption.stops.map((s) => (
-                        <li key={s.seq} className="flex items-center gap-2">
-                          <span className="font-medium">{s.seq}.</span>
-                          <span className="flex-1 truncate">{s.label}</span>
-                          {s.is_school && <Badge variant="outline">School</Badge>}
-                          {s.pickup_time && <span className="text-xs text-muted-foreground">{s.pickup_time}</span>}
-                        </li>
-                      ))}
-                    </ol>
+                    <>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                        <span className="font-medium" data-testid="route-distance">
+                          {fmtKm(activeOption.total_distance_m)}
+                        </span>
+                        <span className="text-muted-foreground">·</span>
+                        <span className="font-medium" data-testid="route-duration">
+                          {fmtMin(activeOption.total_duration_s)}
+                          {activeOption.provider === "google-routes" && " in traffic"}
+                        </span>
+                        {(activeOption.provider ?? provider) && (
+                          <Badge variant="outline" className="ml-auto text-[10px]">
+                            {activeOption.provider === "google-routes"
+                              ? "Google Routes"
+                              : (activeOption.provider ?? provider)}
+                          </Badge>
+                        )}
+                      </div>
+
+                      <ol className="space-y-1 text-sm" data-testid="route-stops">
+                        {activeOption.stops.map((s, i) => (
+                          <li
+                            key={`${s.seq}-${s.lat}-${s.lng}`}
+                            className={`flex items-center gap-2 rounded px-1 py-0.5 ${
+                              dragIndex === i ? "bg-accent" : ""
+                            }`}
+                            draggable={!busy}
+                            onDragStart={() => setDragIndex(i)}
+                            onDragOver={(e) => e.preventDefault()}
+                            onDrop={() => dragIndex != null && reorder(dragIndex, i)}
+                          >
+                            <GripVertical className="h-3.5 w-3.5 shrink-0 cursor-grab text-muted-foreground" />
+                            <span className="font-medium">{s.seq}.</span>
+                            <span className="flex-1 truncate">{s.label}</span>
+                            {s.is_school && <Badge variant="outline">School</Badge>}
+                            {s.eta && (
+                              <span className="text-xs text-muted-foreground" title="Estimated arrival">
+                                {s.eta}
+                              </span>
+                            )}
+                            <span className="flex flex-col">
+                              <button
+                                type="button"
+                                aria-label="Move up"
+                                disabled={i === 0 || busy}
+                                onClick={() => reorder(i, i - 1)}
+                                className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                              >
+                                <ArrowUp className="h-3 w-3" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label="Move down"
+                                disabled={i === activeOption.stops.length - 1 || busy}
+                                onClick={() => reorder(i, i + 1)}
+                                className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                              >
+                                <ArrowDown className="h-3 w-3" />
+                              </button>
+                            </span>
+                          </li>
+                        ))}
+                      </ol>
+                    </>
                   )}
                 </div>
               )}
