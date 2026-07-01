@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Flag, MapPin, Play } from "lucide-react";
@@ -12,6 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { useToast } from "@/components/ui/use-toast";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { DRIVER_NAV } from "@/features/driver/DriverHomePage";
@@ -28,17 +29,16 @@ export function DriverRunPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data } = useDriverContext();
+  // No auto-selection (R27): the Select opens on its "Choose route"
+  // placeholder and Start Run stays disabled until the driver picks a route.
   const [routeId, setRouteId] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
-
-  // Default the pre-run route to the morning route (KTD-9.2), never routes[0].
-  useEffect(() => {
-    if (!routeId && routes.length > 0) setRouteId(morningFirst(routes)[0].id);
-  }, [routes, routeId]);
+  const completedToday: string[] = data?.completed_route_ids_today ?? [];
 
   // Bus position is derived from stop arrivals on the backend (no device GPS):
   // the admin's/driver's device location must never become the bus position.
@@ -51,6 +51,8 @@ export function DriverRunPage() {
       await api.post("/api/runs/driver/start", { route_id: routeId });
       await refresh();
     } catch (err) {
+      // Surfaces the server's friendly 409s too ("already completed today",
+      // "no students assigned yet") — R28/R28b.
       toast({ title: "Cannot start run", description: (err as Error).message, variant: "destructive" });
     } finally {
       setBusy(false);
@@ -72,6 +74,24 @@ export function DriverRunPage() {
 
   const end = async () => {
     if (!activeRun) return;
+    // Ending is final (R29): on afternoon runs, name anyone whose drop-off
+    // was never confirmed — their parents will NOT get a "dropped off" push.
+    const unconfirmed =
+      activeRun.type === "afternoon"
+        ? (data?.students ?? [])
+            .filter((s: any) => s.status === "on-bus")
+            .map((s: any) => s.name)
+        : [];
+    const description =
+      unconfirmed.length > 0
+        ? `Not yet confirmed dropped off: ${unconfirmed.join(", ")}`
+        : "This marks the run as completed.";
+    if (!(await confirm({
+      title: "End this run?",
+      description,
+      confirmLabel: "End Run",
+      cancelLabel: "Cancel",
+    }))) return;
     setBusy(true);
     try {
       await api.post("/api/runs/driver/end", { run_id: activeRun.id });
@@ -103,7 +123,17 @@ export function DriverRunPage() {
                 <Select value={routeId} onValueChange={setRouteId}>
                   <SelectTrigger><SelectValue placeholder="Choose route" /></SelectTrigger>
                   <SelectContent>
-                    {morningFirst(routes).map((r: any) => <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>)}
+                    {morningFirst(routes).map((r: any) => {
+                      // A route already run today can't be restarted (R28);
+                      // the admin recovery path is deleting the mistaken run.
+                      const completed = completedToday.includes(r.id);
+                      return (
+                        <SelectItem key={r.id} value={r.id} disabled={completed}>
+                          {r.name}
+                          {completed && <span className="text-muted-foreground"> · Completed today</span>}
+                        </SelectItem>
+                      );
+                    })}
                   </SelectContent>
                 </Select>
                 <Button className="w-full" onClick={start} disabled={busy || !routeId}>

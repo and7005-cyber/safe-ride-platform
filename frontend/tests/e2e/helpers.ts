@@ -10,6 +10,9 @@ export const SEED = {
   school: "Greenfield Academy",
   /** The demo driver's (Daniel Kamau) live bus. */
   driverBus: "Simba",
+  /** The driver bus's seeded routes (Run page dropdown options). */
+  driverMorningRoute: "Express 1 — Morning",
+  driverAfternoonRoute: "Express 1 — Afternoon",
   /** Any seeded live bus, for admin bus <Select> options. */
   busOption: /Simba|Twiga|Mamba/,
   /** Full name of the PARENT account (Amina). */
