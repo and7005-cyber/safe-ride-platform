@@ -81,10 +81,3 @@ export function useDrivers() {
 export function useParents() {
   return useQuery({ queryKey: ["accounts-parents"], queryFn: () => api.get("/api/accounts/parents") });
 }
-
-export function useParentStudents() {
-  return useQuery({
-    queryKey: ["parent-students"],
-    queryFn: () => api.get("/api/accounts/parent-students"),
-  });
-}

@@ -13,7 +13,6 @@ import { StudentsPage } from "@/features/admin/StudentsPage";
 import { RunsPage } from "@/features/admin/RunsPage";
 import { ParentsPage } from "@/features/admin/ParentsPage";
 import { DriversPage } from "@/features/admin/DriversPage";
-import { ParentAssignmentsPage } from "@/features/admin/ParentAssignmentsPage";
 import { AlertsPage } from "@/features/admin/AlertsPage";
 import { DriverHomePage } from "@/features/driver/DriverHomePage";
 import { DriverRunPage } from "@/features/driver/DriverRunPage";
@@ -52,7 +51,8 @@ export const router = createBrowserRouter([
   { path: "/students", element: admin(<StudentsPage />) },
   { path: "/runs", element: admin(<RunsPage />) },
   { path: "/schools", element: admin(<SchoolsPage />) },
-  { path: "/parent-assignments", element: admin(<ParentAssignmentsPage />) },
+  // Parent assignment now happens in the student form (R12); the old page is gone.
+  { path: "/parent-assignments", element: <Navigate to="/students" replace /> },
   { path: "/parents", element: admin(<ParentsPage />) },
   { path: "/drivers", element: admin(<DriversPage />) },
   { path: "/alerts", element: admin(<AlertsPage />) },

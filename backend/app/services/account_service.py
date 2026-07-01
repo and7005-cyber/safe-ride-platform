@@ -53,12 +53,3 @@ class AccountService:
 
     def delete_parent(self, parent_id):
         self.dao.delete_parent(parent_id)
-
-    def list_parent_students(self):
-        return self.dao.list_parent_students()
-
-    def link_parent_student(self, parent_id, student_id):
-        return self.dao.link_parent_student(parent_id, student_id)
-
-    def unlink_parent_student(self, link_id):
-        self.dao.unlink_parent_student(link_id)

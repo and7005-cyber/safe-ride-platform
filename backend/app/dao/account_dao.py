@@ -135,33 +135,3 @@ class AccountDao:
         the number of links created."""
         with get_connection() as conn:
             return link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
-
-    # --- parent-student assignments ---------------------------------------
-
-    def list_parent_students(self) -> list[dict[str, Any]]:
-        with get_connection() as conn:
-            rows = conn.execute(
-                """
-                select ps.id, ps.parent_id, ps.student_id,
-                       u.full_name as parent_name, s.name as student_name
-                from live_parent_students ps
-                join app_users u on u.id = ps.parent_id
-                join live_students s on s.id = ps.student_id
-                order by u.full_name asc
-                """
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def link_parent_student(self, parent_id: str, student_id: str) -> dict[str, Any]:
-        with get_connection() as conn:
-            row = conn.execute(
-                "insert into live_parent_students (parent_id, student_id) values (%s, %s) "
-                "on conflict (parent_id, student_id) do update set parent_id = excluded.parent_id "
-                "returning *",
-                (parent_id, student_id),
-            ).fetchone()
-        return dict(row)
-
-    def unlink_parent_student(self, link_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_parent_students where id = %s", (link_id,))

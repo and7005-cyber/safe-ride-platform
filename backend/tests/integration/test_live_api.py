@@ -219,39 +219,45 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
     assert driver.status_code == 200, driver.text
     driver_id = driver.json()["id"]
 
+    parent_email = f"it-parent-{marker}@test.local"
     signup = client.post(
         "/api/auth/signup",
-        json={"email": f"it-parent-{marker}@test.local", "password": "ParentPass1!",
+        json={"email": parent_email, "password": "ParentPass1!",
               "full_name": f"IT Parent {marker}", "role": "parent"},
     )
     assert signup.status_code == 200, signup.text
     parent_id = signup.json()["user"]["id"] if "user" in signup.json() else None
     if parent_id is None:
         parents = client.get("/api/accounts/parents", headers=admin_headers).json()
-        parent_id = next(p["id"] for p in parents if p.get("email") == f"it-parent-{marker}@test.local")
+        parent_id = next(p["id"] for p in parents if p.get("email") == parent_email)
 
+    # Linking is email-driven (R11/R12): creating a student that carries the
+    # registered parent's email auto-links it — no manual link endpoint.
     student = client.post(
         "/api/students",
-        json={"name": f"IT LinkKid {marker}", "grade": "G3", "parent_name": "IT Link Parent",
-              "parent_phone": "+254711000001", "parent_email": f"it-linkkid-{marker}@test.local"},
+        json={"name": f"IT LinkKid {marker}", "grade": "G3", "parent_name": f"IT Parent {marker}",
+              "parent_phone": "+254711000001", "parent_email": parent_email},
         headers=admin_headers,
     ).json()
 
     try:
-        link = client.post(
-            "/api/accounts/parent-students",
-            json={"parent_id": parent_id, "student_id": student["id"]},
+        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
+        parent_row = next(p for p in parents if p.get("id") == parent_id)
+        assert parent_row["status"] == "registered"
+        assert f"IT LinkKid {marker}" in parent_row["students"]
+
+        # Moving the student's parent email elsewhere prunes the stale link.
+        updated = client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"IT LinkKid {marker}", "grade": "G3",
+                  "parent_name": f"IT Parent {marker}", "parent_phone": "+254711000001",
+                  "parent_email": f"it-someone-else-{marker}@test.local"},
             headers=admin_headers,
         )
-        assert link.status_code == 200, link.text
-        link_id = link.json()["id"]
-
-        links = client.get("/api/accounts/parent-students", headers=admin_headers).json()
-        assert any(l["id"] == link_id for l in links)
-
-        assert client.delete(
-            f"/api/accounts/parent-students/{link_id}", headers=admin_headers
-        ).status_code == 200
+        assert updated.status_code == 200, updated.text
+        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
+        parent_row = next(p for p in parents if p.get("id") == parent_id)
+        assert f"IT LinkKid {marker}" not in parent_row["students"]
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver_id}", headers=admin_headers)
