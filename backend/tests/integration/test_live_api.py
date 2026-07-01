@@ -178,7 +178,8 @@ def test_school_route_and_student_crud(client, admin_headers):
     student = client.post(
         "/api/students",
         json={"name": f"IT Student {marker}", "grade": "G1", "home_lat": -1.29, "home_lng": 36.81,
-              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711000000"},
+              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711000000",
+              "parent_email": f"it-crud-{marker}@test.local"},
         headers=admin_headers,
     ).json()
     route = client.post(
@@ -194,7 +195,9 @@ def test_school_route_and_student_crud(client, admin_headers):
 
         renamed = client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"IT Student {marker} v2", "grade": "G2"},
+            json={"name": f"IT Student {marker} v2", "grade": "G2",
+                  "parent_name": "IT Parent", "parent_phone": "+254711000000",
+                  "parent_email": f"it-crud-{marker}@test.local"},
             headers=admin_headers,
         )
         assert renamed.status_code == 200
@@ -229,7 +232,8 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
 
     student = client.post(
         "/api/students",
-        json={"name": f"IT LinkKid {marker}", "grade": "G3"},
+        json={"name": f"IT LinkKid {marker}", "grade": "G3", "parent_name": "IT Link Parent",
+              "parent_phone": "+254711000001", "parent_email": f"it-linkkid-{marker}@test.local"},
         headers=admin_headers,
     ).json()
 
@@ -293,6 +297,8 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         "/api/students",
         json={"name": f"Early {marker}", "home_address": "12 Early Lane",
               "home_lat": -1.28, "home_lng": 36.80, "pickup_time": "06:30",
+              "parent_name": "IT Early Parent", "parent_phone": "+254711000002",
+              "parent_email": f"it-early-{marker}@test.local",
               "route_ids": [morning["id"], afternoon["id"]]},
         headers=admin_headers,
     ).json()
@@ -300,6 +306,8 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         "/api/students",
         json={"name": f"Late {marker}", "home_address": "99 Late Road",
               "home_lat": -1.29, "home_lng": 36.81, "pickup_time": "06:50",
+              "parent_name": "IT Late Parent", "parent_phone": "+254711000003",
+              "parent_email": f"it-late-{marker}@test.local",
               "route_ids": [morning["id"], afternoon["id"]]},
         headers=admin_headers,
     ).json()
@@ -353,6 +361,8 @@ def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
     student = client.post(
         "/api/students",
         json={"name": f"NoCoords {marker}", "home_address": address, "pickup_time": "06:45",
+              "parent_name": "IT NoCoords Parent", "parent_phone": "+254711000004",
+              "parent_email": f"it-nocoords-{marker}@test.local",
               "route_ids": [route["id"]]},
         headers=admin_headers,
     ).json()
@@ -409,7 +419,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
     # Created with only the morning route, mirroring the reported flow.
     student = client.post(
         "/api/students",
-        json={"name": f"Both Kid {marker}", "route_ids": [morning["id"]]},
+        json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+              "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+              "route_ids": [morning["id"]]},
         headers=admin_headers,
     ).json()
 
@@ -423,7 +435,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Edit to add the afternoon route while keeping the morning one.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [morning["id"], afternoon["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [morning["id"], afternoon["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {morning["id"], afternoon["id"]}
@@ -431,7 +445,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Idempotent re-save with both already present must not drop either.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"], morning["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [afternoon["id"], morning["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {morning["id"], afternoon["id"]}
@@ -439,7 +455,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Removing one still works.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [afternoon["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {afternoon["id"]}

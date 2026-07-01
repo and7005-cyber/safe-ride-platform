@@ -156,7 +156,9 @@ def test_route_bus_change_rederives_student_bus(client, admin_headers):
     route = _create_route(client, admin_headers, f"IT Derive {marker}", "morning", bus_a["id"]).json()
     student = client.post(
         "/api/students",
-        json={"name": f"IT Derive Kid {marker}", "route_ids": [route["id"]]},
+        json={"name": f"IT Derive Kid {marker}", "parent_name": "IT Derive Parent",
+              "parent_phone": "+254711000006", "parent_email": f"it-derive-{marker}@test.local",
+              "route_ids": [route["id"]]},
         headers=admin_headers,
     ).json()
 
