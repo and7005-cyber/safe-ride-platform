@@ -13,10 +13,12 @@ PWA on phones (Android Chrome and iOS 16.4+ Safari via "Add to Home Screen").
 | `bus-approaching` | Bus GPS comes within `BUS_APPROACHING_RADIUS_M` (default 1000 m) of an upcoming stop | Parents of students at that stop |
 | `reached-school` | Bus arrives at the school gate (or a morning run ends) | Parents of every non-absent student on the run |
 | `dropped-off` | An afternoon run ends | Same |
+| `student-absent` | Driver marks a student absent at pickup | That student's parents only |
 | `incident` | Driver reports breakdown / accident / traffic / student issue / notice | Parents of every student on that bus |
 
 Run-scoped types (`run-started`, `on-way-home`, `student-boarded`,
-`bus-approaching`, `reached-school`, `dropped-off`) are deduplicated per
+`bus-approaching`, `reached-school`, `dropped-off`, `student-absent`) are
+deduplicated per
 (parent, run, student, type), so a parent gets each at most once per run.
 Incident notifications are never deduplicated — every report matters.
 

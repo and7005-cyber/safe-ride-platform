@@ -14,7 +14,8 @@ class FakePushDao:
         self.stops: list[dict] = []
         self.dedup_keys: set[tuple] = set()
 
-    def insert_notification(self, user_id, type, title, body, student_id=None, run_id=None, bus_id=None):
+    def insert_notification(self, user_id, type, title, body, student_id=None, run_id=None,
+                            bus_id=None, run_type=None):
         if run_id is not None and student_id is not None:
             key = (user_id, run_id, student_id, type)
             if key in self.dedup_keys:
@@ -23,6 +24,7 @@ class FakePushDao:
         row = {
             "user_id": user_id, "type": type, "title": title, "body": body,
             "student_id": student_id, "run_id": run_id, "bus_id": bus_id,
+            "run_type": run_type,
         }
         self.notifications.append(row)
         return row
@@ -193,6 +195,98 @@ def test_morning_run_end_falls_back_to_reached_school(
     service.notify_run_ended(run)
 
     assert [n["type"] for n in dao.notifications] == ["reached-school"]
+
+
+def test_student_absent_notifies_only_that_students_parents(
+    service: PushService, dao: FakePushDao
+) -> None:
+    # Two parents linked to Leila; Baraka's parent rides the same bus but
+    # must never learn about her absence.
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p9", "s1", "Leila")],
+        "s2": [link("p2", "s2", "Baraka")],
+    }
+
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, RUN)
+
+    assert [n["type"] for n in dao.notifications] == ["student-absent", "student-absent"]
+    assert {n["user_id"] for n in dao.notifications} == {"p1", "p9"}
+    for note in dao.notifications:
+        assert "Leila" in note["body"]
+        assert "absent at pickup" in note["body"]
+        assert note["run_id"] == "run-1"
+        assert note["student_id"] == "s1"
+
+
+def test_student_absent_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, RUN)
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, RUN, reason="sick")
+
+    assert len(dao.notifications) == 1
+
+
+def test_student_absent_includes_reason_when_given(
+    service: PushService, dao: FakePushDao
+) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, RUN, reason="Doctor visit")
+
+    assert "Doctor visit" in dao.notifications[0]["body"]
+
+
+def test_run_scoped_notifications_carry_run_type(service: PushService, dao: FakePushDao) -> None:
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila")],
+        "s2": [link("p2", "s2", "Baraka")],
+        "s3": [link("p3", "s3", "Wanjiru")],
+    }
+    dao.stops = [
+        {"stop_order": 1, "student_id": "s2", "student_name": "Baraka",
+         "student_status": "at-school"},
+    ]
+
+    service.notify_student_boarded(RUN, "s1")
+    service.notify_bus_approaching(RUN)
+    service.notify_student_absent({"id": "s3", "name": "Wanjiru"}, AFTERNOON_RUN)
+
+    by_type = {n["type"]: n["run_type"] for n in dao.notifications}
+    assert by_type == {
+        "student-boarded": "morning",
+        "bus-approaching": "morning",
+        "student-absent": "afternoon",
+    }
+
+
+def test_deprecated_position_path_carries_run_type(
+    service: PushService, dao: FakePushDao
+) -> None:
+    dao.stops = [
+        {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
+         "student_name": "Leila", "student_status": "at-school"},
+    ]
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_bus_position(RUN, -1.2920, 36.8219)
+
+    assert [n["run_type"] for n in dao.notifications] == ["morning"]
+
+
+def test_incident_passes_through_run_type_without_run_dedup(
+    service: PushService, dao: FakePushDao
+) -> None:
+    dao.bus_parents = [link("p1", "s1", "Leila")]
+
+    service.notify_incident({
+        "type": "breakdown", "bus_id": "bus-1", "run_type": "afternoon",
+        "description": "Flat tire",
+    })
+
+    note = dao.notifications[0]
+    assert note["run_id"] is None  # incidents keep repeat-report semantics
+    assert note["run_type"] == "afternoon"
 
 
 def test_incident_notifies_each_parent_once_without_run_dedup(
