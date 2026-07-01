@@ -33,16 +33,17 @@ export function AddressAutocomplete({
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
-  const skipNextLookup = useRef(false);
+  // Only user-typed edits trigger a lookup: programmatic value changes (a
+  // picked suggestion, an edit-dialog prefill, a reverse-geocoded map pin)
+  // must not pop the dropdown open on their own.
+  const typedSinceRender = useRef(false);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (skipNextLookup.current) {
-      skipNextLookup.current = false;
-      return;
-    }
+    const typed = typedSinceRender.current;
+    typedSinceRender.current = false;
     const q = value.trim();
-    if (q.length < 3) {
+    if (!typed || q.length < 3) {
       setSuggestions([]);
       setOpen(false);
       return;
@@ -70,7 +71,6 @@ export function AddressAutocomplete({
   }, []);
 
   const choose = async (s: Suggestion) => {
-    skipNextLookup.current = true;
     onChange(s.description);
     setOpen(false);
     setSuggestions([]);
@@ -89,7 +89,10 @@ export function AddressAutocomplete({
         value={value}
         autoComplete="off"
         data-testid={testId}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => {
+          typedSinceRender.current = true;
+          onChange(e.target.value);
+        }}
         onFocus={() => suggestions.length > 0 && setOpen(true)}
         onKeyDown={(e) => {
           if (!open) return;

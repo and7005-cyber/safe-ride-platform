@@ -30,12 +30,13 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { AddressAutocomplete } from "@/features/admin/components/AddressAutocomplete";
 import { BulkUploadDialog } from "@/features/admin/components/BulkUploadDialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { MapPicker } from "@/features/admin/components/MapPicker";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
-import { emailError, phoneError } from "@/lib/validation";
+import { emailError, parentContactErrors, phoneError } from "@/lib/validation";
 import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
 
 const STUDENT_STATUS_FILTERS = [
@@ -62,13 +63,14 @@ const EMPTY = {
   grade: "",
   parent_name: "",
   parent_phone: "",
-  parent_phone2: "",
   parent_email: "",
+  parent2_name: "",
+  parent_phone2: "", // Parent 2's phone (reused column, see plan KTDs)
+  parent2_email: "",
   home_address: "",
   home_lat: null as number | null,
   home_lng: null as number | null,
   pickup_time: "",
-  status: "at-school",
   school_id: "none",
   morning_route: "none",
   afternoon_route: "none",
@@ -87,7 +89,9 @@ export function StudentsPage() {
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
   const [saving, setSaving] = useState(false);
-  const [geocoding, setGeocoding] = useState(false);
+  // Invariant messages (parent 1 name / ≥1 phone / ≥1 email) only show after a
+  // blocked save attempt — a fresh dialog shouldn't open covered in red.
+  const [showContactErrors, setShowContactErrors] = useState(false);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -129,49 +133,51 @@ export function StudentsPage() {
     [students, search, statusFilter, schoolFilter],
   );
 
-  const startCreate = () => { setEditId(null); setForm({ ...EMPTY }); setOpen(true); };
+  const startCreate = () => {
+    setEditId(null); setForm({ ...EMPTY }); setShowContactErrors(false); setOpen(true);
+  };
   const startEdit = (s: any) => {
     setEditId(s.id);
     const ids: string[] = s.route_ids ?? [];
     setForm({
       name: s.name, grade: s.grade ?? "", parent_name: s.parent_name ?? "",
-      parent_phone: s.parent_phone ?? "", parent_phone2: s.parent_phone2 ?? "",
-      parent_email: s.parent_email ?? "", home_address: s.home_address ?? "",
+      parent_phone: s.parent_phone ?? "", parent_email: s.parent_email ?? "",
+      parent2_name: s.parent2_name ?? "", parent_phone2: s.parent_phone2 ?? "",
+      parent2_email: s.parent2_email ?? "", home_address: s.home_address ?? "",
       home_lat: s.home_lat, home_lng: s.home_lng, pickup_time: s.pickup_time ?? "",
-      status: s.status ?? "at-school", school_id: s.school_id ?? "none",
+      school_id: s.school_id ?? "none",
       morning_route: morningRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
       afternoon_route: afternoonRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
     });
+    setShowContactErrors(false);
     setOpen(true);
   };
 
+  // Format errors show as you type; the cross-slot invariant (contactErrs)
+  // mirrors the backend contract and blocks save with inline messages.
   const parentPhoneErr = phoneError(form.parent_phone);
   const parentPhone2Err = phoneError(form.parent_phone2);
   const parentEmailErr = emailError(form.parent_email);
+  const parent2EmailErr = emailError(form.parent2_email);
+  const contactErrs = parentContactErrors(form);
+  const contactInvalid = !!(contactErrs.parentName || contactErrs.phone || contactErrs.email);
 
-  const geocodeAddress = async () => {
-    if (!form.home_address.trim()) return;
-    setGeocoding(true);
+  // A pin dropped/dragged on the map resolves to an editable address (R8).
+  // Best-effort: when the lookup finds nothing the field is left as-is.
+  const reverseGeocode = async (lat: number, lng: number) => {
     try {
-      const res = await api.post("/api/fleet/geocode", { address: form.home_address });
-      if (res.found) {
-        setForm((f) => ({ ...f, home_lat: res.lat, home_lng: res.lng }));
-        toast({ title: "Address located", description: res.label ?? "Pin placed on the map." });
-      } else {
-        toast({
-          title: "Address not found",
-          description: "Try a more specific address, or set the pin manually on the map.",
-          variant: "destructive",
-        });
-      }
-    } catch (err) {
-      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
-    } finally {
-      setGeocoding(false);
+      const res = await api.post("/api/fleet/reverse-geocode", { lat, lng });
+      if (res.found && res.label) setForm((f) => ({ ...f, home_address: res.label }));
+    } catch {
+      /* reverse geocoding is a convenience — never block the pin */
     }
   };
 
   const save = async () => {
+    if (contactInvalid) {
+      setShowContactErrors(true);
+      return;
+    }
     setSaving(true);
     try {
       // Both morning and afternoon routes are sent in one payload so editing
@@ -179,10 +185,11 @@ export function StudentsPage() {
       const route_ids = [form.morning_route, form.afternoon_route].filter((r) => r !== "none");
       const payload = {
         name: form.name, grade: form.grade || null, parent_name: form.parent_name || null,
-        parent_phone: form.parent_phone || null, parent_phone2: form.parent_phone2 || null,
-        parent_email: form.parent_email || null, home_address: form.home_address || null,
+        parent_phone: form.parent_phone || null, parent_email: form.parent_email || null,
+        parent2_name: form.parent2_name || null, parent_phone2: form.parent_phone2 || null,
+        parent2_email: form.parent2_email || null, home_address: form.home_address || null,
         home_lat: form.home_lat, home_lng: form.home_lng, pickup_time: form.pickup_time || null,
-        status: form.status, school_id: form.school_id === "none" ? null : form.school_id, route_ids,
+        school_id: form.school_id === "none" ? null : form.school_id, route_ids,
       };
       if (editId) await api.put(`/api/students/${editId}`, payload);
       else await api.post("/api/students", payload);
@@ -322,65 +329,89 @@ export function StudentsPage() {
               <div className="space-y-2"><Label>Grade</Label><Input value={form.grade} onChange={(e) => setForm({ ...form, grade: e.target.value })} /></div>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2"><Label>Parent name</Label><Input value={form.parent_name} onChange={(e) => setForm({ ...form, parent_name: e.target.value })} /></div>
-              <div className="space-y-2">
-                <Label>Parent phone</Label>
-                <Input value={form.parent_phone} onChange={(e) => setForm({ ...form, parent_phone: e.target.value })} />
-                {parentPhoneErr && <p className="text-xs text-destructive">{parentPhoneErr}</p>}
+              <div className="space-y-3 rounded-md border p-3" data-testid="parent1-group">
+                <p className="text-sm font-semibold">Parent 1</p>
+                <div className="space-y-2">
+                  <Label>Name</Label>
+                  <Input value={form.parent_name} onChange={(e) => setForm({ ...form, parent_name: e.target.value })} />
+                  {showContactErrors && contactErrs.parentName && (
+                    <p className="text-xs text-destructive">{contactErrs.parentName}</p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label>Phone</Label>
+                  <Input value={form.parent_phone} onChange={(e) => setForm({ ...form, parent_phone: e.target.value })} />
+                  {parentPhoneErr && <p className="text-xs text-destructive">{parentPhoneErr}</p>}
+                  {!parentPhoneErr && showContactErrors && contactErrs.phone && (
+                    <p className="text-xs text-destructive">{contactErrs.phone}</p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label>Email</Label>
+                  <Input value={form.parent_email} onChange={(e) => setForm({ ...form, parent_email: e.target.value })} />
+                  {parentEmailErr && <p className="text-xs text-destructive">{parentEmailErr}</p>}
+                  {!parentEmailErr && showContactErrors && contactErrs.email && (
+                    <p className="text-xs text-destructive">{contactErrs.email}</p>
+                  )}
+                </div>
+              </div>
+              <div className="space-y-3 rounded-md border p-3" data-testid="parent2-group">
+                <p className="text-sm font-semibold">
+                  Parent 2 <span className="font-normal text-muted-foreground">(optional)</span>
+                </p>
+                <div className="space-y-2">
+                  <Label>Name</Label>
+                  <Input value={form.parent2_name} onChange={(e) => setForm({ ...form, parent2_name: e.target.value })} />
+                </div>
+                <div className="space-y-2">
+                  <Label>Phone</Label>
+                  <Input value={form.parent_phone2} onChange={(e) => setForm({ ...form, parent_phone2: e.target.value })} />
+                  {parentPhone2Err && <p className="text-xs text-destructive">{parentPhone2Err}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label>Email</Label>
+                  <Input value={form.parent2_email} onChange={(e) => setForm({ ...form, parent2_email: e.target.value })} />
+                  {parent2EmailErr && <p className="text-xs text-destructive">{parent2EmailErr}</p>}
+                </div>
               </div>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>Second phone</Label>
-                <Input value={form.parent_phone2} onChange={(e) => setForm({ ...form, parent_phone2: e.target.value })} />
-                {parentPhone2Err && <p className="text-xs text-destructive">{parentPhone2Err}</p>}
-              </div>
-              <div className="space-y-2">
-                <Label>Parent email</Label>
-                <Input value={form.parent_email} onChange={(e) => setForm({ ...form, parent_email: e.target.value })} />
-                {parentEmailErr && <p className="text-xs text-destructive">{parentEmailErr}</p>}
-              </div>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              At least one phone and one email are needed across the two parents; emails link parent accounts.
+            </p>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2">
                 <Label>Home address</Label>
-                <div className="flex gap-2">
-                  <Input value={form.home_address} onChange={(e) => setForm({ ...form, home_address: e.target.value })} />
-                  <Button type="button" variant="outline" onClick={geocodeAddress} disabled={geocoding || !form.home_address.trim()}>
-                    {geocoding ? "Locating…" : "Locate"}
-                  </Button>
-                </div>
+                <AddressAutocomplete
+                  value={form.home_address}
+                  placeholder="Type to search addresses…"
+                  testId="student-address"
+                  onChange={(address) => setForm((f) => ({ ...f, home_address: address }))}
+                  onResolve={(address, lat, lng) =>
+                    setForm((f) => ({ ...f, home_address: address, home_lat: lat, home_lng: lng }))
+                  }
+                />
               </div>
               <div className="space-y-2"><Label>Pickup time</Label><Input placeholder="06:45" value={form.pickup_time} onChange={(e) => setForm({ ...form, pickup_time: e.target.value })} /></div>
             </div>
             <div className="space-y-2">
               <Label>Home location {form.home_lat != null && <span className="text-xs text-muted-foreground">({form.home_lat}, {form.home_lng})</span>}</Label>
-              <MapPicker lat={form.home_lat} lng={form.home_lng} onPick={(lat, lng) => setForm({ ...form, home_lat: lat, home_lng: lng })} />
-              <p className="text-xs text-muted-foreground">Type an address and click Locate, or click the map to set the pickup point.</p>
+              <MapPicker
+                lat={form.home_lat}
+                lng={form.home_lng}
+                onPick={(lat, lng) => setForm((f) => ({ ...f, home_lat: lat, home_lng: lng }))}
+                onMapPick={reverseGeocode}
+              />
+              <p className="text-xs text-muted-foreground">Pick an address suggestion to place the pin, or click the map — the address fills in and stays editable.</p>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>School</Label>
-                <Select value={form.school_id} onValueChange={(v) => setForm({ ...form, school_id: v })}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">— None —</SelectItem>
-                    {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label>Status</Label>
-                <Select value={form.status} onValueChange={(v) => setForm({ ...form, status: v })}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="at-school">At school</SelectItem>
-                    <SelectItem value="on-bus">On bus</SelectItem>
-                    <SelectItem value="dropped-off">Dropped off</SelectItem>
-                    <SelectItem value="absent">Absent</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+            <div className="space-y-2">
+              <Label>School</Label>
+              <Select value={form.school_id} onValueChange={(v) => setForm({ ...form, school_id: v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">— None —</SelectItem>
+                  {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2">
@@ -412,7 +443,11 @@ export function StudentsPage() {
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
             <Button
               onClick={save}
-              disabled={saving || !form.name || !!parentPhoneErr || !!parentPhone2Err || !!parentEmailErr}
+              disabled={
+                saving || !form.name ||
+                !!parentPhoneErr || !!parentPhone2Err || !!parentEmailErr || !!parent2EmailErr ||
+                (showContactErrors && contactInvalid)
+              }
             >
               {saving ? "Saving…" : "Save"}
             </Button>
