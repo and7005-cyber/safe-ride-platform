@@ -105,6 +105,33 @@ def regenerate_route_stops(conn, route_id: str) -> None:
         )
 
 
+def _check_route_bus_conflict(
+    conn, bus_id: str | None, route_type: str, exclude_route_id: str | None = None
+) -> None:
+    """One route per (bus, type) (R1). This friendly pre-check names the
+    conflicting route and bus; the partial unique index
+    live_routes_bus_type_key (migration 007) is the race-proof backstop."""
+    from app.core.errors import ConflictError
+
+    if not bus_id:
+        return
+    exclude_sql = " and r.id <> %s" if exclude_route_id else ""
+    params: list = [bus_id, route_type]
+    if exclude_route_id:
+        params.append(exclude_route_id)
+    existing = conn.execute(
+        "select r.name as route_name, b.name as bus_name "
+        "from live_routes r join live_buses b on b.id = r.bus_id "
+        f"where r.bus_id = %s and r.type = %s{exclude_sql} limit 1",
+        params,
+    ).fetchone()
+    if existing:
+        raise ConflictError(
+            f"Bus {existing['bus_name']} already has a {route_type} route "
+            f"({existing['route_name']})"
+        )
+
+
 class FleetDao:
     # --- buses -------------------------------------------------------------
 
@@ -235,6 +262,7 @@ class FleetDao:
 
     def create_route(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
+            _check_route_bus_conflict(conn, data.get("bus_id"), data.get("type") or "morning")
             row = conn.execute(
                 "insert into live_routes (name, type, bus_id, school_id) "
                 "values (%(name)s, coalesce(%(type)s,'morning'), %(bus_id)s, %(school_id)s) returning *",
@@ -244,7 +272,18 @@ class FleetDao:
         return dict(row)
 
     def update_route(self, route_id: str, data: dict) -> dict[str, Any] | None:
+        from app.dao.student_live_dao import _derive_student_bus
+
         with get_connection() as conn:
+            current = conn.execute(
+                "select bus_id, type from live_routes where id = %s", (route_id,)
+            ).fetchone()
+            if not current:
+                return None
+            _check_route_bus_conflict(
+                conn, data.get("bus_id"), data.get("type") or "morning",
+                exclude_route_id=route_id,
+            )
             row = conn.execute(
                 "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
                 "bus_id=%(bus_id)s, school_id=%(school_id)s where id=%(id)s returning *",
@@ -252,6 +291,17 @@ class FleetDao:
             ).fetchone()
             if row:
                 regenerate_route_stops(conn, route_id)
+                # A bus reassignment (incl. to/from NULL) — or a type flip,
+                # since derivation prefers morning routes — invalidates the
+                # denormalised live_students.bus_id of everyone on this route
+                # (R2); re-derive with the canonical rule.
+                if current["bus_id"] != row["bus_id"] or current["type"] != row["type"]:
+                    students = conn.execute(
+                        "select student_id from live_student_routes where route_id = %s",
+                        (route_id,),
+                    ).fetchall()
+                    for s in students:
+                        _derive_student_bus(conn, s["student_id"])
         return dict(row) if row else None
 
     def delete_route(self, route_id: str) -> None:

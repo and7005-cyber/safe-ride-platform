@@ -50,8 +50,10 @@ class BoardingPayload(BaseModel):
 # Admin run CRUD -------------------------------------------------------------
 
 @router.get("")
-def list_runs(user: dict = Depends(get_current_user)):
-    return safe_call(dao.list_runs)
+def list_runs(active: bool = False, user: dict = Depends(get_current_user)):
+    """?active=true narrows to today's (Africa/Nairobi) non-completed runs —
+    the dashboard's Active Runs card (R5)."""
+    return safe_call(lambda: dao.list_runs(active=active))
 
 
 @router.post("")
