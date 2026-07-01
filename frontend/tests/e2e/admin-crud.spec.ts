@@ -109,6 +109,14 @@ test("admin can create and delete a route attached to a bus and school", async (
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
 
+  // Every route card carries a map preview (R22) or its key-less/stop-less
+  // placeholder (R23) — never a broken map pane.
+  await expect(
+    cardContaining(page, name)
+      .locator('[data-testid="route-map-preview"] .gm-style, [data-testid="route-map-placeholder"]')
+      .first()
+  ).toBeVisible({ timeout: 15_000 });
+
   // Routes render as cards; the trash button is the card's last icon button.
   await cardContaining(page, name).getByRole("button").last().click();
   await confirmDelete(page);
