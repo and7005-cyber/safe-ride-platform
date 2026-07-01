@@ -190,33 +190,51 @@ test("admin can edit and delete a registered parent account", async ({ page, req
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
-test("admin can link and unlink a parent-student assignment", async ({ page, request }) => {
+test("creating a student with a registered parent's email links it to that parent", async ({ page, request }) => {
+  // Parent ↔ student assignment happens in the student form now (R12): a
+  // student carrying a registered parent's email is auto-linked on save.
   const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
   const headers = authHeaders(adminToken);
-  const studentName = uniqueName("E2E AssignKid");
-  const created = await request.post(`${API_URL}/api/students`, {
-    headers,
-    data: { name: studentName, grade: "Grade 1", parent_name: "", parent_phone: "" },
-  });
-  expect(created.ok()).toBeTruthy();
-  const studentId = (await created.json()).id;
 
+  const parentEmail = `e2e-assign-${Date.now()}@test.local`;
+  const parentName = uniqueName("E2E AssignParent");
+  const signup = await request.post(`${API_URL}/api/auth/signup`, {
+    data: { email: parentEmail, password: "ParentPass1!", full_name: parentName, role: "parent" },
+  });
+  expect(signup.ok()).toBeTruthy();
+
+  const studentName = uniqueName("E2E AssignKid");
   try {
     await adminLogin(page);
-    await page.goto("/parent-assignments");
+    await page.goto("/students");
 
-    await page.getByText("Select parent").click();
-    await page.getByRole("option", { name: new RegExp(SEED.parentName) }).click();
-    await page.getByText("Select student").click();
-    await page.getByRole("option", { name: new RegExp(studentName) }).click();
-    await page.getByRole("button", { name: "Assign" }).click();
+    await page.getByRole("button", { name: "Add Student" }).click();
+    await fieldInput(dialog(page), "Name").fill(studentName);
+    await fieldInput(dialog(page), "Grade").fill("Grade 1");
+    // Parent 1 slot: the registered parent's email drives the link.
+    await fieldInput(dialog(page), "Parent name").fill(parentName);
+    await fieldInput(dialog(page), "Parent phone").fill("+254711222333");
+    await fieldInput(dialog(page), "Parent email").fill(parentEmail);
+    await dialog(page).getByRole("button", { name: "Save" }).click();
     await expect(page.getByRole("row", { name: new RegExp(studentName) })).toBeVisible();
 
-    await page.getByRole("row", { name: new RegExp(studentName) }).getByRole("button").last().click();
-    await confirmDelete(page);
-    await expect(page.getByRole("row", { name: new RegExp(studentName) })).toHaveCount(0);
+    // The parent's registered row now lists the student among its children.
+    const parents = await request.get(`${API_URL}/api/accounts/parents`, { headers });
+    expect(parents.ok()).toBeTruthy();
+    const parentRow = (await parents.json()).find((p: any) => p.email === parentEmail);
+    expect(parentRow?.status).toBe("registered");
+    expect(parentRow?.students).toContain(studentName);
   } finally {
-    await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
+    const students = await request.get(`${API_URL}/api/students`, { headers });
+    if (students.ok()) {
+      const row = (await students.json()).find((s: any) => s.name === studentName);
+      if (row) await request.delete(`${API_URL}/api/students/${row.id}`, { headers });
+    }
+    const parents = await request.get(`${API_URL}/api/accounts/parents`, { headers });
+    if (parents.ok()) {
+      const row = (await parents.json()).find((p: any) => p.email === parentEmail);
+      if (row?.id) await request.delete(`${API_URL}/api/accounts/parents/${row.id}`, { headers });
+    }
   }
 });
 

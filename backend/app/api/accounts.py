@@ -31,11 +31,6 @@ class UpdateParentPayload(BaseModel):
     phone: str | None = None
 
 
-class LinkPayload(BaseModel):
-    parent_id: str
-    student_id: str
-
-
 # Drivers --------------------------------------------------------------------
 
 @router.get("/drivers")
@@ -84,19 +79,6 @@ def update_parent(parent_id: str, payload: UpdateParentPayload, user: dict = Dep
 def delete_parent(parent_id: str, user: dict = Depends(admin_only)):
     return safe_call(lambda: (service.delete_parent(parent_id), {"ok": True})[1])
 
-
-# Parent ↔ student assignments ----------------------------------------------
-
-@router.get("/parent-students")
-def list_parent_students(user: dict = Depends(admin_only)):
-    return safe_call(service.list_parent_students)
-
-
-@router.post("/parent-students")
-def link_parent_student(payload: LinkPayload, user: dict = Depends(admin_only)):
-    return safe_call(lambda: service.link_parent_student(payload.parent_id, payload.student_id))
-
-
-@router.delete("/parent-students/{link_id}")
-def unlink_parent_student(link_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: (service.unlink_parent_student(link_id), {"ok": True})[1])
+# Parent ↔ student links are derived from the emails on each student record
+# (R11/R12) — see student create/update sync and auth signup. There are no
+# manual link/unlink endpoints anymore.
