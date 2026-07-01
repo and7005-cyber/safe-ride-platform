@@ -120,11 +120,14 @@ class ParentLiveDao:
             bus_ids = [r["bus_id"] for r in bus_rows]
             if not bus_ids:
                 return []
+            # student_id-stamped incidents are child-specific (absence reports
+            # for the school): only the admin Alerts page may see them — no
+            # other parent on the bus learns a named child's absence here.
             rows = conn.execute(
                 """
                 select id, driver_name, bus_id, bus_name, type, description, created_at
                 from live_incidents
-                where bus_id = any(%s)
+                where bus_id = any(%s) and student_id is null
                 order by created_at desc
                 """,
                 (bus_ids,),

@@ -195,17 +195,23 @@ class PushDao:
         student_id: str | None = None,
         run_id: str | None = None,
         bus_id: str | None = None,
+        run_type: str | None = None,
     ) -> dict | None:
-        """Insert a feed row. Returns None when the run-scoped dedup suppressed it."""
+        """Insert a feed row. Returns None when the run-scoped dedup suppressed it.
+
+        run_type persists the run's period ('morning'/'afternoon') on the row
+        itself — run_id is ON DELETE SET NULL, so a join would silently lose
+        the period once an admin deletes the run.
+        """
         with get_connection() as conn:
             row = conn.execute(
                 """
-                insert into live_notifications (user_id, student_id, run_id, bus_id, type, title, body)
-                values (%s, %s, %s, %s, %s, %s, %s)
+                insert into live_notifications (user_id, student_id, run_id, bus_id, type, title, body, run_type)
+                values (%s, %s, %s, %s, %s, %s, %s, %s)
                 on conflict do nothing
-                returning id, user_id, student_id, run_id, bus_id, type, title, body, read, created_at
+                returning id, user_id, student_id, run_id, bus_id, type, title, body, run_type, read, created_at
                 """,
-                (user_id, student_id, run_id, bus_id, type, title, body),
+                (user_id, student_id, run_id, bus_id, type, title, body, run_type),
             ).fetchone()
         return dict(row) if row else None
 
