@@ -45,3 +45,74 @@ export function emailError(raw: string | null | undefined, required = false): st
   if (!raw || !String(raw).trim()) return required ? "Email is required" : null;
   return isValidEmail(raw) ? null : "Enter a valid email address";
 }
+
+// Two-parent contact invariant (R9–R10) -------------------------------------
+// Mirrors backend `_clean_student`: every student needs a Parent 1 name, at
+// least one phone across the two parent slots, and at least one email across
+// the two slots. `parent_phone2` is Parent 2's phone (reused column).
+
+const present = (v: string | null | undefined) => !!v && !!String(v).trim();
+
+export interface ParentContactFields {
+  parent_name?: string | null;
+  parent_phone?: string | null;
+  parent_phone2?: string | null;
+  parent_email?: string | null;
+  parent2_email?: string | null;
+}
+
+export interface ParentContactErrors {
+  parentName: string | null;
+  phone: string | null;
+  email: string | null;
+}
+
+/** Field-level messages for the parent-contact invariant, all null when it holds. */
+export function parentContactErrors(f: ParentContactFields): ParentContactErrors {
+  return {
+    parentName: present(f.parent_name) ? null : "Parent 1 name is required",
+    phone:
+      present(f.parent_phone) || present(f.parent_phone2)
+        ? null
+        : "At least one parent phone number is required",
+    email:
+      present(f.parent_email) || present(f.parent2_email)
+        ? null
+        : "At least one parent email is required",
+  };
+}
+
+export interface BulkStudentRow extends ParentContactFields {
+  name?: string | null;
+  grade?: string | null;
+  parent2_name?: string | null;
+}
+
+/**
+ * Per-row bulk-upload validation mirroring the backend's `/api/students/bulk`
+ * row checks (same messages, same "first failure wins" behaviour, plus the
+ * phone/email format checks `_clean_student` would reject server-side).
+ * Returns a "label: message" string, or null when the row is uploadable.
+ */
+export function bulkStudentRowError(row: BulkStudentRow, index: number): string | null {
+  const label = present(row.name) ? String(row.name) : `row ${index + 1}`;
+  if (!present(row.name) || !present(row.grade) || !present(row.parent_name)) {
+    return `${label}: missing required field (name, grade, parent name)`;
+  }
+  if (!present(row.parent_phone) && !present(row.parent_phone2)) {
+    return `${label}: at least one parent phone is required`;
+  }
+  if (!present(row.parent_email) && !present(row.parent2_email)) {
+    return `${label}: at least one parent email is required`;
+  }
+  const formatChecks: Array<[string | null, string]> = [
+    [phoneError(row.parent_phone), "parent 1 phone"],
+    [phoneError(row.parent_phone2), "parent 2 phone"],
+    [emailError(row.parent_email), "parent 1 email"],
+    [emailError(row.parent2_email), "parent 2 email"],
+  ];
+  for (const [error, field] of formatChecks) {
+    if (error) return `${label}: invalid ${field}`;
+  }
+  return null;
+}

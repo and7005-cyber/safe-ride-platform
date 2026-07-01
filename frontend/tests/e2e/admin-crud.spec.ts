@@ -124,14 +124,47 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
   await page.getByRole("button", { name: "Add Student" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Grade").fill("Grade 4");
-  await fieldInput(dialog(page), "Parent name").fill("E2E Parent Contact");
-  await fieldInput(dialog(page), "Parent phone").fill("+254711111111");
+  // Parent contact fields live in two labeled groups (Parent 1 / Parent 2).
+  const parent1 = dialog(page).getByTestId("parent1-group");
+  const parent2 = dialog(page).getByTestId("parent2-group");
+  await fieldInput(parent1, "Name").fill("E2E Parent Contact");
+  await fieldInput(parent1, "Phone").fill("+254711111111");
+
+  // No email in either slot: save is blocked with an inline invariant message.
+  await dialog(page).getByRole("button", { name: "Save" }).click();
+  await expect(dialog(page).getByText("At least one parent email is required")).toBeVisible();
+  await expect(dialog(page)).toBeVisible();
+
+  // A Parent 2 email satisfies the cross-slot invariant (parent 1 phone + parent 2 email).
+  await fieldInput(parent2, "Email").fill("e2e-parent2@test.local");
+
+  // Clicking the map fills the address via reverse geocoding — asserted only
+  // when Google Maps loaded and the geocoder actually resolved (mock-free).
+  const mapReady = await dialog(page)
+    .locator(".gm-style")
+    .first()
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (mapReady) {
+    const reverse = page
+      .waitForResponse((r) => r.url().includes("/api/fleet/reverse-geocode"), { timeout: 10_000 })
+      .catch(() => null);
+    await dialog(page).getByTestId("map-picker").click({ position: { x: 150, y: 120 } });
+    const response = await reverse;
+    if (response && (await response.json()).found) {
+      await expect(fieldInput(dialog(page), "Home address")).not.toHaveValue("");
+    }
+  }
+
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
   const row = page.getByRole("row", { name: new RegExp(name) });
   // Actions are [mark-absent, edit, delete]; the pencil is the second button.
   await row.getByRole("button").nth(1).click();
+  // Status is live data — the dialog exposes no status select (R7).
+  await expect(dialog(page).locator('label:text-is("Status")')).toHaveCount(0);
   await fieldInput(dialog(page), "Name").fill(renamed);
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
