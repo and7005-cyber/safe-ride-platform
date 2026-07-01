@@ -7,36 +7,60 @@ from app.dao.absence_dao import absent_student_ids
 class RunDao:
     # --- admin runs --------------------------------------------------------
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, active: bool = False) -> list[dict[str, Any]]:
+        """All runs, newest first. active=True narrows to today's (Africa/
+        Nairobi) non-completed runs — the dashboard's Active Runs card (R5),
+        same predicate shape as find_active_run_today."""
+        where = (
+            "where r.status <> 'completed' "
+            "and r.date = (now() at time zone 'Africa/Nairobi')::date"
+            if active
+            else ""
+        )
         with get_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
+                {where}
                 order by r.date desc, r.created_at desc
                 """
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def create_run(self, data: dict) -> dict[str, Any]:
+    def _assert_no_active_run_conflict(
+        self, conn, bus_id: str, date, exclude_run_id: str | None = None
+    ) -> None:
+        """No two non-completed runs for the same bus on the same date (#12).
+        Friendly message here; the partial unique index
+        live_runs_active_bus_date_key is the race-proof backstop.
+        date=None means today (Africa/Nairobi)."""
         from app.core.errors import ConflictError
 
+        exclude_sql = " and id <> %s" if exclude_run_id else ""
+        params: list = [bus_id, date]
+        if exclude_run_id:
+            params.append(exclude_run_id)
+        existing = conn.execute(
+            f"""
+            select 1 from live_runs
+            where bus_id = %s and status <> 'completed'
+              and date = coalesce(%s::date, (now() at time zone 'Africa/Nairobi')::date)
+              {exclude_sql}
+            limit 1
+            """,
+            params,
+        ).fetchone()
+        if existing:
+            raise ConflictError("This bus already has an active run on that date")
+
+    def create_run(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
             # No two non-completed runs for the same bus on the same date (#12).
             if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
-                existing = conn.execute(
-                    """
-                    select 1 from live_runs
-                    where bus_id = %s and status <> 'completed'
-                      and date = coalesce(%s::date, (now() at time zone 'Africa/Nairobi')::date)
-                    limit 1
-                    """,
-                    (data["bus_id"], data.get("date")),
-                ).fetchone()
-                if existing:
-                    raise ConflictError("This bus already has an active run on that date")
+                self._assert_no_active_run_conflict(conn, data["bus_id"], data.get("date"))
             row = conn.execute(
                 """
                 insert into live_runs
@@ -56,6 +80,21 @@ class RunDao:
 
     def update_run(self, run_id: str, data: dict) -> dict[str, Any] | None:
         with get_connection() as conn:
+            current = conn.execute(
+                "select date from live_runs where id = %s", (run_id,)
+            ).fetchone()
+            if not current:
+                return None
+            # Re-run the create_run conflict check when the resulting state is
+            # non-completed with a bus, excluding this run, so admins get the
+            # friendly 409 instead of the raw unique-violation message (R3).
+            # The resulting date falls back to the run's current date,
+            # matching coalesce(%(date)s, date) in the update below.
+            if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
+                self._assert_no_active_run_conflict(
+                    conn, data["bus_id"], data.get("date") or current["date"],
+                    exclude_run_id=run_id,
+                )
             row = conn.execute(
                 """
                 update live_runs set
