@@ -27,13 +27,19 @@ def regenerate_route_stops(conn, route_id: str) -> None:
     address (so it shows in lists even without a map position) rather than
     collapsing into a generic "School Pickup". A route with no school
     generates no gate stop.
+
+    Planner-saved routes (``custom_stops = true``) are left untouched: their
+    stops are the saved option, authoritative until a student assignment
+    flips the flag off (the sync path in student_live_dao does that before
+    calling here). Early return — no delete, no rebuild (R18).
     """
     route = conn.execute(
-        "select r.id, r.type, r.school_id, s.name as school_name, s.lat as school_lat, s.lng as school_lng "
+        "select r.id, r.type, r.school_id, r.custom_stops, "
+        "s.name as school_name, s.lat as school_lat, s.lng as school_lng "
         "from live_routes r left join live_schools s on s.id = r.school_id where r.id = %s",
         (route_id,),
     ).fetchone()
-    if not route:
+    if not route or route["custom_stops"]:
         return
 
     students = conn.execute(
@@ -129,6 +135,27 @@ def _check_route_bus_conflict(
         raise ConflictError(
             f"Bus {existing['bus_name']} already has a {route_type} route "
             f"({existing['route_name']})"
+        )
+
+
+def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
+    """Persist planner-provided stops verbatim (R17): the given order becomes
+    stop_order 1..n, pickup times land in scheduled_time, school entries are
+    gate stops, and no stop is student-linked (student_id NULL)."""
+    conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
+    for order, stop in enumerate(stops, start=1):
+        conn.execute(
+            "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
+            "values (%s, %s, %s, %s, %s, %s, %s, null)",
+            (
+                route_id,
+                stop.get("label") or "Stop",
+                order,
+                stop.get("pickup_time"),
+                stop.get("lat"),
+                stop.get("lng"),
+                bool(stop.get("is_school")),
+            ),
         )
 
 
@@ -263,12 +290,27 @@ class FleetDao:
     def create_route(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
             _check_route_bus_conflict(conn, data.get("bus_id"), data.get("type") or "morning")
+            # A planner save carries its own stops: flag the route custom,
+            # keep the polyline/totals, write the stops verbatim and skip
+            # student-based regeneration (R17/R18).
+            custom = bool(data.get("stops"))
             row = conn.execute(
-                "insert into live_routes (name, type, bus_id, school_id) "
-                "values (%(name)s, coalesce(%(type)s,'morning'), %(bus_id)s, %(school_id)s) returning *",
-                data,
+                "insert into live_routes (name, type, bus_id, school_id, "
+                "custom_stops, polyline, total_distance_m, total_duration_s) "
+                "values (%(name)s, coalesce(%(type)s,'morning'), %(bus_id)s, %(school_id)s, "
+                "%(custom_stops)s, %(polyline)s, %(total_distance_m)s, %(total_duration_s)s) returning *",
+                {
+                    **data,
+                    "custom_stops": custom,
+                    "polyline": data.get("polyline") if custom else None,
+                    "total_distance_m": data.get("total_distance_m") if custom else None,
+                    "total_duration_s": data.get("total_duration_s") if custom else None,
+                },
             ).fetchone()
-            regenerate_route_stops(conn, row["id"])
+            if custom:
+                _write_custom_stops(conn, row["id"], data["stops"])
+            else:
+                regenerate_route_stops(conn, row["id"])
         return dict(row)
 
     def update_route(self, route_id: str, data: dict) -> dict[str, Any] | None:
@@ -284,13 +326,31 @@ class FleetDao:
                 conn, data.get("bus_id"), data.get("type") or "morning",
                 exclude_route_id=route_id,
             )
-            row = conn.execute(
-                "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                "bus_id=%(bus_id)s, school_id=%(school_id)s where id=%(id)s returning *",
-                {**data, "id": route_id},
-            ).fetchone()
+            custom = bool(data.get("stops"))
+            if custom:
+                # Re-saving from the planner replaces the custom stops
+                # wholesale — same write path as create (R17).
+                row = conn.execute(
+                    "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
+                    "bus_id=%(bus_id)s, school_id=%(school_id)s, custom_stops=true, "
+                    "polyline=%(polyline)s, total_distance_m=%(total_distance_m)s, "
+                    "total_duration_s=%(total_duration_s)s where id=%(id)s returning *",
+                    {**data, "id": route_id},
+                ).fetchone()
+                if row:
+                    _write_custom_stops(conn, route_id, data["stops"])
+            else:
+                # Metadata-only edit: leave custom_stops/polyline/totals and the
+                # saved stops alone on a custom route (regenerate early-returns
+                # for it); normal routes rebuild from students as before.
+                row = conn.execute(
+                    "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
+                    "bus_id=%(bus_id)s, school_id=%(school_id)s where id=%(id)s returning *",
+                    {**data, "id": route_id},
+                ).fetchone()
+                if row:
+                    regenerate_route_stops(conn, route_id)
             if row:
-                regenerate_route_stops(conn, route_id)
                 # A bus reassignment (incl. to/from NULL) — or a type flip,
                 # since derivation prefers morning routes — invalidates the
                 # denormalised live_students.bus_id of everyone on this route

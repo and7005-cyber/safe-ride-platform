@@ -32,11 +32,26 @@ class SchoolPayload(BaseModel):
     lng: float | None = None
 
 
+class RouteStopPayload(BaseModel):
+    label: str
+    lat: float | None = None
+    lng: float | None = None
+    pickup_time: str | None = None
+    is_school: bool = False
+
+
 class RoutePayload(BaseModel):
     name: str
     type: str | None = "morning"
     bus_id: str | None = None
     school_id: str | None = None
+    # Planner persistence (R17/R18): a saved option carries its own ordered
+    # stops plus the road polyline and totals. Presence of `stops` marks the
+    # route custom (custom_stops = true) and skips student-based regeneration.
+    stops: list[RouteStopPayload] | None = None
+    polyline: str | None = None
+    total_distance_m: int | None = None
+    total_duration_s: int | None = None
 
 
 # Buses ----------------------------------------------------------------------
