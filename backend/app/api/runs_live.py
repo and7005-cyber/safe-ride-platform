@@ -71,6 +71,13 @@ def delete_run(run_id: str, user: dict = Depends(admin_only)):
     return safe_call(lambda: (dao.delete_run(run_id), {"ok": True})[1])
 
 
+@router.get("/{run_id}/report")
+def run_report(run_id: str, user: dict = Depends(admin_only)):
+    """Post-run report (R14-R16): the run row + bus/route/driver names + the
+    absent_students snapshot (approximate=true on the legacy fallback)."""
+    return safe_call(lambda: dao.run_report(run_id))
+
+
 # Driver run lifecycle -------------------------------------------------------
 
 @router.get("/driver/context")

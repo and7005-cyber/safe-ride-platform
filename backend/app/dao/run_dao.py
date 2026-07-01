@@ -114,6 +114,61 @@ class RunDao:
         with get_connection() as conn:
             conn.execute("delete from live_runs where id = %s", (run_id,))
 
+    def run_report(self, run_id: str) -> dict[str, Any]:
+        """Post-run report (R14-R16): the run row + bus/route/driver names +
+        the absence snapshot taken at start_run. Legacy runs that predate the
+        snapshot (a route but no run_absences rows and no run_stops — e.g.
+        admin-created) fall back to live_student_absences on the run's date
+        intersected with the route's membership, flagged approximate=True.
+        Runs with no route report an empty list, approximate=False."""
+        from app.core.errors import NotFoundError
+
+        with get_connection() as conn:
+            run = conn.execute(
+                """
+                select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
+                       u.full_name as driver_name
+                from live_runs r
+                left join live_buses b on b.id = r.bus_id
+                left join live_routes rt on rt.id = r.route_id
+                left join app_users u on u.id = r.driver_id
+                where r.id = %s
+                """,
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise NotFoundError("Run was not found")
+            absent = conn.execute(
+                """
+                select student_id, student_name, reason from run_absences
+                where run_id = %s order by student_name asc
+                """,
+                (run_id,),
+            ).fetchall()
+            approximate = False
+            if not absent and run["route_id"] is not None:
+                has_stops = conn.execute(
+                    "select 1 from run_stops where run_id = %s limit 1", (run_id,)
+                ).fetchone()
+                if not has_stops:
+                    absent = conn.execute(
+                        """
+                        select a.student_id, s.name as student_name, a.reason
+                        from live_student_absences a
+                        join live_students s on s.id = a.student_id
+                        join live_student_routes sr
+                            on sr.student_id = a.student_id and sr.route_id = %s
+                        where a.absence_date = %s
+                        order by s.name asc
+                        """,
+                        (run["route_id"], run["date"]),
+                    ).fetchall()
+                    approximate = True
+        report = dict(run)
+        report["absent_students"] = [dict(a) for a in absent]
+        report["approximate"] = approximate
+        return report
+
     # --- driver context ----------------------------------------------------
 
     def get_driver_context(self, driver_id: str) -> dict[str, Any]:
@@ -247,6 +302,24 @@ class RunDao:
                     (run["id"], order_map[s["stop_order"]], s["name"], s["scheduled_time"], s["lat"],
                      s["lng"], s["is_school_gate"], s["student_id"]),
                 )
+            # Snapshot today's absences for the run report (R14-R16): today's
+            # absent students intersected with the ROUTE's membership — never
+            # the derived bus roster (see KTDs). student_name is denormalized
+            # because run_absences.student_id is ON DELETE SET NULL; a
+            # name-less snapshot would rot after student deletion.
+            conn.execute(
+                """
+                insert into run_absences (run_id, student_id, student_name, reason)
+                select %s, s.id, s.name, a.reason
+                from live_student_absences a
+                join live_students s on s.id = a.student_id
+                join live_student_routes sr
+                    on sr.student_id = a.student_id and sr.route_id = %s
+                where a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                on conflict (run_id, student_id) do nothing
+                """,
+                (run["id"], route_id),
+            )
             # Position the bus at the school when the run starts; from here the
             # position is the last stop the driver arrives at (no device GPS).
             school = conn.execute(
@@ -331,10 +404,17 @@ class RunDao:
                 """,
                 (run_id,),
             ).fetchall()
+            # Persist students_boarded as the final pre-sweep count over the
+            # run's own roster (run_stops), per run type: morning counts who
+            # is on the bus; afternoon counts who was dropped off at their
+            # stop (tap-time drop-offs) before the sweep rewrites statuses.
+            final_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
+            final_count = self._count_run_students_with_status(conn, run_id, final_status)
             conn.execute(
                 "update live_runs set status='completed', stops_completed=total_stops, "
+                "students_boarded=%s, "
                 "end_time=to_char(now() at time zone 'Africa/Nairobi','HH24:MI') where id=%s",
-                (run_id,),
+                (final_count, run_id),
             )
             # Sweep the run's roster (run_stops student_ids), skipping absent.
             sweep_status = "dropped-off" if run["type"] == "afternoon" else "at-school"
@@ -394,7 +474,29 @@ class RunDao:
                 "update live_students set status = %s where id = %s returning *",
                 (new_status, student_id),
             ).fetchone()
+            # Recount students_boarded from the run's own roster in the SAME
+            # transaction — never increment/decrement, so repeated taps and
+            # board/unboard cycles can't drift the counter (R15).
+            boarded_count = self._count_run_students_with_status(conn, run["id"], "on-bus")
+            run = conn.execute(
+                "update live_runs set students_boarded = %s where id = %s returning *",
+                (boarded_count, run["id"]),
+            ).fetchone()
         return dict(row), dict(run)
+
+    def _count_run_students_with_status(self, conn, run_id: str, status: str) -> int:
+        """Distinct students on the run's own roster (run_stops) currently in
+        ``status``. The run-scoped roster, never the derived bus roster."""
+        row = conn.execute(
+            """
+            select count(distinct s.id) as n from live_students s
+            where s.id in (
+                select student_id from run_stops where run_id = %s and student_id is not null
+            ) and s.status = %s
+            """,
+            (run_id, status),
+        ).fetchone()
+        return row["n"]
 
     def _bus_id_for_driver(self, conn, driver_id: str) -> str | None:
         row = conn.execute(
