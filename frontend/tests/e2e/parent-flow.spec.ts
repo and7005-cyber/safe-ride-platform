@@ -1,12 +1,19 @@
 import { expect, test } from "@playwright/test";
-import { PARENT, SEED, emailLogin } from "./helpers";
+import { PARENT, SEED, cardContaining, emailLogin } from "./helpers";
 
 // Parent journey: home, tracking, profile, push state.
+
+// Labels the derived display_status can render as (R36).
+const STATUS_BADGE_LABEL = /^(At home|At School|On the bus|Dropped off|Absent)$/;
 
 test("parent home lists children with status and ETA", async ({ page }) => {
   await emailLogin(page, PARENT.email, PARENT.password);
   await expect(page.getByText(/Good (morning|afternoon|evening)/)).toBeVisible();
   await expect(page.getByText(SEED.parentChild)).toBeVisible();
+  // Each child card highlights the server-derived display_status (R36).
+  await expect(
+    cardContaining(page, SEED.parentChild).getByTestId("child-status-badge"),
+  ).toHaveText(STATUS_BADGE_LABEL);
   // The bus-less child renders without driver actions.
   await expect(page.getByText(SEED.buslessChild)).toBeVisible();
 });
@@ -31,6 +38,8 @@ test("parent profile shows account, children, and push state", async ({ page }) 
   await expect(page.getByText(PARENT.email)).toBeVisible();
   await expect(page.getByText("My Children")).toBeVisible();
   await expect(page.getByText(SEED.parentChild)).toBeVisible();
+  // My Children rows carry the same derived status badge as Home (R36).
+  await expect(page.getByTestId("child-status-badge").first()).toHaveText(STATUS_BADGE_LABEL);
 
   // Local stack has no FCM/VAPID config, so the push toggle reports exactly that.
   await expect(

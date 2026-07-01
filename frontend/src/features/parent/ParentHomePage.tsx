@@ -5,9 +5,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
+import { cn } from "@/lib/utils";
 import { PARENT_NAV, useChildren } from "@/features/parent/parentHooks";
 
 const STATUS_VARIANT: Record<string, "secondary" | "success" | "warning" | "destructive"> = {
+  "at-home": "secondary",
   "at-school": "secondary",
   "on-bus": "success",
   "dropped-off": "warning",
@@ -15,11 +17,37 @@ const STATUS_VARIANT: Record<string, "secondary" | "success" | "warning" | "dest
 };
 
 const STATUS_LABEL: Record<string, string> = {
+  "at-home": "At home",
   "at-school": "At School",
   "on-bus": "On the bus",
   "dropped-off": "Dropped off",
   absent: "Absent",
 };
+
+/**
+ * Highlighted child status chip (R36). Renders the server-derived
+ * `display_status` (absence- and staleness-aware) and falls back to the raw
+ * operational `status` for older payloads. Solid fill, slightly larger than
+ * the default badge. Shared with the Profile page's My Children card.
+ */
+export function ChildStatusBadge({
+  child,
+  className,
+}: {
+  child: { display_status?: string | null; status?: string | null };
+  className?: string;
+}) {
+  const status = child.display_status ?? child.status ?? "";
+  return (
+    <Badge
+      data-testid="child-status-badge"
+      variant={STATUS_VARIANT[status] ?? "secondary"}
+      className={cn("px-3 py-1 text-sm", className)}
+    >
+      {STATUS_LABEL[status] ?? status}
+    </Badge>
+  );
+}
 
 function initials(name: string): string {
   return name.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
@@ -60,7 +88,9 @@ export function ParentHomePage() {
         ) : (
           <>
             {children.map((child: any) => {
-              const onBus = child.status === "on-bus";
+              // The derived display_status is the trustworthy state (R36):
+              // the mock ETA only shows while the child is really on a bus.
+              const onBus = (child.display_status ?? child.status) === "on-bus";
               return (
                 <Card key={child.id}>
                   <CardContent className="space-y-3 p-4">
@@ -74,9 +104,7 @@ export function ParentHomePage() {
                           {child.grade ?? ""}{child.bus_name ? ` • ${child.bus_name}` : ""}
                         </p>
                       </div>
-                      <Badge variant={STATUS_VARIANT[child.status] ?? "secondary"}>
-                        {STATUS_LABEL[child.status] ?? child.status}
-                      </Badge>
+                      <ChildStatusBadge child={child} />
                     </div>
 
                     {onBus && (

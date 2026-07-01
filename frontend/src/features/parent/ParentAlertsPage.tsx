@@ -1,11 +1,22 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatDistanceToNow } from "date-fns";
 import { Bell, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import {
+  HISTORY_WINDOW,
   PARENT_NAV,
+  RECENT_WINDOW,
   useMarkNotificationsRead,
   useParentAlerts,
   useParentNotifications,
@@ -38,6 +49,7 @@ const NOTIFICATION_LABEL: Record<string, string> = {
   "reached-school": "Arrived at School",
   "on-way-home": "On the Way Home",
   "dropped-off": "Dropped Off",
+  "student-absent": "Marked Absent",
   incident: "Bus Incident",
   custom: "Notice",
 };
@@ -49,13 +61,32 @@ const NOTIFICATION_VARIANT: Record<string, "destructive" | "warning" | "secondar
   "reached-school": "success",
   "on-way-home": "secondary",
   "dropped-off": "success",
+  "student-absent": "destructive",
   incident: "destructive",
   custom: "secondary",
 };
 
+// Type filter over the merged taxonomy (R33): notification types plus incident
+// types; the never-produced `custom` type is excluded. Values stay raw type
+// strings — the two namespaces don't collide.
+const TYPE_FILTER_OPTIONS: { value: string; label: string }[] = [
+  ...Object.entries(NOTIFICATION_LABEL).filter(([type]) => type !== "custom"),
+  ...Object.entries(TYPE_LABEL),
+].map(([value, label]) => ({ value, label }));
+
+const PERIODS = [
+  { value: "all", label: "All" },
+  { value: "morning", label: "Morning" },
+  { value: "afternoon", label: "Afternoon" },
+] as const;
+
+type Period = (typeof PERIODS)[number]["value"];
+
 interface FeedItem {
   key: string;
   kind: "incident" | "notification";
+  type: string;
+  runType: string | null;
   label: string;
   variant: "destructive" | "warning" | "secondary" | "success";
   heading: string;
@@ -65,12 +96,19 @@ interface FeedItem {
 }
 
 export function ParentAlertsPage() {
-  const { data: alerts = [] } = useParentAlerts();
-  const { data: notifications = [] } = useParentNotifications();
+  // Recent = rolling 24h, History = last 7 days (R35); both server-windowed,
+  // no rows are ever deleted.
+  const [tab, setTab] = useState<"recent" | "history">("recent");
+  const feedWindow = tab === "history" ? HISTORY_WINDOW : RECENT_WINDOW;
+  const { data: alerts = [] } = useParentAlerts(feedWindow);
+  const { data: notifications = [] } = useParentNotifications(feedWindow);
+  const [period, setPeriod] = useState<Period>("all");
+  const [typeFilter, setTypeFilter] = useState<string>("all");
   const markRead = useMarkNotificationsRead();
   const markedOnce = useRef(false);
 
-  // Opening the page clears the unread state (once per visit).
+  // Opening the page clears the unread state (once per visit). Mark-read stays
+  // global (R35); History simply shows read items plainly.
   const hasUnread = notifications.some((n: any) => !n.read);
   useEffect(() => {
     if (hasUnread && !markedOnce.current) {
@@ -83,6 +121,8 @@ export function ParentAlertsPage() {
     const incidentItems: FeedItem[] = alerts.map((a: any) => ({
       key: `incident-${a.id}`,
       kind: "incident" as const,
+      type: a.type,
+      runType: a.run_type ?? null,
       label: TYPE_LABEL[a.type] ?? a.type,
       variant: TYPE_VARIANT[a.type] ?? "secondary",
       heading: a.bus_name ?? "",
@@ -96,6 +136,8 @@ export function ParentAlertsPage() {
       .map((n: any) => ({
         key: `notification-${n.id}`,
         kind: "notification" as const,
+        type: n.type,
+        runType: n.run_type ?? null,
         label: NOTIFICATION_LABEL[n.type] ?? n.type,
         variant: NOTIFICATION_VARIANT[n.type] ?? "secondary",
         heading: n.title ?? "",
@@ -110,20 +152,73 @@ export function ParentAlertsPage() {
     });
   }, [alerts, notifications]);
 
+  // Client-side filters over the fetched window (R33). Rows without a
+  // run_type only show under All.
+  const visible = useMemo(
+    () =>
+      feed.filter(
+        (item) =>
+          (period === "all" || item.runType === period) &&
+          (typeFilter === "all" || item.type === typeFilter),
+      ),
+    [feed, period, typeFilter],
+  );
+
   return (
     <RoleMobileLayout nav={PARENT_NAV} variant="accent" title="Alerts">
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="font-heading text-xl font-bold">Notifications</h1>
-          {feed.length > 0 && (
-            <Badge variant="secondary" className="px-2">{feed.length}</Badge>
+          {visible.length > 0 && (
+            <Badge variant="secondary" className="px-2">{visible.length}</Badge>
           )}
         </div>
-        {feed.length === 0 ? (
-          <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No alerts for your children's buses.</CardContent></Card>
+
+        <Tabs value={tab} onValueChange={(v) => setTab(v as "recent" | "history")}>
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="recent">Recent</TabsTrigger>
+            <TabsTrigger value="history">History</TabsTrigger>
+          </TabsList>
+        </Tabs>
+
+        <div className="space-y-2">
+          <div className="flex gap-2" role="group" aria-label="Filter by period">
+            {PERIODS.map((p) => (
+              <Button
+                key={p.value}
+                size="sm"
+                variant={period === p.value ? "default" : "outline"}
+                className="flex-1"
+                onClick={() => setPeriod(p.value)}
+              >
+                {p.label}
+              </Button>
+            ))}
+          </div>
+          <Select value={typeFilter} onValueChange={setTypeFilter}>
+            <SelectTrigger aria-label="Filter by type">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All types</SelectItem>
+              {TYPE_FILTER_OPTIONS.map((o) => (
+                <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        {visible.length === 0 ? (
+          <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">
+            {feed.length === 0
+              ? tab === "history"
+                ? "Nothing in the last 7 days."
+                : "No alerts for your children's buses."
+              : "No alerts match the selected filters."}
+          </CardContent></Card>
         ) : (
           <div className="space-y-2">
-            {feed.map((item) => (
+            {visible.map((item) => (
               <Card key={item.key} className={item.unread ? "border-primary/40" : undefined}>
                 <CardContent className="flex gap-3 p-4">
                   {item.kind === "incident" ? (
