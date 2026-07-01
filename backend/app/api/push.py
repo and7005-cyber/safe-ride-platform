@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
@@ -80,8 +80,19 @@ def unregister_fcm_token(payload: FcmTokenPayload, user: dict = Depends(get_curr
 
 
 @router.get("/notifications")
-def list_notifications(user: dict = Depends(get_current_user)):
-    return safe_call(lambda: dao.list_notifications(user["id"]))
+def list_notifications(
+    window_hours: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1),
+    user: dict = Depends(get_current_user),
+):
+    """The user's notification feed, newest first.
+
+    window_hours narrows to a rolling window (R35: 24 = Recent, 168 = History);
+    limit defaults to 50 and is hard-capped at 200 in the DAO.
+    """
+    return safe_call(
+        lambda: dao.list_notifications(user["id"], limit=limit, window_hours=window_hours)
+    )
 
 
 @router.get("/notifications/unread-count")
@@ -91,4 +102,5 @@ def notifications_unread_count(user: dict = Depends(get_current_user)):
 
 @router.post("/notifications/mark-read")
 def mark_notifications_read(user: dict = Depends(get_current_user)):
+    # Mark-read stays global across all windows on purpose (R35) — see the DAO.
     return safe_call(lambda: (dao.mark_notifications_read(user["id"]), {"ok": True})[1])
