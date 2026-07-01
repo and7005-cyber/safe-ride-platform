@@ -156,17 +156,30 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
     wanted = {str(rid) for rid in route_ids if rid}
 
     affected: set[str] = set()
+    added: set[str] = set()
     for route_id in wanted - set(existing_by_route):
         conn.execute(
             "insert into live_student_routes (student_id, route_id) values (%s, %s) "
             "on conflict (student_id, route_id) do nothing",
             (student_id, route_id),
         )
+        added.add(route_id)
         affected.add(route_id)
     for route_id, row_id in existing_by_route.items():
         if route_id not in wanted:
             conn.execute("delete from live_student_routes where id = %s", (row_id,))
             affected.add(route_id)
+    for route_id in added:
+        # Handover (R18): assigning a student to a planner-saved route hands
+        # ownership back to the students — flip custom_stops off and drop the
+        # stored polyline/totals (now stale) so the regeneration below rebuilds
+        # the stops from the assigned students.
+        conn.execute(
+            "update live_routes set custom_stops = false, polyline = null, "
+            "total_distance_m = null, total_duration_s = null "
+            "where id = %s and custom_stops",
+            (route_id,),
+        )
     for route_id in affected:
         regenerate_route_stops(conn, route_id)
     _derive_student_bus(conn, student_id)
