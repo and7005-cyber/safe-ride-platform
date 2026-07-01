@@ -277,6 +277,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 
   await page.getByRole("button", { name: "Add Run" }).click();
   await pickSelectOption(dialog(page), "Bus", SEED.busOption);
+  await pickSelectOption(dialog(page), "Route", /Express 1 — Afternoon/);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
   await pickSelectOption(dialog(page), "Status", "Completed");
   await fieldInput(dialog(page), "Date").fill("2030-01-01");
@@ -284,6 +285,22 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 
   const row = page.getByRole("row", { name: /2030-01-01/ });
   await expect(row).toBeVisible();
+
+  // Clicking the row (not its action buttons) opens the read-only Run Report.
+  await row.getByRole("cell", { name: "2030-01-01" }).click();
+  await expect(dialog(page).getByText("Run Report")).toBeVisible();
+  await expect(dialog(page).getByText("Express 1 — Afternoon")).toBeVisible();
+  await expect(dialog(page).getByText("Students", { exact: true })).toBeVisible();
+  await dialog(page).getByRole("button", { name: "Close" }).click();
+  await expect(dialog(page)).toHaveCount(0);
+
+  // The pencil still opens the edit form — not the report (stopPropagation).
+  await row.getByRole("button").first().click();
+  await expect(dialog(page).getByText("Edit Run")).toBeVisible();
+  await expect(dialog(page).getByText("Run Report")).toHaveCount(0);
+  await dialog(page).getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog(page)).toHaveCount(0);
+
   await row.getByRole("button").last().click();
   await confirmDelete(page);
   await expect(page.getByRole("row", { name: /2030-01-01/ })).toHaveCount(0);
