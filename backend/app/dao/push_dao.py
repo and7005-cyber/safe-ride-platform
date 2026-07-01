@@ -215,21 +215,39 @@ class PushDao:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_notifications(self, user_id: str, limit: int = 50) -> list[dict]:
+    def list_notifications(
+        self, user_id: str, limit: int = 50, window_hours: int | None = None
+    ) -> list[dict]:
+        """The user's feed, newest first.
+
+        window_hours, when set, keeps only rows newer than that rolling window
+        (24 for the parent app's Recent view, 168 for its 7-day History tab).
+        limit is hard-capped at 200 — the feed is windowed, never paginated,
+        and no rows are ever deleted (R36: the table is the audit trail).
+        """
+        limit = max(1, min(int(limit), 200))
+        window_sql = ""
+        params: list = [user_id]
+        if window_hours is not None:
+            window_sql = " and created_at > now() - (%s || ' hours')::interval"
+            params.append(int(window_hours))
+        params.append(limit)
         with get_connection() as conn:
             rows = conn.execute(
-                """
-                select id, student_id, run_id, bus_id, type, title, body, read, created_at
+                f"""
+                select id, student_id, run_id, bus_id, type, run_type, title, body, read, created_at
                 from live_notifications
-                where user_id = %s
+                where user_id = %s{window_sql}
                 order by created_at desc
                 limit %s
                 """,
-                (user_id, limit),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
     def mark_notifications_read(self, user_id: str) -> None:
+        # Intentionally global, never window-scoped (R35): opening the feed
+        # clears the unread badge for every row, History-tab rows included.
         with get_connection() as conn:
             conn.execute(
                 "update live_notifications set read = true where user_id = %s and read = false",
