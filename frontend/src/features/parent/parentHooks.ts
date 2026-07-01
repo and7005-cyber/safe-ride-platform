@@ -18,18 +18,28 @@ export function useChildren() {
   });
 }
 
-export function useParentAlerts() {
+// Server-side feed windows (R35): the main feed shows a rolling 24 hours,
+// the History tab the last 7 days (list cap raised to the server's 200 max).
+export interface FeedWindow {
+  windowHours?: number;
+  limit?: number;
+}
+
+export const RECENT_WINDOW: Required<FeedWindow> = { windowHours: 24, limit: 50 };
+export const HISTORY_WINDOW: Required<FeedWindow> = { windowHours: 168, limit: 200 };
+
+export function useParentAlerts({ windowHours, limit }: FeedWindow = RECENT_WINDOW) {
   return useQuery({
-    queryKey: ["parent-alerts"],
-    queryFn: () => api.get("/api/parent-portal/alerts"),
+    queryKey: ["parent-alerts", windowHours, limit],
+    queryFn: () => api.get("/api/parent-portal/alerts", { window_hours: windowHours, limit }),
     refetchInterval: POLL_LIVE,
   });
 }
 
-export function useParentNotifications() {
+export function useParentNotifications({ windowHours, limit }: FeedWindow = RECENT_WINDOW) {
   return useQuery({
-    queryKey: ["parent-notifications"],
-    queryFn: () => api.get("/api/push/notifications"),
+    queryKey: ["parent-notifications", windowHours, limit],
+    queryFn: () => api.get("/api/push/notifications", { window_hours: windowHours, limit }),
     refetchInterval: POLL_LIVE,
   });
 }

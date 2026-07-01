@@ -70,6 +70,27 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   await expect(page.getByText("Arrived at School").first()).toBeVisible();
   await expect(page.getByText(new RegExp(`has boarded ${SEED.driverBus}`)).first()).toBeVisible();
   await expect(page.getByText(/has reached school safely/).first()).toBeVisible();
+
+  // Period filter (R33): these run events carry run_type = morning, so they
+  // survive the Morning toggle and vanish under Afternoon (null-run_type rows
+  // such as incidents only show under All).
+  const feedCards = page.locator("div[class*='bg-card']");
+  await page.getByRole("button", { name: "Morning", exact: true }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Afternoon", exact: true }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" })).toHaveCount(0);
+  await page.getByRole("button", { name: "All", exact: true }).click();
+
+  // Type filter (R33): narrowing to the boarded label leaves only boarded rows.
+  await page.getByRole("combobox", { name: "Filter by type" }).click();
+  await page.getByRole("option", { name: "Boarded the Bus" }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
+  await expect(feedCards.filter({ hasText: "Bus On The Way" })).toHaveCount(0);
+  await expect(feedCards.filter({ hasText: "Arrived at School" })).toHaveCount(0);
+
+  // History (R35): the 7-day window includes everything just created.
+  await page.getByRole("tab", { name: "History" }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
 });
 
 test("opening the alerts page marks notifications as read", async ({ page, request }) => {

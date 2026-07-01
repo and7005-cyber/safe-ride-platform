@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { GraduationCap } from "lucide-react";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
+import { ChildStatusBadge } from "@/features/parent/ParentHomePage";
 import { PARENT_NAV, useParentProfile } from "@/features/parent/parentHooks";
 import { usePushNotifications } from "@/lib/usePushNotifications";
 import { useAuth } from "@/lib/auth";
@@ -66,7 +67,7 @@ export function ParentProfilePage() {
                   <span className="flex h-9 w-9 items-center justify-center rounded-full bg-secondary text-xs font-semibold text-secondary-foreground">
                     {initials(c.name)}
                   </span>
-                  <div className="leading-tight">
+                  <div className="flex-1 leading-tight">
                     <p className="font-medium">{c.name}</p>
                     <p className="flex items-center gap-1 text-xs text-muted-foreground">
                       {c.grade ?? ""}
@@ -78,6 +79,8 @@ export function ParentProfilePage() {
                       </p>
                     )}
                   </div>
+                  {/* Same derived-status chip as the Home cards (R36). */}
+                  <ChildStatusBadge child={c} className="shrink-0" />
                 </div>
               ))
             )}
