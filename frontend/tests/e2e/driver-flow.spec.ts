@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { API_URL, DRIVER, apiDriverToken, authHeaders, endActiveRun, pinLogin } from "./helpers";
+import { API_URL, DRIVER, SEED, apiDriverToken, authHeaders, endActiveRun, pinLogin } from "./helpers";
 
 // Driver journey: PIN login, run lifecycle, GPS, boarding, incident report.
 
@@ -10,7 +10,7 @@ test.afterEach(async ({ request }) => {
 test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
   await pinLogin(page, DRIVER.pin);
   await expect(page.getByText(/Hello,/)).toBeVisible();
-  await expect(page.getByText("Express 1")).toBeVisible();
+  await expect(page.getByText(SEED.driverBus)).toBeVisible();
   await expect(page.getByText("Stops")).toBeVisible();
   await expect(page.getByText("Students")).toBeVisible();
   await expect(page.getByText("Depart")).toBeVisible();
@@ -77,7 +77,7 @@ test("search filters the boarding list", async ({ page }) => {
   await page.goto("/driver/boarding");
   await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
 
-  await page.getByPlaceholder("Search students…").fill("Brian");
-  await expect(page.getByText("Brian Achieng")).toBeVisible();
+  await page.getByPlaceholder("Search students…").fill(SEED.parentChildSearch);
+  await expect(page.getByText(SEED.parentChild)).toBeVisible();
   await expect(page.getByText(/Students \(1\)/)).toBeVisible();
 });

@@ -2,6 +2,8 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   ADMIN,
   API_URL,
+  DRIVER,
+  SEED,
   apiToken,
   authHeaders,
   cardContaining,
@@ -102,8 +104,8 @@ test("admin can create and delete a route attached to a bus and school", async (
   await page.getByRole("button", { name: "Add Route" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
-  await pickSelectOption(dialog(page), "Bus", /Kifaru|Express/);
-  await pickSelectOption(dialog(page), "School", /Greenfield/);
+  await pickSelectOption(dialog(page), "Bus", SEED.busOption);
+  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
 
@@ -204,7 +206,7 @@ test("admin can link and unlink a parent-student assignment", async ({ page, req
     await page.goto("/parent-assignments");
 
     await page.getByText("Select parent").click();
-    await page.getByRole("option", { name: /Amina Parent/ }).click();
+    await page.getByRole("option", { name: new RegExp(SEED.parentName) }).click();
     await page.getByText("Select student").click();
     await page.getByRole("option", { name: new RegExp(studentName) }).click();
     await page.getByRole("button", { name: "Assign" }).click();
@@ -223,7 +225,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
   await page.goto("/runs");
 
   await page.getByRole("button", { name: "Add Run" }).click();
-  await pickSelectOption(dialog(page), "Bus", /Kifaru|Express/);
+  await pickSelectOption(dialog(page), "Bus", SEED.busOption);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
   await pickSelectOption(dialog(page), "Status", "Completed");
   await fieldInput(dialog(page), "Date").fill("2030-01-01");
@@ -239,7 +241,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 test("admin can acknowledge and delete a driver incident", async ({ page, request }) => {
   // A driver files an incident through the API...
   const pinLoginResponse = await request.post(`${API_URL}/api/auth/pin-login`, {
-    data: { pin: "1234" },
+    data: { pin: DRIVER.pin },
   });
   const driverToken = (await pinLoginResponse.json()).token;
   const marker = uniqueName("E2E incident");
@@ -266,7 +268,7 @@ test("dashboard and fleet map render live fleet data", async ({ page }) => {
   await adminLogin(page);
   await expect(page.getByText("Active Buses")).toBeVisible();
   await expect(page.getByText("Fleet Status")).toBeVisible();
-  await expect(page.getByText("Express 1").first()).toBeVisible();
+  await expect(page.getByText(SEED.driverBus).first()).toBeVisible();
 
   await page.goto("/fleet-map");
   await expect(page.getByText("Live bus positions")).toBeVisible();

@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import {
   API_URL,
   PARENT,
+  SEED,
   apiDriverToken,
   apiToken,
   authHeaders,
@@ -39,7 +40,7 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   const driverToken = await apiDriverToken(request);
   const driverHeaders = authHeaders(driverToken);
 
-  // Drive past the first stop and board Brian.
+  // Drive past the first stop and board the parent's child.
   await request.post(`${API_URL}/api/runs/driver/arrive`, {
     headers: driverHeaders,
     data: { run_id: runId },
@@ -50,10 +51,10 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
       headers: authHeaders(parentToken),
     })
   ).json();
-  const brian = children.find((c: any) => c.name === "Brian Achieng");
+  const child = children.find((c: any) => c.name === SEED.parentChild);
   await request.post(`${API_URL}/api/runs/driver/boarding`, {
     headers: driverHeaders,
-    data: { student_id: brian.id, on_bus: true },
+    data: { student_id: child.id, on_bus: true },
   });
   // Complete the run at the school gate.
   await request.post(`${API_URL}/api/runs/driver/end`, {
@@ -67,7 +68,7 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
   await expect(page.getByText("Boarded the Bus").first()).toBeVisible();
   await expect(page.getByText("Arrived at School").first()).toBeVisible();
-  await expect(page.getByText(/has boarded Express 1/).first()).toBeVisible();
+  await expect(page.getByText(new RegExp(`has boarded ${SEED.driverBus}`)).first()).toBeVisible();
   await expect(page.getByText(/has reached school safely/).first()).toBeVisible();
 });
 
@@ -136,7 +137,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
 });
 
 test("notification types are scoped to the right parent", async ({ request }) => {
-  // A parent with no children on Express 1 must see none of its run alerts.
+  // A parent with no children on the demo driver's bus must see none of its run alerts.
   const runId = await startMorningRun(request);
   const driverToken = await apiDriverToken(request);
   await request.post(`${API_URL}/api/runs/driver/end`, {

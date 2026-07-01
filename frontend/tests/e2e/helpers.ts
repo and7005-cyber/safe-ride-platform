@@ -1,9 +1,30 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 
-// Seeded local credentials (backend/db/seeds/002_live_demo_seed.sql).
+// Seeded local credentials and fixtures (backend/db/seeds/003_local_snapshot.sql).
+// On seed drift, update these constants instead of individual specs.
 export const ADMIN = { email: "admin@test.com", password: "test1234." };
 export const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
-export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "1234" };
+export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "0322" };
+
+export const SEED = {
+  school: "Greenfield Academy",
+  /** The demo driver's (Daniel Kamau) live bus. */
+  driverBus: "Simba",
+  /** Any seeded live bus, for admin bus <Select> options. */
+  busOption: /Simba|Twiga|Mamba/,
+  /** Full name of the PARENT account (Amina). */
+  parentName: "Amina Achieng",
+  /** Amina's child riding the demo driver's bus (first stop of Express 1). */
+  parentChild: "Faith Achieng",
+  /** Search term that narrows the boarding list to exactly parentChild. */
+  parentChildSearch: "Faith",
+  /** The stop name shown for parentChild on the track map. */
+  parentChildStop: /Kilimani/,
+  /** Amina's bus-less child (renders without driver actions). */
+  buslessChild: "Grace Njeri",
+  /** Parent-side label of the seeded incident on the parent's bus. */
+  parentBusAlertLabel: "Vehicle Breakdown",
+};
 
 export const API_URL = process.env.PLAYWRIGHT_API_URL ?? "http://localhost:9001";
 

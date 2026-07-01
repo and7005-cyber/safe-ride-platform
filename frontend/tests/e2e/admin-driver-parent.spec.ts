@@ -1,22 +1,9 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { ADMIN, DRIVER, PARENT, SEED, emailLogin } from "./helpers";
 
 // These journeys run against the seeded local stack (see
-// backend/db/seeds/002_live_demo_seed.sql). They assert against the live-parity
-// copy and information architecture.
-
-const ADMIN = { email: "admin@test.com", password: "test1234." };
-const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
-const DRIVER_PIN = "1234";
-
-async function emailLogin(page: Page, email: string, password: string) {
-  await page.goto("/auth");
-  await page.locator("#email").fill(email);
-  await page.locator("#password").fill(password);
-  await page.getByRole("button", { name: "Sign In", exact: true }).click();
-  // Wait for the post-login redirect so the bearer token is persisted before
-  // any follow-up navigation reloads the app.
-  await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
-}
+// backend/db/seeds/003_local_snapshot.sql via tests/e2e/helpers.ts). They
+// assert against the live-parity copy and information architecture.
 
 test("admin sees the dashboard and can navigate the shell", async ({ page }) => {
   await emailLogin(page, ADMIN.email, ADMIN.password);
@@ -31,7 +18,7 @@ test("admin sees the dashboard and can navigate the shell", async ({ page }) => 
   // Routes page shows configured routes with stops (no zero-state when present).
   await page.goto("/routes");
   await expect(page.getByText(/routes configured/)).toBeVisible();
-  await expect(page.getByText("Greenfield Academy").first()).toBeVisible();
+  await expect(page.getByText(SEED.school).first()).toBeVisible();
 });
 
 test("admin is the only role allowed on admin routes", async ({ page }) => {
@@ -44,10 +31,10 @@ test("admin is the only role allowed on admin routes", async ({ page }) => {
 test("driver can log in by PIN and start a run", async ({ page }) => {
   await page.goto("/auth");
   await page.getByRole("tab", { name: /Driver PIN/ }).click();
-  await page.locator("#pin").fill(DRIVER_PIN);
+  await page.locator("#pin").fill(DRIVER.pin);
   await page.getByRole("button", { name: /Sign In with PIN/ }).click();
   await expect(page).toHaveURL("/driver");
-  await expect(page.getByText("Express 1")).toBeVisible();
+  await expect(page.getByText(SEED.driverBus)).toBeVisible();
 
   await page.goto("/driver/run");
   await page.getByRole("button", { name: "Start Run" }).click();
@@ -62,11 +49,11 @@ test("driver can log in by PIN and start a run", async ({ page }) => {
 test("parent sees their children and bus-less child has no driver actions", async ({ page }) => {
   await emailLogin(page, PARENT.email, PARENT.password);
   await expect(page).toHaveURL("/parent");
-  await expect(page.getByText(/Good morning/)).toBeVisible();
-  await expect(page.getByText("Faith Achieng")).toBeVisible();
-  await expect(page.getByText("Grace Njeri")).toBeVisible();
+  await expect(page.getByText(/Good (morning|afternoon|evening)/)).toBeVisible();
+  await expect(page.getByText(SEED.parentChild)).toBeVisible();
+  await expect(page.getByText(SEED.buslessChild)).toBeVisible();
 
   // Parent alerts use the parent-side label and are scoped to their buses.
   await page.goto("/parent/alerts");
-  await expect(page.getByText("Traffic Delay").first()).toBeVisible();
+  await expect(page.getByText(SEED.parentBusAlertLabel).first()).toBeVisible();
 });
