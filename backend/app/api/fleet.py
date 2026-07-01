@@ -141,6 +141,11 @@ class GeocodePayload(BaseModel):
     address: str
 
 
+class ReverseGeocodePayload(BaseModel):
+    lat: float
+    lng: float
+
+
 class PlanStop(BaseModel):
     label: str | None = None
     address: str | None = None
@@ -165,6 +170,13 @@ def geocode_address(payload: GeocodePayload, user: dict = Depends(admin_only)):
     if not hit:
         return {"found": False}
     return {"found": True, **hit}
+
+
+@router.post("/reverse-geocode")
+def reverse_geocode_point(payload: ReverseGeocodePayload, user: dict = Depends(admin_only)):
+    """Resolve a picked map pin to an editable address string (R8). Best-effort:
+    ``{"found": False}`` when there is no key, no result, or the lookup fails."""
+    return geo_service.reverse_geocode(payload.lat, payload.lng)
 
 
 @router.get("/places/suggest")
