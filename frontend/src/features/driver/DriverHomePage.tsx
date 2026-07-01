@@ -1,14 +1,10 @@
 import { useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
 import { Bus, Clock, Home, MapPin, PlayCircle, TriangleAlert, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { useToast } from "@/components/ui/use-toast";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { useDriverContext } from "@/features/driver/driverHooks";
-import { api } from "@/lib/apiClient";
 import { useAuth } from "@/lib/auth";
-import { useState } from "react";
 
 export const DRIVER_NAV = [
   { to: "/driver", label: "Home", icon: Home, end: true },
@@ -16,12 +12,6 @@ export const DRIVER_NAV = [
   { to: "/driver/boarding", label: "Board", icon: Bus },
   { to: "/driver/incident", label: "Incident", icon: TriangleAlert },
 ];
-
-function morningFirst(routes: any[]) {
-  return [...routes].sort(
-    (a, b) => Number(b.type === "morning") - Number(a.type === "morning"),
-  );
-}
 
 function StatTile({ value, label, icon: Icon }: { value: string | number; label: string; icon: any }) {
   return (
@@ -37,32 +27,14 @@ function StatTile({ value, label, icon: Icon }: { value: string | number; label:
 
 export function DriverHomePage() {
   const navigate = useNavigate();
-  const qc = useQueryClient();
-  const { toast } = useToast();
   const { user } = useAuth();
   const { data, isLoading } = useDriverContext();
-  const [busy, setBusy] = useState(false);
 
   const firstName = user?.fullName ?? "Driver";
   const bus = data?.bus;
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
   const students = data?.students ?? [];
-
-  const start = async () => {
-    const route = morningFirst(routes)[0];
-    if (!route) return;
-    setBusy(true);
-    try {
-      await api.post("/api/runs/driver/start", { route_id: route.id });
-      await qc.invalidateQueries({ queryKey: ["driver-context"] });
-      navigate("/driver/run");
-    } catch (err) {
-      toast({ title: "Cannot start run", description: (err as Error).message, variant: "destructive" });
-    } finally {
-      setBusy(false);
-    }
-  };
 
   return (
     <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title="SafeRide Driver">
@@ -86,7 +58,9 @@ export function DriverHomePage() {
               {activeRun ? (
                 <Button onClick={() => navigate("/driver/run")}>Continue Run</Button>
               ) : (
-                <Button onClick={start} disabled={busy || routes.length === 0}>Start Run</Button>
+                // Starting a run always goes through the Run page's explicit
+                // route selection (R27) — the tile never starts one directly.
+                <Button onClick={() => navigate("/driver/run")} disabled={routes.length === 0}>Start Run</Button>
               )}
             </CardContent>
           </Card>
