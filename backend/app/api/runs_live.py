@@ -1,13 +1,19 @@
+import logging
+
 from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
+from app.dao.incident_dao import IncidentDao
 from app.dao.run_dao import RunDao
 from app.services.push_service import PushService
 
+logger = logging.getLogger("saferide.runs")
+
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 dao = RunDao()
+incident_dao = IncidentDao()
 push_service = PushService()
 admin_only = require_role("admin")
 driver_only = require_role("driver")
@@ -45,6 +51,10 @@ class PositionPayload(BaseModel):
 class BoardingPayload(BaseModel):
     student_id: str
     on_bus: bool
+
+
+class StudentIdPayload(BaseModel):
+    student_id: str
 
 
 # Admin run CRUD -------------------------------------------------------------
@@ -130,9 +140,55 @@ def write_position(
 def toggle_boarding(
     payload: BoardingPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
 ):
+    # Morning-only and one-way: the DAO 409s afternoon runs (use /driver/
+    # dropoff) and on_bus=false (un-boarding retracts a sent safety push).
     student, run = safe_call(
         lambda: dao.toggle_boarding(user["id"], payload.student_id, payload.on_bus)
     )
-    if payload.on_bus:
-        background_tasks.add_task(push_service.notify_student_boarded, run, payload.student_id)
+    background_tasks.add_task(push_service.notify_student_boarded, run, payload.student_id)
+    return student
+
+
+@router.post("/driver/dropoff")
+def dropoff_student(
+    payload: StudentIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    """Confirm a drop-off at a reached stop on the driver's active afternoon
+    run (R32). The tap-time notification carries run_id + student_id so the
+    dedup index suppresses retries."""
+    student, run = safe_call(lambda: dao.dropoff_student(user["id"], payload.student_id))
+    background_tasks.add_task(push_service.notify_student_dropped_off, student, run)
+    return student
+
+
+def _record_absent_incident(driver_id: str, student: dict, run: dict) -> None:
+    """School-side channel for a driver-marked absence: a student-stamped
+    incident on the admin Alerts page. Never a parent fan-out — the incident
+    names the child, and ParentLiveDao.list_alerts already excludes
+    student-stamped rows, so notify_incident must not be called here."""
+    try:
+        incident_dao.create_driver_incident(
+            driver_id,
+            "student",
+            f"{student['name']} was marked absent by the driver at pickup on "
+            f"{run.get('route_name') or 'their route'} ({run.get('bus_name') or 'bus'}).",
+            run_id=str(run["id"]),
+            run_type=run.get("type"),
+            student_id=str(student["id"]),
+        )
+    except Exception:
+        logger.exception("recording driver-absent incident failed")
+
+
+@router.post("/driver/absent")
+def mark_student_absent(
+    payload: StudentIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    """Driver marks a roster student absent at the stop (R30). The DAO writes
+    the absence row, the run_absences snapshot, the 'absent' status and the
+    boarded recount in one transaction; the parent push and the admin-only
+    incident fire post-commit."""
+    student, run = safe_call(lambda: dao.mark_student_absent(user["id"], payload.student_id))
+    background_tasks.add_task(push_service.notify_student_absent, student, run)
+    background_tasks.add_task(_record_absent_incident, user["id"], student, run)
     return student

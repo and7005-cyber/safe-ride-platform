@@ -1,8 +1,13 @@
 """Per-date student absences (#7).
 
-Marking a student absent for a date suppresses their stop on that day's run
-without touching their persistent status, so the record is self-clearing the
-next day.
+Marking a student absent for a date suppresses their stop on that day's run,
+so the record is self-clearing the next day. TODAY-dated marks/clears also
+carry operational side-effects (R25b): a mark sets the live status to
+'absent' and appends the run_absences snapshot of any active run whose
+roster (run_stops) carries the student; a clear resets an 'absent' status to
+'at-school' — but is rejected while the student's bus has an active run
+(the run already excluded the stop; un-absenting mid-run is incoherent).
+Past/future-dated marks and clears never touch the live status.
 """
 from typing import Any
 
@@ -40,6 +45,11 @@ class AbsenceDao:
     def mark_absent(
         self, student_id: str, date: str | None, reason: str | None, marked_by: str | None
     ) -> dict[str, Any]:
+        """Upsert an absence (date=None → today, Nairobi). A TODAY-dated mark
+        also sets the live status to 'absent' and appends the run_absences
+        snapshot of any active run whose run_stops roster carries the student
+        (run-scoped — never the derived bus_id roster), all in one
+        transaction. Other dates have no status side-effects."""
         with get_connection() as conn:
             row = conn.execute(
                 """
@@ -51,14 +61,74 @@ class AbsenceDao:
                 )
                 on conflict (student_id, absence_date)
                 do update set reason = excluded.reason, marked_by = excluded.marked_by
-                returning *
+                returning *,
+                    (absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today
                 """,
                 (student_id, date, reason, marked_by),
             ).fetchone()
-        return dict(row)
+            if row["is_today"]:
+                conn.execute(
+                    "update live_students set status = 'absent' where id = %s",
+                    (student_id,),
+                )
+                conn.execute(
+                    """
+                    insert into run_absences (run_id, student_id, student_name, reason)
+                    select r.id, s.id, s.name, %s
+                    from live_runs r
+                    join live_students s on s.id = %s
+                    where r.status <> 'completed'
+                      and r.date = (now() at time zone 'Africa/Nairobi')::date
+                      and exists (
+                          select 1 from run_stops rs
+                          where rs.run_id = r.id and rs.student_id = s.id
+                      )
+                    on conflict (run_id, student_id) do nothing
+                    """,
+                    (reason, student_id),
+                )
+        result = dict(row)
+        result.pop("is_today", None)
+        return result
 
     def clear_absence(self, absence_id: str) -> None:
+        """Delete an absence. Clearing a TODAY-dated absence is rejected while
+        the student's bus has an active run ('End the run first' — the run
+        already excluded the stop); otherwise it resets the live status to
+        'at-school', but only when the current status is 'absent'. Clearing
+        past/future-dated absences never touches the status."""
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
+            row = conn.execute(
+                """
+                select a.student_id,
+                       (a.absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today,
+                       s.bus_id, s.status
+                from live_student_absences a
+                join live_students s on s.id = a.student_id
+                where a.id = %s
+                """,
+                (absence_id,),
+            ).fetchone()
+            if row and row["is_today"]:
+                if row["bus_id"]:
+                    active = conn.execute(
+                        """
+                        select 1 from live_runs
+                        where bus_id = %s and status <> 'completed'
+                          and date = (now() at time zone 'Africa/Nairobi')::date
+                        limit 1
+                        """,
+                        (row["bus_id"],),
+                    ).fetchone()
+                    if active:
+                        raise ConflictError("End the run first")
+                if row["status"] == "absent":
+                    conn.execute(
+                        "update live_students set status = 'at-school' where id = %s",
+                        (row["student_id"],),
+                    )
             conn.execute("delete from live_student_absences where id = %s", (absence_id,))
 
     def clear_for_student_date(self, student_id: str, date: str) -> None:

@@ -166,14 +166,14 @@ def test_reached_school_dedups_within_a_run(service: PushService, dao: FakePushD
     assert len(dao.notifications) == 1
 
 
-def test_afternoon_run_end_sends_dropped_off_for_boarded_snapshot(
-    service: PushService, dao: FakePushDao
-) -> None:
-    # end_run captured the pre-sweep on-bus roster; statuses already swept.
+def test_afternoon_run_end_sends_nothing(service: PushService, dao: FakePushDao) -> None:
+    # Confirmed drop-offs were notified at tap time; the end-run sweep
+    # normalizes unconfirmed students' statuses but a student the driver never
+    # confirmed must not get a false 'dropped off' push (AE12).
     run = {**AFTERNOON_RUN, "boarded_student_ids": ["s1"]}
     dao.run_students = [
         {"id": "s1", "name": "Leila", "status": "dropped-off"},
-        {"id": "s2", "name": "Baraka", "status": "dropped-off"},  # never boarded
+        {"id": "s2", "name": "Baraka", "status": "dropped-off"},  # swept, unconfirmed
     ]
     dao.parents = {
         "s1": [link("p1", "s1", "Leila")],
@@ -182,8 +182,7 @@ def test_afternoon_run_end_sends_dropped_off_for_boarded_snapshot(
 
     service.notify_run_ended(run)
 
-    assert [n["type"] for n in dao.notifications] == ["dropped-off"]
-    assert dao.notifications[0]["user_id"] == "p1"
+    assert dao.notifications == []
 
 
 def test_morning_run_end_falls_back_to_reached_school(
@@ -195,6 +194,45 @@ def test_morning_run_end_falls_back_to_reached_school(
     service.notify_run_ended(run)
 
     assert [n["type"] for n in dao.notifications] == ["reached-school"]
+
+
+def test_dropped_off_notifies_only_that_students_parents(
+    service: PushService, dao: FakePushDao
+) -> None:
+    # Both of Leila's parents hear about her drop-off; Baraka's parent (same
+    # bus) hears nothing.
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p9", "s1", "Leila")],
+        "s2": [link("p2", "s2", "Baraka")],
+    }
+
+    service.notify_student_dropped_off({"id": "s1", "name": "Leila"}, AFTERNOON_RUN)
+
+    assert [n["type"] for n in dao.notifications] == ["dropped-off", "dropped-off"]
+    assert {n["user_id"] for n in dao.notifications} == {"p1", "p9"}
+    for note in dao.notifications:
+        assert "Leila" in note["body"]
+        assert "stop" in note["body"]
+        assert note["run_id"] == "run-2"
+        assert note["student_id"] == "s1"
+
+
+def test_dropped_off_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:
+    # A retried tap (or the legacy end-run path) must not re-notify.
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_student_dropped_off({"id": "s1", "name": "Leila"}, AFTERNOON_RUN)
+    service.notify_student_dropped_off({"id": "s1", "name": "Leila"}, AFTERNOON_RUN)
+
+    assert len(dao.notifications) == 1
+
+
+def test_dropped_off_carries_run_type(service: PushService, dao: FakePushDao) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_student_dropped_off({"id": "s1", "name": "Leila"}, AFTERNOON_RUN)
+
+    assert [n["run_type"] for n in dao.notifications] == ["afternoon"]
 
 
 def test_student_absent_notifies_only_that_students_parents(
