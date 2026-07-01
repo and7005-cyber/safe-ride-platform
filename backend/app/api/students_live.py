@@ -156,7 +156,10 @@ def list_absences(date: str | None = None, user: dict = Depends(get_current_user
 
 @router.post("/absences")
 def mark_absent(payload: AbsencePayload, user: dict = Depends(admin_only)):
-    # date=None defaults to today (Africa/Nairobi) inside the DAO.
+    # date=None defaults to today (Africa/Nairobi) inside the DAO. A
+    # today-dated mark also sets the live status to 'absent' and appends the
+    # run_absences snapshot of any active run carrying the student (R25b);
+    # other dates are bookkeeping only.
     return safe_call(
         lambda: absence_dao.mark_absent(payload.student_id, payload.date, payload.reason, user["id"])
     )
@@ -164,4 +167,7 @@ def mark_absent(payload: AbsencePayload, user: dict = Depends(admin_only)):
 
 @router.delete("/absences/{absence_id}")
 def clear_absence(absence_id: str, user: dict = Depends(admin_only)):
+    # Clearing a today-dated absence 409s while the student's bus has an
+    # active run ("End the run first"), else resets an 'absent' status to
+    # 'at-school'. Past/future-dated clears have no status side-effects.
     return safe_call(lambda: (absence_dao.clear_absence(absence_id), {"ok": True})[1])

@@ -16,7 +16,7 @@ Notification types:
   bus-approaching  bus arrived at the stop just before the child's stop
   reached-school   bus arrived at the school gate (morning, boarded students)
   on-way-home      afternoon run began — child is heading home
-  dropped-off      afternoon run ended (boarded students)
+  dropped-off      driver confirmed the drop-off at the child's stop (tap-time)
   student-absent   driver marked the child absent at pickup (that child's parents only)
   incident         driver reported an issue on the child's bus
 
@@ -139,6 +139,26 @@ class PushService:
         except Exception:
             logger.exception("notify_student_boarded failed")
 
+    def notify_student_dropped_off(self, student: dict, run: dict) -> None:
+        """Driver confirmed the drop-off at the child's stop (afternoon,
+        tap-time) — tell that child's linked parents. Run-scoped
+        (run_id + student_id set) so a retried tap is dedup-suppressed."""
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type="dropped-off",
+                    title="Dropped off",
+                    body=f"{link['student_name']} has arrived at their stop and left the bus.",
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_student_dropped_off failed")
+
     def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
         """Driver marked the child absent at pickup — tell that child's linked
         parents and nobody else. Run-scoped (run_id + student_id set) so a
@@ -189,22 +209,14 @@ class PushService:
             logger.exception("notify_reached_school failed")
 
     def notify_run_ended(self, run: dict) -> None:
-        """Afternoon: every boarded student was dropped off."""
+        """Morning: reached-school for boarded students. Afternoon: nothing —
+        confirmed drop-offs were notified at tap time by
+        notify_student_dropped_off, and students the driver never confirmed
+        must not get a false 'dropped off' assertion when the end-run sweep
+        normalizes their status."""
         try:
             if run.get("type") == "morning":
                 self.notify_reached_school(run)
-                return
-            for link in self._boarded_links(run):
-                self._notify(
-                    link["parent_id"],
-                    type="dropped-off",
-                    title="Dropped off",
-                    body=f"{link['student_name']} has been dropped off at their stop.",
-                    student_id=link["student_id"],
-                    run_id=str(run["id"]),
-                    bus_id=run.get("bus_id"),
-                    run_type=run.get("type"),
-                )
         except Exception:
             logger.exception("notify_run_ended failed")
 
