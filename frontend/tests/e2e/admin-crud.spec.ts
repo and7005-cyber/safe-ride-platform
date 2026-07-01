@@ -353,7 +353,10 @@ test("dashboard and fleet map render live fleet data", async ({ page }) => {
   await expect(page.locator(".gm-style").first()).toBeVisible({ timeout: 15_000 });
 });
 
-test("route planner returns a Google traffic-aware route", async ({ page }) => {
+// Route planner: calculate → save → reset (R17/R19/R20). CSV import (R21) is
+// skipped here on purpose — its parser is covered by tests/unit/plannerCsv.test.ts.
+test("route planner returns a Google traffic-aware route, saves it, and resets", async ({ page, request }) => {
+  const routeName = uniqueName("E2E Planned");
   await adminLogin(page);
   await page.goto("/fleet-map");
   await expect(page.getByText("Route planner")).toBeVisible();
@@ -374,4 +377,37 @@ test("route planner returns a Google traffic-aware route", async ({ page }) => {
   // Reorder (drag-to-reorder uses the same backend path) recomputes the route.
   await page.getByRole("button", { name: "Move down" }).first().click();
   await expect(page.getByTestId("route-distance")).not.toHaveText("—");
+  await expect(page.getByTestId("save-to-routes")).toBeEnabled({ timeout: 20_000 });
+
+  // Save the selected option as a route (R17): name + required school.
+  await page.getByTestId("save-to-routes").click();
+  await fieldInput(dialog(page), "Route name").fill(routeName);
+  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  await dialog(page).getByTestId("confirm-save-route").click();
+
+  // Success closes the dialog, confirms with a Routes link, and resets the planner (R19).
+  await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText("Route saved")).toBeVisible();
+  await expect(page.getByRole("button", { name: "View routes" })).toBeVisible();
+  await expect(page.getByTestId("route-result")).toHaveCount(0);
+  await expect(page.getByTestId("address-input-0")).toHaveValue("");
+
+  // The route persisted with its ordered custom stops.
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(token);
+  const listed = await request.get(`${API_URL}/api/fleet/routes`, { headers });
+  expect(listed.ok()).toBeTruthy();
+  const saved = (await listed.json()).find((r: { name: string }) => r.name === routeName);
+  expect(saved).toBeTruthy();
+  expect(saved.custom_stops).toBeTruthy();
+  expect(saved.route_stops.length).toBeGreaterThan(0);
+
+  // Reset clears planner state (R20): rows emptied and results gone.
+  await page.getByTestId("address-input-0").fill("Somewhere, Nairobi");
+  await page.getByTestId("reset-planner").click();
+  await expect(page.getByTestId("address-input-0")).toHaveValue("");
+  await expect(page.getByTestId("route-result")).toHaveCount(0);
+
+  // API cleanup (the beforeAll sweep also catches aborted runs).
+  await request.delete(`${API_URL}/api/fleet/routes/${saved.id}`, { headers });
 });
