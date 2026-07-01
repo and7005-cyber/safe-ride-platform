@@ -131,6 +131,35 @@ def geocode(address: str | None, *, allow_fallback: bool = True) -> dict | None:
     return None
 
 
+def reverse_geocode(lat: float | None, lng: float | None) -> dict:
+    """Resolve coordinates to a human-readable address (R8: a dropped map pin
+    fills the student's address field) via the Google Geocoding API's
+    ``latlng`` lookup.
+
+    Returns ``{found, label}``. Like :func:`geocode`, this is best-effort: no
+    key, no result, or any network/parse error → ``{"found": False}`` so a
+    failed lookup never breaks the caller (the address is simply left as-is).
+    """
+    if lat is None or lng is None:
+        return {"found": False}
+    s = get_settings()
+    if not s.google_maps_api_key:
+        return {"found": False}
+    try:
+        resp = httpx.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"latlng": f"{lat},{lng}", "key": s.google_maps_api_key, "region": "ke"},
+            timeout=_TIMEOUT,
+        )
+        results = resp.json().get("results") or []
+        label = results[0].get("formatted_address") if results else None
+        if not label:
+            return {"found": False}
+        return {"found": True, "label": label}
+    except Exception:  # noqa: BLE001 - reverse geocoding is always best-effort
+        return {"found": False}
+
+
 # --- Route optimisation -----------------------------------------------------
 
 def _nearest_neighbour(points: list[dict], start: dict | None) -> list[dict]:

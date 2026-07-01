@@ -8,14 +8,16 @@ from app.core.security import (
     verify_pin_hmac,
 )
 from app.core.validation import clean_email
+from app.dao.account_dao import AccountDao
 from app.dao.auth_dao import AuthDao
 
 SIGNUP_ROLES = {"driver", "parent"}
 
 
 class AuthService:
-    def __init__(self, dao: AuthDao | None = None) -> None:
+    def __init__(self, dao: AuthDao | None = None, accounts: AccountDao | None = None) -> None:
         self.dao = dao or AuthDao()
+        self.accounts = accounts or AccountDao()
         self.pepper = get_settings().pin_pepper
 
     # --- session helpers ---------------------------------------------------
@@ -48,6 +50,10 @@ class AuthService:
             raise BadRequestError("An account with this email already exists")
         user = self.dao.create_user(email, hash_password(password), full_name, role)
         user["role"] = role
+        if role == "parent":
+            # R11: a fresh parent account immediately picks up every student
+            # already carrying its email in either parent slot (cap honoured).
+            self.accounts.link_parent_to_matching_students(user["id"], email)
         return self._issue_session(user)
 
     def login(self, email: str, password: str) -> dict:

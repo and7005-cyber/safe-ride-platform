@@ -3,6 +3,7 @@ from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
+from app.core.errors import BadRequestError
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
 from app.dao.student_live_dao import StudentLiveDao
@@ -15,16 +16,32 @@ admin_only = require_role("admin")
 
 
 def _clean_student(data: dict, *, geocode_fallback: bool = True) -> dict:
-    """Validate phones/email and best-effort geocode a typed address so a
-    student lands on a real route stop without needing a manual map pin (#4, #13).
+    """Enforce the two-parent contact contract (R9–R10) and best-effort geocode
+    a typed address so a student lands on a real route stop without needing a
+    manual map pin (#4, #13).
+
+    Every student needs a Parent 1 name, at least one phone across the two
+    parent slots, and at least one email across the two slots — the emails
+    drive parent-account linking (R11), the phones the emergency contact list.
+    ``parent_phone2`` is Parent 2's phone (the pre-existing "second phone"
+    column, reused rather than renamed).
 
     Single saves allow the free OSM fallback (so addresses get coordinates even
     with no maps key); bulk upload passes ``geocode_fallback=False`` to avoid
     hammering the free service's rate limit row-by-row.
     """
-    data["parent_phone"] = clean_phone(data.get("parent_phone"), field="parent phone")
-    data["parent_phone2"] = clean_phone(data.get("parent_phone2"), field="second phone")
-    data["parent_email"] = clean_email(data.get("parent_email"), field="parent email")
+    if not str(data.get("parent_name") or "").strip():
+        raise BadRequestError("Parent 1 name is required")
+    data["parent_name"] = str(data["parent_name"]).strip()
+    data["parent2_name"] = str(data.get("parent2_name") or "").strip() or None
+    data["parent_phone"] = clean_phone(data.get("parent_phone"), field="parent 1 phone")
+    data["parent_phone2"] = clean_phone(data.get("parent_phone2"), field="parent 2 phone")
+    data["parent_email"] = clean_email(data.get("parent_email"), field="parent 1 email")
+    data["parent2_email"] = clean_email(data.get("parent2_email"), field="parent 2 email")
+    if not data["parent_phone"] and not data["parent_phone2"]:
+        raise BadRequestError("At least one parent phone number is required")
+    if not data["parent_email"] and not data["parent2_email"]:
+        raise BadRequestError("At least one parent email is required")
     if data.get("home_address") and (data.get("home_lat") is None or data.get("home_lng") is None):
         hit = geo_service.geocode(data["home_address"], allow_fallback=geocode_fallback)
         if hit:
@@ -37,12 +54,16 @@ class StudentPayload(BaseModel):
     grade: str | None = None
     parent_name: str | None = None
     parent_phone: str | None = None
-    parent_phone2: str | None = None
+    parent_phone2: str | None = None  # Parent 2's phone (reused column)
     parent_email: str | None = None
+    parent2_name: str | None = None
+    parent2_email: str | None = None
     home_address: str | None = None
     home_lat: float | None = None
     home_lng: float | None = None
     pickup_time: str | None = None
+    # Still accepted for backwards compatibility, but PUT ignores it: admin
+    # edits must never reset a live status (R7).
     status: str | None = "at-school"
     bus_id: str | None = None
     school_id: str | None = None
@@ -54,8 +75,10 @@ class BulkRow(BaseModel):
     grade: str | None = None
     parent_name: str | None = None
     parent_phone: str | None = None
-    parent_phone2: str | None = None
+    parent_phone2: str | None = None  # Parent 2's phone (reused column)
     parent_email: str | None = None
+    parent2_name: str | None = None
+    parent2_email: str | None = None
     home_address: str | None = None
     home_lat: float | None = None
     home_lng: float | None = None
@@ -99,8 +122,14 @@ def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
         errors: list[str] = []
         for index, row in enumerate(payload.students):
             label = row.name or f"row {index + 1}"
-            if not row.name or not row.grade or not row.parent_name or not row.parent_phone:
-                errors.append(f"{label}: missing required field (name, grade, parent name, parent phone)")
+            if not row.name or not row.grade or not row.parent_name:
+                errors.append(f"{label}: missing required field (name, grade, parent name)")
+                continue
+            if not row.parent_phone and not row.parent_phone2:
+                errors.append(f"{label}: at least one parent phone is required")
+                continue
+            if not row.parent_email and not row.parent2_email:
+                errors.append(f"{label}: at least one parent email is required")
                 continue
             try:
                 assignments += dao.insert_bulk_student(_clean_student(row.model_dump(), geocode_fallback=False))

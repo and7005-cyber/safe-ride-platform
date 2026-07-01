@@ -5,8 +5,123 @@ from app.dao.fleet_dao import regenerate_route_stops
 
 STUDENT_COLUMNS = (
     "name", "grade", "parent_name", "parent_phone", "parent_phone2", "parent_email",
+    "parent2_name", "parent2_email",
     "home_address", "home_lat", "home_lng", "pickup_time", "status", "bus_id", "school_id",
 )
+
+MAX_PARENT_LINKS = 2  # a student never has more than two linked parent accounts (R11)
+
+
+class _ConnParentLinks:
+    """Data access needed by the parent-link sync rules, over a live connection.
+
+    ``sync_parent_links`` / ``link_account_to_matching_students`` take any
+    object with this interface, so the linking rules unit-test against an
+    in-memory fake (tests/services/test_parent_links.py) without a database.
+    """
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def parent_account_id(self, email: str) -> Any | None:
+        row = self._conn.execute(
+            "select u.id from app_users u join app_user_roles r on r.user_id = u.id "
+            "where lower(u.email) = lower(%s) and r.role = 'parent'",
+            (email,),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def student_links(self, student_id) -> list[dict]:
+        rows = self._conn.execute(
+            "select ps.id, ps.parent_id, lower(u.email) as email "
+            "from live_parent_students ps join app_users u on u.id = ps.parent_id "
+            "where ps.student_id = %s",
+            (student_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def students_with_email(self, email: str) -> list[Any]:
+        rows = self._conn.execute(
+            "select id from live_students "
+            "where lower(parent_email) = lower(%s) or lower(parent2_email) = lower(%s)",
+            (email, email),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def add_link(self, parent_id, student_id) -> None:
+        self._conn.execute(
+            "insert into live_parent_students (parent_id, student_id) values (%s, %s) "
+            "on conflict (parent_id, student_id) do nothing",
+            (parent_id, student_id),
+        )
+
+    def remove_link(self, link_id) -> None:
+        self._conn.execute("delete from live_parent_students where id = %s", (link_id,))
+
+
+def _slot_emails(emails) -> list[str]:
+    """Normalise the (parent_email, parent2_email) pair: lower-cased, blanks
+    dropped, order preserved, duplicates collapsed (the same email in both
+    slots is one parent — one link)."""
+    slots: list[str] = []
+    for email in emails:
+        value = str(email or "").strip().lower()
+        if value and value not in slots:
+            slots.append(value)
+    return slots
+
+
+def sync_parent_links(db, student_id, emails, old_emails=None) -> int:
+    """Reconcile ``live_parent_students`` with a student's parent email slots (R11).
+
+    ``db`` is a live connection or a ``_ConnParentLinks``-shaped store.
+    ``emails`` is the slot-ordered ``(parent_email, parent2_email)`` pair after
+    the write; ``old_emails`` the pair before it (``None`` on create). Links
+    are upserted for parent-role accounts whose email matches either slot
+    case-insensitively. Links matching neither slot are pruned only when a
+    slot value actually changed in this write — an unrelated edit (grade,
+    address…) must never sever a link that drifted (e.g. the account's email
+    was renamed after linking). The student never exceeds ``MAX_PARENT_LINKS``;
+    when accounts compete for the last seat, slot order wins.
+
+    Returns the number of links created.
+    """
+    store = _ConnParentLinks(db) if hasattr(db, "execute") else db
+    slots = _slot_emails(emails)
+    links = store.student_links(student_id)
+
+    if old_emails is not None and set(_slot_emails(old_emails)) != set(slots):
+        for link in list(links):
+            if link["email"] not in slots:
+                store.remove_link(link["id"])
+                links.remove(link)
+
+    linked_ids = {link["parent_id"] for link in links}
+    created = 0
+    for email in slots:
+        if len(linked_ids) >= MAX_PARENT_LINKS:
+            break
+        account_id = store.parent_account_id(email)
+        if account_id is not None and account_id not in linked_ids:
+            store.add_link(account_id, student_id)
+            linked_ids.add(account_id)
+            created += 1
+    return created
+
+
+def link_account_to_matching_students(store, parent_id, email: str) -> int:
+    """Signup-side of R11: link a fresh parent account to every student whose
+    email slots carry its email, honouring the per-student link cap.
+
+    Returns the number of links created.
+    """
+    created = 0
+    for student_id in store.students_with_email(email):
+        links = store.student_links(student_id)
+        if len(links) < MAX_PARENT_LINKS and parent_id not in {l["parent_id"] for l in links}:
+            store.add_link(parent_id, student_id)
+            created += 1
+    return created
 
 
 def _derive_student_bus(conn, student_id: str) -> None:
@@ -77,10 +192,12 @@ class StudentLiveDao:
                 """
                 insert into live_students
                     (name, grade, parent_name, parent_phone, parent_phone2, parent_email,
+                     parent2_name, parent2_email,
                      home_address, home_lat, home_lng, pickup_time, status, school_id)
                 values
                     (%(name)s, %(grade)s, %(parent_name)s, %(parent_phone)s, %(parent_phone2)s,
-                     %(parent_email)s, %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s,
+                     %(parent_email)s, %(parent2_name)s, %(parent2_email)s,
+                     %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s,
                      coalesce(%(status)s,'at-school'), %(school_id)s)
                 returning *
                 """,
@@ -88,19 +205,29 @@ class StudentLiveDao:
             ).fetchone()
             # bus_id is derived from the assigned route(s), not set by hand (#3).
             _sync_routes(conn, row["id"], route_ids)
+            sync_parent_links(conn, row["id"], (data.get("parent_email"), data.get("parent2_email")))
             row = conn.execute("select * from live_students where id = %s", (row["id"],)).fetchone()
         return dict(row)
 
     def update_student(self, student_id: str, data: dict, route_ids: list[str]) -> dict[str, Any] | None:
         with get_connection() as conn:
+            before = conn.execute(
+                "select parent_email, parent2_email from live_students where id = %s",
+                (student_id,),
+            ).fetchone()
+            # No status in this UPDATE, ever: the payload's status (defaulted to
+            # 'at-school') used to silently reset a live on-bus/dropped-off
+            # status on every admin edit (R7). Status is written only by the
+            # run lifecycle; the insert default is the single exception.
             row = conn.execute(
                 """
                 update live_students set
                     name=%(name)s, grade=%(grade)s, parent_name=%(parent_name)s,
                     parent_phone=%(parent_phone)s, parent_phone2=%(parent_phone2)s,
-                    parent_email=%(parent_email)s, home_address=%(home_address)s,
+                    parent_email=%(parent_email)s, parent2_name=%(parent2_name)s,
+                    parent2_email=%(parent2_email)s, home_address=%(home_address)s,
                     home_lat=%(home_lat)s, home_lng=%(home_lng)s, pickup_time=%(pickup_time)s,
-                    status=coalesce(%(status)s,'at-school'), school_id=%(school_id)s
+                    school_id=%(school_id)s
                 where id=%(id)s returning *
                 """,
                 {**data, "id": student_id},
@@ -108,6 +235,12 @@ class StudentLiveDao:
             if row:
                 # bus_id is derived from the assigned route(s) inside _sync_routes (#3).
                 _sync_routes(conn, student_id, route_ids)
+                sync_parent_links(
+                    conn,
+                    student_id,
+                    (data.get("parent_email"), data.get("parent2_email")),
+                    old_emails=(before["parent_email"], before["parent2_email"]) if before else None,
+                )
                 row = conn.execute("select * from live_students where id = %s", (student_id,)).fetchone()
         return dict(row) if row else None
 
@@ -126,32 +259,25 @@ class StudentLiveDao:
             for route_id in affected:
                 regenerate_route_stops(conn, route_id)
 
-    def insert_bulk_student(self, data: dict) -> str:
+    def insert_bulk_student(self, data: dict) -> int:
+        """Insert one bulk-upload row; returns the number of parent-account
+        links auto-created from its email slots."""
         with get_connection() as conn:
             row = conn.execute(
                 """
                 insert into live_students
                     (name, grade, parent_name, parent_phone, parent_phone2, parent_email,
+                     parent2_name, parent2_email,
                      home_address, home_lat, home_lng, pickup_time, status)
                 values
                     (%(name)s, %(grade)s, %(parent_name)s, %(parent_phone)s, %(parent_phone2)s,
-                     %(parent_email)s, %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s, 'at-school')
+                     %(parent_email)s, %(parent2_name)s, %(parent2_email)s,
+                     %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s, 'at-school')
                 returning id
                 """,
                 data,
             ).fetchone()
-            assignments = 0
-            if data.get("parent_email"):
-                parent = conn.execute(
-                    "select u.id from app_users u join app_user_roles r on r.user_id = u.id "
-                    "where lower(u.email) = lower(%s) and r.role = 'parent'",
-                    (data["parent_email"],),
-                ).fetchone()
-                if parent:
-                    conn.execute(
-                        "insert into live_parent_students (parent_id, student_id) values (%s, %s) "
-                        "on conflict (parent_id, student_id) do nothing",
-                        (parent["id"], row["id"]),
-                    )
-                    assignments = 1
+            assignments = sync_parent_links(
+                conn, row["id"], (data.get("parent_email"), data.get("parent2_email"))
+            )
         return assignments
