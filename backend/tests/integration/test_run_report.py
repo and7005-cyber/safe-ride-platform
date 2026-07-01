@@ -15,6 +15,7 @@ approximate=true. Entities are 'IT '-prefixed and cleaned up in finally
 blocks; runs the tests start are always ended (and deleted) afterwards.
 """
 
+import datetime as _dt
 import os
 import uuid
 
@@ -58,18 +59,26 @@ def driver_headers(client):
 
 
 @pytest.fixture()
-def no_active_run(client, driver_headers):
-    """End any active run before and after a lifecycle test."""
+def no_active_run(client, driver_headers, admin_headers):
+    """End and DELETE today's runs for the driver's bus before and after a
+    lifecycle test — completed runs block same-day restarts (R28)."""
 
-    def end_run():
-        context = client.get("/api/runs/driver/context", headers=driver_headers)
-        active = context.json().get("active_run")
+    def reset_today_runs():
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        active = context.get("active_run")
         if active:
             client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
+        bus_id = (context.get("bus") or {}).get("id")
+        if not bus_id:
+            return
+        today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
+        for run in client.get("/api/runs", headers=admin_headers).json():
+            if run.get("bus_id") == bus_id and str(run.get("date")) == today:
+                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
 
-    end_run()
+    reset_today_runs()
     yield
-    end_run()
+    reset_today_runs()
 
 
 def _get_report(client, admin_headers, run_id: str) -> dict:
@@ -159,8 +168,8 @@ def test_report_snapshots_absent_student_and_survives_deletion(
 
 def test_students_boarded_recount_is_idempotent(client, admin_headers, driver_headers, no_active_run):
     """students_boarded is recounted from the run's run_stops roster on every
-    toggle — repeated taps never drift the counter, and unboarding brings it
-    back down. end_run persists the final pre-sweep count (R15)."""
+    tap — repeated taps never drift the counter, and driver un-boarding is
+    rejected outright (R16, R30). end_run persists the final pre-sweep count."""
     context = client.get("/api/runs/driver/context", headers=driver_headers).json()
     morning = next(r for r in context["routes"] if r["type"] == "morning")
 
@@ -183,10 +192,10 @@ def test_students_boarded_recount_is_idempotent(client, admin_headers, driver_he
         })
         assert student_ids, "seeded morning run has no student stops"
 
-        def board(student_id: str, on_bus: bool = True):
+        def board(student_id: str):
             response = client.post(
                 "/api/runs/driver/boarding",
-                json={"student_id": student_id, "on_bus": on_bus},
+                json={"student_id": student_id, "on_bus": True},
                 headers=driver_headers,
             )
             assert response.status_code == 200, response.text
@@ -208,9 +217,14 @@ def test_students_boarded_recount_is_idempotent(client, admin_headers, driver_he
             assert boarded_count() == 2
             expected = 2
 
-        # Unboarding recounts downward instead of decrementing blindly.
-        board(student_ids[0], on_bus=False)
-        expected -= 1
+        # Driver un-boarding is disabled by design (R30): the endpoint rejects
+        # on_bus=false and the counter stays put.
+        rejected = client.post(
+            "/api/runs/driver/boarding",
+            json={"student_id": student_ids[0], "on_bus": False},
+            headers=driver_headers,
+        )
+        assert rejected.status_code == 409, rejected.text
         assert boarded_count() == expected
 
         # end_run persists the final pre-sweep on-bus count for morning runs.

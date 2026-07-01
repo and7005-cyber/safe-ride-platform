@@ -11,6 +11,7 @@ they start are always ended. Re-apply the seed (scripts/reset-local-db.sh)
 to restore pristine demo state afterwards.
 """
 
+import datetime as _dt
 import os
 import time
 import uuid
@@ -68,18 +69,26 @@ def driver_headers(client):
 
 
 @pytest.fixture()
-def no_active_run(client, driver_headers):
-    """End any active run before and after a lifecycle test."""
+def no_active_run(client, driver_headers, admin_headers):
+    """End and DELETE today's runs for the driver's bus before and after a
+    lifecycle test — completed runs block same-day restarts (R28)."""
 
-    def end_run():
-        context = client.get("/api/runs/driver/context", headers=driver_headers)
-        active = context.json().get("active_run")
+    def reset_today_runs():
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        active = context.get("active_run")
         if active:
             client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
+        bus_id = (context.get("bus") or {}).get("id")
+        if not bus_id:
+            return
+        today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
+        for run in client.get("/api/runs", headers=admin_headers).json():
+            if run.get("bus_id") == bus_id and str(run.get("date")) == today:
+                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
 
-    end_run()
+    reset_today_runs()
     yield
-    end_run()
+    reset_today_runs()
 
 
 # Health & auth ---------------------------------------------------------------
@@ -511,12 +520,20 @@ def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, n
         stop_student_ids = {s["student_id"] for s in ctx["run_stops"]}
         assert child["id"] not in stop_student_ids
     finally:
+        # End the run BEFORE clearing the absence — clearing during an active
+        # run is rejected by design (R25), and a silent 409 here would leak
+        # the absent state into every later test.
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        active = context.get("active_run")
+        if active:
+            client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
         absences = client.get(
             "/api/students/absences", headers=admin_headers
         ).json()
         for a in absences:
             if a["student_id"] == child["id"]:
-                client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
+                cleared = client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
+                assert cleared.status_code == 200, cleared.text
 
 
 # Driver lifecycle & notification pipeline -------------------------------------
