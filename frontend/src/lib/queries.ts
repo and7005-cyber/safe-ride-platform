@@ -41,6 +41,15 @@ export function useRuns() {
   return useQuery({ queryKey: ["runs"], queryFn: () => api.get("/api/runs") });
 }
 
+export function useActiveRuns() {
+  // Today's (Africa/Nairobi) non-completed runs — the server owns the predicate.
+  return useQuery({
+    queryKey: ["runs", "active"],
+    queryFn: () => api.get("/api/runs", { active: true }),
+    refetchInterval: POLL_ADMIN,
+  });
+}
+
 export function useIncidents() {
   return useQuery({
     queryKey: ["incidents"],
