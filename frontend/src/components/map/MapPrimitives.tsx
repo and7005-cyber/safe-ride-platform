@@ -7,7 +7,16 @@ export type LatLng = { lat: number; lng: number };
  * Fit the map to a set of points. Refits only when `focusKey` changes — not on
  * every position tick — so it never fights the admin panning the map.
  */
-export function FitBounds({ points, focusKey }: { points: LatLng[]; focusKey: string }) {
+export function FitBounds({
+  points,
+  focusKey,
+  padding = 64,
+}: {
+  points: LatLng[];
+  focusKey: string;
+  /** Pixel padding around the bounds; compact panes want less than the 64px default. */
+  padding?: number;
+}) {
   const map = useMap();
   useEffect(() => {
     if (!map) return;
@@ -17,7 +26,7 @@ export function FitBounds({ points, focusKey }: { points: LatLng[]; focusKey: st
     } else if (points.length > 1) {
       const bounds = new google.maps.LatLngBounds();
       points.forEach((p) => bounds.extend(p));
-      map.fitBounds(bounds, 64);
+      map.fitBounds(bounds, padding);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map, focusKey]);
