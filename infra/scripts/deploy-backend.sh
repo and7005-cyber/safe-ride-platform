@@ -26,6 +26,21 @@ ssm_secret() { # name -> value (creates a random one if missing)
 DB_PASSWORD="$(ssm_secret /saferide/db-password)"
 PIN_PEPPER="$(ssm_secret /saferide/pin-pepper)"
 
+# Google Maps server key: prefer SSM; seed it once from backend/.env when
+# missing (it cannot be auto-generated like the secrets above).
+GOOGLE_MAPS_KEY="$(aws ssm get-parameter --name /saferide/google-maps-api-key --with-decryption \
+  --query Parameter.Value --output text 2>/dev/null || true)"
+if [ -z "$GOOGLE_MAPS_KEY" ] || [ "$GOOGLE_MAPS_KEY" = "None" ]; then
+  GOOGLE_MAPS_KEY="$(sed -n 's/^GOOGLE_MAPS_API_KEY=//p' "$REPO_DIR/backend/.env" 2>/dev/null | head -1)"
+  if [ -n "$GOOGLE_MAPS_KEY" ]; then
+    aws ssm put-parameter --name /saferide/google-maps-api-key --type SecureString \
+      --value "$GOOGLE_MAPS_KEY" >/dev/null
+    echo "==> Seeded SSM /saferide/google-maps-api-key from backend/.env"
+  else
+    echo "WARN: no Google Maps API key in SSM or backend/.env — autocomplete and road routing will be degraded." >&2
+  fi
+fi
+
 cd "$INFRA_DIR/backend"
 
 echo "==> sam build (containerized arm64)"
@@ -35,6 +50,7 @@ echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_A
 # SAM rejects empty Key= overrides, so only pass the cert ARN when we have one.
 DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}")
 [ -n "$API_CERT_ARN" ] && DEPLOY_PARAMS+=("ApiCertificateArn=${API_CERT_ARN}")
+[ -n "$GOOGLE_MAPS_KEY" ] && DEPLOY_PARAMS+=("GoogleMapsApiKey=${GOOGLE_MAPS_KEY}")
 sam deploy --parameter-overrides "${DEPLOY_PARAMS[@]}"
 
 API_URL="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" HttpApiUrl)"
