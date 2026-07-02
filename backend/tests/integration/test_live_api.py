@@ -130,6 +130,14 @@ def test_admin_endpoints_reject_other_roles(client, parent_headers, driver_heade
     assert client.post("/api/fleet/buses", json={"name": "X"}, headers=driver_headers).status_code == 403
     assert client.post("/api/fleet/buses", json={"name": "X"}).status_code == 401
     assert client.delete("/api/students/00000000-0000-0000-0000-000000000000", headers=parent_headers).status_code == 403
+    # PII-bearing reads are admin-only: the roster (parent contacts, home
+    # coordinates), named absences, and every incidents read incl. counts.
+    for headers in (parent_headers, driver_headers):
+        assert client.get("/api/students", headers=headers).status_code == 403
+        assert client.get("/api/students/absences", headers=headers).status_code == 403
+        assert client.get("/api/incidents", headers=headers).status_code == 403
+        assert client.get("/api/incidents/unread-count", headers=headers).status_code == 403
+        assert client.get("/api/incidents/today-count", headers=headers).status_code == 403
 
 
 def test_driver_endpoints_reject_other_roles(client, admin_headers, parent_headers):

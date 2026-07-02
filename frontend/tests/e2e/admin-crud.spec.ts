@@ -96,15 +96,28 @@ test("admin can create and delete a school with a map location", async ({ page }
   await expect(page.getByText(name)).toHaveCount(0);
 });
 
-test("admin can create and delete a route attached to a bus and school", async ({ page }) => {
+test("admin can create and delete a route attached to a bus and school", async ({ page, request }) => {
   const name = uniqueName("E2E Route");
+  // Seeded buses already hold a route of each type; a same-type route on one
+  // of them now 409s (R1). Attach the route to a fresh bus instead.
+  const busName = uniqueName("E2E RouteBus");
+  const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(adminToken);
+  const busResp = await request.post(`${API_URL}/api/fleet/buses`, {
+    headers,
+    data: { name: busName, plate_number: "E2E 100", capacity: 20, status: "idle" },
+  });
+  expect(busResp.ok()).toBeTruthy();
+  const busId = (await busResp.json()).id;
+
+  try {
   await adminLogin(page);
   await page.goto("/routes");
 
   await page.getByRole("button", { name: "Add Route" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
-  await pickSelectOption(dialog(page), "Bus", SEED.busOption);
+  await pickSelectOption(dialog(page), "Bus", busName);
   await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
@@ -121,6 +134,9 @@ test("admin can create and delete a route attached to a bus and school", async (
   await cardContaining(page, name).getByRole("button").last().click();
   await confirmDelete(page);
   await expect(page.getByText(name)).toHaveCount(0);
+  } finally {
+    await request.delete(`${API_URL}/api/fleet/buses/${busId}`, { headers });
+  }
 });
 
 test("admin can create, edit, and delete a student", async ({ page }) => {
@@ -253,9 +269,10 @@ test("creating a student with a registered parent's email links it to that paren
     await fieldInput(dialog(page), "Name").fill(studentName);
     await fieldInput(dialog(page), "Grade").fill("Grade 1");
     // Parent 1 slot: the registered parent's email drives the link.
-    await fieldInput(dialog(page), "Parent name").fill(parentName);
-    await fieldInput(dialog(page), "Parent phone").fill("+254711222333");
-    await fieldInput(dialog(page), "Parent email").fill(parentEmail);
+    const parent1 = dialog(page).getByTestId("parent1-group");
+    await fieldInput(parent1, "Name").fill(parentName);
+    await fieldInput(parent1, "Phone").fill("+254711222333");
+    await fieldInput(parent1, "Email").fill(parentEmail);
     await dialog(page).getByRole("button", { name: "Save" }).click();
     await expect(page.getByRole("row", { name: new RegExp(studentName) })).toBeVisible();
 
@@ -387,7 +404,7 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
 
   // Success closes the dialog, confirms with a Routes link, and resets the planner (R19).
   await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 15_000 });
-  await expect(page.getByText("Route saved")).toBeVisible();
+  await expect(page.getByText("Route saved", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "View routes" })).toBeVisible();
   await expect(page.getByTestId("route-result")).toHaveCount(0);
   await expect(page.getByTestId("address-input-0")).toHaveValue("");

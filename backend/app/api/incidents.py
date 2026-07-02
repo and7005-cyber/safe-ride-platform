@@ -35,7 +35,7 @@ def unread_count(user: dict = Depends(admin_only)):
 
 
 @router.get("/today-count")
-def today_count(user: dict = Depends(get_current_user)):
+def today_count(user: dict = Depends(admin_only)):
     return safe_call(lambda: {"count": dao.today_count()})
 
 

@@ -226,20 +226,37 @@ class RunDao:
             # Today-absent students stay visible with an `absent` flag (R25b):
             # the driver still sees the stop instead of it silently vanishing
             # mid-run, and stop numbering never shifts under their feet.
-            students = conn.execute(
-                """
+            #
+            # With an active run the actionable list is the RUN's roster
+            # (run_stops membership) — never the derived bus roster, which
+            # diverges for students whose afternoon route rides another bus.
+            # Without a run, the bus roster is the natural pre-run view.
+            active_dict = dict(active) if active else None
+            absent_flag_sql = """
                 select s.*, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
                 ) as absent
                 from live_students s
-                where s.bus_id = %s
-                order by s.name asc
-                """,
-                (bus["id"],),
-            ).fetchall()
-            active_dict = dict(active) if active else None
+            """
+            if active_dict:
+                students = conn.execute(
+                    absent_flag_sql
+                    + """
+                    where s.id in (
+                        select rs.student_id from run_stops rs
+                        where rs.run_id = %s and rs.student_id is not null
+                    )
+                    order by s.name asc
+                    """,
+                    (active_dict["id"],),
+                ).fetchall()
+            else:
+                students = conn.execute(
+                    absent_flag_sql + " where s.bus_id = %s order by s.name asc",
+                    (bus["id"],),
+                ).fetchall()
             run_stops = []
             if active_dict:
                 run_stops = [
@@ -323,16 +340,11 @@ class RunDao:
             if not distinct_orders:
                 raise ConflictError("Route has no stops")
             order_map = {orig: i + 1 for i, orig in enumerate(distinct_orders)}
-            students = conn.execute(
-                """
-                select count(*) as n from live_students
-                where bus_id = %s and id not in (
-                    select student_id from live_student_absences
-                    where absence_date = (now() at time zone 'Africa/Nairobi')::date
-                )
-                """,
-                (bus["id"],),
-            ).fetchone()
+            # total_students is the RUN's roster size (distinct non-absent
+            # students in the snapshot) — never the derived bus roster, which
+            # diverges for cross-bus riders and would let dropped-off counts
+            # exceed the total.
+            roster_size = len({str(s["student_id"]) for s in kept if s["student_id"]})
 
             run = conn.execute(
                 """
@@ -346,7 +358,7 @@ class RunDao:
                 returning *
                 """,
                 (bus["id"], route_id, route["school_id"], driver_id, route["type"],
-                 len(distinct_orders), students["n"]),
+                 len(distinct_orders), roster_size),
             ).fetchone()
             for s in kept:
                 conn.execute(
@@ -688,14 +700,15 @@ class RunDao:
                 "update live_students set status = 'absent' where id = %s returning *",
                 (student_id,),
             ).fetchone()
-            conn.execute(
+            inserted = conn.execute(
                 """
                 insert into run_absences (run_id, student_id, student_name, reason)
                 values (%s, %s, %s, %s)
                 on conflict (run_id, student_id) do nothing
+                returning id
                 """,
                 (run["id"], student_id, student["name"], reason),
-            )
+            ).fetchone()
             count_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
             boarded_count = self._count_run_students_with_status(conn, run["id"], count_status)
             run = conn.execute(
@@ -715,6 +728,9 @@ class RunDao:
         run = dict(run)
         run["bus_name"] = names["bus_name"] if names else None
         run["route_name"] = names["route_name"] if names else None
+        # newly_recorded lets the API layer keep the school-side incident
+        # idempotent per run+student: repeat taps re-notify nothing.
+        run["newly_recorded"] = inserted is not None
         return dict(student), run
 
     def _count_run_students_with_status(self, conn, run_id: str, status: str) -> int:

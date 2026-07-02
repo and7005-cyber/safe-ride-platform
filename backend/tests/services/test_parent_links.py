@@ -157,11 +157,31 @@ def test_unrelated_edit_preserves_drifted_link(store):
     assert store.linked_parents("s1") == {"acc-old"}
 
 
-def test_email_change_prunes_drifted_link(store):
+def test_email_change_keeps_drifted_link(store):
+    # Pruning is per removed slot value: a drifted link (account renamed after
+    # linking — matches no old slot) is never severed, even when another slot
+    # changes in the same write.
     store.add_account("acc-b", "b@test.com")
     store.seed_link("acc-old", "s1", "renamed@test.com")
     sync_parent_links(store, "s1", ("b@test.com", None), old_emails=("a@test.com", None))
-    assert store.linked_parents("s1") == {"acc-b"}
+    assert store.linked_parents("s1") == {"acc-b", "acc-old"}
+
+
+def test_other_slot_change_keeps_untouched_slots_drifted_link(store):
+    # Slot 2 changes; a drifted link that once belonged to slot 1 survives.
+    store.add_account("acc-c", "c@test.com")
+    store.seed_link("acc-drift", "s1", "renamed@test.com")
+    sync_parent_links(
+        store, "s1", ("a@test.com", "c@test.com"), old_emails=("a@test.com", "b@test.com")
+    )
+    assert store.linked_parents("s1") == {"acc-drift", "acc-c"}
+
+
+def test_removing_a_slot_prunes_its_link(store):
+    store.add_account("acc-b", "b@test.com")
+    store.seed_link("acc-b", "s1", "b@test.com")
+    sync_parent_links(store, "s1", ("a@test.com", None), old_emails=("a@test.com", "b@test.com"))
+    assert store.linked_parents("s1") == set()
 
 
 def test_swapping_slots_prunes_nothing(store):

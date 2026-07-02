@@ -79,6 +79,13 @@ alter table live_incidents add column if not exists student_id uuid
 alter table live_incidents add column if not exists run_type text
   check (run_type in ('morning', 'afternoon'));
 
+-- Backfill run_type from surviving runs, mirroring the notifications backfill.
+update live_incidents i
+set run_type = r.type
+from live_runs r
+where i.run_id = r.id
+  and i.run_type is null;
+
 -- 6. Route dedup, then one route per (bus, type) -------------------------------
 -- For each (bus_id, type) group with more than one route keep the earliest
 -- created_at (tie-break on id) and detach the rest, so the partial unique

@@ -1,5 +1,15 @@
 import { expect, test } from "@playwright/test";
-import { ADMIN, DRIVER, PARENT, SEED, emailLogin } from "./helpers";
+import {
+  ADMIN,
+  API_URL,
+  DRIVER,
+  PARENT,
+  SEED,
+  apiDriverToken,
+  authHeaders,
+  emailLogin,
+  endActiveRun,
+} from "./helpers";
 
 // These journeys run against the seeded local stack (see
 // backend/db/seeds/003_local_snapshot.sql via tests/e2e/helpers.ts). They
@@ -28,25 +38,46 @@ test("admin is the only role allowed on admin routes", async ({ page }) => {
   await expect(page).toHaveURL("/parent");
 });
 
-test("driver can log in by PIN and start a run", async ({ page }) => {
-  await page.goto("/auth");
-  await page.getByRole("tab", { name: /Driver PIN/ }).click();
-  await page.locator("#pin").fill(DRIVER.pin);
-  await page.getByRole("button", { name: /Sign In with PIN/ }).click();
-  await expect(page).toHaveURL("/driver");
-  await expect(page.getByText(SEED.driverBus)).toBeVisible();
+test("driver can log in by PIN and start a run", async ({ page, request }) => {
+  try {
+    await page.goto("/auth");
+    await page.getByRole("tab", { name: /Driver PIN/ }).click();
+    await page.locator("#pin").fill(DRIVER.pin);
+    await page.getByRole("button", { name: /Sign In with PIN/ }).click();
+    await expect(page).toHaveURL("/driver");
+    await expect(page.getByText(SEED.driverBus)).toBeVisible();
 
-  await page.goto("/driver/run");
-  await page.getByRole("button", { name: "Start Run" }).click();
-  await expect(page.getByText("Run in progress")).toBeVisible();
-  await expect(page.getByText("Arrive Next Stop")).toBeVisible();
+    // Explicit route selection is required before starting (R27).
+    await page.goto("/driver/run");
+    await expect(page.getByRole("button", { name: "Start Run" })).toBeDisabled();
+    await page.getByRole("combobox").click();
+    await page.getByRole("option", { name: SEED.driverMorningRoute }).click();
+    await page.getByRole("button", { name: "Start Run" }).click();
+    await expect(page.getByText("Run in progress")).toBeVisible();
+    await expect(page.getByText("Arrive Next Stop")).toBeVisible();
 
-  // Clean up so the run does not block subsequent suite runs.
-  await page.getByRole("button", { name: "End Run" }).click();
-  await expect(page).toHaveURL("/driver");
+    // Ending the run requires confirmation (R29).
+    await page.getByRole("button", { name: "End Run" }).click();
+    const endDialog = page.getByRole("dialog");
+    await expect(endDialog.getByText("End this run?")).toBeVisible();
+    await endDialog.getByRole("button", { name: "End Run" }).click();
+    await expect(page).toHaveURL("/driver");
+  } finally {
+    // End + delete today's runs so completed-today gating (R28) cannot block
+    // later lifecycle suites.
+    await endActiveRun(request);
+  }
 });
 
-test("parent sees their children and bus-less child has no driver actions", async ({ page }) => {
+test("parent sees their children and bus-less child has no driver actions", async ({ page, request }) => {
+  // The alerts feed defaults to a 24h Recent window (R35), so the weeks-old
+  // seeded incident is invisible by design — raise a fresh one via the driver.
+  const driverToken = await apiDriverToken(request);
+  await request.post(`${API_URL}/api/incidents/driver`, {
+    headers: authHeaders(driverToken),
+    data: { type: "breakdown", description: "E2E smoke breakdown" },
+  });
+
   await emailLogin(page, PARENT.email, PARENT.password);
   await expect(page).toHaveURL("/parent");
   await expect(page.getByText(/Good (morning|afternoon|evening)/)).toBeVisible();

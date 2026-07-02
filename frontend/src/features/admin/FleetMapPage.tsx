@@ -182,7 +182,10 @@ export function FleetMapPage() {
       if (generation !== requestGeneration.current) return;
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
-      if (generation === requestGeneration.current) setLoading(false);
+      // Spinners clear unconditionally — the generation guard only protects
+      // response-derived state. A plan superseded by a reorder (or vice
+      // versa) must never leave its own busy flag stuck on.
+      setLoading(false);
     }
   };
 
@@ -216,10 +219,9 @@ export function FleetMapPage() {
       if (generation !== requestGeneration.current) return;
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
-      if (generation === requestGeneration.current) {
-        setBusy(false);
-        setDragIndex(null);
-      }
+      // Unconditional for the same reason as plan()'s finally above.
+      setBusy(false);
+      setDragIndex(null);
     }
   };
 

@@ -132,6 +132,32 @@ class AccountDao:
     def link_parent_to_matching_students(self, parent_id, email: str) -> int:
         """Link a (new) parent account to every student carrying its email in
         either parent slot (R11), honouring the per-student link cap. Returns
-        the number of links created."""
+        the number of links created.
+
+        Signup emails are self-asserted and unverified, so every auto-link
+        also raises an admin-visible incident (no bus/student stamp, so it
+        never reaches a parent feed): the office knows its families and can
+        catch an email claimed by the wrong person before it matters.
+        """
         with get_connection() as conn:
-            return link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
+            created = link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
+            if created:
+                names = [
+                    r["name"]
+                    for r in conn.execute(
+                        """
+                        select s.name from live_students s
+                        join live_parent_students ps on ps.student_id = s.id
+                        where ps.parent_id = %s order by s.name
+                        """,
+                        (parent_id,),
+                    ).fetchall()
+                ]
+                conn.execute(
+                    "insert into live_incidents (type, description) values ('other', %s)",
+                    (
+                        f"Parent signup auto-linked: {email} now tracks "
+                        f"{', '.join(names)} — verify this is the child's parent.",
+                    ),
+                )
+            return created

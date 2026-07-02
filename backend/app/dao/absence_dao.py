@@ -93,10 +93,11 @@ class AbsenceDao:
 
     def clear_absence(self, absence_id: str) -> None:
         """Delete an absence. Clearing a TODAY-dated absence is rejected while
-        the student's bus has an active run ('End the run first' — the run
-        already excluded the stop); otherwise it resets the live status to
-        'at-school', but only when the current status is 'absent'. Clearing
-        past/future-dated absences never touches the status."""
+        any active run today involves the student ('End the run first' — the
+        run either contains their stop or excluded it at snapshot time);
+        otherwise it resets the live status to 'at-school', but only when the
+        current status is 'absent'. Clearing past/future-dated absences never
+        touches the status."""
         from app.core.errors import ConflictError
 
         with get_connection() as conn:
@@ -104,7 +105,7 @@ class AbsenceDao:
                 """
                 select a.student_id,
                        (a.absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today,
-                       s.bus_id, s.status
+                       s.status
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
                 where a.id = %s
@@ -112,18 +113,28 @@ class AbsenceDao:
                 (absence_id,),
             ).fetchone()
             if row and row["is_today"]:
-                if row["bus_id"]:
-                    active = conn.execute(
-                        """
-                        select 1 from live_runs
-                        where bus_id = %s and status <> 'completed'
-                          and date = (now() at time zone 'Africa/Nairobi')::date
-                        limit 1
-                        """,
-                        (row["bus_id"],),
-                    ).fetchone()
-                    if active:
-                        raise ConflictError("End the run first")
+                # Run-scoped guard (never the derived bus roster, which
+                # diverges for cross-bus afternoon riders): the student is
+                # mid-run when any of today's non-completed runs contains
+                # them in run_stops, or belongs to a route they are on —
+                # their stop was excluded at snapshot time by this absence.
+                active = conn.execute(
+                    """
+                    select 1 from live_runs r
+                    where r.status <> 'completed'
+                      and r.date = (now() at time zone 'Africa/Nairobi')::date
+                      and (
+                        exists (select 1 from run_stops rs
+                                where rs.run_id = r.id and rs.student_id = %s)
+                        or exists (select 1 from live_student_routes sr
+                                   where sr.route_id = r.route_id and sr.student_id = %s)
+                      )
+                    limit 1
+                    """,
+                    (row["student_id"], row["student_id"]),
+                ).fetchone()
+                if active:
+                    raise ConflictError("End the run first")
                 if row["status"] == "absent":
                     conn.execute(
                         "update live_students set status = 'at-school' where id = %s",

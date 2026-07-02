@@ -78,10 +78,11 @@ def sync_parent_links(db, student_id, emails, old_emails=None) -> int:
     ``emails`` is the slot-ordered ``(parent_email, parent2_email)`` pair after
     the write; ``old_emails`` the pair before it (``None`` on create). Links
     are upserted for parent-role accounts whose email matches either slot
-    case-insensitively. Links matching neither slot are pruned only when a
-    slot value actually changed in this write — an unrelated edit (grade,
-    address…) must never sever a link that drifted (e.g. the account's email
-    was renamed after linking). The student never exceeds ``MAX_PARENT_LINKS``;
+    case-insensitively. Pruning is per-slot: a link is removed only when its
+    account email matched a slot value that was REMOVED in this write — an
+    unrelated edit, or an edit to the other slot, must never sever a link,
+    and a drifted link (account email renamed after linking, matching no old
+    slot) is never pruned. The student never exceeds ``MAX_PARENT_LINKS``;
     when accounts compete for the last seat, slot order wins.
 
     Returns the number of links created.
@@ -90,9 +91,10 @@ def sync_parent_links(db, student_id, emails, old_emails=None) -> int:
     slots = _slot_emails(emails)
     links = store.student_links(student_id)
 
-    if old_emails is not None and set(_slot_emails(old_emails)) != set(slots):
+    if old_emails is not None:
+        removed_values = set(_slot_emails(old_emails)) - set(slots)
         for link in list(links):
-            if link["email"] not in slots:
+            if link["email"] in removed_values and link["email"] not in slots:
                 store.remove_link(link["id"])
                 links.remove(link)
 

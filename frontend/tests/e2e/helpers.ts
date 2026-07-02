@@ -82,12 +82,30 @@ export async function endActiveRun(request: APIRequestContext): Promise<void> {
     headers: authHeaders(token),
   });
   if (!context.ok()) return;
-  const activeRun = (await context.json()).active_run;
+  const body = await context.json();
+  const activeRun = body.active_run;
   if (activeRun) {
     await request.post(`${API_URL}/api/runs/driver/end`, {
       headers: authHeaders(token),
       data: { run_id: activeRun.id },
     });
+  }
+  // Also DELETE today's runs for the driver's bus: completed runs block
+  // same-day restarts (R28) and would poison later lifecycle tests.
+  const busId = body.bus?.id;
+  if (!busId) return;
+  const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
+  const runs = await request.get(`${API_URL}/api/runs`, {
+    headers: authHeaders(adminToken),
+  });
+  if (!runs.ok()) return;
+  const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10); // Nairobi UTC+3
+  for (const run of await runs.json()) {
+    if (run.bus_id === busId && String(run.date).slice(0, 10) === today) {
+      await request.delete(`${API_URL}/api/runs/${run.id}`, {
+        headers: authHeaders(adminToken),
+      });
+    }
   }
 }
 

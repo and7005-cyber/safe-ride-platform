@@ -91,7 +91,10 @@ class BulkPayload(BaseModel):
 
 
 @router.get("")
-def list_students(user: dict = Depends(get_current_user)):
+def list_students(user: dict = Depends(admin_only)):
+    # Admin-only: rows carry parent contact PII and home coordinates, and the
+    # email slots gate parent-account linking (R11). Drivers get their roster
+    # via /api/runs/driver/context; parents via /api/parent-portal/children.
     return safe_call(dao.list_students)
 
 
@@ -150,7 +153,9 @@ class AbsencePayload(BaseModel):
 
 
 @router.get("/absences")
-def list_absences(date: str | None = None, user: dict = Depends(get_current_user)):
+def list_absences(date: str | None = None, user: dict = Depends(admin_only)):
+    # Admin-only: named child absences are exactly the data the incidents
+    # feed was locked down for; the sole consumer is the admin StudentsPage.
     return safe_call(lambda: absence_dao.list_absences(date))
 
 

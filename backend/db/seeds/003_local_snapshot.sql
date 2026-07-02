@@ -480,3 +480,17 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO public.live_parent_students (id, parent_id, student_id)
 VALUES ('52000000-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-000000000005')
 ON CONFLICT (id) DO NOTHING;
+
+-- Post-007 normalization: fresh bootstraps apply migrations (incl. 007's
+-- backfills) to an EMPTY database and only then load this pre-007-shaped
+-- snapshot, so the one-shot backfills must be replayed here idempotently to
+-- keep fresh environments identical to migrated production.
+UPDATE public.live_notifications n
+SET run_type = r.type
+FROM public.live_runs r
+WHERE n.run_id = r.id AND n.run_type IS NULL;
+
+UPDATE public.live_incidents i
+SET run_type = r.type
+FROM public.live_runs r
+WHERE i.run_id = r.id AND i.run_type IS NULL;

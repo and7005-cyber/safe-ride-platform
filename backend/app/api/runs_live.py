@@ -190,5 +190,8 @@ def mark_student_absent(
     incident fire post-commit."""
     student, run = safe_call(lambda: dao.mark_student_absent(user["id"], payload.student_id))
     background_tasks.add_task(push_service.notify_student_absent, student, run)
-    background_tasks.add_task(_record_absent_incident, user["id"], student, run)
+    # The parent push dedups on the notifications unique index; the incident
+    # has no such index, so only a NEWLY recorded absence raises one.
+    if run.get("newly_recorded"):
+        background_tasks.add_task(_record_absent_incident, user["id"], student, run)
     return student
