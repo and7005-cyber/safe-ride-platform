@@ -19,6 +19,14 @@ Parameters:
     Type: String
     NoEcho: true
     Description: HMAC pepper for driver PIN hashing.
+  GoogleMapsApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Server-side Google Maps Platform key (Geocoding, Places, Routes v2).
+      Injected at deploy time from SSM /saferide/google-maps-api-key. Empty
+      disables Google-backed geo features (autocomplete, road routing).
   CorsOrigins:
     Type: String
     Default: https://saferidelive.co.ke,https://www.saferidelive.co.ke
@@ -94,9 +102,98 @@ Resources:
         - Key: Name
           Value: saferide-private-b
 
-  # Isolated subnets: the default route table has only the local route, so
-  # there is no internet egress and therefore no NAT/IGW cost. Lambda reaches
-  # RDS over private VPC networking; API Gateway invokes Lambda out-of-band.
+  # Private subnets with NAT egress: the Lambdas must reach Google's Geocoding,
+  # Places, and Routes APIs (address autocomplete + road routing) and, when
+  # configured, FCM/Web Push endpoints. A single NAT gateway (~$0.06/h in
+  # af-south-1) in a public subnet provides that egress; RDS stays private.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: saferide-backend
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: saferide-public-a
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: saferide-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: saferide-backend
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: saferide-private
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -186,6 +283,7 @@ Resources:
           CORS_ORIGINS: !Ref CorsOrigins
           PIN_PEPPER: !Ref PinPepper
           APP_BASE_URL: !Ref AppBaseUrl
+          GOOGLE_MAPS_API_KEY: !Ref GoogleMapsApiKey
       Events:
         Proxy:
           Type: HttpApi
