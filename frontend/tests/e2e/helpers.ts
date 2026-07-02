@@ -1,9 +1,33 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 
-// Seeded local credentials (backend/db/seeds/002_live_demo_seed.sql).
+// Seeded local credentials and fixtures (backend/db/seeds/003_local_snapshot.sql).
+// On seed drift, update these constants instead of individual specs.
 export const ADMIN = { email: "admin@test.com", password: "test1234." };
 export const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
-export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "1234" };
+export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "0322" };
+
+export const SEED = {
+  school: "Greenfield Academy",
+  /** The demo driver's (Daniel Kamau) live bus. */
+  driverBus: "Simba",
+  /** The driver bus's seeded routes (Run page dropdown options). */
+  driverMorningRoute: "Express 1 — Morning",
+  driverAfternoonRoute: "Express 1 — Afternoon",
+  /** Any seeded live bus, for admin bus <Select> options. */
+  busOption: /Simba|Twiga|Mamba/,
+  /** Full name of the PARENT account (Amina). */
+  parentName: "Amina Achieng",
+  /** Amina's child riding the demo driver's bus (first stop of Express 1). */
+  parentChild: "Faith Achieng",
+  /** Search term that narrows the boarding list to exactly parentChild. */
+  parentChildSearch: "Faith",
+  /** The stop name shown for parentChild on the track map. */
+  parentChildStop: /Kilimani/,
+  /** Amina's bus-less child (renders without driver actions). */
+  buslessChild: "Grace Njeri",
+  /** Parent-side label of the seeded incident on the parent's bus. */
+  parentBusAlertLabel: "Vehicle Breakdown",
+};
 
 export const API_URL = process.env.PLAYWRIGHT_API_URL ?? "http://localhost:9001";
 
@@ -58,12 +82,30 @@ export async function endActiveRun(request: APIRequestContext): Promise<void> {
     headers: authHeaders(token),
   });
   if (!context.ok()) return;
-  const activeRun = (await context.json()).active_run;
+  const body = await context.json();
+  const activeRun = body.active_run;
   if (activeRun) {
     await request.post(`${API_URL}/api/runs/driver/end`, {
       headers: authHeaders(token),
       data: { run_id: activeRun.id },
     });
+  }
+  // Also DELETE today's runs for the driver's bus: completed runs block
+  // same-day restarts (R28) and would poison later lifecycle tests.
+  const busId = body.bus?.id;
+  if (!busId) return;
+  const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
+  const runs = await request.get(`${API_URL}/api/runs`, {
+    headers: authHeaders(adminToken),
+  });
+  if (!runs.ok()) return;
+  const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10); // Nairobi UTC+3
+  for (const run of await runs.json()) {
+    if (run.bus_id === busId && String(run.date).slice(0, 10) === today) {
+      await request.delete(`${API_URL}/api/runs/${run.id}`, {
+        headers: authHeaders(adminToken),
+      });
+    }
   }
 }
 

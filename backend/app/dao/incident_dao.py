@@ -40,7 +40,24 @@ class IncidentDao:
             ).fetchone()
         return dict(row)
 
-    def create_driver_incident(self, driver_id: str, incident_type: str, description: str) -> dict[str, Any]:
+    def create_driver_incident(
+        self,
+        driver_id: str,
+        incident_type: str,
+        description: str,
+        run_id: str | None = None,
+        run_type: str | None = None,
+        student_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert an incident reported by a driver, stamped with run context.
+
+        run_type persists the period even after the run row is deleted
+        (run_id is ON DELETE SET NULL). A non-null student_id marks a
+        child-specific incident (the absent flow): those rows surface only on
+        the admin Alerts page — ParentLiveDao.list_alerts excludes them — and
+        this layer never fans out to parents, so callers of the absent flow
+        insert directly here without notify_incident.
+        """
         with get_connection() as conn:
             bus = conn.execute(
                 "select * from live_buses where driver_id = %s limit 1", (driver_id,)
@@ -50,12 +67,14 @@ class IncidentDao:
             ).fetchone()
             row = conn.execute(
                 """
-                insert into live_incidents (driver_id, driver_name, bus_id, bus_name, type, description)
-                values (%s, %s, %s, %s, %s, %s) returning *
+                insert into live_incidents
+                    (driver_id, driver_name, bus_id, bus_name, type, description,
+                     run_id, run_type, student_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s) returning *
                 """,
                 (driver_id, driver["full_name"] if driver else None,
                  bus["id"] if bus else None, bus["name"] if bus else None,
-                 incident_type, description),
+                 incident_type, description, run_id, run_type, student_id),
             ).fetchone()
         return dict(row)
 

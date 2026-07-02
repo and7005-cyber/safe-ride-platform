@@ -32,11 +32,26 @@ class SchoolPayload(BaseModel):
     lng: float | None = None
 
 
+class RouteStopPayload(BaseModel):
+    label: str
+    lat: float | None = None
+    lng: float | None = None
+    pickup_time: str | None = None
+    is_school: bool = False
+
+
 class RoutePayload(BaseModel):
     name: str
     type: str | None = "morning"
     bus_id: str | None = None
     school_id: str | None = None
+    # Planner persistence (R17/R18): a saved option carries its own ordered
+    # stops plus the road polyline and totals. Presence of `stops` marks the
+    # route custom (custom_stops = true) and skips student-based regeneration.
+    stops: list[RouteStopPayload] | None = None
+    polyline: str | None = None
+    total_distance_m: int | None = None
+    total_duration_s: int | None = None
 
 
 # Buses ----------------------------------------------------------------------
@@ -141,6 +156,11 @@ class GeocodePayload(BaseModel):
     address: str
 
 
+class ReverseGeocodePayload(BaseModel):
+    lat: float
+    lng: float
+
+
 class PlanStop(BaseModel):
     label: str | None = None
     address: str | None = None
@@ -165,6 +185,13 @@ def geocode_address(payload: GeocodePayload, user: dict = Depends(admin_only)):
     if not hit:
         return {"found": False}
     return {"found": True, **hit}
+
+
+@router.post("/reverse-geocode")
+def reverse_geocode_point(payload: ReverseGeocodePayload, user: dict = Depends(admin_only)):
+    """Resolve a picked map pin to an editable address string (R8). Best-effort:
+    ``{"found": False}`` when there is no key, no result, or the lookup fails."""
+    return geo_service.reverse_geocode(payload.lat, payload.lng)
 
 
 @router.get("/places/suggest")

@@ -65,9 +65,26 @@ class FakeAuthDao:
         self.sessions = {k: v for k, v in self.sessions.items() if v != user_id}
 
 
+class FakeAccountsDao:
+    """Records signup auto-link calls (the linking rules themselves are covered
+    in tests/services/test_parent_links.py)."""
+
+    def __init__(self):
+        self.linked: list[tuple] = []
+
+    def link_parent_to_matching_students(self, parent_id, email):
+        self.linked.append((parent_id, email))
+        return 1
+
+
 @pytest.fixture
-def service():
-    return AuthService(dao=FakeAuthDao())
+def accounts():
+    return FakeAccountsDao()
+
+
+@pytest.fixture
+def service(accounts):
+    return AuthService(dao=FakeAuthDao(), accounts=accounts)
 
 
 def test_login_returns_role(service):
@@ -89,6 +106,17 @@ def test_signup_rejects_admin_role(service):
 def test_signup_creates_parent_session(service):
     result = service.signup("p@test.com", "secret1", "Parent", "parent")
     assert result["user"]["role"] == "parent"
+
+
+def test_parent_signup_auto_links_matching_students(service, accounts):
+    result = service.signup("  p@test.com  ", "secret1", "Parent", "parent")
+    # Linked with the new account's id and the cleaned email (R11).
+    assert accounts.linked == [(result["user"]["id"], "p@test.com")]
+
+
+def test_driver_signup_does_not_link_students(service, accounts):
+    service.signup("d@test.com", "secret1", "Driver", "driver")
+    assert accounts.linked == []
 
 
 def test_pin_login_single_match(service):

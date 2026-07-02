@@ -11,6 +11,7 @@ they start are always ended. Re-apply the seed (scripts/reset-local-db.sh)
 to restore pristine demo state afterwards.
 """
 
+import datetime as _dt
 import os
 import time
 import uuid
@@ -27,7 +28,14 @@ BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
 
 ADMIN = {"email": "admin@test.com", "password": "test1234."}
 PARENT = {"email": "and7005@gmail.com", "password": "Test1234"}
-DRIVER_PIN = "1234"
+DRIVER_PIN = "0322"
+
+# Seeded fixtures (backend/db/seeds/003_local_snapshot.sql). On seed drift,
+# update these constants instead of individual tests.
+PARENT_CHILD = "Faith Achieng"  # Amina's child on the demo driver's bus (Simba)
+PARENT_BUSLESS_CHILD = "Grace Njeri"  # Amina's bus-less child (local-only seed extension)
+PARENT_CHILDREN = {PARENT_CHILD, PARENT_BUSLESS_CHILD}
+FOREIGN_STUDENT_ID = "50000000-0000-0000-0000-000000000003"  # Happiness Kenesa — not Amina's
 
 
 @pytest.fixture(scope="module")
@@ -61,18 +69,26 @@ def driver_headers(client):
 
 
 @pytest.fixture()
-def no_active_run(client, driver_headers):
-    """End any active run before and after a lifecycle test."""
+def no_active_run(client, driver_headers, admin_headers):
+    """End and DELETE today's runs for the driver's bus before and after a
+    lifecycle test — completed runs block same-day restarts (R28)."""
 
-    def end_run():
-        context = client.get("/api/runs/driver/context", headers=driver_headers)
-        active = context.json().get("active_run")
+    def reset_today_runs():
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        active = context.get("active_run")
         if active:
             client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
+        bus_id = (context.get("bus") or {}).get("id")
+        if not bus_id:
+            return
+        today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
+        for run in client.get("/api/runs", headers=admin_headers).json():
+            if run.get("bus_id") == bus_id and str(run.get("date")) == today:
+                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
 
-    end_run()
+    reset_today_runs()
     yield
-    end_run()
+    reset_today_runs()
 
 
 # Health & auth ---------------------------------------------------------------
@@ -114,6 +130,14 @@ def test_admin_endpoints_reject_other_roles(client, parent_headers, driver_heade
     assert client.post("/api/fleet/buses", json={"name": "X"}, headers=driver_headers).status_code == 403
     assert client.post("/api/fleet/buses", json={"name": "X"}).status_code == 401
     assert client.delete("/api/students/00000000-0000-0000-0000-000000000000", headers=parent_headers).status_code == 403
+    # PII-bearing reads are admin-only: the roster (parent contacts, home
+    # coordinates), named absences, and every incidents read incl. counts.
+    for headers in (parent_headers, driver_headers):
+        assert client.get("/api/students", headers=headers).status_code == 403
+        assert client.get("/api/students/absences", headers=headers).status_code == 403
+        assert client.get("/api/incidents", headers=headers).status_code == 403
+        assert client.get("/api/incidents/unread-count", headers=headers).status_code == 403
+        assert client.get("/api/incidents/today-count", headers=headers).status_code == 403
 
 
 def test_driver_endpoints_reject_other_roles(client, admin_headers, parent_headers):
@@ -128,9 +152,10 @@ def test_parent_portal_rejects_other_roles(client, admin_headers, driver_headers
 
 
 def test_parents_cannot_track_other_children(client, parent_headers):
-    foreign = "50000000-0000-0000-0000-000000000003"  # seeded, not Amina's
     response = client.get(
-        "/api/parent-portal/track", params={"student_id": foreign}, headers=parent_headers
+        "/api/parent-portal/track",
+        params={"student_id": FOREIGN_STUDENT_ID},
+        headers=parent_headers,
     )
     assert response.status_code == 404
 
@@ -170,7 +195,8 @@ def test_school_route_and_student_crud(client, admin_headers):
     student = client.post(
         "/api/students",
         json={"name": f"IT Student {marker}", "grade": "G1", "home_lat": -1.29, "home_lng": 36.81,
-              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711000000"},
+              "home_address": "Home Rd", "parent_name": "IT Parent", "parent_phone": "+254711000000",
+              "parent_email": f"it-crud-{marker}@test.local"},
         headers=admin_headers,
     ).json()
     route = client.post(
@@ -186,7 +212,9 @@ def test_school_route_and_student_crud(client, admin_headers):
 
         renamed = client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"IT Student {marker} v2", "grade": "G2"},
+            json={"name": f"IT Student {marker} v2", "grade": "G2",
+                  "parent_name": "IT Parent", "parent_phone": "+254711000000",
+                  "parent_email": f"it-crud-{marker}@test.local"},
             headers=admin_headers,
         )
         assert renamed.status_code == 200
@@ -208,38 +236,45 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
     assert driver.status_code == 200, driver.text
     driver_id = driver.json()["id"]
 
+    parent_email = f"it-parent-{marker}@test.local"
     signup = client.post(
         "/api/auth/signup",
-        json={"email": f"it-parent-{marker}@test.local", "password": "ParentPass1!",
+        json={"email": parent_email, "password": "ParentPass1!",
               "full_name": f"IT Parent {marker}", "role": "parent"},
     )
     assert signup.status_code == 200, signup.text
     parent_id = signup.json()["user"]["id"] if "user" in signup.json() else None
     if parent_id is None:
         parents = client.get("/api/accounts/parents", headers=admin_headers).json()
-        parent_id = next(p["id"] for p in parents if p.get("email") == f"it-parent-{marker}@test.local")
+        parent_id = next(p["id"] for p in parents if p.get("email") == parent_email)
 
+    # Linking is email-driven (R11/R12): creating a student that carries the
+    # registered parent's email auto-links it — no manual link endpoint.
     student = client.post(
         "/api/students",
-        json={"name": f"IT LinkKid {marker}", "grade": "G3"},
+        json={"name": f"IT LinkKid {marker}", "grade": "G3", "parent_name": f"IT Parent {marker}",
+              "parent_phone": "+254711000001", "parent_email": parent_email},
         headers=admin_headers,
     ).json()
 
     try:
-        link = client.post(
-            "/api/accounts/parent-students",
-            json={"parent_id": parent_id, "student_id": student["id"]},
+        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
+        parent_row = next(p for p in parents if p.get("id") == parent_id)
+        assert parent_row["status"] == "registered"
+        assert f"IT LinkKid {marker}" in parent_row["students"]
+
+        # Moving the student's parent email elsewhere prunes the stale link.
+        updated = client.put(
+            f"/api/students/{student['id']}",
+            json={"name": f"IT LinkKid {marker}", "grade": "G3",
+                  "parent_name": f"IT Parent {marker}", "parent_phone": "+254711000001",
+                  "parent_email": f"it-someone-else-{marker}@test.local"},
             headers=admin_headers,
         )
-        assert link.status_code == 200, link.text
-        link_id = link.json()["id"]
-
-        links = client.get("/api/accounts/parent-students", headers=admin_headers).json()
-        assert any(l["id"] == link_id for l in links)
-
-        assert client.delete(
-            f"/api/accounts/parent-students/{link_id}", headers=admin_headers
-        ).status_code == 200
+        assert updated.status_code == 200, updated.text
+        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
+        parent_row = next(p for p in parents if p.get("id") == parent_id)
+        assert f"IT LinkKid {marker}" not in parent_row["students"]
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver_id}", headers=admin_headers)
@@ -285,6 +320,8 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         "/api/students",
         json={"name": f"Early {marker}", "home_address": "12 Early Lane",
               "home_lat": -1.28, "home_lng": 36.80, "pickup_time": "06:30",
+              "parent_name": "IT Early Parent", "parent_phone": "+254711000002",
+              "parent_email": f"it-early-{marker}@test.local",
               "route_ids": [morning["id"], afternoon["id"]]},
         headers=admin_headers,
     ).json()
@@ -292,6 +329,8 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         "/api/students",
         json={"name": f"Late {marker}", "home_address": "99 Late Road",
               "home_lat": -1.29, "home_lng": 36.81, "pickup_time": "06:50",
+              "parent_name": "IT Late Parent", "parent_phone": "+254711000003",
+              "parent_email": f"it-late-{marker}@test.local",
               "route_ids": [morning["id"], afternoon["id"]]},
         headers=admin_headers,
     ).json()
@@ -345,6 +384,8 @@ def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
     student = client.post(
         "/api/students",
         json={"name": f"NoCoords {marker}", "home_address": address, "pickup_time": "06:45",
+              "parent_name": "IT NoCoords Parent", "parent_phone": "+254711000004",
+              "parent_email": f"it-nocoords-{marker}@test.local",
               "route_ids": [route["id"]]},
         headers=admin_headers,
     ).json()
@@ -401,7 +442,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
     # Created with only the morning route, mirroring the reported flow.
     student = client.post(
         "/api/students",
-        json={"name": f"Both Kid {marker}", "route_ids": [morning["id"]]},
+        json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+              "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+              "route_ids": [morning["id"]]},
         headers=admin_headers,
     ).json()
 
@@ -415,7 +458,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Edit to add the afternoon route while keeping the morning one.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [morning["id"], afternoon["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [morning["id"], afternoon["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {morning["id"], afternoon["id"]}
@@ -423,7 +468,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Idempotent re-save with both already present must not drop either.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"], morning["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [afternoon["id"], morning["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {morning["id"], afternoon["id"]}
@@ -431,7 +478,9 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         # Removing one still works.
         client.put(
             f"/api/students/{student['id']}",
-            json={"name": f"Both Kid {marker}", "route_ids": [afternoon["id"]]},
+            json={"name": f"Both Kid {marker}", "parent_name": "IT Both Parent",
+                  "parent_phone": "+254711000005", "parent_email": f"it-both-{marker}@test.local",
+                  "route_ids": [afternoon["id"]]},
             headers=admin_headers,
         )
         assert route_ids() == {afternoon["id"]}
@@ -463,9 +512,9 @@ def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
 
 def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, no_active_run):
     students = client.get("/api/students", headers=admin_headers).json()
-    brian = next(s for s in students if s["name"] == "Brian Achieng")
+    child = next(s for s in students if s["name"] == PARENT_CHILD)
     marked = client.post(
-        "/api/students/absences", json={"student_id": brian["id"]}, headers=admin_headers
+        "/api/students/absences", json={"student_id": child["id"]}, headers=admin_headers
     )
     assert marked.status_code == 200, marked.text
     try:
@@ -477,14 +526,22 @@ def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, n
         assert run.status_code == 200, run.text
         ctx = client.get("/api/runs/driver/context", headers=driver_headers).json()
         stop_student_ids = {s["student_id"] for s in ctx["run_stops"]}
-        assert brian["id"] not in stop_student_ids
+        assert child["id"] not in stop_student_ids
     finally:
+        # End the run BEFORE clearing the absence — clearing during an active
+        # run is rejected by design (R25), and a silent 409 here would leak
+        # the absent state into every later test.
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        active = context.get("active_run")
+        if active:
+            client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
         absences = client.get(
             "/api/students/absences", headers=admin_headers
         ).json()
         for a in absences:
-            if a["student_id"] == brian["id"]:
-                client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
+            if a["student_id"] == child["id"]:
+                cleared = client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
+                assert cleared.status_code == 200, cleared.text
 
 
 # Driver lifecycle & notification pipeline -------------------------------------
@@ -501,18 +558,18 @@ def test_run_lifecycle_notifies_parents(client, admin_headers, parent_headers, d
 
     # GPS near the first stop fires bus-approaching.
     track_children = client.get("/api/parent-portal/children", headers=parent_headers).json()
-    brian = next(c for c in track_children if c["name"] == "Brian Achieng")
+    child = next(c for c in track_children if c["name"] == PARENT_CHILD)
     assert client.post(
         "/api/runs/driver/position", json={"lat": -1.2902, "lng": 36.7823}, headers=driver_headers
     ).status_code == 200
 
-    # Reach stop 1 and board Brian.
+    # Reach stop 1 and board the child.
     assert client.post(
         "/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers
     ).status_code == 200
     boarded = client.post(
         "/api/runs/driver/boarding",
-        json={"student_id": brian["id"], "on_bus": True},
+        json={"student_id": child["id"], "on_bus": True},
         headers=driver_headers,
     )
     assert boarded.status_code == 200
@@ -592,13 +649,13 @@ def test_push_endpoints_require_auth(client):
 def test_parent_children_and_track(client, parent_headers):
     children = client.get("/api/parent-portal/children", headers=parent_headers).json()
     names = {c["name"] for c in children}
-    assert {"Brian Achieng", "Faith Achieng", "Grace Njeri"} <= names
+    assert PARENT_CHILDREN <= names
 
-    brian = next(c for c in children if c["name"] == "Brian Achieng")
+    child = next(c for c in children if c["name"] == PARENT_CHILD)
     track = client.get(
-        "/api/parent-portal/track", params={"student_id": brian["id"]}, headers=parent_headers
+        "/api/parent-portal/track", params={"student_id": child["id"]}, headers=parent_headers
     ).json()
-    assert track["student"]["name"] == "Brian Achieng"
+    assert track["student"]["name"] == PARENT_CHILD
     assert any(s["is_school_gate"] for s in track["stops"])
     # Sibling-shared stops still mark the requesting child's own stop.
     assert any(s["is_own"] for s in track["stops"])

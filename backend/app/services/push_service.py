@@ -16,8 +16,13 @@ Notification types:
   bus-approaching  bus arrived at the stop just before the child's stop
   reached-school   bus arrived at the school gate (morning, boarded students)
   on-way-home      afternoon run began — child is heading home
-  dropped-off      afternoon run ended (boarded students)
+  dropped-off      driver confirmed the drop-off at the child's stop (tap-time)
+  student-absent   driver marked the child absent at pickup (that child's parents only)
   incident         driver reported an issue on the child's bus
+
+Rows persist the run's period as run_type ('morning'/'afternoon') so the
+parent feed can filter by period even after the run itself is deleted
+(run_id is ON DELETE SET NULL).
 """
 
 import ipaddress
@@ -101,6 +106,7 @@ class PushService:
                         student_id=link["student_id"],
                         run_id=str(run["id"]),
                         bus_id=run.get("bus_id"),
+                        run_type=run.get("type"),
                     )
                 else:
                     self._notify(
@@ -111,6 +117,7 @@ class PushService:
                         student_id=link["student_id"],
                         run_id=str(run["id"]),
                         bus_id=run.get("bus_id"),
+                        run_type=run.get("type"),
                     )
         except Exception:
             logger.exception("notify_run_started failed")
@@ -127,9 +134,55 @@ class PushService:
                     student_id=student_id,
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
                 )
         except Exception:
             logger.exception("notify_student_boarded failed")
+
+    def notify_student_dropped_off(self, student: dict, run: dict) -> None:
+        """Driver confirmed the drop-off at the child's stop (afternoon,
+        tap-time) — tell that child's linked parents. Run-scoped
+        (run_id + student_id set) so a retried tap is dedup-suppressed."""
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type="dropped-off",
+                    title="Dropped off",
+                    body=f"{link['student_name']} has arrived at their stop and left the bus.",
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_student_dropped_off failed")
+
+    def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
+        """Driver marked the child absent at pickup — tell that child's linked
+        parents and nobody else. Run-scoped (run_id + student_id set) so a
+        repeat mark within the same run is dedup-suppressed. The school-side
+        channel is a student-stamped incident inserted by the caller, never a
+        parent fan-out."""
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id]):
+                body = f"{link['student_name']} was marked absent at pickup and will not board the bus today."
+                if reason:
+                    body = f"{body} Reason: {reason}"
+                self._notify(
+                    link["parent_id"],
+                    type="student-absent",
+                    title="Marked absent",
+                    body=body,
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_student_absent failed")
 
     def notify_reached_school(self, run: dict) -> None:
         """Morning arrival at the school gate (or morning run end).
@@ -150,26 +203,20 @@ class PushService:
                     student_id=link["student_id"],
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
                 )
         except Exception:
             logger.exception("notify_reached_school failed")
 
     def notify_run_ended(self, run: dict) -> None:
-        """Afternoon: every boarded student was dropped off."""
+        """Morning: reached-school for boarded students. Afternoon: nothing —
+        confirmed drop-offs were notified at tap time by
+        notify_student_dropped_off, and students the driver never confirmed
+        must not get a false 'dropped off' assertion when the end-run sweep
+        normalizes their status."""
         try:
             if run.get("type") == "morning":
                 self.notify_reached_school(run)
-                return
-            for link in self._boarded_links(run):
-                self._notify(
-                    link["parent_id"],
-                    type="dropped-off",
-                    title="Dropped off",
-                    body=f"{link['student_name']} has been dropped off at their stop.",
-                    student_id=link["student_id"],
-                    run_id=str(run["id"]),
-                    bus_id=run.get("bus_id"),
-                )
         except Exception:
             logger.exception("notify_run_ended failed")
 
@@ -195,6 +242,7 @@ class PushService:
                     student_id=link["student_id"],
                     run_id=None,  # incidents are not deduped: each report matters
                     bus_id=incident.get("bus_id"),
+                    run_type=incident.get("run_type"),
                 )
         except Exception:
             logger.exception("notify_incident failed")
@@ -221,6 +269,7 @@ class PushService:
                     student_id=link["student_id"],
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
                 )
         except Exception:
             logger.exception("notify_bus_approaching failed")
@@ -246,6 +295,7 @@ class PushService:
                     student_id=link["student_id"],
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
                 )
         except Exception:
             logger.exception("notify_bus_position failed")
@@ -279,6 +329,7 @@ class PushService:
         student_id: str | None,
         run_id: str | None,
         bus_id: str | None,
+        run_type: str | None = None,
     ) -> None:
         row = self.dao.insert_notification(
             str(parent_id),
@@ -288,6 +339,7 @@ class PushService:
             student_id=str(student_id) if student_id else None,
             run_id=run_id,
             bus_id=str(bus_id) if bus_id else None,
+            run_type=run_type,
         )
         if row is None:
             return  # run-scoped dedup suppressed a repeat

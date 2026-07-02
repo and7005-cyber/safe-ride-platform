@@ -98,6 +98,29 @@ def test_next_departure_falls_back_to_default_on_garbage():
     assert (when.hour, when.minute) == (15, 30)
 
 
+def test_reverse_geocode_not_found_without_key(no_keys):
+    assert geo_service.reverse_geocode(-1.286, 36.817) == {"found": False}
+
+
+def test_reverse_geocode_not_found_without_coordinates(no_keys):
+    assert geo_service.reverse_geocode(None, 36.817) == {"found": False}
+    assert geo_service.reverse_geocode(-1.286, None) == {"found": False}
+
+
+def test_reverse_geocode_swallows_provider_errors(monkeypatch):
+    class _Settings:
+        google_maps_api_key = "test-key"
+        mapbox_token = ""
+
+    monkeypatch.setattr(geo_service, "get_settings", lambda: _Settings())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(geo_service.httpx, "get", boom)
+    assert geo_service.reverse_geocode(-1.286, 36.817) == {"found": False}
+
+
 def test_places_autocomplete_empty_without_key(no_keys):
     assert geo_service.places_autocomplete("Yaya Centre") == []
 

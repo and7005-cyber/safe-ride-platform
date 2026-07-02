@@ -459,3 +459,38 @@ INSERT INTO public.run_stops (id, run_id, stop_order, name, scheduled_time, lat,
 
 
 SET session_replication_role = DEFAULT;
+
+-- Local test-fixture extension (NOT part of the prod snapshot) ---------------
+-- The snapshot has no bus-less child linked to the demo parent, but the test
+-- suites assert that entity class (a child card without driver actions on the
+-- parent home). Guarded like seeds 001/002: demo data must never load unless
+-- the session explicitly opts in (scripts/reset-local-db.sh does this).
+DO $$
+BEGIN
+  IF coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' THEN
+    RAISE EXCEPTION 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  END IF;
+END $$;
+
+-- Grace Njeri: Amina Achieng's bus-less child (bus_id is null on purpose).
+INSERT INTO public.live_students (id, name, grade, parent_name, parent_phone, parent_phone2, parent_email, home_address, home_lat, home_lng, pickup_time, status, bus_id, school_id, boarding_stop_name, created_at)
+VALUES ('50000000-0000-0000-0000-000000000005', 'Grace Njeri', 'Grade 1', 'Amina Achieng', '+254700000002', NULL, 'and7005@gmail.com', 'Karen, Nairobi', -1.319400, 36.706800, '07:00', 'at-school', NULL, '5cae0000-0000-0000-0000-000000000001', NULL, '2026-06-15 06:14:40.564728+00')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.live_parent_students (id, parent_id, student_id)
+VALUES ('52000000-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-000000000005')
+ON CONFLICT (id) DO NOTHING;
+
+-- Post-007 normalization: fresh bootstraps apply migrations (incl. 007's
+-- backfills) to an EMPTY database and only then load this pre-007-shaped
+-- snapshot, so the one-shot backfills must be replayed here idempotently to
+-- keep fresh environments identical to migrated production.
+UPDATE public.live_notifications n
+SET run_type = r.type
+FROM public.live_runs r
+WHERE n.run_id = r.id AND n.run_type IS NULL;
+
+UPDATE public.live_incidents i
+SET run_type = r.type
+FROM public.live_runs r
+WHERE i.run_id = r.id AND i.run_type IS NULL;

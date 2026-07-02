@@ -2,6 +2,8 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   ADMIN,
   API_URL,
+  DRIVER,
+  SEED,
   apiToken,
   authHeaders,
   cardContaining,
@@ -94,23 +96,47 @@ test("admin can create and delete a school with a map location", async ({ page }
   await expect(page.getByText(name)).toHaveCount(0);
 });
 
-test("admin can create and delete a route attached to a bus and school", async ({ page }) => {
+test("admin can create and delete a route attached to a bus and school", async ({ page, request }) => {
   const name = uniqueName("E2E Route");
+  // Seeded buses already hold a route of each type; a same-type route on one
+  // of them now 409s (R1). Attach the route to a fresh bus instead.
+  const busName = uniqueName("E2E RouteBus");
+  const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(adminToken);
+  const busResp = await request.post(`${API_URL}/api/fleet/buses`, {
+    headers,
+    data: { name: busName, plate_number: "E2E 100", capacity: 20, status: "idle" },
+  });
+  expect(busResp.ok()).toBeTruthy();
+  const busId = (await busResp.json()).id;
+
+  try {
   await adminLogin(page);
   await page.goto("/routes");
 
   await page.getByRole("button", { name: "Add Route" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
-  await pickSelectOption(dialog(page), "Bus", /Kifaru|Express/);
-  await pickSelectOption(dialog(page), "School", /Greenfield/);
+  await pickSelectOption(dialog(page), "Bus", busName);
+  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
+
+  // Every route card carries a map preview (R22) or its key-less/stop-less
+  // placeholder (R23) — never a broken map pane.
+  await expect(
+    cardContaining(page, name)
+      .locator('[data-testid="route-map-preview"] .gm-style, [data-testid="route-map-placeholder"]')
+      .first()
+  ).toBeVisible({ timeout: 15_000 });
 
   // Routes render as cards; the trash button is the card's last icon button.
   await cardContaining(page, name).getByRole("button").last().click();
   await confirmDelete(page);
   await expect(page.getByText(name)).toHaveCount(0);
+  } finally {
+    await request.delete(`${API_URL}/api/fleet/buses/${busId}`, { headers });
+  }
 });
 
 test("admin can create, edit, and delete a student", async ({ page }) => {
@@ -122,14 +148,47 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
   await page.getByRole("button", { name: "Add Student" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Grade").fill("Grade 4");
-  await fieldInput(dialog(page), "Parent name").fill("E2E Parent Contact");
-  await fieldInput(dialog(page), "Parent phone").fill("+254711111111");
+  // Parent contact fields live in two labeled groups (Parent 1 / Parent 2).
+  const parent1 = dialog(page).getByTestId("parent1-group");
+  const parent2 = dialog(page).getByTestId("parent2-group");
+  await fieldInput(parent1, "Name").fill("E2E Parent Contact");
+  await fieldInput(parent1, "Phone").fill("+254711111111");
+
+  // No email in either slot: save is blocked with an inline invariant message.
+  await dialog(page).getByRole("button", { name: "Save" }).click();
+  await expect(dialog(page).getByText("At least one parent email is required")).toBeVisible();
+  await expect(dialog(page)).toBeVisible();
+
+  // A Parent 2 email satisfies the cross-slot invariant (parent 1 phone + parent 2 email).
+  await fieldInput(parent2, "Email").fill("e2e-parent2@test.local");
+
+  // Clicking the map fills the address via reverse geocoding — asserted only
+  // when Google Maps loaded and the geocoder actually resolved (mock-free).
+  const mapReady = await dialog(page)
+    .locator(".gm-style")
+    .first()
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (mapReady) {
+    const reverse = page
+      .waitForResponse((r) => r.url().includes("/api/fleet/reverse-geocode"), { timeout: 10_000 })
+      .catch(() => null);
+    await dialog(page).getByTestId("map-picker").click({ position: { x: 150, y: 120 } });
+    const response = await reverse;
+    if (response && (await response.json()).found) {
+      await expect(fieldInput(dialog(page), "Home address")).not.toHaveValue("");
+    }
+  }
+
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
   const row = page.getByRole("row", { name: new RegExp(name) });
   // Actions are [mark-absent, edit, delete]; the pencil is the second button.
   await row.getByRole("button").nth(1).click();
+  // Status is live data — the dialog exposes no status select (R7).
+  await expect(dialog(page).locator('label:text-is("Status")')).toHaveCount(0);
   await fieldInput(dialog(page), "Name").fill(renamed);
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
@@ -188,33 +247,52 @@ test("admin can edit and delete a registered parent account", async ({ page, req
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
-test("admin can link and unlink a parent-student assignment", async ({ page, request }) => {
+test("creating a student with a registered parent's email links it to that parent", async ({ page, request }) => {
+  // Parent ↔ student assignment happens in the student form now (R12): a
+  // student carrying a registered parent's email is auto-linked on save.
   const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
   const headers = authHeaders(adminToken);
-  const studentName = uniqueName("E2E AssignKid");
-  const created = await request.post(`${API_URL}/api/students`, {
-    headers,
-    data: { name: studentName, grade: "Grade 1", parent_name: "", parent_phone: "" },
-  });
-  expect(created.ok()).toBeTruthy();
-  const studentId = (await created.json()).id;
 
+  const parentEmail = `e2e-assign-${Date.now()}@test.local`;
+  const parentName = uniqueName("E2E AssignParent");
+  const signup = await request.post(`${API_URL}/api/auth/signup`, {
+    data: { email: parentEmail, password: "ParentPass1!", full_name: parentName, role: "parent" },
+  });
+  expect(signup.ok()).toBeTruthy();
+
+  const studentName = uniqueName("E2E AssignKid");
   try {
     await adminLogin(page);
-    await page.goto("/parent-assignments");
+    await page.goto("/students");
 
-    await page.getByText("Select parent").click();
-    await page.getByRole("option", { name: /Amina Parent/ }).click();
-    await page.getByText("Select student").click();
-    await page.getByRole("option", { name: new RegExp(studentName) }).click();
-    await page.getByRole("button", { name: "Assign" }).click();
+    await page.getByRole("button", { name: "Add Student" }).click();
+    await fieldInput(dialog(page), "Name").fill(studentName);
+    await fieldInput(dialog(page), "Grade").fill("Grade 1");
+    // Parent 1 slot: the registered parent's email drives the link.
+    const parent1 = dialog(page).getByTestId("parent1-group");
+    await fieldInput(parent1, "Name").fill(parentName);
+    await fieldInput(parent1, "Phone").fill("+254711222333");
+    await fieldInput(parent1, "Email").fill(parentEmail);
+    await dialog(page).getByRole("button", { name: "Save" }).click();
     await expect(page.getByRole("row", { name: new RegExp(studentName) })).toBeVisible();
 
-    await page.getByRole("row", { name: new RegExp(studentName) }).getByRole("button").last().click();
-    await confirmDelete(page);
-    await expect(page.getByRole("row", { name: new RegExp(studentName) })).toHaveCount(0);
+    // The parent's registered row now lists the student among its children.
+    const parents = await request.get(`${API_URL}/api/accounts/parents`, { headers });
+    expect(parents.ok()).toBeTruthy();
+    const parentRow = (await parents.json()).find((p: any) => p.email === parentEmail);
+    expect(parentRow?.status).toBe("registered");
+    expect(parentRow?.students).toContain(studentName);
   } finally {
-    await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
+    const students = await request.get(`${API_URL}/api/students`, { headers });
+    if (students.ok()) {
+      const row = (await students.json()).find((s: any) => s.name === studentName);
+      if (row) await request.delete(`${API_URL}/api/students/${row.id}`, { headers });
+    }
+    const parents = await request.get(`${API_URL}/api/accounts/parents`, { headers });
+    if (parents.ok()) {
+      const row = (await parents.json()).find((p: any) => p.email === parentEmail);
+      if (row?.id) await request.delete(`${API_URL}/api/accounts/parents/${row.id}`, { headers });
+    }
   }
 });
 
@@ -223,7 +301,8 @@ test("admin can add and delete a manual run record", async ({ page }) => {
   await page.goto("/runs");
 
   await page.getByRole("button", { name: "Add Run" }).click();
-  await pickSelectOption(dialog(page), "Bus", /Kifaru|Express/);
+  await pickSelectOption(dialog(page), "Bus", SEED.busOption);
+  await pickSelectOption(dialog(page), "Route", /Express 1 — Afternoon/);
   await pickSelectOption(dialog(page), "Type", "Afternoon");
   await pickSelectOption(dialog(page), "Status", "Completed");
   await fieldInput(dialog(page), "Date").fill("2030-01-01");
@@ -231,6 +310,22 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 
   const row = page.getByRole("row", { name: /2030-01-01/ });
   await expect(row).toBeVisible();
+
+  // Clicking the row (not its action buttons) opens the read-only Run Report.
+  await row.getByRole("cell", { name: "2030-01-01" }).click();
+  await expect(dialog(page).getByText("Run Report")).toBeVisible();
+  await expect(dialog(page).getByText("Express 1 — Afternoon")).toBeVisible();
+  await expect(dialog(page).getByText("Students", { exact: true })).toBeVisible();
+  await dialog(page).getByRole("button", { name: "Close" }).click();
+  await expect(dialog(page)).toHaveCount(0);
+
+  // The pencil still opens the edit form — not the report (stopPropagation).
+  await row.getByRole("button").first().click();
+  await expect(dialog(page).getByText("Edit Run")).toBeVisible();
+  await expect(dialog(page).getByText("Run Report")).toHaveCount(0);
+  await dialog(page).getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog(page)).toHaveCount(0);
+
   await row.getByRole("button").last().click();
   await confirmDelete(page);
   await expect(page.getByRole("row", { name: /2030-01-01/ })).toHaveCount(0);
@@ -239,7 +334,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 test("admin can acknowledge and delete a driver incident", async ({ page, request }) => {
   // A driver files an incident through the API...
   const pinLoginResponse = await request.post(`${API_URL}/api/auth/pin-login`, {
-    data: { pin: "1234" },
+    data: { pin: DRIVER.pin },
   });
   const driverToken = (await pinLoginResponse.json()).token;
   const marker = uniqueName("E2E incident");
@@ -266,7 +361,7 @@ test("dashboard and fleet map render live fleet data", async ({ page }) => {
   await adminLogin(page);
   await expect(page.getByText("Active Buses")).toBeVisible();
   await expect(page.getByText("Fleet Status")).toBeVisible();
-  await expect(page.getByText("Express 1").first()).toBeVisible();
+  await expect(page.getByText(SEED.driverBus).first()).toBeVisible();
 
   await page.goto("/fleet-map");
   await expect(page.getByText("Live bus positions")).toBeVisible();
@@ -275,7 +370,10 @@ test("dashboard and fleet map render live fleet data", async ({ page }) => {
   await expect(page.locator(".gm-style").first()).toBeVisible({ timeout: 15_000 });
 });
 
-test("route planner returns a Google traffic-aware route", async ({ page }) => {
+// Route planner: calculate → save → reset (R17/R19/R20). CSV import (R21) is
+// skipped here on purpose — its parser is covered by tests/unit/plannerCsv.test.ts.
+test("route planner returns a Google traffic-aware route, saves it, and resets", async ({ page, request }) => {
+  const routeName = uniqueName("E2E Planned");
   await adminLogin(page);
   await page.goto("/fleet-map");
   await expect(page.getByText("Route planner")).toBeVisible();
@@ -296,4 +394,37 @@ test("route planner returns a Google traffic-aware route", async ({ page }) => {
   // Reorder (drag-to-reorder uses the same backend path) recomputes the route.
   await page.getByRole("button", { name: "Move down" }).first().click();
   await expect(page.getByTestId("route-distance")).not.toHaveText("—");
+  await expect(page.getByTestId("save-to-routes")).toBeEnabled({ timeout: 20_000 });
+
+  // Save the selected option as a route (R17): name + required school.
+  await page.getByTestId("save-to-routes").click();
+  await fieldInput(dialog(page), "Route name").fill(routeName);
+  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  await dialog(page).getByTestId("confirm-save-route").click();
+
+  // Success closes the dialog, confirms with a Routes link, and resets the planner (R19).
+  await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText("Route saved", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "View routes" })).toBeVisible();
+  await expect(page.getByTestId("route-result")).toHaveCount(0);
+  await expect(page.getByTestId("address-input-0")).toHaveValue("");
+
+  // The route persisted with its ordered custom stops.
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(token);
+  const listed = await request.get(`${API_URL}/api/fleet/routes`, { headers });
+  expect(listed.ok()).toBeTruthy();
+  const saved = (await listed.json()).find((r: { name: string }) => r.name === routeName);
+  expect(saved).toBeTruthy();
+  expect(saved.custom_stops).toBeTruthy();
+  expect(saved.route_stops.length).toBeGreaterThan(0);
+
+  // Reset clears planner state (R20): rows emptied and results gone.
+  await page.getByTestId("address-input-0").fill("Somewhere, Nairobi");
+  await page.getByTestId("reset-planner").click();
+  await expect(page.getByTestId("address-input-0")).toHaveValue("");
+  await expect(page.getByTestId("route-result")).toHaveCount(0);
+
+  // API cleanup (the beforeAll sweep also catches aborted runs).
+  await request.delete(`${API_URL}/api/fleet/routes/${saved.id}`, { headers });
 });

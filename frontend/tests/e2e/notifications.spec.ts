@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import {
   API_URL,
   PARENT,
+  SEED,
   apiDriverToken,
   apiToken,
   authHeaders,
@@ -39,7 +40,7 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   const driverToken = await apiDriverToken(request);
   const driverHeaders = authHeaders(driverToken);
 
-  // Drive past the first stop and board Brian.
+  // Drive past the first stop and board the parent's child.
   await request.post(`${API_URL}/api/runs/driver/arrive`, {
     headers: driverHeaders,
     data: { run_id: runId },
@@ -50,10 +51,10 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
       headers: authHeaders(parentToken),
     })
   ).json();
-  const brian = children.find((c: any) => c.name === "Brian Achieng");
+  const child = children.find((c: any) => c.name === SEED.parentChild);
   await request.post(`${API_URL}/api/runs/driver/boarding`, {
     headers: driverHeaders,
-    data: { student_id: brian.id, on_bus: true },
+    data: { student_id: child.id, on_bus: true },
   });
   // Complete the run at the school gate.
   await request.post(`${API_URL}/api/runs/driver/end`, {
@@ -67,8 +68,29 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
   await expect(page.getByText("Boarded the Bus").first()).toBeVisible();
   await expect(page.getByText("Arrived at School").first()).toBeVisible();
-  await expect(page.getByText(/has boarded Express 1/).first()).toBeVisible();
+  await expect(page.getByText(new RegExp(`has boarded ${SEED.driverBus}`)).first()).toBeVisible();
   await expect(page.getByText(/has reached school safely/).first()).toBeVisible();
+
+  // Period filter (R33): these run events carry run_type = morning, so they
+  // survive the Morning toggle and vanish under Afternoon (null-run_type rows
+  // such as incidents only show under All).
+  const feedCards = page.locator("div[class*='bg-card']");
+  await page.getByRole("button", { name: "Morning", exact: true }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Afternoon", exact: true }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" })).toHaveCount(0);
+  await page.getByRole("button", { name: "All", exact: true }).click();
+
+  // Type filter (R33): narrowing to the boarded label leaves only boarded rows.
+  await page.getByRole("combobox", { name: "Filter by type" }).click();
+  await page.getByRole("option", { name: "Boarded the Bus" }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
+  await expect(feedCards.filter({ hasText: "Bus On The Way" })).toHaveCount(0);
+  await expect(feedCards.filter({ hasText: "Arrived at School" })).toHaveCount(0);
+
+  // History (R35): the 7-day window includes everything just created.
+  await page.getByRole("tab", { name: "History" }).click();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
 });
 
 test("opening the alerts page marks notifications as read", async ({ page, request }) => {
@@ -136,7 +158,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
 });
 
 test("notification types are scoped to the right parent", async ({ request }) => {
-  // A parent with no children on Express 1 must see none of its run alerts.
+  // A parent with no children on the demo driver's bus must see none of its run alerts.
   const runId = await startMorningRun(request);
   const driverToken = await apiDriverToken(request);
   await request.post(`${API_URL}/api/runs/driver/end`, {

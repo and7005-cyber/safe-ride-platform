@@ -20,6 +20,24 @@ class ParentLiveDao:
         return [r["student_id"] for r in rows]
 
     def list_children(self, parent_id: str) -> list[dict[str, Any]]:
+        """The parent's children, each with a derived ``display_status``.
+
+        ``display_status`` is computed at read time, never stored (the raw
+        ``status`` field stays untouched in the payload — admin keeps the
+        operational value). Branches, in order:
+
+        - a today-absence exists (live_student_absences, Africa/Nairobi today)
+          → 'absent', whatever the raw status says;
+        - raw 'absent' with no today-absence → 'at-home' (stale absent);
+        - raw 'on-bus' with no active run today whose run_stops contain the
+          student → 'at-home' (stale on-bus). "Active" is the codebase's
+          status <> 'completed' convention, so 'delayed' keeps counting, and
+          membership goes through run_stops — never live_students.bus_id,
+          which is derived, morning-preferring, and drifts;
+        - raw 'dropped-off' with no afternoon run today containing the student
+          (same run_stops membership) → 'at-home' (stale dropped-off);
+        - anything else → the raw status.
+        """
         with get_connection() as conn:
             ids = self._child_ids(conn, parent_id)
             if not ids:
@@ -28,7 +46,32 @@ class ParentLiveDao:
                 """
                 select s.*, b.name as bus_name, b.driver_name, b.driver_phone,
                        b.current_lat as bus_current_lat, b.current_lng as bus_current_lng,
-                       sc.name as school_name
+                       sc.name as school_name,
+                       case
+                           when exists (
+                               select 1 from live_student_absences a
+                               where a.student_id = s.id
+                                 and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                           ) then 'absent'
+                           when s.status = 'absent' then 'at-home'
+                           when s.status = 'on-bus' and not exists (
+                               select 1
+                               from live_runs r
+                               join run_stops rs on rs.run_id = r.id
+                               where rs.student_id = s.id
+                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
+                                 and r.status <> 'completed'
+                           ) then 'at-home'
+                           when s.status = 'dropped-off' and not exists (
+                               select 1
+                               from live_runs r
+                               join run_stops rs on rs.run_id = r.id
+                               where rs.student_id = s.id
+                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
+                                 and r.type = 'afternoon'
+                           ) then 'at-home'
+                           else s.status
+                       end as display_status
                 from live_students s
                 left join live_buses b on b.id = s.bus_id
                 left join live_schools sc on sc.id = s.school_id
@@ -108,7 +151,15 @@ class ParentLiveDao:
                 run = dict(r) if r else None
         return {"student": dict(student), "stops": stops, "run": run}
 
-    def list_alerts(self, parent_id: str) -> list[dict[str, Any]]:
+    def list_alerts(
+        self, parent_id: str, window_hours: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Incidents on the children's buses, newest first.
+
+        window_hours, when set, keeps only rows newer than that rolling window
+        (24 = Recent, 168 = History); limit is hard-capped at 200 (R35/R36).
+        """
+        limit = max(1, min(int(limit), 200))
         with get_connection() as conn:
             ids = self._child_ids(conn, parent_id)
             if not ids:
@@ -120,14 +171,24 @@ class ParentLiveDao:
             bus_ids = [r["bus_id"] for r in bus_rows]
             if not bus_ids:
                 return []
+            window_sql = ""
+            params: list = [bus_ids]
+            if window_hours is not None:
+                window_sql = " and created_at > now() - (%s || ' hours')::interval"
+                params.append(int(window_hours))
+            params.append(limit)
+            # student_id-stamped incidents are child-specific (absence reports
+            # for the school): only the admin Alerts page may see them — no
+            # other parent on the bus learns a named child's absence here.
             rows = conn.execute(
-                """
-                select id, driver_name, bus_id, bus_name, type, description, created_at
+                f"""
+                select id, driver_name, bus_id, bus_name, type, run_type, description, created_at
                 from live_incidents
-                where bus_id = any(%s)
+                where bus_id = any(%s) and student_id is null{window_sql}
                 order by created_at desc
+                limit %s
                 """,
-                (bus_ids,),
+                params,
             ).fetchall()
         return [dict(r) for r in rows]
 

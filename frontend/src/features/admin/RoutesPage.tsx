@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { RouteMapPreview } from "@/components/map/RouteMapPreview";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
 import { useBuses, useRoutes, useSchools } from "@/lib/queries";
@@ -165,7 +166,8 @@ export function RoutesPage() {
                   <Button variant="ghost" size="icon" onClick={() => remove(route.id)}><Trash2 className="h-4 w-4" /></Button>
                 </div>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-3">
+                <RouteMapPreview stops={route.route_stops ?? []} polyline={route.polyline} />
                 {stops.length === 0 ? (
                   <p className="text-sm text-muted-foreground">
                     No students assigned to this route yet. Add students with home addresses to see pickups here.

@@ -44,11 +44,18 @@ CUSTOM_URL="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" ApiCustomDomainUrl)"
 
 echo ""
 echo "==> Running DB migrations + seeds via ${MIGRATE_FN}"
-aws lambda invoke --region "$BACKEND_REGION" --function-name "$MIGRATE_FN" \
+# NOTE deploy window: the new API code is already live at this point and its
+# DAOs hard-depend on the latest migration objects. The window is brief, but a
+# FAILED migration must abort loudly rather than leave the API 500ing.
+MIGRATE_STATUS=$(aws lambda invoke --region "$BACKEND_REGION" --function-name "$MIGRATE_FN" \
   --cli-binary-format raw-in-base64-out --payload '{}' \
-  "$STATE_DIR/migrate-out.json" >/dev/null
+  "$STATE_DIR/migrate-out.json" --query 'FunctionError' --output text)
 echo "    migrate result:"
 cat "$STATE_DIR/migrate-out.json"; echo
+if [ "$MIGRATE_STATUS" != "None" ] && [ -n "$MIGRATE_STATUS" ]; then
+  echo "ERROR: migrate Lambda failed ($MIGRATE_STATUS) — the live API depends on these migrations. Fix and re-run immediately." >&2
+  exit 1
+fi
 
 echo ""
 echo "Backend deployed:"

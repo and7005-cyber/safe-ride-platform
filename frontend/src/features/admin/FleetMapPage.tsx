@@ -1,9 +1,21 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { AdvancedMarker, InfoWindow, Map } from "@vis.gl/react-google-maps";
-import { ArrowDown, ArrowUp, GripVertical, Plus, Route as RouteIcon, Trash2, Wand2 } from "lucide-react";
+import {
+  ArrowDown, ArrowUp, GripVertical, Plus, RotateCcw,
+  Route as RouteIcon, Save, Trash2, Upload, Wand2,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -13,9 +25,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ToastAction } from "@/components/ui/toast";
 import { useToast } from "@/components/ui/use-toast";
 import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
 import { AddressAutocomplete } from "@/features/admin/components/AddressAutocomplete";
+import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
 import { useBuses, useSchools } from "@/lib/queries";
@@ -74,6 +88,8 @@ export function FleetMapPage() {
   const { data: buses = [] } = useBuses({ poll: true });
   const { data: schools = [] } = useSchools();
   const { toast } = useToast();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const located = (buses as any[]).filter((b) => b.current_lat != null && b.current_lng != null);
   const [selectedBus, setSelectedBus] = useState<string | null>(null);
@@ -98,10 +114,38 @@ export function FleetMapPage() {
   const [busy, setBusy] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
 
+  // Save-to-Routes dialog (R17/R19) and CSV import (R21).
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [saveSchoolId, setSaveSchoolId] = useState("none");
+  const [saveBusId, setSaveBusId] = useState("none");
+  const [saveError, setSaveError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [csvOpen, setCsvOpen] = useState(false);
+
+  // Request generation (R20): reset and every plan()/reorder() call bump the
+  // counter; a response only applies if its generation is still current, so
+  // anything in flight at reset time is discarded.
+  const requestGeneration = useRef(0);
+
   const setRow = (i: number, patch: Partial<PlanRow>) =>
     setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, { address: "", pickup_time: "" }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i));
+
+  const resetPlanner = () => {
+    requestGeneration.current += 1;
+    setRows([{ address: "", pickup_time: "" }]);
+    setType("morning");
+    setSchoolId("none");
+    setOptions(null);
+    setUnresolved([]);
+    setProvider("");
+    setSelected(0);
+    setDragIndex(null);
+    setLoading(false);
+    setBusy(false);
+  };
 
   const plan = async () => {
     const stops = rows.filter((r) => r.address.trim());
@@ -109,6 +153,7 @@ export function FleetMapPage() {
       toast({ title: "Add at least two addresses", variant: "destructive" });
       return;
     }
+    const generation = ++requestGeneration.current;
     setLoading(true);
     try {
       const res = await api.post("/api/fleet/route-options", {
@@ -121,6 +166,7 @@ export function FleetMapPage() {
           lng: s.lng ?? null,
         })),
       });
+      if (generation !== requestGeneration.current) return; // stale (reset/newer request)
       setOptions(res.options ?? []);
       setUnresolved(res.unresolved ?? []);
       setProvider(res.provider ?? "");
@@ -133,8 +179,12 @@ export function FleetMapPage() {
         });
       }
     } catch (err) {
+      if (generation !== requestGeneration.current) return;
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
+      // Spinners clear unconditionally — the generation guard only protects
+      // response-derived state. A plan superseded by a reorder (or vice
+      // versa) must never leave its own busy flag stuck on.
       setLoading(false);
     }
   };
@@ -148,6 +198,7 @@ export function FleetMapPage() {
     if (to < 0 || to >= stops.length || from === to) return;
     const [moved] = stops.splice(from, 1);
     stops.splice(to, 0, moved);
+    const generation = ++requestGeneration.current;
     setBusy(true);
     try {
       const res = await api.post("/api/fleet/route-options", {
@@ -158,16 +209,80 @@ export function FleetMapPage() {
           pickup_time: s.pickup_time ?? null, is_school: !!s.is_school,
         })),
       });
+      if (generation !== requestGeneration.current) return; // stale (reset/newer request)
       const opt = (res.options ?? [])[0];
       if (opt) {
         setProvider(res.provider ?? provider);
         setOptions((prev) => (prev ? prev.map((o, i) => (i === selected ? opt : o)) : prev));
       }
     } catch (err) {
+      if (generation !== requestGeneration.current) return;
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
+      // Unconditional for the same reason as plan()'s finally above.
       setBusy(false);
       setDragIndex(null);
+    }
+  };
+
+  const openSaveDialog = () => {
+    setSaveName(`Planned route ${new Date().toISOString().slice(0, 10)}`);
+    setSaveSchoolId(schoolId); // planner's school preselected; "none" must be changed
+    setSaveBusId("none");
+    setSaveError("");
+    setSaveOpen(true);
+  };
+
+  const saveRoute = async () => {
+    // Snapshot at click time — never re-read planner state after the await.
+    const option = activeOption;
+    if (!option) return;
+    if (saveSchoolId === "none") {
+      setSaveError("Please choose a school — every route belongs to one.");
+      return;
+    }
+    const name = saveName.trim();
+    if (!name) {
+      setSaveError("Please give the route a name.");
+      return;
+    }
+    setSaving(true);
+    setSaveError("");
+    try {
+      await api.post("/api/fleet/routes", {
+        name,
+        type,
+        school_id: saveSchoolId,
+        bus_id: saveBusId === "none" ? null : saveBusId,
+        stops: option.stops.map((s) => ({
+          label: s.label,
+          lat: s.lat,
+          lng: s.lng,
+          pickup_time: s.pickup_time ?? null,
+          is_school: !!s.is_school,
+        })),
+        polyline: option.polyline ?? null,
+        total_distance_m: option.total_distance_m ?? null,
+        total_duration_s: option.total_duration_s ?? null,
+      });
+      setSaveOpen(false);
+      toast({
+        title: "Route saved",
+        description: name,
+        action: (
+          <ToastAction altText="View routes" onClick={() => navigate("/routes")}>
+            View routes
+          </ToastAction>
+        ),
+      });
+      queryClient.invalidateQueries({ queryKey: ["routes"] });
+      resetPlanner();
+    } catch (err) {
+      // Bus conflicts (409) and other failures keep the dialog open with the
+      // server's message so the admin can pick another bus or rename.
+      setSaveError((err as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -303,7 +418,12 @@ export function FleetMapPage() {
                     </Button>
                   </div>
                 ))}
-                <Button variant="outline" size="sm" onClick={addRow}><Plus className="h-4 w-4" /> Add stop</Button>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" onClick={addRow}><Plus className="h-4 w-4" /> Add stop</Button>
+                  <Button variant="outline" size="sm" onClick={() => setCsvOpen(true)}>
+                    <Upload className="h-4 w-4" /> Upload CSV
+                  </Button>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -329,9 +449,14 @@ export function FleetMapPage() {
                 </div>
               </div>
 
-              <Button onClick={plan} disabled={loading} className="w-full" data-testid="get-route-options">
-                <Wand2 className="h-4 w-4" /> {loading ? "Planning…" : "Get route options"}
-              </Button>
+              <div className="flex gap-2">
+                <Button onClick={plan} disabled={loading} className="flex-1" data-testid="get-route-options">
+                  <Wand2 className="h-4 w-4" /> {loading ? "Planning…" : "Get route options"}
+                </Button>
+                <Button variant="outline" onClick={resetPlanner} data-testid="reset-planner">
+                  <RotateCcw className="h-4 w-4" /> Reset
+                </Button>
+              </div>
 
               {options && (
                 <div className="space-y-3 pt-2" data-testid="route-result">
@@ -415,6 +540,20 @@ export function FleetMapPage() {
                           </li>
                         ))}
                       </ol>
+
+                      <Button
+                        className="w-full"
+                        onClick={openSaveDialog}
+                        disabled={busy || loading || unresolved.length > 0}
+                        data-testid="save-to-routes"
+                      >
+                        <Save className="h-4 w-4" /> Save to Routes
+                      </Button>
+                      {unresolved.length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Fix the unlocated addresses above before saving.
+                        </p>
+                      )}
                     </>
                   )}
                 </div>
@@ -423,6 +562,54 @@ export function FleetMapPage() {
           </Card>
         </div>
       </div>
+
+      {/* Save-to-Routes dialog (R17): persists the selected option as a custom-stops route. */}
+      <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Save to Routes</DialogTitle></DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-1">
+              <Label>Route name</Label>
+              <Input value={saveName} onChange={(e) => setSaveName(e.target.value)} />
+            </div>
+            <div className="space-y-1">
+              <Label>School</Label>
+              <Select value={saveSchoolId} onValueChange={(v) => { setSaveSchoolId(v); setSaveError(""); }}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">— Choose a school —</SelectItem>
+                  {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Bus</Label>
+              <Select value={saveBusId} onValueChange={setSaveBusId}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">— Unassigned —</SelectItem>
+                  {(buses as any[]).map((b) => <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+            {saveError && <p className="text-sm text-destructive" data-testid="save-route-error">{saveError}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveOpen(false)} disabled={saving}>Cancel</Button>
+            <Button onClick={saveRoute} disabled={saving} data-testid="confirm-save-route">
+              {saving ? "Saving…" : "Save route"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* CSV import (R21): appends parsed stop rows to the planner. */}
+      <PlannerCsvDialog
+        open={csvOpen}
+        onOpenChange={setCsvOpen}
+        existingRows={rows}
+        onImport={(next) => setRows(next)}
+      />
     </div>
   );
 }

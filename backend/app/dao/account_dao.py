@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.student_live_dao import _ConnParentLinks, link_account_to_matching_students
 
 
 class AccountDao:
@@ -74,19 +75,26 @@ class AccountDao:
                 {**dict(r), "status": "registered", "students": list(r["students"])}
                 for r in registered
             ]
-            # Pending parents: student.parent_email with no matching account.
+            # Pending parents: an email in either parent slot with no matching
+            # account (R11 — Parent 2 shows up as pending too).
             pending = conn.execute(
                 """
-                select parent_email, parent_name,
+                with slots as (
+                    select parent_email as email, parent_name as pname, name
+                    from live_students where parent_email is not null
+                    union all
+                    select parent2_email, parent2_name, name
+                    from live_students where parent2_email is not null
+                )
+                select email as parent_email, pname as parent_name,
                        coalesce(array_agg(name) filter (where name is not null), '{}') as students
-                from live_students
-                where parent_email is not null
-                    and lower(parent_email) not in (
+                from slots
+                where lower(email) not in (
                         select lower(email) from app_users u
                         join app_user_roles r on r.user_id = u.id and r.role = 'parent'
                     )
-                group by parent_email, parent_name
-                order by parent_name asc
+                group by email, pname
+                order by pname asc
                 """
             ).fetchall()
             for p in pending:
@@ -121,32 +129,35 @@ class AccountDao:
             ).fetchone()
         return bool(row)
 
-    # --- parent-student assignments ---------------------------------------
+    def link_parent_to_matching_students(self, parent_id, email: str) -> int:
+        """Link a (new) parent account to every student carrying its email in
+        either parent slot (R11), honouring the per-student link cap. Returns
+        the number of links created.
 
-    def list_parent_students(self) -> list[dict[str, Any]]:
+        Signup emails are self-asserted and unverified, so every auto-link
+        also raises an admin-visible incident (no bus/student stamp, so it
+        never reaches a parent feed): the office knows its families and can
+        catch an email claimed by the wrong person before it matters.
+        """
         with get_connection() as conn:
-            rows = conn.execute(
-                """
-                select ps.id, ps.parent_id, ps.student_id,
-                       u.full_name as parent_name, s.name as student_name
-                from live_parent_students ps
-                join app_users u on u.id = ps.parent_id
-                join live_students s on s.id = ps.student_id
-                order by u.full_name asc
-                """
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def link_parent_student(self, parent_id: str, student_id: str) -> dict[str, Any]:
-        with get_connection() as conn:
-            row = conn.execute(
-                "insert into live_parent_students (parent_id, student_id) values (%s, %s) "
-                "on conflict (parent_id, student_id) do update set parent_id = excluded.parent_id "
-                "returning *",
-                (parent_id, student_id),
-            ).fetchone()
-        return dict(row)
-
-    def unlink_parent_student(self, link_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_parent_students where id = %s", (link_id,))
+            created = link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
+            if created:
+                names = [
+                    r["name"]
+                    for r in conn.execute(
+                        """
+                        select s.name from live_students s
+                        join live_parent_students ps on ps.student_id = s.id
+                        where ps.parent_id = %s order by s.name
+                        """,
+                        (parent_id,),
+                    ).fetchall()
+                ]
+                conn.execute(
+                    "insert into live_incidents (type, description) values ('other', %s)",
+                    (
+                        f"Parent signup auto-linked: {email} now tracks "
+                        f"{', '.join(names)} — verify this is the child's parent.",
+                    ),
+                )
+            return created

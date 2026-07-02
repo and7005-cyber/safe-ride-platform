@@ -3,7 +3,7 @@ import { Bus, Clock, TriangleAlert, Users } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatCard } from "@/features/admin/components/StatCard";
-import { useBuses, useRuns, useStudents, useTodayIncidentCount } from "@/lib/queries";
+import { useActiveRuns, useBuses, useRuns, useStudents, useTodayIncidentCount } from "@/lib/queries";
 
 const RUN_STATUS_VARIANT: Record<string, "default" | "success" | "warning"> = {
   "in-progress": "success",
@@ -21,6 +21,9 @@ const BUS_STATUS_VARIANT: Record<string, "success" | "warning" | "secondary" | "
 export function DashboardPage() {
   const { data: buses = [] } = useBuses();
   const { data: runs = [] } = useRuns();
+  // Server-side predicate (today Nairobi + non-completed), polled so ended runs
+  // drop off the card without a reload.
+  const { data: liveRuns = [] } = useActiveRuns();
   const { data: students = [] } = useStudents();
   const { data: todayIncidents } = useTodayIncidentCount();
 
@@ -30,7 +33,6 @@ export function DashboardPage() {
   const delayed = buses.filter((b: any) => b.status === "delayed").length;
   const studentsOnBus = students.filter((s: any) => s.status === "on-bus").length;
   const incidentsToday = todayIncidents?.count ?? 0;
-  const liveRuns = runs.filter((r: any) => r.status !== "completed");
 
   return (
     <div className="space-y-6">

@@ -18,10 +18,19 @@ export function MapPicker({
   lat,
   lng,
   onPick,
+  onMapPick,
 }: {
   lat: number | null;
   lng: number | null;
   onPick: (lat: number, lng: number) => void;
+  /**
+   * Fired only for direct map interactions (click / marker drag), after
+   * `onPick` — not for internal search-box picks, where the address is
+   * already known. Lets the parent reverse-geocode the point into its own
+   * address field (StudentsPage); optional so other consumers (SchoolsPage)
+   * are unchanged.
+   */
+  onMapPick?: (lat: number, lng: number) => void;
 }) {
   const [search, setSearch] = useState("");
   // AdvancedMarker drag-end also fires a map click (vis.gl quirk) — suppress it.
@@ -50,7 +59,10 @@ export function MapPicker({
           onClick={(e) => {
             if (justDragged.current) return;
             const ll = e.detail.latLng;
-            if (ll) onPick(round(ll.lat), round(ll.lng));
+            if (ll) {
+              onPick(round(ll.lat), round(ll.lng));
+              onMapPick?.(round(ll.lat), round(ll.lng));
+            }
           }}
         >
           <Recenter lat={lat} lng={lng} />
@@ -63,7 +75,10 @@ export function MapPicker({
               }}
               onDragEnd={(e: google.maps.MapMouseEvent) => {
                 const p = e.latLng;
-                if (p) onPick(round(p.lat()), round(p.lng()));
+                if (p) {
+                  onPick(round(p.lat()), round(p.lng()));
+                  onMapPick?.(round(p.lat()), round(p.lng()));
+                }
                 setTimeout(() => {
                   justDragged.current = false;
                 }, 0);
