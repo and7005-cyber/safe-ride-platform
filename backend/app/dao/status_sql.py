@@ -9,8 +9,10 @@ The derivation is day-scoped to Africa/Nairobi, computed at read time and
 never stored (the raw ``status`` column stays untouched in every payload).
 Branches, in order:
 
-- a today-absence exists (live_student_absences) → 'absent', whatever the
-  raw status says;
+- a whole-day today-absence exists (live_student_absences, scope='day') →
+  'absent', whatever the raw status says. Partial-scope rows ('morning'/
+  'afternoon' — parent Cancel-a-Ride) gate rosters per run type but never
+  the displayed status (U4);
 - raw 'absent' with no today-absence → 'at-home' (stale absent);
 - raw 'on-bus' with no active run today whose run_stops contain the student
   → 'at-home' (stale on-bus). "Active" is the codebase's
@@ -26,14 +28,12 @@ The admin students list wraps this expression with its own 'unassigned' rule
 wrap is admin-side only and lives in student_live_dao.
 """
 
-# U4 adds the scope = 'day' predicate to the absent-override branch below
-# once migration 008 introduces live_student_absences.scope: partial-scope
-# cancellations gate rosters, never the displayed status.
 _DISPLAY_STATUS_CASE = """case
                            when exists (
                                select 1 from live_student_absences a
                                where a.student_id = {student}.id
                                  and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                                 and a.scope = 'day'
                            ) then 'absent'
                            when {student}.status = 'absent' then 'at-home'
                            when {student}.status = 'on-bus' and not exists (
