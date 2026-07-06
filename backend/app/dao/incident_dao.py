@@ -78,6 +78,42 @@ class IncidentDao:
             ).fetchone()
         return dict(row)
 
+    def create_cancellation_incident(
+        self,
+        student_id: str,
+        description: str,
+        bus_id: str | None,
+        bus_name: str | None,
+        run_type: str | None,
+    ) -> dict[str, Any]:
+        """Insert a parent Cancel-a-Ride alert for the admin Alerts page (U5).
+
+        Student-stamped like the driver-absent incident: these rows surface
+        only on the admin Alerts page (ParentLiveDao.list_alerts excludes
+        student_id rows) and callers must never hand them to
+        push_service.notify_incident — its bus-wide fan-out would tell every
+        family on the bus about a named child; the household's channel is
+        notify_ride_cancelled. Not create_driver_incident either: that path
+        keys its bus lookup on driver_id, which would stamp NULL bus context
+        — or the acting parent's name in the driver slot. Here the caller
+        passes the covered route's bus and the driver columns stay NULL; the
+        acting parent is named only in the description. run_id stays NULL
+        (the cancellation precedes any run); run_type carries the period,
+        scope-mapped (whole-day → NULL).
+        """
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                insert into live_incidents
+                    (driver_id, driver_name, bus_id, bus_name, type, description,
+                     run_id, run_type, student_id)
+                values (null, null, %s, %s, 'cancellation', %s, null, %s, %s)
+                returning *
+                """,
+                (bus_id, bus_name, description, run_type, student_id),
+            ).fetchone()
+        return dict(row)
+
     def acknowledge(self, incident_id: str, admin_id: str) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(

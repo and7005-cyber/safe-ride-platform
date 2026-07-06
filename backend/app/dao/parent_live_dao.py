@@ -27,6 +27,16 @@ class ParentLiveDao:
         ``status`` field stays untouched in the payload — admin keeps the
         operational value). The branch-by-branch derivation lives in
         ``app.dao.status_sql``, shared with the admin students list.
+
+        Each row also carries ``cancellation`` (U5): today's parent-sourced
+        absence as ``{scope, withdrawable}``, else None (a staff-sourced
+        absence is not a cancellation — it surfaces through display_status
+        when whole-day). ``withdrawable`` mirrors the withdraw guard: some
+        covered run type still has NO run row today involving the child
+        (run-row existence, not the active-run predicate — completion must
+        not reopen withdrawal). For a merged 'day' row that means at least
+        one half is still withdrawable, which is exactly when the UI should
+        offer the action (U13's dialog picks the half).
         """
         with get_connection() as conn:
             ids = self._child_ids(conn, parent_id)
@@ -37,16 +47,127 @@ class ParentLiveDao:
                 select s.*, b.name as bus_name, b.driver_name, b.driver_phone,
                        b.current_lat as bus_current_lat, b.current_lng as bus_current_lng,
                        sc.name as school_name,
-                       {display_status_case("s")} as display_status
+                       {display_status_case("s")} as display_status,
+                       a.scope as cancel_scope, a.source as cancel_source,
+                       case when a.source = 'parent' then exists (
+                           select 1
+                           from (values ('morning'), ('afternoon')) as covered(run_type)
+                           where (a.scope = 'day' or a.scope = covered.run_type)
+                             and not exists (
+                                 select 1 from live_runs r
+                                 where r.date = (now() at time zone 'Africa/Nairobi')::date
+                                   and r.type = covered.run_type
+                                   and (
+                                       exists (select 1 from run_stops rs
+                                               where rs.run_id = r.id
+                                                 and rs.student_id = s.id)
+                                       or exists (select 1 from live_student_routes sr
+                                                  where sr.route_id = r.route_id
+                                                    and sr.student_id = s.id)
+                                   )
+                             )
+                       ) end as cancel_withdrawable
                 from live_students s
                 left join live_buses b on b.id = s.bus_id
                 left join live_schools sc on sc.id = s.school_id
+                left join live_student_absences a
+                    on a.student_id = s.id
+                   and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
                 where s.id = any(%s)
                 order by s.name asc
                 """,
                 (ids,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        children = []
+        for r in rows:
+            child = dict(r)
+            scope = child.pop("cancel_scope")
+            source = child.pop("cancel_source")
+            withdrawable = child.pop("cancel_withdrawable")
+            child["cancellation"] = (
+                {"scope": scope, "withdrawable": bool(withdrawable)}
+                if source == "parent"
+                else None
+            )
+            children.append(child)
+        return children
+
+    def cancel_ride_context(self, parent_id: str, student_id: str) -> dict[str, Any] | None:
+        """Ownership check + guard snapshot for Cancel-a-Ride (U5), one read.
+
+        None means the student is not linked to this parent — the 404
+        boundary, matching get_track. Ownership is the SOLE boundary and it
+        evaluates before any guard: student UUIDs are harvestable by any
+        authenticated token, and a guard's 409 fired first would leak another
+        child's live on-bus state. Otherwise returns:
+
+          student      {id, name, status, bus_id}
+          absence      today's absence row {scope, source, reason} or None
+          runs         today's run rows involving the child, each
+                       {type, status} — involvement is run_stops membership
+                       OR the run's route being one of the child's routes
+                       (the child may have been excluded from run_stops at
+                       snapshot time by this very absence)
+          route_buses  {'morning'|'afternoon': {bus_id, bus_name}} from the
+                       child's route assignments (first route per type)
+
+        Guards evaluated over this snapshot are best-effort pre-reads for
+        friendly messages; the atomic set_scope / withdraw_scope statements
+        stay the authority under concurrency.
+        """
+        with get_connection() as conn:
+            ids = [str(cid) for cid in self._child_ids(conn, parent_id)]
+            if str(student_id) not in ids:
+                return None  # ownership: not this parent's child
+            student = conn.execute(
+                "select id, name, status, bus_id from live_students where id = %s",
+                (student_id,),
+            ).fetchone()
+            if not student:
+                return None  # link row outlived the student: same 404
+            absence = conn.execute(
+                """
+                select scope, source, reason from live_student_absences
+                where student_id = %s
+                  and absence_date = (now() at time zone 'Africa/Nairobi')::date
+                """,
+                (student_id,),
+            ).fetchone()
+            runs = conn.execute(
+                """
+                select r.type, r.status from live_runs r
+                where r.date = (now() at time zone 'Africa/Nairobi')::date
+                  and (
+                      exists (select 1 from run_stops rs
+                              where rs.run_id = r.id and rs.student_id = %s)
+                      or exists (select 1 from live_student_routes sr
+                                 where sr.route_id = r.route_id and sr.student_id = %s)
+                  )
+                """,
+                (student_id, student_id),
+            ).fetchall()
+            route_rows = conn.execute(
+                """
+                select r.type, b.id as bus_id, b.name as bus_name
+                from live_student_routes sr
+                join live_routes r on r.id = sr.route_id
+                left join live_buses b on b.id = r.bus_id
+                where sr.student_id = %s
+                order by r.created_at asc
+                """,
+                (student_id,),
+            ).fetchall()
+        route_buses: dict[str, dict[str, Any]] = {}
+        for r in route_rows:
+            route_buses.setdefault(
+                r["type"], {"bus_id": r["bus_id"], "bus_name": r["bus_name"]}
+            )
+        return {
+            "student": dict(student),
+            "absence": dict(absence) if absence else None,
+            "runs": [dict(r) for r in runs],
+            "route_buses": route_buses,
+        }
 
     def get_track(self, parent_id: str, student_id: str) -> dict[str, Any] | None:
         with get_connection() as conn:

@@ -19,6 +19,7 @@ Notification types:
   dropped-off      driver confirmed the drop-off at the child's stop (tap-time)
   student-absent   driver marked the child absent at pickup (that child's parents only)
   incident         driver reported an issue on the child's bus
+  ride-cancelled   a parent cancelled the child's ride (that child's linked parents only)
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -184,6 +185,37 @@ class PushService:
         except Exception:
             logger.exception("notify_student_absent failed")
 
+    def notify_ride_cancelled(self, student: dict, scope: str) -> None:
+        """A parent cancelled the child's ride (U5) — confirm to EVERY linked
+        parent of that child (both co-parents see it, whoever submitted) and
+        nobody else. run_id stays NULL: cancellations precede any run, and
+        the run-scoped dedup exemption means every emission is a real row —
+        the caller only fires this on an actual set_scope transition.
+        run_type maps from the recorded scope ('morning'/'afternoon';
+        whole-day → NULL) so the feed's period filter surfaces the row under
+        the period the parent cancelled."""
+        try:
+            student_id = str(student["id"])
+            phrases = {
+                "morning": "morning pickup today has been cancelled",
+                "afternoon": "afternoon ride today has been cancelled",
+                "day": "rides for the rest of today have been cancelled",
+            }
+            phrase = phrases.get(scope, "ride today has been cancelled")
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type="ride-cancelled",
+                    title="Ride cancelled",
+                    body=f"{link['student_name']}'s {phrase} by a parent on the account.",
+                    student_id=student_id,
+                    run_id=None,
+                    bus_id=student.get("bus_id"),
+                    run_type=scope if scope in ("morning", "afternoon") else None,
+                )
+        except Exception:
+            logger.exception("notify_ride_cancelled failed")
+
     def notify_reached_school(self, run: dict) -> None:
         """Morning arrival at the school gate (or morning run end).
 
@@ -222,6 +254,14 @@ class PushService:
 
     def notify_incident(self, incident: dict) -> None:
         try:
+            # Student-stamped incidents are child-specific (driver-absent
+            # reports, parent cancellations): admin Alerts page only. A
+            # bus-wide fan-out would tell every family on the bus about a
+            # named child. Callers already keep these DAO-direct; this
+            # early-return holds the line if one ever slips through —
+            # type-agnostic on purpose (defense in depth, U5).
+            if incident.get("student_id"):
+                return
             if incident.get("type") == "arrival" or not incident.get("bus_id"):
                 return
             title = INCIDENT_TITLES.get(incident.get("type", ""), "Notice from the bus")

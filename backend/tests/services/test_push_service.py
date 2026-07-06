@@ -358,6 +358,57 @@ def test_arrival_incidents_do_not_double_notify(service: PushService, dao: FakeP
     assert dao.notifications == []
 
 
+def test_student_stamped_incidents_never_fan_out(service: PushService, dao: FakePushDao) -> None:
+    """Defense in depth (U5): a student-stamped incident names a child, so it
+    must never reach the bus-wide fan-out — whatever its type (the guard
+    protects the driver-absent 'student' path and the parent 'cancellation'
+    path alike)."""
+    dao.bus_parents = [link("p1", "s1", "Leila"), link("p2", "s3", "Wanjiru")]
+
+    for incident_type in ("cancellation", "student", "other"):
+        service.notify_incident({
+            "type": incident_type, "bus_id": "bus-1", "bus_name": "Kifaru Bus",
+            "student_id": "s1", "description": "Leila is off the afternoon run",
+        })
+
+    assert dao.notifications == []
+
+
+def test_ride_cancelled_notifies_all_linked_parents_with_scoped_run_type(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Cancel-a-Ride confirmation (U5): every linked parent of THAT child gets
+    one 'ride-cancelled' row — run_id NULL (no run-scoped dedup: the caller
+    only fires on real transitions) and run_type mapped from the scope so
+    the feed's period filter surfaces it where the parent will look."""
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p2", "s1", "Leila")],
+        "s2": [link("p3", "s2", "Baraka")],  # another household: never notified
+    }
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": "bus-1"}, "afternoon")
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p2"]
+    for note in dao.notifications:
+        assert note["type"] == "ride-cancelled"
+        assert note["run_id"] is None
+        assert note["run_type"] == "afternoon"
+        assert note["student_id"] == "s1"
+        assert "Leila" in note["body"]
+
+
+def test_ride_cancelled_day_scope_maps_run_type_to_none(
+    service: PushService, dao: FakePushDao
+) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": None}, "day")
+
+    assert len(dao.notifications) == 1
+    assert dao.notifications[0]["run_type"] is None
+    assert dao.notifications[0]["type"] == "ride-cancelled"
+
+
 def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -> None:
     # ~550m from the bus position below.
     dao.stops = [

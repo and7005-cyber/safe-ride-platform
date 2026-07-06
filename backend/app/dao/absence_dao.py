@@ -128,12 +128,15 @@ class AbsenceDao:
         return result
 
     def set_scope(
-        self, student_id: str, scope: str, actor_user_id: str
+        self, student_id: str, scope: str, actor_user_id: str, reason: str | None = None
     ) -> dict[str, Any] | None:
         """Parent transition (U4): upsert a TODAY absence at ``scope`` as ONE
         atomic statement. Merge rule in the DO UPDATE expression: same scope
         is idempotent; any two different scopes union to 'day' (morning +
         afternoon → day; a partial under an existing 'day' stays 'day').
+        ``reason`` (Cancel-a-Ride passes "Cancelled by parent", U5) lands on
+        the row and on any run_absences snapshot taken here, so the admin
+        absence list and run reports say why the child is off the roster.
 
         The provenance ratchet lives in the statement's WHERE clause — the
         conflict branch only fires on source='parent' rows, so a staff mark
@@ -147,7 +150,13 @@ class AbsenceDao:
 
         Only a resulting 'day' scope writes status='absent' (partial scopes
         gate rosters, never the displayed status), and only on an actual
-        transition — an idempotent re-cancel has zero side effects.
+        transition — an idempotent re-cancel has zero side effects. A real
+        transition also appends the run_absences snapshot of any active run
+        of a COVERED type whose run_stops roster carries the student
+        (mirroring mark_absent, U5): the run started while the child was
+        still expected, and the completed report must list who never
+        boarded. Boarded children never reach this point — the API layer
+        rejects an on-bus child on an active covered run (R16).
         """
         _validate_scope(scope)
         with get_connection() as conn:
@@ -162,29 +171,53 @@ class AbsenceDao:
                     (student_id, absence_date, reason, marked_by, scope, source)
                 values (
                     %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
-                    null, %(actor)s, %(scope)s, 'parent'
+                    %(reason)s, %(actor)s, %(scope)s, 'parent'
                 )
                 on conflict (student_id, absence_date) do update
                     set scope = case
                             when a.scope = excluded.scope then a.scope
                             else 'day'
                         end,
+                        reason = excluded.reason,
                         marked_by = excluded.marked_by,
                         source = 'parent'
                     where a.source = 'parent'
                 returning a.*, (select scope from prior) as prior_scope
                 """,
-                {"student_id": student_id, "scope": scope, "actor": actor_user_id},
+                {
+                    "student_id": student_id,
+                    "scope": scope,
+                    "actor": actor_user_id,
+                    "reason": reason,
+                },
             ).fetchone()
             if row is None:
                 return None  # staff-sourced row: the ratchet refused the write
             result = dict(row)
             prior_scope = result.pop("prior_scope")
             result["changed"] = prior_scope is None or prior_scope != result["scope"]
-            if result["changed"] and result["scope"] == "day":
+            if result["changed"]:
+                if result["scope"] == "day":
+                    conn.execute(
+                        "update live_students set status = 'absent' where id = %s",
+                        (student_id,),
+                    )
                 conn.execute(
-                    "update live_students set status = 'absent' where id = %s",
-                    (student_id,),
+                    """
+                    insert into run_absences (run_id, student_id, student_name, reason)
+                    select r.id, s.id, s.name, %s
+                    from live_runs r
+                    join live_students s on s.id = %s
+                    where r.status <> 'completed'
+                      and r.date = (now() at time zone 'Africa/Nairobi')::date
+                      and (%s = 'day' or r.type = %s)
+                      and exists (
+                          select 1 from run_stops rs
+                          where rs.run_id = r.id and rs.student_id = s.id
+                      )
+                    on conflict (run_id, student_id) do nothing
+                    """,
+                    (reason, student_id, result["scope"], result["scope"]),
                 )
         return result
 
