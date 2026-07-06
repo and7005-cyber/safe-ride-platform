@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.status_sql import display_status_case
 
 
 def _mask_stop_name(name: str, is_own: bool, is_gate: bool) -> str:
@@ -24,54 +25,19 @@ class ParentLiveDao:
 
         ``display_status`` is computed at read time, never stored (the raw
         ``status`` field stays untouched in the payload — admin keeps the
-        operational value). Branches, in order:
-
-        - a today-absence exists (live_student_absences, Africa/Nairobi today)
-          → 'absent', whatever the raw status says;
-        - raw 'absent' with no today-absence → 'at-home' (stale absent);
-        - raw 'on-bus' with no active run today whose run_stops contain the
-          student → 'at-home' (stale on-bus). "Active" is the codebase's
-          status <> 'completed' convention, so 'delayed' keeps counting, and
-          membership goes through run_stops — never live_students.bus_id,
-          which is derived, morning-preferring, and drifts;
-        - raw 'dropped-off' with no afternoon run today containing the student
-          (same run_stops membership) → 'at-home' (stale dropped-off);
-        - anything else → the raw status.
+        operational value). The branch-by-branch derivation lives in
+        ``app.dao.status_sql``, shared with the admin students list.
         """
         with get_connection() as conn:
             ids = self._child_ids(conn, parent_id)
             if not ids:
                 return []
             rows = conn.execute(
-                """
+                f"""
                 select s.*, b.name as bus_name, b.driver_name, b.driver_phone,
                        b.current_lat as bus_current_lat, b.current_lng as bus_current_lng,
                        sc.name as school_name,
-                       case
-                           when exists (
-                               select 1 from live_student_absences a
-                               where a.student_id = s.id
-                                 and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                           ) then 'absent'
-                           when s.status = 'absent' then 'at-home'
-                           when s.status = 'on-bus' and not exists (
-                               select 1
-                               from live_runs r
-                               join run_stops rs on rs.run_id = r.id
-                               where rs.student_id = s.id
-                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
-                                 and r.status <> 'completed'
-                           ) then 'at-home'
-                           when s.status = 'dropped-off' and not exists (
-                               select 1
-                               from live_runs r
-                               join run_stops rs on rs.run_id = r.id
-                               where rs.student_id = s.id
-                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
-                                 and r.type = 'afternoon'
-                           ) then 'at-home'
-                           else s.status
-                       end as display_status
+                       {display_status_case("s")} as display_status
                 from live_students s
                 left join live_buses b on b.id = s.bus_id
                 left join live_schools sc on sc.id = s.school_id

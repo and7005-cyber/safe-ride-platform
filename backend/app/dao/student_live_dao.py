@@ -2,6 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.fleet_dao import regenerate_route_stops
+from app.dao.status_sql import display_status_case
 
 STUDENT_COLUMNS = (
     "name", "grade", "parent_name", "parent_phone", "parent_phone2", "parent_email",
@@ -189,8 +190,26 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
 
 class StudentLiveDao:
     def list_students(self) -> list[dict[str, Any]]:
+        """All students, each with ``route_ids`` and a derived
+        ``display_status`` — the parent-portal derivation (app.dao.status_sql)
+        wrapped by the admin-only unassigned rule: a student with zero route
+        assignments displays 'unassigned', overriding everything (R1–R4). The
+        raw ``status`` stays in the payload untouched."""
         with get_connection() as conn:
-            rows = conn.execute("select * from live_students order by name asc").fetchall()
+            rows = conn.execute(
+                f"""
+                select s.*,
+                       case
+                           when not exists (
+                               select 1 from live_student_routes lsr
+                               where lsr.student_id = s.id
+                           ) then 'unassigned'
+                           else {display_status_case("s")}
+                       end as display_status
+                from live_students s
+                order by s.name asc
+                """
+            ).fetchall()
             result = []
             for row in rows:
                 item = dict(row)
