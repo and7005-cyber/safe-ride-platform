@@ -133,6 +133,46 @@ class PushDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def route_broadcast_context(self, route_id: str) -> dict | None:
+        """The route row plus its assigned-student count, for the broadcast
+        endpoint's guards (U8). None = unknown route (404); a zero count backs
+        the no-students 409 — a broadcast that can reach nobody must fail
+        loudly, never answer 200 with nothing sent."""
+        with get_connection() as conn:
+            route = conn.execute(
+                "select id, name, type, bus_id from live_routes where id = %s",
+                (route_id,),
+            ).fetchone()
+            if not route:
+                return None
+            count = conn.execute(
+                "select count(*) as n from live_student_routes where route_id = %s",
+                (route_id,),
+            ).fetchone()
+        return {"route": dict(route), "student_count": int(count["n"])}
+
+    def parents_of_route(self, route_id: str) -> list[str]:
+        """DISTINCT parent account ids for the students ASSIGNED to a route
+        (U8, R20/R21).
+
+        Assignment truth only: live_student_routes → live_parent_students.
+        Never students.bus_id — bus membership drifts from route assignment
+        (a student can ride the bus on the other route only, or keep a stale
+        bus after reassignment), and R20 scopes the broadcast to the route's
+        assigned students. Distinct at the SQL level: a parent with several
+        children on the route is one recipient (AE5)."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                select distinct ps.parent_id
+                from live_student_routes sr
+                join live_parent_students ps on ps.student_id = sr.student_id
+                where sr.route_id = %s
+                """,
+                (route_id,),
+            ).fetchall()
+        return [str(row["parent_id"]) for row in rows]
+
     def students_on_run(self, run_id: str, include_absent: bool = False) -> list[dict]:
         """Students with a seat on the run's stop roster."""
         with get_connection() as conn:

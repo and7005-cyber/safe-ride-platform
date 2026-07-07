@@ -409,6 +409,42 @@ def test_ride_cancelled_day_scope_maps_run_type_to_none(
     assert dao.notifications[0]["type"] == "ride-cancelled"
 
 
+def test_admin_broadcast_one_row_per_distinct_parent(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Route broadcast (U8): one 'admin-notice' row per DISTINCT recipient in
+    the endpoint-resolved set — a duplicated id never double-sends. run_id
+    NULL (two identical sends must stay two rows, R23) and run_type NULL
+    (period-agnostic, R22); the body lands verbatim."""
+    route = {"id": "r1", "name": "Express 1 — Morning", "bus_id": "bus-1"}
+
+    service.notify_admin_broadcast(route, "Pickup delayed 20 min.", ["p1", "p2", "p1"])
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p2"]
+    for note in dao.notifications:
+        assert note["type"] == "admin-notice"
+        assert note["title"] == "School notice — Express 1 — Morning"
+        assert note["body"] == "Pickup delayed 20 min."
+        assert note["run_id"] is None
+        assert note["run_type"] is None
+        assert note["student_id"] is None
+        assert note["bus_id"] == "bus-1"
+
+
+def test_admin_broadcast_title_is_length_bounded(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Web-push services reject ~4KB payloads: a very long route name must
+    not blow up the composed title."""
+    from app.services.push_service import BROADCAST_TITLE_MAX_CHARS
+
+    service.notify_admin_broadcast({"id": "r1", "name": "R" * 300, "bus_id": None}, "hi", ["p1"])
+
+    assert len(dao.notifications) == 1
+    assert len(dao.notifications[0]["title"]) == BROADCAST_TITLE_MAX_CHARS
+    assert dao.notifications[0]["title"].endswith("…")
+
+
 def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -> None:
     # ~550m from the bus position below.
     dao.stops = [

@@ -20,6 +20,7 @@ Notification types:
   student-absent   driver marked the child absent at pickup (that child's parents only)
   incident         driver reported an issue on the child's bus
   ride-cancelled   a parent cancelled the child's ride (that child's linked parents only)
+  admin-notice     office broadcast to a route (one copy per parent with a child assigned)
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -50,6 +51,11 @@ INCIDENT_TITLES = {
     "traffic": "Traffic delay",
     "other": "Notice from the bus",
 }
+
+# Web-push services reject payloads past ~4KB; the broadcast body is capped by
+# the endpoint (500 chars) and the composed title is bounded here — a very long
+# route name must not push the payload over the edge.
+BROADCAST_TITLE_MAX_CHARS = 120
 
 # Shared across service instances: delivery must not monopolize the request
 # thread pool, and a slow push provider must not back up driver requests.
@@ -286,6 +292,43 @@ class PushService:
                 )
         except Exception:
             logger.exception("notify_incident failed")
+
+    def notify_admin_broadcast(self, route: dict, body: str, parent_ids: list[str]) -> None:
+        """Admin route broadcast (U8: R20, R21, R23; AE5): one 'admin-notice'
+        feed row + push per DISTINCT parent with a child assigned to the route.
+
+        The recipient set is resolved by the endpoint (synchronously, from
+        assignments — never bus_id) and passed in: this runs in
+        BackgroundTasks, and the response's recipient count must be what was
+        actually fanned out, not a hope. The set is deduped again here
+        (notify_incident's per-parent pattern) so a duplicated id can never
+        double-send. run_id stays NULL — every send is a real row (R23 bans
+        run-scoped dedup: two identical sends are two rows) — and run_type
+        stays NULL (R22: the notice is period-agnostic). body arrives
+        validated and stored as-is; the title is length-bounded because
+        web-push services reject ~4KB payloads."""
+        try:
+            title = f"School notice — {route.get('name') or 'your route'}"
+            if len(title) > BROADCAST_TITLE_MAX_CHARS:
+                title = title[: BROADCAST_TITLE_MAX_CHARS - 1] + "…"
+            notified: set[str] = set()
+            for parent_id in parent_ids:
+                parent_id = str(parent_id)
+                if parent_id in notified:
+                    continue
+                notified.add(parent_id)
+                self._notify(
+                    parent_id,
+                    type="admin-notice",
+                    title=title,
+                    body=body,
+                    student_id=None,
+                    run_id=None,
+                    bus_id=route.get("bus_id"),
+                    run_type=None,
+                )
+        except Exception:
+            logger.exception("notify_admin_broadcast failed")
 
     def notify_bus_approaching(self, run: dict) -> None:
         """Stop-based 'bus-approaching': the instant the driver arrives at a

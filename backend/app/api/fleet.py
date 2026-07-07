@@ -1,17 +1,29 @@
 import datetime as dt
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
+from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.core.rate_limit import SlidingWindowLimiter
 from app.core.validation import clean_phone
 from app.dao.fleet_dao import FleetDao
+from app.dao.push_dao import PushDao
 from app.services import geo_service
+from app.services.push_service import PushService
 
 router = APIRouter(prefix="/api/fleet", tags=["fleet"])
 dao = FleetDao()
+push_dao = PushDao()
+push_service = PushService()
 admin_only = require_role("admin")
+
+# Broadcast blast protection (U8): per-admin, in-process best-effort (per
+# Lambda container, auth.py pattern) — enough to stop a stuck retry loop from
+# spamming every parent on a route twelve times over.
+broadcast_limiter = SlidingWindowLimiter(max_attempts=12, window_seconds=3600)
+_BROADCAST_LIMIT_MESSAGE = "Too many broadcasts this hour. Please try again later."
 
 
 class BusPayload(BaseModel):
@@ -183,6 +195,76 @@ def recalculate_route(route_id: str, user: dict = Depends(admin_only)):
     return safe_call(
         lambda: {"ok": True, "stops_recalculated": dao.recalculate_route(route_id)}
     )
+
+
+# Route broadcast (U8) ---------------------------------------------------------
+
+BROADCAST_BODY_MAX_CHARS = 500
+
+
+class BroadcastPayload(BaseModel):
+    body: str
+
+
+def _clean_broadcast_body(raw: str) -> str:
+    """Server-side body validation (R23): strip C0 control characters except
+    newline, trim, reject empty/whitespace-only, cap at 500 characters.
+
+    The cleaned text is stored RAW by design — no HTML/markdown stripping.
+    The sole rendering surface is the parent feed's text-only React path,
+    which is what keeps admin free text inert; any future consumer of
+    live_notifications.body must re-verify that invariant before rendering
+    it any other way."""
+    body = "".join(ch for ch in raw if ch == "\n" or ord(ch) >= 32).strip()
+    if not body:
+        raise BadRequestError("Message body must not be empty")
+    if len(body) > BROADCAST_BODY_MAX_CHARS:
+        raise BadRequestError(
+            f"Message body must be {BROADCAST_BODY_MAX_CHARS} characters or fewer"
+        )
+    return body
+
+
+@router.post("/routes/{route_id}/broadcast")
+def broadcast_to_route(
+    route_id: str,
+    payload: BroadcastPayload,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
+    """Free-text message to every parent with a child assigned to the route
+    (U8: R20, R21, R23; AE5).
+
+    Recipients come from assignments (live_student_routes →
+    live_parent_students), never students.bus_id, distinct per parent
+    (siblings on the route = one copy). The recipient set is resolved HERE,
+    synchronously — the fan-out runs in BackgroundTasks, so the response's
+    `recipients` count must be computed before dispatch to be the truth.
+    Zero recipients is never a silent 200: no assigned students → 409, and
+    students assigned but zero linked parent accounts → a DISTINCT 409."""
+    broadcast_limiter.check(str(user["id"]), _BROADCAST_LIMIT_MESSAGE)
+
+    def run() -> tuple[dict, str, list[str]]:
+        body = _clean_broadcast_body(payload.body)
+        context = push_dao.route_broadcast_context(route_id)
+        if context is None:
+            raise NotFoundError("Route not found")
+        if context["student_count"] == 0:
+            raise ConflictError(
+                "No students are assigned to this route — there is nobody to message."
+            )
+        parent_ids = push_dao.parents_of_route(route_id)
+        if not parent_ids:
+            raise ConflictError(
+                "None of this route's students have a linked parent account — "
+                "the message would reach nobody. Link parent emails on the "
+                "students first."
+            )
+        return context["route"], body, parent_ids
+
+    route, body, parent_ids = safe_call(run)
+    background_tasks.add_task(push_service.notify_admin_broadcast, route, body, parent_ids)
+    return {"ok": True, "recipients": len(parent_ids)}
 
 
 # Geocoding & route planning (#4, #9) ----------------------------------------
