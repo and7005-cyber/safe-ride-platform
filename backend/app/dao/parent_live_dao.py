@@ -239,12 +239,20 @@ class ParentLiveDao:
         return {"student": dict(student), "stops": stops, "run": run}
 
     def list_alerts(
-        self, parent_id: str, window_hours: int | None = None, limit: int = 50
+        self,
+        parent_id: str,
+        window_hours: int | None = None,
+        min_age_hours: int | None = None,
+        limit: int = 50,
     ) -> list[dict[str, Any]]:
         """Incidents on the children's buses, newest first.
 
-        window_hours, when set, keeps only rows newer than that rolling window
-        (24 = Recent, 168 = History); limit is hard-capped at 200 (R35/R36).
+        window_hours keeps only rows newer than that rolling window;
+        min_age_hours keeps only rows at least that old (U9: R5–R7 — Recent =
+        window 24, History = min_age 24 + window 168, disjoint). Both are
+        WHERE predicates, so the exclusion applies before the row cap and a
+        busy last 24h cannot starve History. limit is hard-capped at 200
+        (R35/R36: display windows over a feed that never deletes rows).
         """
         limit = max(1, min(int(limit), 200))
         with get_connection() as conn:
@@ -261,8 +269,11 @@ class ParentLiveDao:
             window_sql = ""
             params: list = [bus_ids]
             if window_hours is not None:
-                window_sql = " and created_at > now() - (%s || ' hours')::interval"
+                window_sql += " and created_at > now() - (%s || ' hours')::interval"
                 params.append(int(window_hours))
+            if min_age_hours is not None:
+                window_sql += " and created_at <= now() - (%s || ' hours')::interval"
+                params.append(int(min_age_hours))
             params.append(limit)
             # student_id-stamped incidents are child-specific (absence reports
             # for the school): only the admin Alerts page may see them — no

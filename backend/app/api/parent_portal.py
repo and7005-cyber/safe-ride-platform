@@ -53,17 +53,25 @@ def track(student_id: str = Query(...), user: dict = Depends(parent_only)):
 
 @router.get("/alerts")
 def alerts(
-    window_hours: int | None = Query(default=None, ge=1),
+    window_hours: int | None = Query(default=None, ge=1, le=8760),
+    min_age_hours: int | None = Query(default=None, ge=1, le=8760),
     limit: int = Query(default=50, ge=1),
     user: dict = Depends(parent_only),
 ):
     """Incidents feed for the parent's buses, newest first.
 
-    window_hours narrows to a rolling window (R35: 24 = Recent, 168 = History);
-    limit defaults to 50 and is hard-capped at 200 in the DAO.
+    window_hours narrows to a rolling window and min_age_hours excludes rows
+    younger than that age, server-side so the cap applies after the exclusion
+    (U9: R5–R7 — Recent = window 24; History = min_age 24 + window 168,
+    disjoint). Both are capped at 8760 (a year): unbounded values reach the
+    DB's interval arithmetic and 500 (SQLSTATE 22015 is not a bad-request
+    state in safe_call). limit defaults to 50 and is hard-capped at 200 in
+    the DAO.
     """
     return safe_call(
-        lambda: dao.list_alerts(user["id"], window_hours=window_hours, limit=limit)
+        lambda: dao.list_alerts(
+            user["id"], window_hours=window_hours, min_age_hours=min_age_hours, limit=limit
+        )
     )
 
 

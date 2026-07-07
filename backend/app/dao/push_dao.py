@@ -256,12 +256,20 @@ class PushDao:
         return dict(row) if row else None
 
     def list_notifications(
-        self, user_id: str, limit: int = 50, window_hours: int | None = None
+        self,
+        user_id: str,
+        limit: int = 50,
+        window_hours: int | None = None,
+        min_age_hours: int | None = None,
     ) -> list[dict]:
         """The user's feed, newest first.
 
-        window_hours, when set, keeps only rows newer than that rolling window
-        (24 for the parent app's Recent view, 168 for its 7-day History tab).
+        window_hours, when set, keeps only rows newer than that rolling
+        window; min_age_hours keeps only rows at least that old. The parent
+        app's Recent view is window 24; its History tab is min_age 24 +
+        window 168 — disjoint by construction (U9: R5–R7), and because both
+        are WHERE predicates the exclusion happens BEFORE the row cap, so a
+        busy last 24h can never starve History out of the 200 rows.
         limit is hard-capped at 200 — the feed is windowed, never paginated,
         and no rows are ever deleted (R36: the table is the audit trail).
         """
@@ -269,8 +277,11 @@ class PushDao:
         window_sql = ""
         params: list = [user_id]
         if window_hours is not None:
-            window_sql = " and created_at > now() - (%s || ' hours')::interval"
+            window_sql += " and created_at > now() - (%s || ' hours')::interval"
             params.append(int(window_hours))
+        if min_age_hours is not None:
+            window_sql += " and created_at <= now() - (%s || ' hours')::interval"
+            params.append(int(min_age_hours))
         params.append(limit)
         with get_connection() as conn:
             rows = conn.execute(
