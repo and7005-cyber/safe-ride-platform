@@ -4,9 +4,11 @@ import {
   API_URL,
   DRIVER,
   SEED,
+  apiCancelRide,
   apiToken,
   authHeaders,
   cardContaining,
+  clearCancellationState,
   confirmDelete,
   emailLogin,
   fieldInput,
@@ -427,4 +429,86 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
 
   // API cleanup (the beforeAll sweep also catches aborted runs).
   await request.delete(`${API_URL}/api/fleet/routes/${saved.id}`, { headers });
+});
+
+// Cross-surface honesty of a parent cancellation (U14: R17, R19; AE1/AE4):
+// a partial-scope cancellation never rewrites the day status, the office is
+// alerted, and the Unassigned filter isolates route-less students.
+test("a parent cancellation shows a scoped badge and an office alert without changing the student's status", async ({
+  page,
+  request,
+}) => {
+  await apiCancelRide(request, SEED.parentChild, "afternoon");
+  try {
+    await adminLogin(page);
+    await page.goto("/students");
+
+    const row = page.getByRole("row", { name: new RegExp(SEED.parentChild) });
+    // Display honesty (R19): the STATUS cell still reads "At school" — a
+    // partial cancellation gates rosters, never the displayed day status.
+    // The selector pins the status cell (index 7): a day-absent student would
+    // read "Absent today" in both the name badge and the status cell, and
+    // this assertion must fail for that shape.
+    await expect(row.getByRole("cell").nth(7).getByText("At school")).toBeVisible();
+    // The name cell carries the scope-labelled absence badge (U10).
+    await expect(row.getByText("Absent (PM)")).toBeVisible();
+    await expect(row.getByText("Absent today")).toHaveCount(0);
+
+    // The office channel: an unread "Ride Cancellation" alert naming the
+    // covered route's bus (R17) — the parent appears only in the description.
+    await page.goto("/alerts");
+    const alert = cardContaining(page, "Ride Cancellation");
+    await expect(alert).toBeVisible({ timeout: 10_000 });
+    await expect(alert.getByText("New", { exact: true })).toBeVisible();
+    await expect(alert.getByText(SEED.driverBus)).toBeVisible();
+    await expect(
+      alert.getByText(new RegExp(`${SEED.parentChild}: afternoon ride cancelled by parent`)),
+    ).toBeVisible();
+
+    // Unassigned filter (R3/R4; AE1): exactly the seeded route-less child.
+    await page.goto("/students");
+    await page.getByRole("combobox").first().click();
+    await page.getByRole("option", { name: "Unassigned" }).click();
+    const dataRows = page.locator("tbody tr");
+    await expect(dataRows).toHaveCount(1);
+    await expect(dataRows.first()).toContainText(SEED.buslessChild);
+    await expect(dataRows.first()).toContainText("Unassigned");
+  } finally {
+    await clearCancellationState(request, SEED.parentChild);
+  }
+});
+
+// Manual stop ordering (U14: R11, R13; AE3): arrow reorder persists across
+// reload under a "Manual order" chip; Recalculate hands the route back to auto.
+test("admin reorders route stops with the arrows and the manual order persists", async ({ page }) => {
+  await adminLogin(page);
+  await page.goto("/routes");
+  const card = cardContaining(page, SEED.driverMorningRoute);
+
+  // Seeded state: auto mode, three location groups then the school gate.
+  // Assertions track location-group order only — sibling rows inside one
+  // group share a stop_order and carry no defined intra-group order (U7).
+  await expect(card.getByTestId("route-mode-chip")).toHaveText("Auto");
+  const stops = card.locator("ol > li");
+  await expect(stops).toHaveCount(4);
+  await expect(stops.nth(0)).toContainText("Kilimani");
+  await expect(stops.nth(1)).toContainText("Lavington");
+
+  // Move the first group down one slot; the server flips the route to manual.
+  await card.getByRole("button", { name: "Move down" }).first().click();
+  await expect(stops.nth(0)).toContainText("Lavington");
+  await expect(stops.nth(1)).toContainText("Kilimani");
+  await expect(card.getByTestId("route-mode-chip")).toHaveText("Manual order");
+
+  // The order is persisted server-side, not a client-side illusion.
+  await page.reload();
+  await expect(card.getByTestId("route-mode-chip")).toHaveText("Manual order");
+  await expect(stops.nth(0)).toContainText("Lavington");
+  await expect(stops.nth(1)).toContainText("Kilimani");
+  await expect(stops.nth(3)).toContainText("School gate");
+
+  // Recalculate is the explicit exit: the route returns to auto ordering
+  // (also the cleanup — later suites expect the seeded route in auto mode).
+  await card.getByTestId("recalculate-order").click();
+  await expect(card.getByTestId("route-mode-chip")).toHaveText("Auto", { timeout: 20_000 });
 });

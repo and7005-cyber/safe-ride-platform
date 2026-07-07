@@ -1,11 +1,13 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
 import {
+  ADMIN,
   API_URL,
   PARENT,
   SEED,
   apiDriverToken,
   apiToken,
   authHeaders,
+  cardContaining,
   emailLogin,
   endActiveRun,
 } from "./helpers";
@@ -88,9 +90,14 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   await expect(feedCards.filter({ hasText: "Bus On The Way" })).toHaveCount(0);
   await expect(feedCards.filter({ hasText: "Arrived at School" })).toHaveCount(0);
 
-  // History (R35): the 7-day window includes everything just created.
+  // History (R5–R7): disjoint from Recent by construction — the rows this
+  // test just created are younger than 24h, so they stay under Recent only,
+  // and the 24h–7d band is empty on a freshly seeded database.
   await page.getByRole("tab", { name: "History" }).click();
-  await expect(feedCards.filter({ hasText: "Boarded the Bus" }).first()).toBeVisible();
+  await expect(feedCards.filter({ hasText: "Boarded the Bus" })).toHaveCount(0);
+  await expect(
+    page.getByText("Nothing older than 24 hours in the last 7 days."),
+  ).toBeVisible();
 });
 
 test("opening the alerts page marks notifications as read", async ({ page, request }) => {
@@ -155,6 +162,43 @@ test("an incident report notifies parents on that bus", async ({ page, request }
   const entry = feed.find((n: any) => n.body === marker);
   expect(entry).toBeTruthy();
   expect(entry.type).toBe("incident");
+});
+
+// Admin route broadcast (U14: R20–R23; AE5): the office messages a route from
+// the Routes page; every parent with a child assigned to it gets exactly one
+// "School Notice", visible under every period chip (R22's period exemption).
+test("an admin route broadcast reaches route parents under every period chip", async ({ page }) => {
+  const marker = `E2E school notice ${Date.now()}`;
+
+  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await page.goto("/routes");
+  const card = cardContaining(page, SEED.driverMorningRoute);
+  await card.getByTestId("message-parents").click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(`Message parents — ${SEED.driverMorningRoute}`)).toBeVisible();
+  await dialog.getByTestId("broadcast-body").fill(marker);
+  await dialog.getByTestId("broadcast-send").click();
+  // Success toast reports the DISTINCT recipient count: the route's three
+  // seeded students (Faith, Happiness, Kevin) link three parent accounts.
+  await expect(page.getByText("Sent to 3 parents")).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+
+  // Switch to the seeded parent (auth.spec's storage sign-out idiom).
+  await page.evaluate(() => localStorage.removeItem("saferide-token"));
+  await emailLogin(page, PARENT.email, PARENT.password);
+  await page.goto("/parent/alerts");
+
+  // Exactly one School Notice row, and it survives every period chip —
+  // 'admin-notice' is the one period-filter exemption (R22).
+  const feedCards = page.locator("div[class*='bg-card']");
+  for (const period of ["Morning", "Afternoon", "All"]) {
+    await page.getByRole("button", { name: period, exact: true }).click();
+    const notice = feedCards.filter({ hasText: marker });
+    await expect(notice.first()).toBeVisible({ timeout: 10_000 });
+    await expect(notice).toHaveCount(1);
+    await expect(notice.getByText("School Notice", { exact: true })).toBeVisible();
+    await expect(notice.getByText(`School notice — ${SEED.driverMorningRoute}`)).toBeVisible();
+  }
 });
 
 test("notification types are scoped to the right parent", async ({ request }) => {

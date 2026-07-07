@@ -11,12 +11,15 @@ import { useIncidents } from "@/lib/queries";
 
 // Admin-side labels (note: traffic differs from the parent-side "Traffic Delay";
 // arrival has no mapping here — the live admin feed shows the raw "arrival").
+// 'cancellation' is the parent Cancel-a-Ride alert (R17/U14): student-stamped,
+// bus context from the covered route, the acting parent named in the description.
 const TYPE_LABEL: Record<string, string> = {
   breakdown: "Vehicle Breakdown",
   accident: "Road Accident",
   student: "Student Issue",
   traffic: "Heavy Traffic / Delay",
   other: "Notice",
+  cancellation: "Ride Cancellation",
 };
 
 const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "success"> = {
@@ -26,6 +29,7 @@ const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "su
   traffic: "warning",
   arrival: "success",
   other: "secondary",
+  cancellation: "warning",
 };
 
 export function AlertsPage() {
