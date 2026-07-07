@@ -18,6 +18,19 @@ export function useChildren() {
   });
 }
 
+// Cancel-a-Ride (R14–R18): each children row carries today's parent-sourced
+// cancellation as {scope, withdrawable} | null (staff-sourced absences are
+// not cancellations and come through as null). `withdrawable` mirrors the
+// server's withdraw guard — true while some covered half still has no run
+// row today; for a merged 'day' row that means at least one half is still
+// withdrawable, and the UI dialog picks the half. No central Child type
+// exists; this is the one structural piece the cancel/withdraw UI needs.
+export type CancelScope = "morning" | "afternoon" | "day";
+export interface ChildCancellation {
+  scope: CancelScope;
+  withdrawable: boolean;
+}
+
 // Server-side feed windows (R5–R7): Recent is the rolling last 24 hours;
 // History is 24 hours to 7 days — minAgeHours excludes the young rows on the
 // server (client-side trimming of the 168h query would let a busy last 24h
