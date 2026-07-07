@@ -23,7 +23,7 @@ import {
 } from "@/features/parent/parentHooks";
 
 // Parent-side labels (traffic = "Traffic Delay", distinct from the admin label).
-const TYPE_LABEL: Record<string, string> = {
+export const TYPE_LABEL: Record<string, string> = {
   breakdown: "Vehicle Breakdown",
   accident: "Road Accident",
   student: "Student Issue",
@@ -41,8 +41,10 @@ const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "su
   other: "secondary",
 };
 
-// Typed parent notifications (the push feed mirror).
-const NOTIFICATION_LABEL: Record<string, string> = {
+// Typed parent notifications (the push feed mirror). 'admin-notice' is the
+// office route broadcast and 'ride-cancelled' the Cancel-a-Ride confirmation
+// (R22, R17) — both first-class, with their own label and styling.
+export const NOTIFICATION_LABEL: Record<string, string> = {
   "run-started": "Bus On The Way",
   "student-boarded": "Boarded the Bus",
   "bus-approaching": "Bus Approaching",
@@ -51,10 +53,15 @@ const NOTIFICATION_LABEL: Record<string, string> = {
   "dropped-off": "Dropped Off",
   "student-absent": "Marked Absent",
   incident: "Bus Incident",
+  "admin-notice": "School Notice",
+  "ride-cancelled": "Ride Cancelled",
   custom: "Notice",
 };
 
-const NOTIFICATION_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "success"> = {
+export const NOTIFICATION_VARIANT: Record<
+  string,
+  "destructive" | "warning" | "secondary" | "success"
+> = {
   "run-started": "secondary",
   "student-boarded": "success",
   "bus-approaching": "warning",
@@ -63,13 +70,15 @@ const NOTIFICATION_VARIANT: Record<string, "destructive" | "warning" | "secondar
   "dropped-off": "success",
   "student-absent": "destructive",
   incident: "destructive",
+  "admin-notice": "warning",
+  "ride-cancelled": "secondary",
   custom: "secondary",
 };
 
 // Type filter over the merged taxonomy (R33): notification types plus incident
 // types; the never-produced `custom` type is excluded. Values stay raw type
 // strings — the two namespaces don't collide.
-const TYPE_FILTER_OPTIONS: { value: string; label: string }[] = [
+export const TYPE_FILTER_OPTIONS: { value: string; label: string }[] = [
   ...Object.entries(NOTIFICATION_LABEL).filter(([type]) => type !== "custom"),
   ...Object.entries(TYPE_LABEL),
 ].map(([value, label]) => ({ value, label }));
@@ -80,7 +89,7 @@ const PERIODS = [
   { value: "afternoon", label: "Afternoon" },
 ] as const;
 
-type Period = (typeof PERIODS)[number]["value"];
+export type Period = (typeof PERIODS)[number]["value"];
 
 interface FeedItem {
   key: string;
@@ -95,9 +104,21 @@ interface FeedItem {
   unread: boolean;
 }
 
+// Period chips filter on run_type; rows without one (whole-day cancellations,
+// generic notices) show under All only. 'admin-notice' is the one type-scoped
+// exemption (R22): a school broadcast carries no run period yet stays visible
+// under every chip. 'ride-cancelled' needs none — its rows carry the cancelled
+// scope's run_type (whole-day → null, correctly All-only).
+export function matchesPeriod(item: Pick<FeedItem, "type" | "runType">, period: Period): boolean {
+  if (period === "all") return true;
+  if (item.type === "admin-notice") return true;
+  return item.runType === period;
+}
+
 export function ParentAlertsPage() {
-  // Recent = rolling 24h, History = last 7 days (R35); both server-windowed,
-  // no rows are ever deleted.
+  // Recent = rolling 24h, History = 24h–7d (R5–R7) — disjoint by construction:
+  // HISTORY_WINDOW's minAgeHours excludes Recent's rows server-side. Both are
+  // server-windowed; no rows are ever deleted.
   const [tab, setTab] = useState<"recent" | "history">("recent");
   const feedWindow = tab === "history" ? HISTORY_WINDOW : RECENT_WINDOW;
   const { data: alerts = [] } = useParentAlerts(feedWindow);
@@ -152,14 +173,12 @@ export function ParentAlertsPage() {
     });
   }, [alerts, notifications]);
 
-  // Client-side filters over the fetched window (R33). Rows without a
-  // run_type only show under All.
+  // Client-side filters over the fetched window (R33): period rules live in
+  // matchesPeriod; the type filter matches raw type strings.
   const visible = useMemo(
     () =>
       feed.filter(
-        (item) =>
-          (period === "all" || item.runType === period) &&
-          (typeFilter === "all" || item.type === typeFilter),
+        (item) => matchesPeriod(item, period) && (typeFilter === "all" || item.type === typeFilter),
       ),
     [feed, period, typeFilter],
   );
@@ -212,7 +231,7 @@ export function ParentAlertsPage() {
           <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">
             {feed.length === 0
               ? tab === "history"
-                ? "Nothing in the last 7 days."
+                ? "Nothing older than 24 hours in the last 7 days."
                 : "No alerts for your children's buses."
               : "No alerts match the selected filters."}
           </CardContent></Card>
@@ -234,7 +253,10 @@ export function ParentAlertsPage() {
                         <span className="h-2 w-2 rounded-full bg-primary" aria-label="unread" />
                       )}
                     </div>
-                    <p className="text-sm">{item.body}</p>
+                    {/* Text-only body keeps admin free text inert (no HTML or
+                        markdown interpretation, R22/U8); pre-line preserves the
+                        newlines broadcast bodies may carry. */}
+                    <p className="whitespace-pre-line text-sm">{item.body}</p>
                     <p className="text-xs text-muted-foreground">
                       {item.createdAt
                         ? formatDistanceToNow(new Date(item.createdAt), { addSuffix: true })

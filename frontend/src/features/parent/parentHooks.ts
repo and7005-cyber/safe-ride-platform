@@ -18,28 +18,46 @@ export function useChildren() {
   });
 }
 
-// Server-side feed windows (R35): the main feed shows a rolling 24 hours,
-// the History tab the last 7 days (list cap raised to the server's 200 max).
+// Server-side feed windows (R5–R7): Recent is the rolling last 24 hours;
+// History is 24 hours to 7 days — minAgeHours excludes the young rows on the
+// server (client-side trimming of the 168h query would let a busy last 24h
+// eat the 200-row cap), so the two tabs are disjoint by construction. No rows
+// are deleted: both are display windows over the retained trail.
 export interface FeedWindow {
   windowHours?: number;
   limit?: number;
+  minAgeHours?: number;
 }
 
-export const RECENT_WINDOW: Required<FeedWindow> = { windowHours: 24, limit: 50 };
-export const HISTORY_WINDOW: Required<FeedWindow> = { windowHours: 168, limit: 200 };
+export const RECENT_WINDOW: FeedWindow = { windowHours: 24, limit: 50 };
+export const HISTORY_WINDOW: FeedWindow = { windowHours: 168, limit: 200, minAgeHours: 24 };
 
-export function useParentAlerts({ windowHours, limit }: FeedWindow = RECENT_WINDOW) {
+export function useParentAlerts({ windowHours, limit, minAgeHours }: FeedWindow = RECENT_WINDOW) {
   return useQuery({
-    queryKey: ["parent-alerts", windowHours, limit],
-    queryFn: () => api.get("/api/parent-portal/alerts", { window_hours: windowHours, limit }),
+    queryKey: ["parent-alerts", windowHours, limit, minAgeHours],
+    queryFn: () =>
+      api.get("/api/parent-portal/alerts", {
+        window_hours: windowHours,
+        limit,
+        min_age_hours: minAgeHours,
+      }),
     refetchInterval: POLL_LIVE,
   });
 }
 
-export function useParentNotifications({ windowHours, limit }: FeedWindow = RECENT_WINDOW) {
+export function useParentNotifications({
+  windowHours,
+  limit,
+  minAgeHours,
+}: FeedWindow = RECENT_WINDOW) {
   return useQuery({
-    queryKey: ["parent-notifications", windowHours, limit],
-    queryFn: () => api.get("/api/push/notifications", { window_hours: windowHours, limit }),
+    queryKey: ["parent-notifications", windowHours, limit, minAgeHours],
+    queryFn: () =>
+      api.get("/api/push/notifications", {
+        window_hours: windowHours,
+        limit,
+        min_age_hours: minAgeHours,
+      }),
     refetchInterval: POLL_LIVE,
   });
 }
@@ -49,6 +67,9 @@ export function useMarkNotificationsRead() {
   return useMutation({
     mutationFn: () => api.post("/api/push/notifications/mark-read"),
     onSuccess: () => {
+      // Prefix match (TanStack default): this one invalidation covers every
+      // window-variant key (["parent-notifications", windowHours, limit,
+      // minAgeHours]), so Recent and History both refresh their read state.
       queryClient.invalidateQueries({ queryKey: ["parent-notifications"] });
     },
   });
