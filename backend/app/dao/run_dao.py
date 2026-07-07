@@ -2,6 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.absence_dao import absent_student_ids
+from app.dao.status_sql import scope_covers
 
 
 class RunDao:
@@ -170,17 +171,21 @@ class RunDao:
                     "select 1 from run_stops where run_id = %s limit 1", (run_id,)
                 ).fetchone()
                 if not has_stops:
+                    # Scope-aware (U4): only absences COVERING this run's type
+                    # count — a morning-cancelled child is not absent from the
+                    # afternoon run.
                     absent = conn.execute(
-                        """
+                        f"""
                         select a.student_id, s.name as student_name, a.reason
                         from live_student_absences a
                         join live_students s on s.id = a.student_id
                         join live_student_routes sr
                             on sr.student_id = a.student_id and sr.route_id = %s
                         where a.absence_date = %s
+                          and {scope_covers("a.scope", "%s")}
                         order by s.name asc
                         """,
-                        (run["route_id"], run["date"]),
+                        (run["route_id"], run["date"], run["type"]),
                     ).fetchall()
                     approximate = True
         report = dict(run)
@@ -231,12 +236,18 @@ class RunDao:
             # (run_stops membership) — never the derived bus roster, which
             # diverges for students whose afternoon route rides another bus.
             # Without a run, the bus roster is the natural pre-run view.
+            #
+            # Scope-aware flag (U4): with an active run, a partial absence
+            # flags only when it covers the RUN's type; pre-run there is no
+            # run to match, so only whole-day rows flag (the %s arm is NULL
+            # then, and `a.scope = null` matches nothing).
             active_dict = dict(active) if active else None
-            absent_flag_sql = """
+            absent_flag_sql = f"""
                 select s.*, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                      and {scope_covers("a.scope", "%s")}
                 ) as absent
                 from live_students s
             """
@@ -250,12 +261,12 @@ class RunDao:
                     )
                     order by s.name asc
                     """,
-                    (active_dict["id"],),
+                    (active_dict["type"], active_dict["id"]),
                 ).fetchall()
             else:
                 students = conn.execute(
                     absent_flag_sql + " where s.bus_id = %s order by s.name asc",
-                    (bus["id"],),
+                    (None, bus["id"]),
                 ).fetchall()
             run_stops = []
             if active_dict:
@@ -328,10 +339,11 @@ class RunDao:
                 "select * from live_route_stops where route_id = %s order by stop_order asc, name asc",
                 (route_id,),
             ).fetchall()
-            # Drop stops for students marked absent today (#7), then renumber so
-            # the snapshot's stop_orders stay contiguous (arrive_next_stop walks
-            # them one at a time).
-            absent = absent_student_ids(conn)
+            # Drop stops for students marked absent today (#7) with a scope
+            # covering THIS run's type (U4 — a morning-only cancellation keeps
+            # the afternoon stop), then renumber so the snapshot's stop_orders
+            # stay contiguous (arrive_next_stop walks them one at a time).
+            absent = absent_student_ids(conn, run_type=route["type"])
             kept = [
                 s for s in all_stops
                 if s["student_id"] is None or str(s["student_id"]) not in absent
@@ -375,12 +387,13 @@ class RunDao:
             # previous day (no today-absence row) must not stay stuck.
             if route["type"] == "afternoon":
                 # Auto-board the roster (R32): every roster student without a
-                # today-absence goes 'on-bus' directly in SQL — no per-student
-                # 'student-boarded' pushes; the run-level 'on-way-home'
-                # notification covers the start. Stale-'absent' students join
-                # the auto-board set here.
+                # today-absence COVERING the afternoon (U4 — a morning-only
+                # cancellation still boards) goes 'on-bus' directly in SQL —
+                # no per-student 'student-boarded' pushes; the run-level
+                # 'on-way-home' notification covers the start. Stale-'absent'
+                # students join the auto-board set here.
                 conn.execute(
-                    """
+                    f"""
                     update live_students set status = 'on-bus'
                     where id in (
                         select student_id from run_stops
@@ -389,15 +402,19 @@ class RunDao:
                       and id not in (
                           select student_id from live_student_absences
                           where absence_date = (now() at time zone 'Africa/Nairobi')::date
+                            and {scope_covers("scope", "%s")}
                       )
                     """,
-                    (run["id"],),
+                    (run["id"], route["type"]),
                 )
             else:
                 # Morning: reset stale-'absent' roster students to 'at-school'
-                # so they board normally.
+                # so they board normally. Heal only when no absence COVERS
+                # this run (U4): an afternoon-only cancellation does not make
+                # the child absent from the morning, so it never blocks the
+                # heal — and a covering row means genuinely absent, no heal.
                 conn.execute(
-                    """
+                    f"""
                     update live_students set status = 'at-school'
                     where status = 'absent'
                       and id in (
@@ -407,9 +424,10 @@ class RunDao:
                       and id not in (
                           select student_id from live_student_absences
                           where absence_date = (now() at time zone 'Africa/Nairobi')::date
+                            and {scope_covers("scope", "%s")}
                       )
                     """,
-                    (run["id"],),
+                    (run["id"], route["type"]),
                 )
             # Recount students_boarded (never increment): morning counts who is
             # on the bus, afternoon counts confirmed drop-offs — both 0 at
@@ -423,11 +441,12 @@ class RunDao:
             ).fetchone()
             # Snapshot today's absences for the run report (R14-R16): today's
             # absent students intersected with the ROUTE's membership — never
-            # the derived bus roster (see KTDs). student_name is denormalized
-            # because run_absences.student_id is ON DELETE SET NULL; a
-            # name-less snapshot would rot after student deletion.
+            # the derived bus roster (see KTDs) — and only absences COVERING
+            # this run's type (U4). student_name is denormalized because
+            # run_absences.student_id is ON DELETE SET NULL; a name-less
+            # snapshot would rot after student deletion.
             conn.execute(
-                """
+                f"""
                 insert into run_absences (run_id, student_id, student_name, reason)
                 select %s, s.id, s.name, a.reason
                 from live_student_absences a
@@ -435,9 +454,10 @@ class RunDao:
                 join live_student_routes sr
                     on sr.student_id = a.student_id and sr.route_id = %s
                 where a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                  and {scope_covers("a.scope", "%s")}
                 on conflict (run_id, student_id) do nothing
                 """,
-                (run["id"], route_id),
+                (run["id"], route_id, route["type"]),
             )
             # Position the bus at the school when the run starts; from here the
             # position is the last stop the driver arrives at (no device GPS).
@@ -672,6 +692,11 @@ class RunDao:
         500), append the run_absences snapshot (on conflict do nothing —
         one row per run+student), set status 'absent', recount
         students_boarded from the run's roster.
+
+        Staff transition rule (U4): a driver mark is a whole-day absence, so
+        the conflict branch escalates any existing row — a parent's partial
+        cancellation included — to scope='day' and stamps source='driver'
+        (the provenance ratchet's one-way direction).
         """
         from app.core.errors import ForbiddenError
 
@@ -689,10 +714,12 @@ class RunDao:
                 raise ForbiddenError("Student is not on this run")
             conn.execute(
                 """
-                insert into live_student_absences (student_id, absence_date, reason, marked_by)
-                values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s)
+                insert into live_student_absences
+                    (student_id, absence_date, reason, marked_by, scope, source)
+                values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'day', 'driver')
                 on conflict (student_id, absence_date)
-                do update set reason = excluded.reason, marked_by = excluded.marked_by
+                do update set reason = excluded.reason, marked_by = excluded.marked_by,
+                              scope = 'day', source = 'driver'
                 """,
                 (student_id, reason, driver_id),
             )

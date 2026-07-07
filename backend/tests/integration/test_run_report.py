@@ -13,6 +13,10 @@ row + bus/route/driver names + the absent_students snapshot — with the
 legacy fallback (route but no snapshot and no run_stops) flagged
 approximate=true. Entities are 'IT '-prefixed and cleaned up in finally
 blocks; runs the tests start are always ended (and deleted) afterwards.
+
+Also covers the scope-aware legacy fallback (ops-refinement U4: R16): only
+absences covering the run's type report — a morning-cancelled child never
+shows absent on the afternoon run.
 """
 
 import datetime as _dt
@@ -20,6 +24,7 @@ import os
 import uuid
 
 import httpx
+import psycopg
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -28,6 +33,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
+# The local stack's Postgres, published by docker-compose.local.yml. Used only
+# to stage scoped parent rows no API can produce until U5 (the same
+# direct-SQL fixture pattern test_students_parents documents).
+DB_URL = os.environ.get(
+    "INTEGRATION_DB_URL", "postgresql://saferide:saferide@localhost:5432/saferide"
+)
 
 ADMIN = {"email": "admin@test.com", "password": "test1234."}
 DRIVER_PIN = "0322"
@@ -320,4 +331,76 @@ def test_legacy_run_falls_back_to_live_absences_flagged_approximate(client, admi
             client.delete(f"/api/runs/{run_id}", headers=admin_headers)
         _clear_absences_for(client, admin_headers, student["id"])
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+
+
+def test_legacy_fallback_excludes_non_covering_scopes(client, admin_headers):
+    """Ops-refinement U4 (R16): the legacy live-absence fallback counts only
+    absences whose scope covers the run's type — on an afternoon run a
+    morning-cancelled child is NOT absent, while whole-day and
+    afternoon-scoped rows still report."""
+    marker = uuid.uuid4().hex[:6]
+    route = client.post(
+        "/api/fleet/routes",
+        json={"name": f"IT Scoped Legacy {marker}", "type": "afternoon"},
+        headers=admin_headers,
+    )
+    assert route.status_code == 200, route.text
+    route = route.json()
+
+    def make_student(tag: str) -> dict:
+        response = client.post(
+            "/api/students",
+            json={"name": f"IT Scoped {tag} {marker}", "parent_name": "IT Scoped Parent",
+                  "parent_phone": "+254711000044",
+                  "parent_email": f"it-scoped-{tag}-{marker}@test.local",
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    morning_kid = make_student("am")
+    afternoon_kid = make_student("pm")
+    day_kid = make_student("day")
+    run_id = None
+    try:
+        # Scoped parent cancellations, staged by SQL (the write API is U5).
+        with psycopg.connect(DB_URL, autocommit=True) as conn:
+            for student, scope in ((morning_kid, "morning"), (afternoon_kid, "afternoon")):
+                conn.execute(
+                    """
+                    insert into live_student_absences
+                        (student_id, absence_date, reason, scope, source)
+                    values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'parent')
+                    """,
+                    (student["id"], f"IT cancelled {scope} {marker}", scope),
+                )
+        marked = client.post(
+            "/api/students/absences",
+            json={"student_id": day_kid["id"], "reason": f"IT sick {marker}"},
+            headers=admin_headers,
+        )
+        assert marked.status_code == 200, marked.text
+
+        created = client.post(
+            "/api/runs",
+            json={"route_id": route["id"], "type": "afternoon", "status": "completed"},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        run_id = created.json()["id"]
+
+        report = _get_report(client, admin_headers, run_id)
+        assert report["approximate"] is True
+        listed = {a["student_id"] for a in report["absent_students"]}
+        assert afternoon_kid["id"] in listed
+        assert day_kid["id"] in listed
+        assert morning_kid["id"] not in listed  # morning cancellation ≠ afternoon absence
+    finally:
+        if run_id:
+            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        for student in (morning_kid, afternoon_kid, day_kid):
+            _clear_absences_for(client, admin_headers, student["id"])
+            client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)

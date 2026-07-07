@@ -11,6 +11,14 @@ silent sweep lifecycle, one-way morning boarding, the driver absent flow
 fan-out), today-scoped admin absence side-effects with the active-run clear
 guard, the stale-'absent' self-heal, and delete_run's status reset.
 
+Also covers scoped absences through the roster machinery (ops-refinement U4:
+R2, R15, R16, R19; AE4 groundwork): partial-scope run filtering per run type,
+the staff-over-parent provenance ratchet (escalation and the atomic refusal),
+parent merge/downgrade/withdraw transitions with their status resets, the
+scope-pinned driver flags and clear guard, and the scope-aware stale-'absent'
+heal. Parent transitions run DAO-direct (set_scope/withdraw_scope have no
+HTTP surface until U5).
+
 Isolation: this module builds its own throwaway fleet — a driver account
 created through POST /api/accounts/drivers WITH a known PIN (the payload
 accepts `pin`, so no test ever needs the seeded Simba driver or PIN 0322),
@@ -37,6 +45,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
+# The local stack's Postgres, published by docker-compose.local.yml — the
+# same database the containerized API serves (see the `absences` fixture).
+DB_URL = os.environ.get(
+    "INTEGRATION_DB_URL", "postgresql://saferide:saferide@localhost:5432/saferide"
+)
 
 ADMIN = {"email": "admin@test.com", "password": "test1234."}
 NAIROBI = ZoneInfo("Africa/Nairobi")
@@ -63,6 +76,22 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 @pytest.fixture(scope="module")
 def admin_headers(client):
     return login(client, ADMIN["email"], ADMIN["password"])
+
+
+@pytest.fixture(scope="module")
+def absences():
+    """The working-tree AbsenceDao wired to the stack's published Postgres.
+
+    Parent scope transitions (set_scope / withdraw_scope) have no HTTP
+    surface until U5, so these tests drive the DAO directly — same database
+    the containerized API serves, so both sides observe one state. The env
+    override must land before the app's lazy pool first opens: backend/.env
+    points DATABASE_URL at the compose-internal 'db' host, unreachable from
+    the host."""
+    os.environ["DATABASE_URL"] = DB_URL
+    from app.dao.absence_dao import AbsenceDao
+
+    return AbsenceDao()
 
 
 def _create_driver(client, admin_headers, marker: str) -> dict:
@@ -578,4 +607,384 @@ def test_stale_absent_student_joins_afternoon_auto_board(client, admin_headers, 
         assert _student_status(client, admin_headers, stale["id"]) == "on-bus"
     finally:
         _end_and_delete(client, admin_headers, fleet["driver_headers"], run_id)
+        client.delete(f"/api/students/{stale['id']}", headers=admin_headers)
+
+
+# Scoped absences and provenance (ops-refinement U4: R2, R15, R16, R19; AE4) --------
+#
+# Parent transitions go DAO-direct through the `absences` fixture; roster
+# effects are asserted over the HTTP surface. Actor ids only satisfy the
+# marked_by FK here — role enforcement is U5's API-layer concern.
+
+def test_afternoon_scoped_absence_rides_morning_and_skips_afternoon(
+    client, admin_headers, fleet, absences
+):
+    """Covers AE4 (first half): an afternoon-only cancellation leaves the
+    morning run untouched — stop present, empty snapshot — and on the
+    afternoon run drops the stop, skips the auto-board, and lands in the
+    run_absences snapshot. The partial never writes the live status."""
+    driver_headers = fleet["driver_headers"]
+    s2 = fleet["s2"]
+    run_id = None
+    try:
+        before = _student_status(client, admin_headers, s2["id"])
+        result = absences.set_scope(s2["id"], "afternoon", fleet["driver"]["id"])
+        assert result is not None and result["changed"] is True
+        assert _student_status(client, admin_headers, s2["id"]) == before
+
+        run = _start_run(client, driver_headers, fleet["morning"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        assert s2["id"] in {s["student_id"] for s in context["run_stops"]}
+        assert _report(client, admin_headers, run_id)["absent_students"] == []
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        run_id = None
+
+        run = _start_run(client, driver_headers, fleet["afternoon"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        assert s2["id"] not in {s["student_id"] for s in context["run_stops"]}
+        assert _student_status(client, admin_headers, s2["id"]) == "at-school"  # not boarded
+        report = _report(client, admin_headers, run_id)
+        assert [a["student_id"] for a in report["absent_students"]] == [s2["id"]]
+    finally:
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        _clear_absences_for(client, admin_headers, s2["id"])
+
+
+def test_morning_scoped_absence_skips_morning_and_boards_afternoon(
+    client, admin_headers, fleet, absences
+):
+    """The mirror case: a morning-only cancellation drops the morning stop
+    and snapshots, then the afternoon run carries and auto-boards the child
+    as if nothing happened."""
+    driver_headers = fleet["driver_headers"]
+    s2 = fleet["s2"]
+    run_id = None
+    try:
+        result = absences.set_scope(s2["id"], "morning", fleet["driver"]["id"])
+        assert result is not None and result["changed"] is True
+
+        run = _start_run(client, driver_headers, fleet["morning"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        assert s2["id"] not in {s["student_id"] for s in context["run_stops"]}
+        report = _report(client, admin_headers, run_id)
+        assert [a["student_id"] for a in report["absent_students"]] == [s2["id"]]
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        run_id = None
+
+        run = _start_run(client, driver_headers, fleet["afternoon"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        assert s2["id"] in {s["student_id"] for s in context["run_stops"]}
+        assert _student_status(client, admin_headers, s2["id"]) == "on-bus"  # auto-boarded
+        assert _report(client, admin_headers, run_id)["absent_students"] == []
+    finally:
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        _clear_absences_for(client, admin_headers, s2["id"])
+
+
+def test_staff_mark_escalates_parent_partial_to_day(client, admin_headers, fleet, absences):
+    """R15/R19 (provenance ratchet, staff direction): an office mark over a
+    parent's partial cancellation escalates the single row to a whole-day
+    admin absence — scope 'day', source 'admin' in the absences payload —
+    and with every roster student under a day absence the afternoon
+    auto-board boards nobody."""
+    driver_headers = fleet["driver_headers"]
+    s1, s2 = fleet["s1"], fleet["s2"]
+    run_id = None
+    try:
+        result = absences.set_scope(s2["id"], "morning", fleet["driver"]["id"])
+        assert result is not None and result["scope"] == "morning"
+
+        marked = client.post(
+            "/api/students/absences",
+            json={"student_id": s2["id"], "reason": "IT sick day"},
+            headers=admin_headers,
+        )
+        assert marked.status_code == 200, marked.text
+        assert (marked.json()["scope"], marked.json()["source"]) == ("day", "admin")
+        rows = [
+            a for a in client.get("/api/students/absences", headers=admin_headers).json()
+            if a["student_id"] == s2["id"]
+        ]
+        assert len(rows) == 1  # a transition on the single row, never a second row
+        assert (rows[0]["scope"], rows[0]["source"]) == ("day", "admin")
+        assert _student_status(client, admin_headers, s2["id"]) == "absent"
+
+        marked = client.post(
+            "/api/students/absences",
+            json={"student_id": s1["id"], "reason": "IT sick day"},
+            headers=admin_headers,
+        )
+        assert marked.status_code == 200, marked.text
+
+        run = _start_run(client, driver_headers, fleet["afternoon"]["id"])
+        run_id = run["id"]
+        assert run["total_students"] == 0
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        assert {s["student_id"] for s in context["run_stops"] if s["student_id"]} == set()
+        for sid in (s1["id"], s2["id"]):
+            assert _student_status(client, admin_headers, sid) == "absent"  # nobody boarded
+        report = _report(client, admin_headers, run_id)
+        assert {a["student_id"] for a in report["absent_students"]} == {s1["id"], s2["id"]}
+    finally:
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        for student in (s1, s2):
+            _clear_absences_for(client, admin_headers, student["id"])
+
+
+def test_staff_mark_committed_before_parent_write_still_wins(
+    client, admin_headers, fleet, absences
+):
+    """The ratchet is enforced INSIDE the upsert: with a staff row already
+    committed (simulating the staff mark landing between a parent's check
+    and write), set_scope hits the DO UPDATE's source='parent' WHERE on the
+    current row and returns the zero-row refusal — no scope, source, or
+    status moves; withdraw_scope refuses the same way."""
+    s1 = fleet["s1"]
+    try:
+        marked = client.post(
+            "/api/students/absences",
+            json={"student_id": s1["id"], "reason": "IT office sick day"},
+            headers=admin_headers,
+        )
+        assert marked.status_code == 200, marked.text
+
+        assert absences.set_scope(s1["id"], "afternoon", fleet["driver"]["id"]) is None
+        assert absences.withdraw_scope(s1["id"], "day", fleet["driver"]["id"]) is None
+
+        row = next(
+            a for a in client.get("/api/students/absences", headers=admin_headers).json()
+            if a["student_id"] == s1["id"]
+        )
+        assert (row["scope"], row["source"]) == ("day", "admin")
+        assert row["reason"] == "IT office sick day"
+        assert _student_status(client, admin_headers, s1["id"]) == "absent"
+    finally:
+        _clear_absences_for(client, admin_headers, s1["id"])
+
+
+def test_parent_merge_downgrade_and_withdraw_transitions(
+    client, admin_headers, fleet, absences
+):
+    """Parent transitions on the single row: morning + afternoon merge to
+    'day' (which is when — and only when — the status flips to 'absent'),
+    the day − morning downgrade lands on 'afternoon' and resets the status,
+    and withdrawing the remaining half deletes the row without touching the
+    status again. A same-scope re-cancel reports changed=False."""
+    s1 = fleet["s1"]
+    actor = fleet["driver"]["id"]
+    try:
+        before = _student_status(client, admin_headers, s1["id"])
+        first = absences.set_scope(s1["id"], "morning", actor)
+        assert first is not None
+        assert (first["scope"], first["source"], first["changed"]) == ("morning", "parent", True)
+        assert _student_status(client, admin_headers, s1["id"]) == before
+
+        again = absences.set_scope(s1["id"], "morning", actor)
+        assert again is not None and again["changed"] is False  # idempotent re-cancel
+
+        merged = absences.set_scope(s1["id"], "afternoon", actor)
+        assert merged is not None and (merged["scope"], merged["changed"]) == ("day", True)
+        assert _student_status(client, admin_headers, s1["id"]) == "absent"
+        row = next(
+            a for a in client.get("/api/students/absences", headers=admin_headers).json()
+            if a["student_id"] == s1["id"]
+        )
+        assert (row["scope"], row["source"]) == ("day", "parent")
+
+        downgraded = absences.withdraw_scope(s1["id"], "morning", actor)
+        assert downgraded == {"deleted": False, "scope": "afternoon"}
+        assert _student_status(client, admin_headers, s1["id"]) == "at-school"  # exit from day
+
+        removed = absences.withdraw_scope(s1["id"], "afternoon", actor)
+        assert removed == {"deleted": True, "scope": None}
+        assert _student_status(client, admin_headers, s1["id"]) == "at-school"
+        assert all(
+            a["student_id"] != s1["id"]
+            for a in client.get("/api/students/absences", headers=admin_headers).json()
+        )
+    finally:
+        _clear_absences_for(client, admin_headers, s1["id"])
+
+
+def test_withdrawal_delete_of_day_row_resets_status(client, admin_headers, fleet, absences):
+    """Withdrawing a straight 'day' cancellation (never merged) is the other
+    exit from 'day': the row deletes and the 'absent' status resets to
+    'at-school', exactly like the admin clear."""
+    s2 = fleet["s2"]
+    actor = fleet["driver"]["id"]
+    try:
+        result = absences.set_scope(s2["id"], "day", actor)
+        assert result is not None and (result["scope"], result["changed"]) == ("day", True)
+        assert _student_status(client, admin_headers, s2["id"]) == "absent"
+
+        removed = absences.withdraw_scope(s2["id"], "day", actor)
+        assert removed == {"deleted": True, "scope": None}
+        assert _student_status(client, admin_headers, s2["id"]) == "at-school"
+        assert all(
+            a["student_id"] != s2["id"]
+            for a in client.get("/api/students/absences", headers=admin_headers).json()
+        )
+    finally:
+        _clear_absences_for(client, admin_headers, s2["id"])
+
+
+def test_parent_transitions_reject_unknown_scopes(client, admin_headers, fleet, absences):
+    """An unknown scope must fail loudly BEFORE the SQL runs: the upsert's
+    merge expression would otherwise fold any unequal value into 'day' — a
+    typo becoming a whole-day absence is exactly the silent degradation the
+    plan bans."""
+    from app.core.errors import BadRequestError
+
+    for verb in (absences.set_scope, absences.withdraw_scope):
+        with pytest.raises(BadRequestError):
+            verb(fleet["s1"]["id"], "evening", fleet["driver"]["id"])
+    assert all(
+        a["student_id"] != fleet["s1"]["id"]
+        for a in client.get("/api/students/absences", headers=admin_headers).json()
+    )
+
+
+def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
+    client, admin_headers, fleet, absences
+):
+    """R2/R16: a partial cancellation gates rosters only — raw status AND
+    derived display_status stay untouched on the parent and admin surfaces,
+    and the pre-run driver flag pins to whole-day rows. Merging to 'day'
+    makes it a real absence on every surface; withdrawing the day resets."""
+    from test_students_parents import assert_display_parity, create_linked_student
+
+    marker = uuid.uuid4().hex[:6]
+    student, parent_id, _, parent_headers = create_linked_student(
+        client, admin_headers, marker,
+        route_ids=[fleet["morning"]["id"], fleet["afternoon"]["id"]],
+        home_lat=-1.27, home_lng=36.795, pickup_time="06:20",
+    )
+
+    def driver_flag() -> bool:
+        context = client.get("/api/runs/driver/context", headers=fleet["driver_headers"]).json()
+        return {s["id"]: s["absent"] for s in context["students"]}[student["id"]]
+
+    try:
+        result = absences.set_scope(student["id"], "afternoon", parent_id)
+        assert result is not None and result["scope"] == "afternoon"
+        assert_display_parity(
+            client, parent_headers, admin_headers, student["id"],
+            expected="at-school", raw="at-school",
+        )
+        assert driver_flag() is False  # pre-run branch pins to 'day'-only
+
+        merged = absences.set_scope(student["id"], "morning", parent_id)
+        assert merged is not None and merged["scope"] == "day"
+        assert_display_parity(
+            client, parent_headers, admin_headers, student["id"],
+            expected="absent", raw="absent",
+        )
+        assert driver_flag() is True
+
+        removed = absences.withdraw_scope(student["id"], "day", parent_id)
+        assert removed == {"deleted": True, "scope": None}
+        assert_display_parity(
+            client, parent_headers, admin_headers, student["id"],
+            expected="at-school", raw="at-school",
+        )
+    finally:
+        _clear_absences_for(client, admin_headers, student["id"])
+        client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+
+
+def test_driver_flag_and_clear_guard_follow_the_active_run_type(
+    client, admin_headers, fleet, absences
+):
+    """Mid-run: the driver context's absent flag fires only for absences
+    covering the ACTIVE run's type, and the admin clear is blocked only
+    while a covered-type run is active (the R25b guard made scope-aware) —
+    a non-covering partial stays clearable mid-run."""
+    driver_headers = fleet["driver_headers"]
+    s2 = fleet["s2"]
+    actor = fleet["driver"]["id"]
+    run_id = None
+
+    def absent_flag() -> bool:
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        return {s["id"]: s["absent"] for s in context["students"]}[s2["id"]]
+
+    def s2_absence_id() -> str:
+        return next(
+            a["id"] for a in client.get("/api/students/absences", headers=admin_headers).json()
+            if a["student_id"] == s2["id"]
+        )
+
+    try:
+        run = _start_run(client, driver_headers, fleet["morning"]["id"])
+        run_id = run["id"]
+
+        # Afternoon partial during the morning run: invisible to this run...
+        assert absences.set_scope(s2["id"], "afternoon", actor) is not None
+        assert absent_flag() is False
+        # ...and clearable — no covered-type run is active.
+        cleared = client.delete(
+            f"/api/students/absences/{s2_absence_id()}", headers=admin_headers
+        )
+        assert cleared.status_code == 200, cleared.text
+
+        # Morning partial during the morning run: covered — flags and blocks.
+        assert absences.set_scope(s2["id"], "morning", actor) is not None
+        assert absent_flag() is True
+        blocked = client.delete(
+            f"/api/students/absences/{s2_absence_id()}", headers=admin_headers
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert "End the run first" in blocked.json()["detail"]
+
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        run_id = None
+        cleared = client.delete(
+            f"/api/students/absences/{s2_absence_id()}", headers=admin_headers
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert _student_status(client, admin_headers, s2["id"]) == "at-school"
+    finally:
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        _clear_absences_for(client, admin_headers, s2["id"])
+
+
+def test_stale_absent_heal_respects_covering_partials(client, admin_headers, fleet, absences):
+    """The morning stale-'absent' self-heal fires when today's only absence
+    does NOT cover the morning (afternoon partial — the child rides and the
+    stop stays), and stays away when a covering partial exists (the child
+    is genuinely off this run, stop dropped, status untouched)."""
+    from test_students_parents import force_student_status
+
+    marker = uuid.uuid4().hex[:6]
+    stale = _make_stale_absent_student(client, admin_headers, fleet, marker)
+    actor = fleet["driver"]["id"]
+    run_id = None
+    try:
+        # Non-covering partial: the heal ignores it and proceeds.
+        assert absences.set_scope(stale["id"], "afternoon", actor) is not None
+        run = _start_run(client, fleet["driver_headers"], fleet["morning"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=fleet["driver_headers"]).json()
+        assert stale["id"] in {s["student_id"] for s in context["run_stops"]}
+        assert _student_status(client, admin_headers, stale["id"]) == "at-school"
+        _end_and_delete(client, admin_headers, fleet["driver_headers"], run_id)
+        run_id = None
+        _clear_absences_for(client, admin_headers, stale["id"])
+
+        # Covering partial: no heal, stop dropped.
+        force_student_status(stale["id"], "absent")
+        assert absences.set_scope(stale["id"], "morning", actor) is not None
+        run = _start_run(client, fleet["driver_headers"], fleet["morning"]["id"])
+        run_id = run["id"]
+        context = client.get("/api/runs/driver/context", headers=fleet["driver_headers"]).json()
+        assert stale["id"] not in {s["student_id"] for s in context["run_stops"]}
+        assert _student_status(client, admin_headers, stale["id"]) == "absent"
+    finally:
+        _end_and_delete(client, admin_headers, fleet["driver_headers"], run_id)
+        _clear_absences_for(client, admin_headers, stale["id"])
         client.delete(f"/api/students/{stale['id']}", headers=admin_headers)

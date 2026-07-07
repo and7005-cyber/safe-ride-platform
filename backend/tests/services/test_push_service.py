@@ -358,6 +358,137 @@ def test_arrival_incidents_do_not_double_notify(service: PushService, dao: FakeP
     assert dao.notifications == []
 
 
+def test_student_stamped_incidents_never_fan_out(service: PushService, dao: FakePushDao) -> None:
+    """Defense in depth (U5): a student-stamped incident names a child, so it
+    must never reach the bus-wide fan-out — whatever its type (the guard
+    protects the driver-absent 'student' path and the parent 'cancellation'
+    path alike)."""
+    dao.bus_parents = [link("p1", "s1", "Leila"), link("p2", "s3", "Wanjiru")]
+
+    for incident_type in ("cancellation", "student", "other"):
+        service.notify_incident({
+            "type": incident_type, "bus_id": "bus-1", "bus_name": "Kifaru Bus",
+            "student_id": "s1", "description": "Leila is off the afternoon run",
+        })
+
+    assert dao.notifications == []
+
+
+def test_ride_cancelled_notifies_all_linked_parents_with_scoped_run_type(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Cancel-a-Ride confirmation (U5): every linked parent of THAT child gets
+    one 'ride-cancelled' row — run_id NULL (no run-scoped dedup: the caller
+    only fires on real transitions) and run_type mapped from the scope so
+    the feed's period filter surfaces it where the parent will look."""
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p2", "s1", "Leila")],
+        "s2": [link("p3", "s2", "Baraka")],  # another household: never notified
+    }
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": "bus-1"}, "afternoon")
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p2"]
+    for note in dao.notifications:
+        assert note["type"] == "ride-cancelled"
+        assert note["run_id"] is None
+        assert note["run_type"] == "afternoon"
+        assert note["student_id"] == "s1"
+        assert "Leila" in note["body"]
+
+
+def test_ride_cancelled_day_scope_maps_run_type_to_none(
+    service: PushService, dao: FakePushDao
+) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": None}, "day")
+
+    assert len(dao.notifications) == 1
+    assert dao.notifications[0]["run_type"] is None
+    assert dao.notifications[0]["type"] == "ride-cancelled"
+
+
+def test_admin_broadcast_one_row_per_distinct_parent(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Route broadcast (U8): one 'admin-notice' row per DISTINCT recipient in
+    the endpoint-resolved set — a duplicated id never double-sends. run_id
+    NULL (two identical sends must stay two rows, R23) and run_type NULL
+    (period-agnostic, R22); the body lands verbatim."""
+    route = {"id": "r1", "name": "Express 1 — Morning", "bus_id": "bus-1"}
+
+    service.notify_admin_broadcast(route, "Pickup delayed 20 min.", ["p1", "p2", "p1"])
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p2"]
+    for note in dao.notifications:
+        assert note["type"] == "admin-notice"
+        assert note["title"] == "School notice — Express 1 — Morning"
+        assert note["body"] == "Pickup delayed 20 min."
+        assert note["run_id"] is None
+        assert note["run_type"] is None
+        assert note["student_id"] is None
+        assert note["bus_id"] == "bus-1"
+
+
+def test_admin_broadcast_isolates_per_recipient_failures(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """One recipient's failing insert must not cut off the rest of the route:
+    recipients before AND after the failure still get their rows (review C1)."""
+    real_insert = dao.insert_notification
+
+    def flaky_insert(user_id, *args, **kwargs):
+        if user_id == "p2":
+            raise RuntimeError("db hiccup")
+        return real_insert(user_id, *args, **kwargs)
+
+    dao.insert_notification = flaky_insert  # type: ignore[assignment]
+
+    service.notify_admin_broadcast(
+        {"id": "r1", "name": "Express 1", "bus_id": "bus-1"}, "hi", ["p1", "p2", "p3"]
+    )
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p3"]
+
+
+def test_ride_cancelled_isolates_per_recipient_failures(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """A failing co-parent insert must not cost the other linked parents
+    their confirmation (review C1)."""
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p2", "s1", "Leila"), link("p3", "s1", "Leila")],
+    }
+    real_insert = dao.insert_notification
+
+    def flaky_insert(user_id, *args, **kwargs):
+        if user_id == "p2":
+            raise RuntimeError("db hiccup")
+        return real_insert(user_id, *args, **kwargs)
+
+    dao.insert_notification = flaky_insert  # type: ignore[assignment]
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": "bus-1"}, "morning")
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p3"]
+    assert all(n["type"] == "ride-cancelled" for n in dao.notifications)
+
+
+def test_admin_broadcast_title_is_length_bounded(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """Web-push services reject ~4KB payloads: a very long route name must
+    not blow up the composed title."""
+    from app.services.push_service import BROADCAST_TITLE_MAX_CHARS
+
+    service.notify_admin_broadcast({"id": "r1", "name": "R" * 300, "bus_id": None}, "hi", ["p1"])
+
+    assert len(dao.notifications) == 1
+    assert len(dao.notifications[0]["title"]) == BROADCAST_TITLE_MAX_CHARS
+    assert dao.notifications[0]["title"].endswith("…")
+
+
 def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -> None:
     # ~550m from the bus position below.
     dao.stops = [

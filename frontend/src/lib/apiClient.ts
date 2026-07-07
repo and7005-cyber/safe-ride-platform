@@ -74,5 +74,8 @@ export const api = {
   get: (path: string, query?: Query) => request("GET", path, { query }),
   post: (path: string, body?: unknown) => request("POST", path, { body: body ?? {} }),
   put: (path: string, body?: unknown) => request("PUT", path, { body: body ?? {} }),
-  del: (path: string) => request("DELETE", path),
+  // DELETE takes an optional JSON body (Cancel-a-Ride withdrawal sends
+  // {student_id, scope}); unlike post/put it is NOT defaulted to {} so
+  // existing body-less deletes keep sending no body and no Content-Type.
+  del: (path: string, body?: unknown) => request("DELETE", path, { body }),
 };

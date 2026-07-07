@@ -69,9 +69,11 @@ SafeRide is a school bus management platform (Nairobi private schools) with thre
    stack (mirror `scripts/certify.sh`).
 4. Production deployment story (frontend Dockerfile, reverse proxy with
    `TRUST_PROXY_HEADERS=true`, env-based config, real domain).
-5. Admin attendance / absence marking parity check — the old monorepo had a
-   daily-attendance flow; confirm the live platform's equivalent (if any) is
-   covered or intentionally dropped.
+5. ~~Admin attendance / absence marking parity check~~ — **done (July 2026,
+   feat/ops-refinement):** absences are first-class and scoped
+   (day/morning/afternoon with parent/driver/admin provenance), written by
+   admin, driver, and the parent Cancel-a-Ride flow, and consumed by every
+   roster surface. See docs/plans/2026-07-06-001-feat-ops-refinement-plan.md.
 6. Accessibility & mobile QA pass on real devices (driver/parent flows are
    mobile web; push on iOS requires the installed PWA, iOS 16.4+).
 

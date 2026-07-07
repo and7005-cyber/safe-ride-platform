@@ -308,6 +308,35 @@ def _routes_call(
     return routes[0] if routes else None
 
 
+def optimized_order_with_provider(students: list[dict], school: dict | None) -> dict[str, Any]:
+    """Like :func:`optimized_order`, but the caller learns WHO ordered.
+
+    Returns ``{ordered, provider}`` where ``provider`` is ``'google'`` only
+    when the Routes API waypoint optimiser actually sequenced the points,
+    ``'trivial'`` when there was nothing to order (fewer than two located
+    points), and ``'nearest-neighbour'`` for the offline fallback. Geometry
+    writes are gated on this signal (U6/R10): the bare list return of
+    ``optimized_order`` swallows failures, which is fine for the planner's
+    best-effort options but would let a silent fallback masquerade as a
+    computed order.
+    """
+    located = [p for p in students if p.get("lat") is not None and p.get("lng") is not None]
+    if len(located) <= 1:
+        return {"ordered": located, "provider": "trivial"}
+    s = get_settings()
+    if s.google_maps_api_key and school:
+        try:
+            rt = _routes_call(
+                school, school, located, s.google_maps_api_key, optimize=True, departure=None
+            )
+            order = rt.get("optimizedIntermediateWaypointIndex") if rt else None
+            if order is not None and len(order) == len(located):
+                return {"ordered": [located[i] for i in order], "provider": "google"}
+        except Exception:  # noqa: BLE001 - fall back to offline ordering
+            pass
+    return {"ordered": _nearest_neighbour(located, school or located[0]), "provider": "nearest-neighbour"}
+
+
 def optimized_order(students: list[dict], school: dict | None) -> list[dict]:
     """Return ``students`` re-sequenced into an efficient visiting order.
 
@@ -315,21 +344,7 @@ def optimized_order(students: list[dict], school: dict | None) -> list[dict]:
     used purely to derive the order), falling back to the offline
     nearest-neighbour heuristic when there is no key or the call fails.
     """
-    located = [p for p in students if p.get("lat") is not None and p.get("lng") is not None]
-    if len(located) <= 1:
-        return located
-    s = get_settings()
-    if s.google_maps_api_key and school and len(located) >= 2:
-        try:
-            rt = _routes_call(
-                school, school, located, s.google_maps_api_key, optimize=True, departure=None
-            )
-            order = rt.get("optimizedIntermediateWaypointIndex") if rt else None
-            if order is not None and len(order) == len(located):
-                return [located[i] for i in order]
-        except Exception:  # noqa: BLE001 - fall back to offline ordering
-            pass
-    return _nearest_neighbour(located, school or located[0])
+    return optimized_order_with_provider(students, school)["ordered"]
 
 
 def route_geometry(sequence: list[dict], *, departure: dt.datetime | None = None) -> dict[str, Any]:

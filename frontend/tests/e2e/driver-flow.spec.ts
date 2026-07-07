@@ -4,10 +4,12 @@ import {
   API_URL,
   DRIVER,
   SEED,
+  apiCancelRide,
   apiDriverToken,
   apiToken,
   authHeaders,
   cardContaining,
+  clearCancellationState,
   endActiveRun,
   pinLogin,
 } from "./helpers";
@@ -200,4 +202,39 @@ test("search filters the boarding list", async ({ page }) => {
   await page.getByPlaceholder("Search students…").fill(SEED.parentChildSearch);
   await expect(page.getByText(SEED.parentChild)).toBeVisible();
   await expect(page.getByText(/Students \(1\)/)).toBeVisible();
+});
+
+// Cancel-a-Ride on the driver surface (U14: R16, R19; AE4): a pre-run
+// afternoon cancellation keeps the child's stop out of the run snapshot, so
+// the auto-boarded roster never carries her.
+test("an afternoon cancellation excludes the student from the driver's run", async ({
+  page,
+  request,
+}) => {
+  await apiCancelRide(request, SEED.parentChild, "afternoon");
+  try {
+    await pinLogin(page, DRIVER.pin);
+    await page.goto("/driver/run");
+    await page.getByRole("combobox").click();
+    await page.getByRole("option", { name: SEED.driverAfternoonRoute }).click();
+    await page.getByRole("button", { name: "Start Run" }).click();
+    await expect(page.getByText("Run in progress")).toBeVisible();
+
+    // With an active run the boarding list is the RUN's roster: the cancelled
+    // child was excluded at start (not merely flagged) — start_run dropped her
+    // stop before the snapshot, and the afternoon auto-board skipped her.
+    await page.goto("/driver/boarding");
+    await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
+    await expect(page.getByText(SEED.afternoonRideMate)).toBeVisible();
+    await expect(page.getByText(SEED.parentChild)).toHaveCount(0);
+    await page.getByPlaceholder("Search students…").fill(SEED.parentChildSearch);
+    await expect(page.getByText(/Students \(0\)/)).toBeVisible();
+  } finally {
+    // End the run BEFORE clearing: clear_absence 409s ("End the run first")
+    // while an active covered run exists on the student's route, even though
+    // she was excluded from its snapshot. afterEach repeats the run cleanup
+    // idempotently; the absence row and office alert are this journey's own.
+    await endActiveRun(request);
+    await clearCancellationState(request, SEED.parentChild);
+  }
 });

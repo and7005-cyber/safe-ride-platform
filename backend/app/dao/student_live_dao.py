@@ -2,6 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.fleet_dao import regenerate_route_stops
+from app.dao.status_sql import display_status_case
 
 STUDENT_COLUMNS = (
     "name", "grade", "parent_name", "parent_phone", "parent_phone2", "parent_email",
@@ -147,7 +148,12 @@ def _derive_student_bus(conn, student_id: str) -> None:
     )
 
 
-def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
+def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
+    """Reconcile a student's route links and regenerate the affected routes.
+
+    Returns the aggregate ``stops_recalculated`` signal (U6/R10): False when
+    any affected route's regeneration fell back instead of computing geometry;
+    True otherwise (including when no route membership changed)."""
     existing = conn.execute(
         "select id, route_id from live_student_routes where student_id = %s", (student_id,)
     ).fetchall()
@@ -171,7 +177,10 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
         if route_id not in wanted:
             conn.execute("delete from live_student_routes where id = %s", (row_id,))
             affected.add(route_id)
-    for route_id in added:
+    # sorted(): route ids are UUID strings, so iteration order is a global
+    # total order — every multi-route writer takes the route-row locks in the
+    # same sequence and two concurrent edits cannot deadlock across routes.
+    for route_id in sorted(added):
         # Handover (R18): assigning a student to a planner-saved route hands
         # ownership back to the students — flip custom_stops off and drop the
         # stored polyline/totals (now stale) so the regeneration below rebuilds
@@ -182,15 +191,35 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> None:
             "where id = %s and custom_stops",
             (route_id,),
         )
-    for route_id in affected:
-        regenerate_route_stops(conn, route_id)
+    stops_recalculated = True
+    for route_id in sorted(affected):
+        stops_recalculated = regenerate_route_stops(conn, route_id) and stops_recalculated
     _derive_student_bus(conn, student_id)
+    return stops_recalculated
 
 
 class StudentLiveDao:
     def list_students(self) -> list[dict[str, Any]]:
+        """All students, each with ``route_ids`` and a derived
+        ``display_status`` — the parent-portal derivation (app.dao.status_sql)
+        wrapped by the admin-only unassigned rule: a student with zero route
+        assignments displays 'unassigned', overriding everything (R1–R4). The
+        raw ``status`` stays in the payload untouched."""
         with get_connection() as conn:
-            rows = conn.execute("select * from live_students order by name asc").fetchall()
+            rows = conn.execute(
+                f"""
+                select s.*,
+                       case
+                           when not exists (
+                               select 1 from live_student_routes lsr
+                               where lsr.student_id = s.id
+                           ) then 'unassigned'
+                           else {display_status_case("s")}
+                       end as display_status
+                from live_students s
+                order by s.name asc
+                """
+            ).fetchall()
             result = []
             for row in rows:
                 item = dict(row)
@@ -219,10 +248,12 @@ class StudentLiveDao:
                 data,
             ).fetchone()
             # bus_id is derived from the assigned route(s), not set by hand (#3).
-            _sync_routes(conn, row["id"], route_ids)
+            stops_recalculated = _sync_routes(conn, row["id"], route_ids)
             sync_parent_links(conn, row["id"], (data.get("parent_email"), data.get("parent2_email")))
             row = conn.execute("select * from live_students where id = %s", (row["id"],)).fetchone()
-        return dict(row)
+        # stops_recalculated: false = the routes fell back to the preserved /
+        # pickup-time order instead of recomputing geometry (U6/R10).
+        return {**dict(row), "stops_recalculated": stops_recalculated}
 
     def update_student(self, student_id: str, data: dict, route_ids: list[str]) -> dict[str, Any] | None:
         with get_connection() as conn:
@@ -247,9 +278,10 @@ class StudentLiveDao:
                 """,
                 {**data, "id": student_id},
             ).fetchone()
+            stops_recalculated = True
             if row:
                 # bus_id is derived from the assigned route(s) inside _sync_routes (#3).
-                _sync_routes(conn, student_id, route_ids)
+                stops_recalculated = _sync_routes(conn, student_id, route_ids)
                 sync_parent_links(
                     conn,
                     student_id,
@@ -257,17 +289,22 @@ class StudentLiveDao:
                     old_emails=(before["parent_email"], before["parent2_email"]) if before else None,
                 )
                 row = conn.execute("select * from live_students where id = %s", (student_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        return {**dict(row), "stops_recalculated": stops_recalculated}
 
     def delete_student(self, student_id: str) -> None:
         with get_connection() as conn:
             # Cancelling a student must also cancel their stop on every route
             # they were on (#1, #6) — regenerate after the cascade delete clears
-            # their live_student_routes rows.
+            # their live_student_routes rows. order by route_id: the same
+            # global lock order every multi-route writer uses (_sync_routes).
             affected = [
                 r["route_id"]
                 for r in conn.execute(
-                    "select route_id from live_student_routes where student_id = %s", (student_id,)
+                    "select route_id from live_student_routes where student_id = %s "
+                    "order by route_id",
+                    (student_id,),
                 ).fetchall()
             ]
             conn.execute("delete from live_students where id = %s", (student_id,))

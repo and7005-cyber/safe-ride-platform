@@ -100,6 +100,9 @@ def list_students(user: dict = Depends(admin_only)):
 
 @router.post("")
 def create_student(payload: StudentPayload, user: dict = Depends(admin_only)):
+    # The response carries stops_recalculated (U6/R10): false when an affected
+    # auto route fell back to the preserved/pickup-time order instead of
+    # recomputing geometry (the durable signal is live_routes.last_recalc_degraded).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
     return safe_call(lambda: dao.create_student(_clean_student(data), route_ids))
@@ -107,6 +110,7 @@ def create_student(payload: StudentPayload, user: dict = Depends(admin_only)):
 
 @router.put("/{student_id}")
 def update_student(student_id: str, payload: StudentPayload, user: dict = Depends(admin_only)):
+    # Carries stops_recalculated like create (U6/R10).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
     return safe_call(lambda: dao.update_student(student_id, _clean_student(data), route_ids))
@@ -156,6 +160,9 @@ class AbsencePayload(BaseModel):
 def list_absences(date: str | None = None, user: dict = Depends(admin_only)):
     # Admin-only: named child absences are exactly the data the incidents
     # feed was locked down for; the sole consumer is the admin StudentsPage.
+    # Rows carry scope ('day'/'morning'/'afternoon') and source
+    # ('parent'/'driver'/'admin') so the UI can render partial parent
+    # cancellations and gate its actions on provenance (U4).
     return safe_call(lambda: absence_dao.list_absences(date))
 
 
@@ -164,7 +171,9 @@ def mark_absent(payload: AbsencePayload, user: dict = Depends(admin_only)):
     # date=None defaults to today (Africa/Nairobi) inside the DAO. A
     # today-dated mark also sets the live status to 'absent' and appends the
     # run_absences snapshot of any active run carrying the student (R25b);
-    # other dates are bookkeeping only.
+    # other dates are bookkeeping only. An admin mark is always whole-day:
+    # the DAO escalates an existing partial parent cancellation to
+    # scope='day', source='admin' (U4).
     return safe_call(
         lambda: absence_dao.mark_absent(payload.student_id, payload.date, payload.reason, user["id"])
     )
@@ -172,7 +181,8 @@ def mark_absent(payload: AbsencePayload, user: dict = Depends(admin_only)):
 
 @router.delete("/absences/{absence_id}")
 def clear_absence(absence_id: str, user: dict = Depends(admin_only)):
-    # Clearing a today-dated absence 409s while the student's bus has an
-    # active run ("End the run first"), else resets an 'absent' status to
-    # 'at-school'. Past/future-dated clears have no status side-effects.
+    # Clearing a today-dated absence 409s while the student is involved in an
+    # active run of a type the absence covers ("End the run first"), else
+    # resets an 'absent' status to 'at-school' when the row was whole-day.
+    # Past/future-dated clears have no status side-effects.
     return safe_call(lambda: (absence_dao.clear_absence(absence_id), {"ok": True})[1])

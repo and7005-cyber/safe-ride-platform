@@ -1,0 +1,9 @@
+# pickup_time is a morning-clock attribute — never anchor afternoon computations on it
+
+**Context (2026-07-07, feat/ops-refinement).** `live_students.pickup_time` is a single per-student column holding the *morning* pickup time (seeds: 06:40/06:48). Students riding both a morning and an afternoon route have exactly one value, and the planner's `next_departure(anchor, default)` only falls back to its type default when the anchor is `None` — so any "earliest student pickup_time" anchor applied to an afternoon route produces dawn-clock drop-off times that look computed and trustworthy.
+
+**The near-miss.** The ops-refinement plan originally anchored geometry-recalculated stop times on "earliest assigned student pickup_time" for both route types. Two independent reviewers caught it pre-implementation; the shipped rule (`backend/app/dao/fleet_dao.py`, `regenerate_route_stops`) is: **morning routes anchor on earliest `pickup_time` else 07:00; afternoon routes always anchor on the 15:30 type default.** A regression test pins the afternoon gate time with seeded morning pickup times present.
+
+**Related trap in the same family.** The per-stop time editor writes through to `live_students.pickup_time`. On geometry-computed routes the stop's `scheduled_time` is a computed ETA, not the student attribute — the editor must prefill from the stop row's `student_pickup_time` field (added for this purpose), never from `scheduled_time`, or a no-op Save round-trips a computed ETA into the anchor.
+
+**Rule of thumb.** Any new feature computing, displaying, or editing times on afternoon routes must ask: is this value morning-clock (student attribute), afternoon-clock (drop-off schedule), or type-relative (anchor/default)? The planner's route-options endpoint (`backend/app/api/fleet.py:212-309`) still carries the old single-anchor quirk — do not copy its anchor logic.

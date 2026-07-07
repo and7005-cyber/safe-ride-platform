@@ -19,6 +19,8 @@ Notification types:
   dropped-off      driver confirmed the drop-off at the child's stop (tap-time)
   student-absent   driver marked the child absent at pickup (that child's parents only)
   incident         driver reported an issue on the child's bus
+  ride-cancelled   a parent cancelled the child's ride (that child's linked parents only)
+  admin-notice     office broadcast to a route (one copy per parent with a child assigned)
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -49,6 +51,11 @@ INCIDENT_TITLES = {
     "traffic": "Traffic delay",
     "other": "Notice from the bus",
 }
+
+# Web-push services reject payloads past ~4KB; the broadcast body is capped by
+# the endpoint (500 chars) and the composed title is bounded here — a very long
+# route name must not push the payload over the edge.
+BROADCAST_TITLE_MAX_CHARS = 120
 
 # Shared across service instances: delivery must not monopolize the request
 # thread pool, and a slow push provider must not back up driver requests.
@@ -184,6 +191,53 @@ class PushService:
         except Exception:
             logger.exception("notify_student_absent failed")
 
+    def notify_ride_cancelled(self, student: dict, scope: str) -> None:
+        """A parent cancelled the child's ride (U5) — confirm to EVERY linked
+        parent of that child (both co-parents see it, whoever submitted) and
+        nobody else. run_id stays NULL: cancellations precede any run, and
+        the run-scoped dedup exemption means every emission is a real row —
+        the caller only fires this on an actual set_scope transition.
+        run_type maps from the recorded scope ('morning'/'afternoon';
+        whole-day → NULL) so the feed's period filter surfaces the row under
+        the period the parent cancelled.
+
+        Failure isolation is per recipient: one co-parent's failing insert or
+        send must not cost the other their confirmation."""
+        try:
+            student_id = str(student["id"])
+            phrases = {
+                "morning": "morning pickup today has been cancelled",
+                "afternoon": "afternoon ride today has been cancelled",
+                "day": "rides for the rest of today have been cancelled",
+            }
+            phrase = phrases.get(scope, "ride today has been cancelled")
+            delivered = intended = 0
+            for link in self.dao.parents_of_students([student_id]):
+                intended += 1
+                try:
+                    self._notify(
+                        link["parent_id"],
+                        type="ride-cancelled",
+                        title="Ride cancelled",
+                        body=f"{link['student_name']}'s {phrase} by a parent on the account.",
+                        student_id=student_id,
+                        run_id=None,
+                        bus_id=student.get("bus_id"),
+                        run_type=scope if scope in ("morning", "afternoon") else None,
+                    )
+                    delivered += 1
+                except Exception:
+                    logger.exception(
+                        "ride-cancelled confirmation failed for parent %s", link["parent_id"]
+                    )
+            if delivered < intended:
+                logger.warning(
+                    "ride-cancelled fan-out for student %s reached %d of %d linked parents",
+                    student_id, delivered, intended,
+                )
+        except Exception:
+            logger.exception("notify_ride_cancelled failed")
+
     def notify_reached_school(self, run: dict) -> None:
         """Morning arrival at the school gate (or morning run end).
 
@@ -222,6 +276,14 @@ class PushService:
 
     def notify_incident(self, incident: dict) -> None:
         try:
+            # Student-stamped incidents are child-specific (driver-absent
+            # reports, parent cancellations): admin Alerts page only. A
+            # bus-wide fan-out would tell every family on the bus about a
+            # named child. Callers already keep these DAO-direct; this
+            # early-return holds the line if one ever slips through —
+            # type-agnostic on purpose (defense in depth, U5).
+            if incident.get("student_id"):
+                return
             if incident.get("type") == "arrival" or not incident.get("bus_id"):
                 return
             title = INCIDENT_TITLES.get(incident.get("type", ""), "Notice from the bus")
@@ -246,6 +308,56 @@ class PushService:
                 )
         except Exception:
             logger.exception("notify_incident failed")
+
+    def notify_admin_broadcast(self, route: dict, body: str, parent_ids: list[str]) -> None:
+        """Admin route broadcast (U8: R20, R21, R23; AE5): one 'admin-notice'
+        feed row + push per DISTINCT parent with a child assigned to the route.
+
+        The recipient set is resolved by the endpoint (synchronously, from
+        assignments — never bus_id) and passed in: this runs in
+        BackgroundTasks, and the response's recipient count must be what was
+        actually fanned out, not a hope. The set is deduped again here
+        (notify_incident's per-parent pattern) so a duplicated id can never
+        double-send. run_id stays NULL — every send is a real row (R23 bans
+        run-scoped dedup: two identical sends are two rows) — and run_type
+        stays NULL (R22: the notice is period-agnostic). body arrives
+        validated and stored as-is; the title is length-bounded because
+        web-push services reject ~4KB payloads.
+
+        Failure isolation is per recipient: one failing insert or send must
+        not cut off the rest of the route's parents."""
+        try:
+            title = f"School notice — {route.get('name') or 'your route'}"
+            if len(title) > BROADCAST_TITLE_MAX_CHARS:
+                title = title[: BROADCAST_TITLE_MAX_CHARS - 1] + "…"
+            notified: set[str] = set()
+            delivered = 0
+            for parent_id in parent_ids:
+                parent_id = str(parent_id)
+                if parent_id in notified:
+                    continue
+                notified.add(parent_id)
+                try:
+                    self._notify(
+                        parent_id,
+                        type="admin-notice",
+                        title=title,
+                        body=body,
+                        student_id=None,
+                        run_id=None,
+                        bus_id=route.get("bus_id"),
+                        run_type=None,
+                    )
+                    delivered += 1
+                except Exception:
+                    logger.exception("admin broadcast failed for parent %s", parent_id)
+            if delivered < len(notified):
+                logger.warning(
+                    "admin broadcast for route %s reached %d of %d recipients",
+                    route.get("id"), delivered, len(notified),
+                )
+        except Exception:
+            logger.exception("notify_admin_broadcast failed")
 
     def notify_bus_approaching(self, run: dict) -> None:
         """Stop-based 'bus-approaching': the instant the driver arrives at a

@@ -21,6 +21,8 @@ export const SEED = {
   parentChild: "Faith Achieng",
   /** Search term that narrows the boarding list to exactly parentChild. */
   parentChildSearch: "Faith",
+  /** The other seeded student riding Express 1 — Afternoon with parentChild. */
+  afternoonRideMate: "Happiness Kenesa",
   /** The stop name shown for parentChild on the track map. */
   parentChildStop: /Kilimani/,
   /** Amina's bus-less child (renders without driver actions). */
@@ -105,6 +107,63 @@ export async function endActiveRun(request: APIRequestContext): Promise<void> {
       await request.delete(`${API_URL}/api/runs/${run.id}`, {
         headers: authHeaders(adminToken),
       });
+    }
+  }
+}
+
+// Cancel-a-Ride journey helpers (U14): the cross-role specs set up and tear
+// down parent cancellations through the API so each spec file stays
+// self-contained (the suite is serial, but files must not depend on each
+// other's leftover state).
+
+export type CancelScope = "morning" | "afternoon" | "day";
+
+/** Parent-side Cancel-a-Ride (R14): cancel `scope` for the named linked child
+ * today. Returns the child's student id. */
+export async function apiCancelRide(
+  request: APIRequestContext,
+  childName: string,
+  scope: CancelScope,
+): Promise<string> {
+  const token = await apiToken(request, PARENT.email, PARENT.password);
+  const children = await request.get(`${API_URL}/api/parent-portal/children`, {
+    headers: authHeaders(token),
+  });
+  expect(children.ok()).toBeTruthy();
+  const child = (await children.json()).find((c: any) => c.name === childName);
+  expect(child, `${childName} should be linked to the seeded parent`).toBeTruthy();
+  const cancelled = await request.post(`${API_URL}/api/parent-portal/cancel-ride`, {
+    headers: authHeaders(token),
+    data: { student_id: child.id, scope },
+  });
+  expect(cancelled.ok()).toBeTruthy();
+  return child.id;
+}
+
+/** Office-side cleanup after a cancellation journey (idempotent): remove the
+ * student's absence rows and their "Ride Cancellation" alerts. Uses the admin
+ * endpoints rather than the parent withdraw, which by design 409s once a
+ * covered run row exists for the day (R18). */
+export async function clearCancellationState(
+  request: APIRequestContext,
+  studentName: string,
+): Promise<void> {
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(token);
+  const absences = await request.get(`${API_URL}/api/students/absences`, { headers });
+  if (absences.ok()) {
+    for (const row of await absences.json()) {
+      if (row.student_name === studentName) {
+        await request.delete(`${API_URL}/api/students/absences/${row.id}`, { headers });
+      }
+    }
+  }
+  const incidents = await request.get(`${API_URL}/api/incidents`, { headers });
+  if (incidents.ok()) {
+    for (const row of await incidents.json()) {
+      if (row.type === "cancellation" && String(row.description ?? "").startsWith(`${studentName}:`)) {
+        await request.delete(`${API_URL}/api/incidents/${row.id}`, { headers });
+      }
     }
   }
 }

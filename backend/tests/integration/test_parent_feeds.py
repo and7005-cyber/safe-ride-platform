@@ -5,19 +5,26 @@ Run with the stack up (scripts/start-local.sh):
     RUN_INTEGRATION=1 ../.venv/bin/python -m pytest tests/integration -q
 
 These tests certify the windowed notification/alert feeds (window_hours +
-limit with the 200 hard cap) and the parent-portal display_status derivation
-(today-absence, stale dropped-off). They use the seeded demo data
-(backend/db/seeds/003_local_snapshot.sql) and clean up what they create;
-runs they start are always ended or deleted.
+min_age_hours + limit with the 200 hard cap) and the parent-portal
+display_status derivation (today-absence, stale dropped-off). They use the
+seeded demo data (backend/db/seeds/003_local_snapshot.sql) and clean up what
+they create; runs they start are always ended or deleted.
+
+Also covers the disjoint Recent/History split (ops-refinement U9: R5–R7,
+AE2): min_age_hours on both list endpoints excludes rows younger than that
+age server-side, BEFORE the 200-row cap, and both hour params are bounded at
+8760 (beyond it → 422; unbounded values used to reach interval arithmetic
+and 500).
 
 created_at cannot be back-dated over HTTP (no API exposes it), so window
-assertions lean on two real sources of aged rows:
+assertions lean on three sources of aged rows:
 - the seed's own notifications, all dated weeks in the past — they prove the
   exclusion side of window_hours;
-- freshly generated rows (driver incidents) — they prove the inclusion side.
-The one assertion that needs a row aged *between* the two windows (older than
-24h, younger than 168h) is documented as a skip below: it genuinely requires
-an orchestrator-side SQL fixture.
+- freshly generated rows (driver incidents) — they prove the inclusion side;
+- rows back-dated by direct SQL against the stack's published Postgres (the
+  suite's accepted escape hatch — see test_students_parents.py) — they stage
+  ages *between* the windows for the U9 disjointness and cap-starvation
+  proofs, and are always deleted in finally blocks.
 """
 
 import os
@@ -26,6 +33,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import psycopg
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -34,6 +42,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
+# The local stack's Postgres, published by docker-compose.local.yml. Used only
+# to back-date created_at (no API exposes it) and to prove excluded ≠ deleted.
+DB_URL = os.environ.get(
+    "INTEGRATION_DB_URL", "postgresql://saferide:saferide@localhost:5432/saferide"
+)
 
 ADMIN = {"email": "admin@test.com", "password": "test1234."}
 PARENT = {"email": "and7005@gmail.com", "password": "Test1234"}
@@ -199,31 +212,222 @@ def test_fresh_row_is_inside_both_windows_and_feed_is_newest_first(
     assert any(a["description"] == marker for a in alerts)
 
 
-@pytest.mark.skip(
-    reason="needs an orchestrator-side SQL fixture: no API can back-date "
-    "live_notifications.created_at, and this assertion needs a row aged between "
-    "the two windows. Fixture: insert into live_notifications "
-    "(user_id, type, title, body, created_at) values "
-    "('a0000000-0000-0000-0000-000000000002', 'custom', 'IT backdated', "
-    "'<marker>', now() - interval '48 hours'); then assert the row is absent "
-    "from GET /api/push/notifications?window_hours=24 and present with "
-    "window_hours=168 (AE10)."
-)
-def test_window_168_includes_a_row_older_than_24h():
-    pass
+# Disjoint Recent/History (ops-refinement U9: R5–R7, AE2) -----------------------
+# These replace two former skip placeholders ("needs an orchestrator-side SQL
+# fixture"): the fixture is now in-module — back-dated rows via direct SQL,
+# always deleted in finally.
+
+@pytest.fixture(scope="module")
+def throwaway_parent(client):
+    """A fresh parent account whose notification feed starts EMPTY and can
+    only ever contain rows this suite stages — the seeded parent's feed
+    accretes hundreds of real last-24h rows from the other suites' run
+    lifecycles, which would truncate the 200-row responses these partition
+    assertions compare (signup precedent: test_route_broadcast.py)."""
+    email = f"it-u9-{uuid.uuid4().hex[:6]}@test.local"
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": email, "password": "ParentPass1!",
+              "full_name": "IT U9 Feed Parent", "role": "parent"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    yield {"id": body["user"]["id"], "headers": {"Authorization": f"Bearer {body['token']}"}}
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        # Notifications, roles and sessions cascade with the user row.
+        conn.execute("delete from app_users where id = %s", (body["user"]["id"],))
 
 
-@pytest.mark.skip(
-    reason="needs an orchestrator-side SQL fixture: same back-dated row as the "
-    "notifications case but for live_incidents (created_at is not settable via "
-    "POST /api/incidents/driver). Fixture: insert into live_incidents "
-    "(bus_id, bus_name, type, description, created_at) values "
-    "('146a1837-af5e-494c-8be6-f78db9c4280a', 'Simba', 'other', '<marker>', "
-    "now() - interval '48 hours'); then assert it is absent from "
-    "GET /api/parent-portal/alerts?window_hours=24 and present with 168."
-)
-def test_alerts_window_168_includes_a_row_older_than_24h():
-    pass
+@pytest.fixture(scope="module")
+def child_bus(client, parent_headers):
+    """The seeded child's bus (id + name) for staging parent-visible incidents."""
+    kid = get_child(client, parent_headers, PARENT_CHILD)
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        row = conn.execute(
+            "select s.bus_id, b.name from live_students s "
+            "join live_buses b on b.id = s.bus_id where s.id = %s",
+            (kid["id"],),
+        ).fetchone()
+    assert row and row[0], f"seeded child {PARENT_CHILD} has no bus"
+    return {"bus_id": str(row[0]), "bus_name": row[1]}
+
+
+def backdate_notification(user_id: str, title: str, hours: int) -> str:
+    """Insert a feed row aged `hours` into the past; returns its id."""
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        row = conn.execute(
+            """
+            insert into live_notifications (user_id, type, title, body, created_at)
+            values (%s, 'custom', %s, 'IT backdated', now() - (%s || ' hours')::interval)
+            returning id
+            """,
+            (user_id, title, hours),
+        ).fetchone()
+    return str(row[0])
+
+
+def backdate_incident(bus: dict, description: str, hours: int) -> str:
+    """Insert a parent-visible incident (student_id NULL) aged `hours` back."""
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        row = conn.execute(
+            """
+            insert into live_incidents (bus_id, bus_name, type, description, created_at)
+            values (%s, %s, 'other', %s, now() - (%s || ' hours')::interval)
+            returning id
+            """,
+            (bus["bus_id"], bus["bus_name"], description, hours),
+        ).fetchone()
+    return str(row[0])
+
+
+def delete_rows(table: str, ids: list[str]) -> None:
+    if not ids:
+        return
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        conn.execute(f"delete from {table} where id = any(%s::uuid[])", (ids,))
+
+
+def fetch_id_set(client, headers, path: str, params: dict) -> set:
+    response = client.get(path, params=params, headers=headers)
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    # The partition assertions below compare whole responses; at the cap they
+    # would be comparing truncations. The flood test cleans up after itself,
+    # so hitting 200 here means stale fixture rows leaked.
+    assert len(rows) < 200, f"{path} at the row cap; partition asserts unsafe"
+    return {r["id"] for r in rows}
+
+
+def assert_disjoint_split(client, headers, path: str, ids: dict) -> None:
+    """The AE2 contract, shared by both feeds: Recent (window 24) sees only
+    the 23h row, History (min_age 24 + window 168) only the 25h row, the 8d
+    row neither; the legacy shape (window 168, NO min_age) is untouched by
+    this feature and still spans both sides — Recent and History partition
+    it exactly (disjoint, jointly exhaustive)."""
+    recent = fetch_id_set(client, headers, path, {"window_hours": 24, "limit": 200})
+    history = fetch_id_set(
+        client, headers, path, {"window_hours": 168, "min_age_hours": 24, "limit": 200}
+    )
+    legacy = fetch_id_set(client, headers, path, {"window_hours": 168, "limit": 200})
+
+    assert ids["23h"] in recent and ids["23h"] not in history
+    assert ids["25h"] in history and ids["25h"] not in recent
+    assert ids["8d"] not in recent and ids["8d"] not in history
+    # Omitted min_age_hours → today's behavior: the 168h window keeps rows
+    # younger than 24h too.
+    assert ids["23h"] in legacy and ids["25h"] in legacy and ids["8d"] not in legacy
+    assert not (recent & history), "Recent and History overlap"
+    assert (recent | history) == legacy, "the split lost or invented rows"
+
+
+def count_rows(table: str, row_id: str) -> int:
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        return conn.execute(
+            f"select count(*) from {table} where id = %s", (row_id,)
+        ).fetchone()[0]
+
+
+def test_notifications_recent_history_split_is_disjoint(client, throwaway_parent):
+    """Covers AE2 (R5, R6): 23h/25h/8d notifications split exactly — and the
+    8d row is excluded, not deleted (the table stays the audit trail)."""
+    marker = uuid.uuid4().hex[:6]
+    ids: dict[str, str] = {}
+    try:
+        for tag, hours in (("23h", 23), ("25h", 25), ("8d", 192)):
+            ids[tag] = backdate_notification(
+                throwaway_parent["id"], f"IT U9 {marker} {tag}", hours
+            )
+        assert_disjoint_split(
+            client, throwaway_parent["headers"], "/api/push/notifications", ids
+        )
+        assert count_rows("live_notifications", ids["8d"]) == 1  # R6: not deleted
+    finally:
+        delete_rows("live_notifications", list(ids.values()))
+
+
+def test_alerts_recent_history_split_is_disjoint(client, parent_headers, child_bus):
+    """Covers AE2 + R7: the split applies to the alerts feed too — back-dated
+    incidents on the child's bus follow the identical partition."""
+    marker = uuid.uuid4().hex[:6]
+    ids: dict[str, str] = {}
+    try:
+        for tag, hours in (("23h", 23), ("25h", 25), ("8d", 192)):
+            ids[tag] = backdate_incident(child_bus, f"IT U9 alert {marker} {tag}", hours)
+        assert_disjoint_split(client, parent_headers, "/api/parent-portal/alerts", ids)
+        assert count_rows("live_incidents", ids["8d"]) == 1  # R6: not deleted
+    finally:
+        delete_rows("live_incidents", list(ids.values()))
+
+
+def test_history_cap_applies_after_the_exclusion(client, throwaway_parent):
+    """Covers R5's server-side rationale (U9): with 250 rows inside the last
+    24h and 10 rows aged between the windows, History (min_age 24 + window
+    168, limit 200) returns ALL 10 older rows and none of the recent flood —
+    the WHERE exclusion runs before LIMIT, so a busy day cannot starve
+    History out of the cap (the failure mode of client-side filtering)."""
+    marker = uuid.uuid4().hex[:6]
+    flood_title = f"IT U9 flood {marker}"
+    old_title = f"IT U9 old {marker}"
+    user_id = throwaway_parent["id"]
+    headers = throwaway_parent["headers"]
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        conn.execute(
+            """
+            insert into live_notifications (user_id, type, title, body, created_at)
+            select %s, 'custom', %s, 'recent ' || n,
+                   now() - interval '1 hour' - (n || ' seconds')::interval
+            from generate_series(1, 250) as n
+            """,
+            (user_id, flood_title),
+        )
+        conn.execute(
+            """
+            insert into live_notifications (user_id, type, title, body, created_at)
+            select %s, 'custom', %s, 'old ' || n,
+                   now() - interval '48 hours' - (n || ' minutes')::interval
+            from generate_series(1, 10) as n
+            """,
+            (user_id, old_title),
+        )
+    try:
+        history = client.get(
+            "/api/push/notifications",
+            params={"window_hours": 168, "min_age_hours": 24, "limit": 200},
+            headers=headers,
+        ).json()
+        titles = [n["title"] for n in history]
+        assert titles.count(old_title) == 10, "History lost aged rows to the cap"
+        assert flood_title not in titles, "History leaked rows younger than min_age"
+
+        # The flood still saturates Recent's cap without pulling in aged rows.
+        recent = client.get(
+            "/api/push/notifications",
+            params={"window_hours": 24, "limit": 200},
+            headers=headers,
+        ).json()
+        assert len(recent) == 200
+        assert old_title not in [n["title"] for n in recent]
+    finally:
+        with psycopg.connect(DB_URL, autocommit=True) as conn:
+            conn.execute(
+                "delete from live_notifications where user_id = %s and title = any(%s)",
+                (user_id, [flood_title, old_title]),
+            )
+
+
+def test_hour_params_are_bounded_at_a_year(client, parent_headers):
+    """U9: window_hours and min_age_hours reject values beyond 8760 at
+    validation (422) on both endpoints — unbounded values used to reach the
+    DB's interval arithmetic and 500 (SQLSTATE 22015 is not mapped to 400).
+    The boundary itself stays accepted, and ge=1 still holds."""
+    for path in ("/api/push/notifications", "/api/parent-portal/alerts"):
+        for param in ("window_hours", "min_age_hours"):
+            over = client.get(path, params={param: 999999}, headers=parent_headers)
+            assert over.status_code == 422, f"{path}?{param}=999999 → {over.status_code}"
+            zero = client.get(path, params={param: 0}, headers=parent_headers)
+            assert zero.status_code == 422, f"{path}?{param}=0 → {zero.status_code}"
+            at_bound = client.get(path, params={param: 8760}, headers=parent_headers)
+            assert at_bound.status_code == 200, at_bound.text
 
 
 # Limit cap (R35) ---------------------------------------------------------------
