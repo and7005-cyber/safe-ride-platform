@@ -1,6 +1,17 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Clock, MapPin, Pencil, Plus, Trash2, X } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  Clock,
+  MapPin,
+  Megaphone,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -20,6 +31,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { RouteMapPreview } from "@/components/map/RouteMapPreview";
@@ -34,7 +46,82 @@ interface StopGroup {
   name: string;
   scheduled_time: string | null;
   is_school_gate: boolean;
+  /** Server-issued location-group key; null on the school gate and planner stops. */
+  group_key: string | null;
   studentIds: string[];
+}
+
+// --- U11 pure pieces (exported for tests/unit/routeOrdering.test.ts) --------
+
+/** Durable R10 degradation signal — the card badge and the transient toast
+ * raised on any `stops_recalculated: false` mutation share this text. */
+export const DEGRADED_MESSAGE =
+  "Order/times not recalculated — check addresses/maps key";
+
+/** Client mirror of the server's broadcast body cap (R23). */
+export const BROADCAST_MAX_CHARS = 500;
+
+export interface ReorderableStop {
+  group_key: string | null;
+}
+
+/**
+ * Full-order payload for PUT /routes/:id/stop-order: every student-stop group
+ * key of the route in display order, deduped (siblings share a key), with the
+ * group at `fromIdx` shifted into `toIdx`'s slot. Returns null when the move
+ * is illegal or a no-op (gate/planner rows, out of bounds, same slot) — the
+ * arrows reuse it as their disabled predicate, so the UI never fires a
+ * request that isn't a real move.
+ */
+export function buildReorderPayload(
+  stops: ReorderableStop[],
+  fromIdx: number,
+  toIdx: number,
+): string[] | null {
+  if (fromIdx === toIdx || !stops[fromIdx]?.group_key || !stops[toIdx]?.group_key) return null;
+
+  // Deduped key list in display order, plus each row's slot within it.
+  const keys: string[] = [];
+  const slotOf = stops.map((s) => {
+    if (!s.group_key) return -1;
+    const seen = keys.indexOf(s.group_key);
+    if (seen !== -1) return seen;
+    keys.push(s.group_key);
+    return keys.length - 1;
+  });
+
+  const fromSlot = slotOf[fromIdx];
+  const toSlot = slotOf[toIdx];
+  if (fromSlot === toSlot) return null;
+  const order = [...keys];
+  const [moved] = order.splice(fromSlot, 1);
+  order.splice(toSlot, 0, moved);
+  return order;
+}
+
+interface RouteModeFlags {
+  custom_stops?: boolean;
+  manual_stop_order?: boolean;
+  last_recalc_degraded?: boolean;
+}
+
+/** One ordering authority per route: custom (planner) > manual > auto. */
+export function routeModeLabel(route: RouteModeFlags): "Planner" | "Manual order" | "Auto" {
+  if (route.custom_stops) return "Planner";
+  return route.manual_stop_order ? "Manual order" : "Auto";
+}
+
+/** Recalculate is offered when there is an order to recompute back to auto
+ * (manual mode) or a degraded pass to retry — never on planner routes, where
+ * the server 409s and neither flag can be set (008 CHECK / planner save). */
+export function showRecalculate(route: RouteModeFlags): boolean {
+  return !route.custom_stops && Boolean(route.manual_stop_order || route.last_recalc_degraded);
+}
+
+/** The warning badge renders purely from the persisted route flag so the R10
+ * signal survives reloads; the next successful recalculation clears it. */
+export function showDegradedBadge(route: RouteModeFlags): boolean {
+  return Boolean(route.last_recalc_degraded);
 }
 
 export function RoutesPage() {
@@ -53,7 +140,26 @@ export function RoutesPage() {
     { routeId: string; studentIds: string[]; name: string; time: string } | null
   >(null);
 
+  // Route whose reorder/recalculate request is in flight: every arrow and
+  // stop control on that card disables (FleetMapPage `busy` pattern) —
+  // a double-fired arrow would PUT a stale full-order payload into a 400.
+  const [busyRouteId, setBusyRouteId] = useState<string | null>(null);
+
+  // Broadcast dialog ("Message parents", R20).
+  const [broadcast, setBroadcast] = useState<{ routeId: string; routeName: string } | null>(null);
+  const [broadcastBody, setBroadcastBody] = useState("");
+  const [sending, setSending] = useState(false);
+
   const busName = (id: string | null) => buses.find((b: any) => b.id === id)?.name ?? "Unassigned";
+
+  // Transient counterpart of the durable card badge: any mutation response on
+  // this page that reports stops_recalculated: false degraded instead of
+  // recomputing (U6/R10). Responses without the field are ignored.
+  const notifyIfDegraded = (...responses: any[]) => {
+    if (responses.some((r) => r && r.stops_recalculated === false)) {
+      toast({ title: DEGRADED_MESSAGE });
+    }
+  };
 
   const startCreate = () => { setEditId(null); setForm({ ...EMPTY }); setOpen(true); };
   const startEdit = (r: any) => {
@@ -70,10 +176,12 @@ export function RoutesPage() {
         bus_id: form.bus_id === "none" ? null : form.bus_id,
         school_id: form.school_id === "none" ? null : form.school_id,
       };
-      if (editId) await api.put(`/api/fleet/routes/${editId}`, payload);
-      else await api.post("/api/fleet/routes", payload);
+      const res = editId
+        ? await api.put(`/api/fleet/routes/${editId}`, payload)
+        : await api.post("/api/fleet/routes", payload);
       await qc.invalidateQueries({ queryKey: ["routes"] });
       setOpen(false);
+      notifyIfDegraded(res);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     }
@@ -98,12 +206,69 @@ export function RoutesPage() {
         name: s.name,
         scheduled_time: s.scheduled_time,
         is_school_gate: s.is_school_gate,
+        group_key: s.group_key ?? null,
         studentIds: [],
       };
       if (s.student_id) g.studentIds.push(s.student_id);
       byOrder.set(s.stop_order, g);
     }
     return [...byOrder.values()].sort((a, b) => a.order - b.order);
+  };
+
+  // Manual reorder (R11): echo the full deduped group_key order back with one
+  // group shifted; the server flips the route to manual mode.
+  const reorderStop = async (routeId: string, stops: StopGroup[], fromIdx: number, toIdx: number) => {
+    const order = buildReorderPayload(stops, fromIdx, toIdx);
+    if (!order) return;
+    setBusyRouteId(routeId);
+    try {
+      await api.put(`/api/fleet/routes/${routeId}/stop-order`, { order });
+      // Await the refetch so the arrows stay disabled until the display order
+      // (the next payload's source) is fresh.
+      await qc.invalidateQueries({ queryKey: ["routes"] });
+    } catch (err) {
+      // 400 "refresh and try again" (stale order) and the planner 409 verbatim.
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setBusyRouteId(null);
+    }
+  };
+
+  // Explicit return to auto ordering / retry of a degraded pass (R11).
+  const recalculate = async (routeId: string) => {
+    setBusyRouteId(routeId);
+    try {
+      const res = await api.post(`/api/fleet/routes/${routeId}/recalculate`);
+      await qc.invalidateQueries({ queryKey: ["routes"] });
+      notifyIfDegraded(res);
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setBusyRouteId(null);
+    }
+  };
+
+  const openBroadcast = (route: any) => {
+    setBroadcastBody("");
+    setBroadcast({ routeId: route.id, routeName: route.name });
+  };
+
+  const sendBroadcast = async () => {
+    if (!broadcast) return;
+    setSending(true);
+    try {
+      const res = await api.post(`/api/fleet/routes/${broadcast.routeId}/broadcast`, {
+        body: broadcastBody,
+      });
+      toast({ title: `Sent to ${res.recipients} parents` });
+      setBroadcast(null);
+    } catch (err) {
+      // 400/409/429 server detail verbatim; the dialog stays open so the
+      // admin keeps the drafted message.
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setSending(false);
+    }
   };
 
   const cancelStop = async (routeId: string, g: StopGroup) => {
@@ -113,11 +278,13 @@ export function RoutesPage() {
       confirmLabel: "Cancel stop",
     }))) return;
     try {
+      const responses = [];
       for (const sid of g.studentIds) {
-        await api.del(`/api/fleet/routes/${routeId}/stops/${sid}`);
+        responses.push(await api.del(`/api/fleet/routes/${routeId}/stops/${sid}`));
       }
       await qc.invalidateQueries({ queryKey: ["routes"] });
       await qc.invalidateQueries({ queryKey: ["students"] });
+      notifyIfDegraded(...responses);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     }
@@ -126,13 +293,19 @@ export function RoutesPage() {
   const saveStopTime = async () => {
     if (!stopEdit) return;
     try {
+      const responses = [];
       for (const sid of stopEdit.studentIds) {
-        await api.put(`/api/fleet/routes/${stopEdit.routeId}/stops/${sid}`, {
-          pickup_time: stopEdit.time || null,
-        });
+        responses.push(
+          await api.put(`/api/fleet/routes/${stopEdit.routeId}/stops/${sid}`, {
+            pickup_time: stopEdit.time || null,
+          }),
+        );
       }
       await qc.invalidateQueries({ queryKey: ["routes"] });
       setStopEdit(null);
+      // Today this endpoint returns bare {ok}; the durable card badge still
+      // surfaces a degraded rebuild via the invalidated payload.
+      notifyIfDegraded(...responses);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     }
@@ -151,22 +324,60 @@ export function RoutesPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         {routes.map((route: any) => {
           const stops = groupStops(route.route_stops ?? []);
+          const busy = busyRouteId === route.id;
+          const mode = routeModeLabel(route);
           return (
             <Card key={route.id}>
               <CardHeader className="flex-row items-start justify-between space-y-0">
                 <div>
                   <p className="font-heading text-lg font-semibold">{route.name}</p>
-                  <div className="mt-1 flex items-center gap-2">
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
                     <Badge variant={route.type === "morning" ? "secondary" : "warning"}>{route.type}</Badge>
+                    <Badge
+                      variant={mode === "Manual order" ? "default" : "outline"}
+                      data-testid="route-mode-chip"
+                    >
+                      {mode}
+                    </Badge>
                     <span className="text-xs text-muted-foreground">{busName(route.bus_id)}</span>
                   </div>
                 </div>
-                <div>
+                <div className="flex shrink-0">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="Message parents"
+                    aria-label="Message parents"
+                    data-testid="message-parents"
+                    onClick={() => openBroadcast(route)}
+                  >
+                    <Megaphone className="h-4 w-4" />
+                  </Button>
                   <Button variant="ghost" size="icon" onClick={() => startEdit(route)}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => remove(route.id)}><Trash2 className="h-4 w-4" /></Button>
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
+                {(showDegradedBadge(route) || showRecalculate(route)) && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {showDegradedBadge(route) && (
+                      <Badge variant="warning" data-testid="degraded-badge">
+                        {DEGRADED_MESSAGE}
+                      </Badge>
+                    )}
+                    {showRecalculate(route) && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        data-testid="recalculate-order"
+                        onClick={() => recalculate(route.id)}
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" /> Recalculate order & times
+                      </Button>
+                    )}
+                  </div>
+                )}
                 <RouteMapPreview stops={route.route_stops ?? []} polyline={route.polyline} />
                 {stops.length === 0 ? (
                   <p className="text-sm text-muted-foreground">
@@ -174,7 +385,7 @@ export function RoutesPage() {
                   </p>
                 ) : (
                   <ol className="space-y-1.5">
-                    {stops.map((s) => (
+                    {stops.map((s, i) => (
                       <li key={s.order} className="flex items-center gap-2 text-sm">
                         <MapPin className="h-3.5 w-3.5 shrink-0 text-primary" />
                         <span className="font-medium">{s.order}.</span>
@@ -187,12 +398,35 @@ export function RoutesPage() {
                         {s.is_school_gate ? (
                           <Badge variant="outline" className="ml-auto">School gate</Badge>
                         ) : (
-                          <span className="ml-auto flex items-center">
+                          <span className="ml-auto flex items-center gap-0.5">
+                            {!route.custom_stops && (
+                              <span className="mr-1 flex flex-col">
+                                <button
+                                  type="button"
+                                  aria-label="Move up"
+                                  disabled={busy || buildReorderPayload(stops, i, i - 1) === null}
+                                  onClick={() => reorderStop(route.id, stops, i, i - 1)}
+                                  className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                                >
+                                  <ArrowUp className="h-3 w-3" />
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label="Move down"
+                                  disabled={busy || buildReorderPayload(stops, i, i + 1) === null}
+                                  onClick={() => reorderStop(route.id, stops, i, i + 1)}
+                                  className="text-muted-foreground hover:text-foreground disabled:opacity-30"
+                                >
+                                  <ArrowDown className="h-3 w-3" />
+                                </button>
+                              </span>
+                            )}
                             <Button
                               variant="ghost"
                               size="icon"
                               className="h-7 w-7"
                               title="Edit pickup time"
+                              disabled={busy}
                               onClick={() =>
                                 setStopEdit({
                                   routeId: route.id,
@@ -209,6 +443,7 @@ export function RoutesPage() {
                               size="icon"
                               className="h-7 w-7"
                               title="Cancel this stop"
+                              disabled={busy}
                               onClick={() => cancelStop(route.id, s)}
                             >
                               <X className="h-3.5 w-3.5" />
@@ -290,6 +525,55 @@ export function RoutesPage() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setStopEdit(null)}>Cancel</Button>
             <Button onClick={saveStopTime}>Save</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!broadcast}
+        onOpenChange={(o) => {
+          if (!o && !sending) setBroadcast(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Message parents — {broadcast?.routeName}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label>Message</Label>
+            <Textarea
+              rows={4}
+              value={broadcastBody}
+              onChange={(e) => setBroadcastBody(e.target.value)}
+              placeholder="Type the notice for this route's parents…"
+              disabled={sending}
+              data-testid="broadcast-body"
+            />
+            <p
+              className={`text-xs ${
+                broadcastBody.length > BROADCAST_MAX_CHARS
+                  ? "font-medium text-destructive"
+                  : "text-muted-foreground"
+              }`}
+              data-testid="broadcast-counter"
+            >
+              {broadcastBody.length}/{BROADCAST_MAX_CHARS}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Sent once to every parent with a child assigned to this route.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={sending} onClick={() => setBroadcast(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={sendBroadcast}
+              disabled={sending || !broadcastBody.trim() || broadcastBody.length > BROADCAST_MAX_CHARS}
+              data-testid="broadcast-send"
+            >
+              Send
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
