@@ -156,6 +156,35 @@ def cancel_stop(route_id: str, student_id: str, user: dict = Depends(admin_only)
     )
 
 
+# Manual ordering (U7) ---------------------------------------------------------
+
+class StopOrderPayload(BaseModel):
+    # The FULL ordered list of the route's location-group keys — the
+    # `group_key` each non-gate stop row carries in the routes payload,
+    # echoed back verbatim in the admin's chosen order.
+    order: list[str]
+
+
+@router.put("/routes/{route_id}/stop-order")
+def set_stop_order(route_id: str, payload: StopOrderPayload, user: dict = Depends(admin_only)):
+    """Persist the admin's manual stop order and flip the route to manual mode
+    (R11). Set-equality validated server-side: missing, extra, duplicate or
+    foreign keys → 400; planner-saved (custom) routes → 409."""
+    return safe_call(
+        lambda: (dao.set_route_stop_order(route_id, payload.order), {"ok": True})[1]
+    )
+
+
+@router.post("/routes/{route_id}/recalculate")
+def recalculate_route(route_id: str, user: dict = Depends(admin_only)):
+    """Explicit return to automatic ordering (R11): clears manual mode and
+    regenerates immediately. stops_recalculated: false = the rebuild fell back
+    (degraded) instead of computing geometry. Custom routes → 409."""
+    return safe_call(
+        lambda: {"ok": True, "stops_recalculated": dao.recalculate_route(route_id)}
+    )
+
+
 # Geocoding & route planning (#4, #9) ----------------------------------------
 
 class GeocodePayload(BaseModel):

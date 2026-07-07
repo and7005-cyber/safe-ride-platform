@@ -3,6 +3,7 @@ import logging
 from typing import Any
 
 from app.core.db import get_connection
+from app.core.errors import BadRequestError, ConflictError, NotFoundError
 from app.services import geo_service
 
 logger = logging.getLogger("saferide.fleet")
@@ -23,6 +24,54 @@ def _stop_label(st: dict) -> str:
     if address:
         return address
     return (st["name"].split()[-1] + " Stop") if st.get("name") else "Stop"
+
+
+def _group_key(home_lat, home_lng, home_address, student_id) -> str:
+    """Location-group identity for a student's pickup point (U6/U7). Located
+    students group by rounded coordinates (siblings share a stop); without
+    coordinates the key is the address so each distinct pickup point keeps
+    its own stop, with a per-student fallback when neither exists. These keys
+    are server-issued: the routes payload exposes them per stop row and the
+    manual reorder payload (U7) echoes them back verbatim — clients never
+    derive them."""
+    if home_lat is not None and home_lng is not None:
+        return f"{home_lat:.6f},{home_lng:.6f}"
+    addr = (home_address or "").strip().lower()
+    return f"addr:{addr}" if addr else f"student:{student_id}"
+
+
+def _assigned_students(conn, route_id: str) -> list[dict]:
+    """A route's assigned students in canonical pickup-time-then-name order."""
+    return conn.execute(
+        """
+        select st.id, st.name, st.home_address, st.home_lat, st.home_lng, st.pickup_time
+        from live_student_routes sr
+        join live_students st on st.id = sr.student_id
+        where sr.route_id = %s
+        order by coalesce(st.pickup_time, '99:99') asc, st.name asc
+        """,
+        (route_id,),
+    ).fetchall()
+
+
+def _group_students(
+    students: list[dict],
+) -> tuple[list[str], dict[str, list[dict]], dict[str, dict]]:
+    """Group student rows by location identity, preserving the given order.
+    Returns (keys in first-seen order, key -> students, key -> representative
+    point for located groups only)."""
+    location_keys: list[str] = []
+    by_key: dict[str, list[dict]] = {}
+    points: dict[str, dict] = {}
+    for st in students:
+        key = _group_key(st["home_lat"], st["home_lng"], st.get("home_address"), st["id"])
+        if st["home_lat"] is not None and st["home_lng"] is not None:
+            points.setdefault(key, {"key": key, "lat": st["home_lat"], "lng": st["home_lng"]})
+        if key not in by_key:
+            by_key[key] = []
+            location_keys.append(key)
+        by_key[key].append(dict(st))
+    return location_keys, by_key, points
 
 
 def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
@@ -100,16 +149,7 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     if not route or route["custom_stops"]:
         return True
 
-    students = conn.execute(
-        """
-        select st.id, st.name, st.home_address, st.home_lat, st.home_lng, st.pickup_time
-        from live_student_routes sr
-        join live_students st on st.id = sr.student_id
-        where sr.route_id = %s
-        order by coalesce(st.pickup_time, '99:99') asc, st.name asc
-        """,
-        (route_id,),
-    ).fetchall()
+    students = _assigned_students(conn, route_id)
 
     is_afternoon = route["type"] == "afternoon"
     has_gate = route["school_id"] is not None
@@ -125,23 +165,7 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
         departure = geo_service.next_departure(earliest, default=_MORNING_DEFAULT)
 
     # Group students by location, preserving morning pickup order.
-    location_keys: list[str] = []
-    by_key: dict[str, list[dict]] = {}
-    points: dict[str, dict] = {}  # located groups only: key -> representative point
-    for st in students:
-        if st["home_lat"] is None or st["home_lng"] is None:
-            # No map coordinates: key by address so each distinct pickup point
-            # keeps its own stop (labelled by address) instead of collapsing
-            # into one generic stop. Falls back to a per-student key.
-            addr = (st.get("home_address") or "").strip().lower()
-            key = f"addr:{addr}" if addr else f"student:{st['id']}"
-        else:
-            key = f"{st['home_lat']:.6f},{st['home_lng']:.6f}"
-            points.setdefault(key, {"key": key, "lat": st["home_lat"], "lng": st["home_lng"]})
-        if key not in by_key:
-            by_key[key] = []
-            location_keys.append(key)
-        by_key[key].append(dict(st))
+    location_keys, by_key, points = _group_students(students)
 
     # Pre-delete snapshot keyed by location-group identity (the keys above),
     # feeding the preservation fallback. Rows are read in display order so the
@@ -312,6 +336,91 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     return True
 
 
+def reorder_route_stops(conn, route_id: str, ordered_keys: list[str]) -> None:
+    """Persist an admin's manual stop order and flip the route to manual mode
+    (U7, R11).
+
+    ``ordered_keys`` is the FULL ordered list of the route's location-group
+    keys — the ``group_key`` values the routes payload exposes per stop row.
+    Validation is set-equality against the server-derived current keys, so
+    missing, extra, duplicate and foreign keys (e.g. a ``student:<uuid>`` key
+    from another route) are all rejected; the renumber is positional — a
+    client key never targets a row for update, it only says where the
+    server's own group lands. Everything runs under the route-row
+    ``select … for update`` that every regeneration path takes (U6), so a
+    concurrent rebuild serializes instead of interleaving with the renumber.
+
+    The school-gate row is never touched: its position (first on afternoon
+    routes, last on morning) is invariant under a permutation of the student
+    groups, and its ``scheduled_time`` doubles as the previously-computed
+    marker the preservation fallback reads.
+
+    Custom routes 409 — the planner's saved order is the ordering authority
+    (custom_stops > manual_stop_order > auto).
+    """
+    route = conn.execute(
+        "select id, type, custom_stops from live_routes where id = %s for update",
+        (route_id,),
+    ).fetchone()
+    if not route:
+        raise NotFoundError("Route not found")
+    if route["custom_stops"]:
+        raise ConflictError(
+            "This route uses planner-saved stops — change its order by re-saving "
+            "from the route planner"
+        )
+
+    location_keys, by_key, _ = _group_students(_assigned_students(conn, route_id))
+    if len(ordered_keys) != len(set(ordered_keys)):
+        raise BadRequestError("Duplicate stop in the requested order")
+    if set(ordered_keys) != set(location_keys):
+        raise BadRequestError(
+            "Stop order does not match the route's current stops — refresh and try again"
+        )
+
+    is_afternoon = route["type"] == "afternoon"
+    has_gate_row = conn.execute(
+        "select 1 from live_route_stops where route_id = %s and is_school_gate limit 1",
+        (route_id,),
+    ).fetchone() is not None
+    base = 2 if (is_afternoon and has_gate_row) else 1
+    for idx, key in enumerate(ordered_keys):
+        conn.execute(
+            "update live_route_stops set stop_order = %s "
+            "where route_id = %s and student_id = any(%s)",
+            (base + idx, route_id, [st["id"] for st in by_key[key]]),
+        )
+    conn.execute(
+        "update live_routes set manual_stop_order = true where id = %s", (route_id,)
+    )
+
+
+def recalculate_route_stops(conn, route_id: str) -> bool:
+    """Explicit return to automatic ordering (U7, R11): clear
+    ``manual_stop_order`` under the route-row lock, then regenerate
+    immediately through the U6 path. Returns its ``stops_recalculated``
+    signal (False = the rebuild fell back instead of computing geometry).
+
+    Custom routes 409: regeneration early-returns on them, and answering 200
+    to a recalculation that did nothing is exactly the silent no-op R10 bans.
+    """
+    route = conn.execute(
+        "select id, custom_stops from live_routes where id = %s for update",
+        (route_id,),
+    ).fetchone()
+    if not route:
+        raise NotFoundError("Route not found")
+    if route["custom_stops"]:
+        raise ConflictError(
+            "This route uses planner-saved stops — recalculation applies only to "
+            "student-based routes"
+        )
+    conn.execute(
+        "update live_routes set manual_stop_order = false where id = %s", (route_id,)
+    )
+    return regenerate_route_stops(conn, route_id)
+
+
 def _check_route_bus_conflict(
     conn, bus_id: str | None, route_type: str, exclude_route_id: str | None = None
 ) -> None:
@@ -480,11 +589,32 @@ class FleetDao:
             result = []
             for route in routes:
                 stops = conn.execute(
-                    "select * from live_route_stops where route_id = %s order by stop_order asc, name asc",
+                    """
+                    select rs.*, st.home_lat as _home_lat, st.home_lng as _home_lng,
+                           st.home_address as _home_address
+                    from live_route_stops rs
+                    left join live_students st on st.id = rs.student_id
+                    where rs.route_id = %s
+                    order by rs.stop_order asc, rs.name asc
+                    """,
                     (route["id"],),
                 ).fetchall()
                 item = dict(route)
-                item["route_stops"] = [dict(s) for s in stops]
+                item["route_stops"] = []
+                for s in stops:
+                    stop = dict(s)
+                    home = (stop.pop("_home_lat"), stop.pop("_home_lng"), stop.pop("_home_address"))
+                    # Server-issued location-group key (U7): the manual reorder
+                    # payload echoes these back verbatim. Derived from the
+                    # student row — the same source the reorder validation
+                    # reads — never from the stop row's own lat/lng. NULL on
+                    # gate and planner-authored (student-less) stops.
+                    stop["group_key"] = (
+                        _group_key(*home, stop["student_id"])
+                        if stop["student_id"] is not None
+                        else None
+                    )
+                    item["route_stops"].append(stop)
                 result.append(item)
         return result
 
@@ -531,10 +661,16 @@ class FleetDao:
             stops_recalculated = True
             if custom:
                 # Re-saving from the planner replaces the custom stops
-                # wholesale — same write path as create (R17).
+                # wholesale — same write path as create (R17). The SAME UPDATE
+                # clears manual_stop_order (one ordering authority per route,
+                # U7 — the 008 CHECK is the race-proof backstop, never the
+                # mechanism) and last_recalc_degraded (custom routes never
+                # regenerate, so a stale degradation badge could otherwise
+                # never clear).
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
                     "bus_id=%(bus_id)s, school_id=%(school_id)s, custom_stops=true, "
+                    "manual_stop_order=false, last_recalc_degraded=false, "
                     "polyline=%(polyline)s, total_distance_m=%(total_distance_m)s, "
                     "total_duration_s=%(total_duration_s)s where id=%(id)s returning *",
                     {**data, "id": route_id},
@@ -590,24 +726,53 @@ class FleetDao:
         return stops_recalculated
 
     def set_student_pickup_time(self, student_id: str, pickup_time: str | None) -> bool:
-        """Edit a stop's pickup time (a student attribute) and regenerate every
-        route the student is on: on auto+google routes the new time re-anchors
-        the morning departure (pickup_time is otherwise input-only there);
-        never-computed routes re-sort by it as before. Manual-mode semantics
-        (write through to that one stop) land with U7 — regeneration already
-        branches on the flag. Returns False when any regeneration degraded."""
+        """Edit a stop's pickup time (a student attribute). The effect depends
+        on each affected route's ordering mode, decided under the same
+        route-row lock every stop rewrite takes (U6):
+
+        - auto: regenerate — on google routes the new time re-anchors the
+          morning departure (pickup_time is otherwise input-only there);
+          never-computed routes re-sort by it as before.
+        - manual (U7, R13): write the new time through to that student's own
+          stop row only — the admin's order is authoritative, so no re-sort
+          and no regeneration; every other stop and the gate row stay as-is.
+        - custom: nothing to touch — planner stops are not student-linked.
+
+        Returns False when any auto regeneration degraded."""
         with get_connection() as conn:
             conn.execute(
                 "update live_students set pickup_time = %s where id = %s",
                 (pickup_time, student_id),
             )
-            route_ids = [
-                r["route_id"]
-                for r in conn.execute(
-                    "select route_id from live_student_routes where student_id = %s", (student_id,)
-                ).fetchall()
-            ]
+            # order by r.id: a student can sit on several routes — take their
+            # row locks in a stable order so two concurrent edits cannot
+            # deadlock across routes.
+            routes = conn.execute(
+                "select r.id, r.custom_stops, r.manual_stop_order "
+                "from live_student_routes sr join live_routes r on r.id = sr.route_id "
+                "where sr.student_id = %s order by r.id for update of r",
+                (student_id,),
+            ).fetchall()
             ok = True
-            for route_id in route_ids:
-                ok = regenerate_route_stops(conn, route_id) and ok
+            for route in routes:
+                if route["custom_stops"]:
+                    continue
+                if route["manual_stop_order"]:
+                    conn.execute(
+                        "update live_route_stops set scheduled_time = %s "
+                        "where route_id = %s and student_id = %s",
+                        (pickup_time, route["id"], student_id),
+                    )
+                else:
+                    ok = regenerate_route_stops(conn, route["id"]) and ok
         return ok
+
+    # --- manual ordering (U7) -----------------------------------------------
+
+    def set_route_stop_order(self, route_id: str, ordered_keys: list[str]) -> None:
+        with get_connection() as conn:
+            reorder_route_stops(conn, route_id, ordered_keys)
+
+    def recalculate_route(self, route_id: str) -> bool:
+        with get_connection() as conn:
+            return recalculate_route_stops(conn, route_id)

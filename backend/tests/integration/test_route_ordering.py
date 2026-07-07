@@ -1,5 +1,6 @@
-"""Geometry recalculation in auto mode (ops-refinement U6: R9, R10, R12; AE3
-auto half, AE6).
+"""Route stop ordering (ops-refinement U6 + U7): geometry recalculation in
+auto mode (U6: R9, R10, R12; AE3 auto half, AE6) and admin manual ordering
+with explicit recalculate (U7: R11–R13; AE3 manual half).
 
 Run with the stack up (scripts/start-local.sh):
 
@@ -190,6 +191,25 @@ def _get_route(client, admin_headers, route_id: str) -> dict:
 
 def _stops(route_payload: dict) -> list[dict]:
     return sorted(route_payload["route_stops"], key=lambda s: s["stop_order"])
+
+
+def _ordered_group_keys(stops: list[dict]) -> list[str]:
+    """The manual-reorder payload (U7): every non-gate stop's server-issued
+    group_key in display order, deduped — siblings at one location share a
+    key and move as one group."""
+    keys: list[str] = []
+    for stop in stops:
+        if stop["is_school_gate"] or stop["group_key"] is None:
+            continue
+        if stop["group_key"] not in keys:
+            keys.append(stop["group_key"])
+    return keys
+
+
+def _reorder(client, admin_headers, route_id: str, order: list[str]) -> httpx.Response:
+    return client.put(
+        f"/api/fleet/routes/{route_id}/stop-order", json={"order": order}, headers=admin_headers
+    )
 
 
 def _cleanup(client, admin_headers, *, students=(), routes=(), schools=(), buses=(), drivers=()):
@@ -762,3 +782,600 @@ def test_started_run_keeps_its_snapshot_through_a_recalc(
             client, admin_headers,
             students=kids, routes=(route,), schools=(school,), buses=(bus,), drivers=(driver,),
         )
+
+
+# Manual ordering (U7) ---------------------------------------------------------
+
+def test_manual_reorder_persists_flips_flag_and_moves_sibling_groups_together(
+    client, admin_headers
+):
+    """Covers AE3 (manual half): the admin's order is written positionally,
+    manual_stop_order flips on, every stop keeps its own scheduled_time (times
+    travel WITH their stop), the gate row is untouched, and siblings sharing a
+    location move as one group under their shared server-issued group_key."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("A2", "06:35", -1.2800, 36.7900),  # sibling location: same group
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is False
+        stops = _stops(listed)
+        # Server-issued keys: coordinate-format for located groups, NULL on
+        # the gate row; the sibling rows share one key.
+        keys = _ordered_group_keys(stops)
+        assert keys[0] == "-1.280000,36.790000"
+        assert len(keys) == 3
+        assert stops[-1]["is_school_gate"] is True and stops[-1]["group_key"] is None
+
+        key_a, key_b, key_c = keys
+        response = _reorder(client, admin_headers, route["id"], [key_c, key_a, key_b])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True}
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is True
+        # Reordering is not a recalculation: the degraded badge from the
+        # container's key-less builds stays until an explicit Recalculate.
+        assert listed["last_recalc_degraded"] is True
+        # Assert per-stop order and time (display order within a shared
+        # stop_order is a collation detail): the siblings moved together and
+        # every stop kept its own time; the gate row is untouched.
+        assert {s["name"]: (s["stop_order"], s["scheduled_time"])
+                for s in listed["route_stops"]} == {
+            f"IT RO C Lane {marker}": (1, "06:50"),
+            f"IT RO A Lane {marker}": (2, "06:30"),
+            f"IT RO A2 Lane {marker}": (2, "06:35"),
+            f"IT RO B Lane {marker}": (3, "06:40"),
+            f"IT RO School {marker}": (4, None),
+        }
+
+        # Reordering again while already manual just rewrites the order.
+        response = _reorder(client, admin_headers, route["id"], [key_a, key_b, key_c])
+        assert response.status_code == 200, response.text
+        listed = _get_route(client, admin_headers, route["id"])
+        assert {s["name"]: s["stop_order"] for s in listed["route_stops"]} == {
+            f"IT RO A Lane {marker}": 1,
+            f"IT RO A2 Lane {marker}": 1,
+            f"IT RO B Lane {marker}": 2,
+            f"IT RO C Lane {marker}": 3,
+            f"IT RO School {marker}": 4,
+        }
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_reorder_validation_rejects_bad_key_sets(client, admin_headers):
+    """Missing, extra, duplicate, empty and foreign key lists are all 400s —
+    including a real student:<uuid> key harvested from ANOTHER route — an
+    unknown route is 404, and no failed attempt leaves any trace: the order
+    stays put and the route never flips to manual."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    other_route = _make_route(client, admin_headers, marker, "afternoon", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        # Coordinate-less, address-less student on the OTHER route: its group
+        # key is the per-student fallback — a harvestable foreign key.
+        kids.append(_make_student(
+            client, admin_headers, _student_payload(marker, "N", "06:45"), [other_route["id"]],
+        ))
+        foreign_key = _ordered_group_keys(
+            _stops(_get_route(client, admin_headers, other_route["id"]))
+        )[0]
+        assert foreign_key == f"student:{kids[-1]['id']}"
+
+        key_a, key_b = _ordered_group_keys(_stops(_get_route(client, admin_headers, route["id"])))
+        for bad in (
+            [key_a],                                   # missing
+            [],                                        # missing everything
+            [key_a, key_b, "addr:it ro nowhere"],      # extra/unknown
+            [key_a, key_a],                            # duplicate (same length)
+            [key_a, key_b, key_b],                     # duplicate (extra copy)
+            [key_a, foreign_key],                      # another route's student key
+            [key_a, key_b, f"student:{uuid.uuid4()}"],  # nonexistent student key
+        ):
+            response = _reorder(client, admin_headers, route["id"], bad)
+            assert response.status_code == 400, (bad, response.text)
+
+        response = _reorder(client, admin_headers, str(uuid.uuid4()), [key_a, key_b])
+        assert response.status_code == 404, response.text
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is False  # nothing flipped
+        assert [s["name"] for s in _stops(listed)] == [
+            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}", f"IT RO School {marker}",
+        ]
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route, other_route),
+                 schools=(school,))
+
+
+def test_reorder_and_recalculate_conflict_on_custom_routes(client, admin_headers):
+    """Planner-saved routes have one ordering authority — their saved stops:
+    both verbs answer a friendly 409 (recalculate must never 200 while the
+    regeneration silently early-returns) and the saved stops survive."""
+    marker = uuid.uuid4().hex[:6]
+    created = client.post(
+        "/api/fleet/routes",
+        json={
+            "name": f"IT RO Planned {marker}",
+            "type": "morning",
+            "stops": [
+                {"label": f"IT RO Corner A {marker}", "lat": -1.30, "lng": 36.80,
+                 "pickup_time": "07:05"},
+                {"label": f"IT RO Corner B {marker}", "lat": -1.31, "lng": 36.81,
+                 "pickup_time": "07:20"},
+                {"label": f"IT RO Gate {marker}", "lat": -1.32, "lng": 36.82,
+                 "is_school": True},
+            ],
+            "polyline": "itfakepoly",
+            "total_distance_m": 12345,
+            "total_duration_s": 1800,
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    route = created.json()
+    try:
+        assert route["custom_stops"] is True
+
+        response = _reorder(client, admin_headers, route["id"], ["addr:anywhere"])
+        assert response.status_code == 409, response.text
+        assert "planner" in response.json()["detail"].lower()
+
+        response = client.post(
+            f"/api/fleet/routes/{route['id']}/recalculate", headers=admin_headers
+        )
+        assert response.status_code == 409, response.text
+        assert "planner" in response.json()["detail"].lower()
+
+        response = client.post(
+            f"/api/fleet/routes/{uuid.uuid4()}/recalculate", headers=admin_headers
+        )
+        assert response.status_code == 404, response.text
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["custom_stops"] is True
+        assert listed["manual_stop_order"] is False
+        assert [s["name"] for s in _stops(listed)] == [
+            f"IT RO Corner A {marker}", f"IT RO Corner B {marker}", f"IT RO Gate {marker}",
+        ]
+    finally:
+        _cleanup(client, admin_headers, routes=(route,))
+
+
+def test_manual_order_survives_assignment_and_unassignment(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """Covers AE3 (manual half) + R13: with google-computed times on the
+    stops, a manual reorder carries each time with its stop; a later
+    assignment through the key-less container appends the new group before
+    the gate with the student's own pickup_time and disturbs neither the
+    manual order nor the surviving times nor the gate; unassignment preserves
+    the same way. Manual preservation is a choice, not a degradation:
+    stops_recalculated stays true and the degraded flag is never raised."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    kid_d = None
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        patch_google(monkeypatch, geo, order=[2, 0, 1])  # computed: C,A,B
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        # Computed state: C 06:30, A 06:35, B 06:40, gate 06:45.
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        key_c, key_a, key_b = _ordered_group_keys(stops)
+
+        response = _reorder(client, admin_headers, route["id"], [key_b, key_c, key_a])
+        assert response.status_code == 200, response.text
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is True
+        assert listed["last_recalc_degraded"] is False
+        # Times travelled with their stops — deliberately non-monotonic now.
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO B Lane {marker}", "06:40"),
+            (f"IT RO C Lane {marker}", "06:30"),
+            (f"IT RO A Lane {marker}", "06:35"),
+            (f"IT RO School {marker}", "06:45"),
+        ]
+
+        # Assignment through the degraded container: appends before the gate,
+        # own pickup time, nothing else moves, no degradation signalled.
+        created = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "D", "06:35", -1.3200, 36.8400),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        kid_d = created.json()
+        assert kid_d["stops_recalculated"] is True  # manual preserve ≠ degraded
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is True
+        assert listed["last_recalc_degraded"] is False
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO B Lane {marker}", "06:40"),
+            (f"IT RO C Lane {marker}", "06:30"),
+            (f"IT RO A Lane {marker}", "06:35"),
+            (f"IT RO D Lane {marker}", "06:35"),  # appended, own pickup time
+            (f"IT RO School {marker}", "06:45"),  # gate untouched
+        ]
+
+        # Unassignment preserves the manual order and surviving times too.
+        removed = client.delete(
+            f"/api/fleet/routes/{route['id']}/stops/{kid_d['id']}", headers=admin_headers
+        )
+        assert removed.status_code == 200, removed.text
+        assert removed.json() == {"ok": True, "stops_recalculated": True}
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is True
+        assert listed["last_recalc_degraded"] is False
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO B Lane {marker}", "06:40"),
+            (f"IT RO C Lane {marker}", "06:30"),
+            (f"IT RO A Lane {marker}", "06:35"),
+            (f"IT RO School {marker}", "06:45"),
+        ]
+    finally:
+        _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,),
+                 schools=(school,))
+
+
+def test_recalculate_clears_manual_and_recomputes(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """Recalculate is the explicit exit from manual mode: it clears the flag
+    and reruns U6's path immediately — through the key-less container that is
+    the observable degraded fallback ({ok, stops_recalculated: false}); at
+    the DAO level with a fake google provider it recomputes order and times
+    and clears the degraded flag."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        key_a, key_b, key_c = _ordered_group_keys(
+            _stops(_get_route(client, admin_headers, route["id"]))
+        )
+        assert _reorder(
+            client, admin_headers, route["id"], [key_c, key_a, key_b]
+        ).status_code == 200
+
+        # Container recalculate (no key there): manual clears, the rebuild
+        # falls back observably — never-computed route, so pickup order.
+        response = client.post(
+            f"/api/fleet/routes/{route['id']}/recalculate", headers=admin_headers
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "stops_recalculated": False}
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is False
+        assert listed["last_recalc_degraded"] is True
+        assert [s["name"] for s in _stops(listed)] == [
+            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}",
+            f"IT RO C Lane {marker}", f"IT RO School {marker}",
+        ]
+
+        # Back to manual, then recalculate at the DAO level with google up:
+        # optimizer order + anchored times land, both flags come back clean.
+        assert _reorder(
+            client, admin_headers, route["id"], [key_c, key_a, key_b]
+        ).status_code == 200
+        patch_google(monkeypatch, geo, order=[1, 0, 2])  # A,B,C -> B,A,C
+        assert fleet_dao.recalculate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is False
+        assert listed["last_recalc_degraded"] is False
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO B Lane {marker}", "06:30"),
+            (f"IT RO A Lane {marker}", "06:35"),
+            (f"IT RO C Lane {marker}", "06:40"),
+            (f"IT RO School {marker}", "06:45"),
+        ]
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_manual_pickup_time_edit_writes_through_to_that_stop_only(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """R13: in manual mode a pickup-time edit updates that student's own stop
+    time in place — no re-sort (the new time would move it first under auto),
+    no regeneration, every other stop and the gate untouched — while the
+    student attribute itself still updates."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        patch_google(monkeypatch, geo)  # computed: A 06:30, B 06:35, C 06:40
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        key_a, key_b, key_c = _ordered_group_keys(
+            _stops(_get_route(client, admin_headers, route["id"]))
+        )
+        assert _reorder(
+            client, admin_headers, route["id"], [key_c, key_a, key_b]
+        ).status_code == 200
+
+        # Edit A's pickup time through the container: 05:50 would sort first
+        # under any re-sort — the manual order must not move.
+        response = client.put(
+            f"/api/fleet/routes/{route['id']}/stops/{kids[0]['id']}",
+            json={"pickup_time": "05:50"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True}
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["manual_stop_order"] is True
+        assert listed["last_recalc_degraded"] is False  # nothing regenerated
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO C Lane {marker}", "06:40"),
+            (f"IT RO A Lane {marker}", "05:50"),  # written through in place
+            (f"IT RO B Lane {marker}", "06:35"),
+            (f"IT RO School {marker}", "06:45"),  # gate untouched
+        ]
+
+        students = client.get("/api/students", headers=admin_headers).json()
+        me = next(s for s in students if s["id"] == kids[0]["id"])
+        assert me["pickup_time"] == "05:50"  # the student attribute updated
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_concurrent_reorder_and_assignment_serialize_on_the_route_lock(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """The reorder transaction and the assignment's regeneration take the same
+    route-row lock, both ways: an uncommitted reorder blocks the assignment,
+    and an in-flight assignment blocks the reorder — no interleaving, no lost
+    update. Nothing here commits; the lock assertions leave no state."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    from app.dao.student_live_dao import _sync_routes
+
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kid = loose = None
+    try:
+        kid = _make_student(
+            client, admin_headers,
+            _student_payload(marker, "A", "06:30", -1.2800, 36.7900), [route["id"]],
+        )
+        loose = _make_student(
+            client, admin_headers,
+            _student_payload(marker, "B", "06:40", -1.2900, 36.8000), [],
+        )
+        patch_offline(monkeypatch, geo)
+        keys = _ordered_group_keys(_stops(_get_route(client, admin_headers, route["id"])))
+
+        # Reorder holds the route row: the assignment path cannot interleave.
+        fleet_dao.reorder_route_stops(db, route["id"], keys)  # uncommitted
+        with psycopg.connect(DB_URL, row_factory=dict_row) as other:
+            other.execute("set lock_timeout = '400ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                _sync_routes(other, loose["id"], [route["id"]])
+            other.rollback()
+        db.rollback()
+
+        # And the reverse: an in-flight assignment blocks the reorder.
+        with psycopg.connect(DB_URL, row_factory=dict_row) as other:
+            assert _sync_routes(other, loose["id"], [route["id"]]) is False  # holds lock
+            db.execute("set lock_timeout = '400ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                fleet_dao.reorder_route_stops(db, route["id"], keys)
+            db.rollback()
+            other.rollback()
+
+        # Released: the reorder goes straight through (and is discarded).
+        fleet_dao.reorder_route_stops(db, route["id"], keys)
+        db.rollback()
+        assert _get_route(client, admin_headers, route["id"])["manual_stop_order"] is False
+    finally:
+        _cleanup(client, admin_headers, students=(kid, loose), routes=(route,),
+                 schools=(school,))
+
+
+def test_custom_to_auto_handover_lands_in_auto_and_recalculates_immediately(
+    client, admin_headers, db, geo, monkeypatch
+):
+    """R18 x U7: assigning a student to a planner-saved route hands ordering
+    back to auto — custom_stops clears, manual_stop_order is (and stays)
+    false — and the regeneration runs immediately in the same transaction:
+    with google up the rebuilt stops carry computed times, no degradation."""
+    from app.dao.student_live_dao import _sync_routes
+
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    created = client.post(
+        "/api/fleet/routes",
+        json={
+            "name": f"IT RO Handover {marker}",
+            "type": "morning",
+            "school_id": school["id"],
+            "stops": [
+                {"label": f"IT RO Corner {marker}", "lat": -1.3050, "lng": 36.8100,
+                 "pickup_time": "07:05"},
+                {"label": f"IT RO Gate {marker}", "lat": -1.3000, "lng": 36.8200,
+                 "is_school": True},
+            ],
+            "polyline": "itfakepoly",
+            "total_distance_m": 5000,
+            "total_duration_s": 900,
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    route = created.json()
+    kid = None
+    try:
+        assert route["custom_stops"] is True
+        kid = _make_student(
+            client, admin_headers,
+            _student_payload(marker, "A", "06:30", -1.2800, 36.7900), [],
+        )
+        patch_google(monkeypatch, geo)
+        assert _sync_routes(db, kid["id"], [route["id"]]) is True
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["custom_stops"] is False
+        assert listed["manual_stop_order"] is False  # auto, not manual
+        assert listed["last_recalc_degraded"] is False
+        assert listed["polyline"] is None
+        stops = _stops(listed)
+        assert [s["is_school_gate"] for s in stops] == [False, True]
+        assert stops[0]["student_id"] == kid["id"]  # student stops, not planner rows
+        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35"]  # computed now
+    finally:
+        _cleanup(client, admin_headers, students=(kid,), routes=(route,), schools=(school,))
+
+
+def test_started_run_keeps_its_snapshot_through_a_manual_reorder(client, admin_headers):
+    """R12 (manual half): a run started before the admin reorders operates on
+    its own run_stops snapshot — the reorder rewrites the live stops only."""
+    import random
+
+    marker = uuid.uuid4().hex[:6]
+    driver = None
+    for _ in range(5):
+        pin = str(random.randint(100000, 999999))
+        response = client.post(
+            "/api/accounts/drivers",
+            json={"full_name": f"IT RO Driver M {marker}",
+                  "email": f"it-ro-driver-m-{marker}@test.local",
+                  "password": "test1234.", "phone": "+254711000043", "pin": pin},
+            headers=admin_headers,
+        )
+        if response.status_code == 200:
+            driver = {**response.json(), "pin": pin}
+            break
+    assert driver, "could not create throwaway driver"
+
+    school = _make_school(client, admin_headers, marker)
+    bus = client.post(
+        "/api/fleet/buses",
+        json={"name": f"IT RO Bus M {marker}", "driver_id": driver["id"]},
+        headers=admin_headers,
+    ).json()
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], bus_id=bus["id"])
+    kids = []
+    run_id = None
+    driver_headers = None
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+
+        pin_login = client.post("/api/auth/pin-login", json={"pin": driver["pin"]})
+        assert pin_login.status_code == 200, pin_login.text
+        driver_headers = {"Authorization": f"Bearer {pin_login.json()['token']}"}
+
+        started = client.post(
+            "/api/runs/driver/start", json={"route_id": route["id"]}, headers=driver_headers
+        )
+        assert started.status_code == 200, started.text
+        run_id = started.json()["id"]
+
+        def run_snapshot() -> list[tuple]:
+            context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+            return [
+                (s["stop_order"], s["name"], s["scheduled_time"])
+                for s in context["run_stops"]
+            ]
+
+        before = run_snapshot()
+        assert before, "started run must carry a run_stops snapshot"
+
+        key_a, key_b = _ordered_group_keys(
+            _stops(_get_route(client, admin_headers, route["id"]))
+        )
+        assert _reorder(client, admin_headers, route["id"], [key_b, key_a]).status_code == 200
+
+        live = _stops(_get_route(client, admin_headers, route["id"]))
+        assert live[0]["name"] == f"IT RO B Lane {marker}"  # live order changed
+        assert run_snapshot() == before  # the run's snapshot did not (R12)
+    finally:
+        if run_id and driver_headers:
+            client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        _cleanup(
+            client, admin_headers,
+            students=kids, routes=(route,), schools=(school,), buses=(bus,), drivers=(driver,),
+        )
+
+
+def test_ordering_endpoints_require_admin(client):
+    """Both U7 verbs sit under the admin-only dependency: a parent token is
+    rejected before any route lookup runs."""
+    parent_headers = login(client, "and7005@gmail.com", "Test1234")
+    bogus = uuid.uuid4()
+    response = client.put(
+        f"/api/fleet/routes/{bogus}/stop-order", json={"order": []}, headers=parent_headers
+    )
+    assert response.status_code == 403, response.text
+    response = client.post(f"/api/fleet/routes/{bogus}/recalculate", headers=parent_headers)
+    assert response.status_code == 403, response.text
