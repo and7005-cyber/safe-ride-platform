@@ -100,6 +100,9 @@ def list_students(user: dict = Depends(admin_only)):
 
 @router.post("")
 def create_student(payload: StudentPayload, user: dict = Depends(admin_only)):
+    # The response carries stops_recalculated (U6/R10): false when an affected
+    # auto route fell back to the preserved/pickup-time order instead of
+    # recomputing geometry (the durable signal is live_routes.last_recalc_degraded).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
     return safe_call(lambda: dao.create_student(_clean_student(data), route_ids))
@@ -107,6 +110,7 @@ def create_student(payload: StudentPayload, user: dict = Depends(admin_only)):
 
 @router.put("/{student_id}")
 def update_student(student_id: str, payload: StudentPayload, user: dict = Depends(admin_only)):
+    # Carries stops_recalculated like create (U6/R10).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
     return safe_call(lambda: dao.update_student(student_id, _clean_student(data), route_ids))

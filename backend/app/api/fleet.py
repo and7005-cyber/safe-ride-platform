@@ -145,8 +145,14 @@ def set_stop_time(
 
 @router.delete("/routes/{route_id}/stops/{student_id}")
 def cancel_stop(route_id: str, student_id: str, user: dict = Depends(admin_only)):
+    # stops_recalculated: false = the rebuild fell back instead of recomputing
+    # geometry; the durable last_recalc_degraded flag rides the route payload
+    # (U6/R10).
     return safe_call(
-        lambda: (dao.remove_student_from_route(route_id, student_id), {"ok": True})[1]
+        lambda: {
+            "ok": True,
+            "stops_recalculated": dao.remove_student_from_route(route_id, student_id),
+        }
     )
 
 

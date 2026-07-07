@@ -1,6 +1,19 @@
+import datetime as dt
+import logging
 from typing import Any
 
 from app.core.db import get_connection
+from app.services import geo_service
+
+logger = logging.getLogger("saferide.fleet")
+
+# Departure anchors (Africa/Nairobi wall clock) for the geometry ETAs (U6).
+# Morning anchors on the earliest assigned pickup_time when one exists;
+# afternoon ALWAYS anchors on its type default — pickup_time is a
+# morning-clock attribute, so an afternoon route anchored on it would write
+# dawn-clock drop-off times that look derived.
+_MORNING_DEFAULT = "07:00"
+_AFTERNOON_DEFAULT = "15:30"
 
 
 def _stop_label(st: dict) -> str:
@@ -12,35 +25,80 @@ def _stop_label(st: dict) -> str:
     return (st["name"].split()[-1] + " Stop") if st.get("name") else "Stop"
 
 
-def regenerate_route_stops(conn, route_id: str) -> None:
+def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
+                 lat: float | None, lng: float | None, is_gate: bool, student_id) -> None:
+    conn.execute(
+        "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (route_id, name, order, time, lat, lng, is_gate, student_id),
+    )
+
+
+def regenerate_route_stops(conn, route_id: str) -> bool:
     """Rebuild a route's stops from its assigned students + the school gate.
 
     One stop per unique home location (siblings share an order). Stops are
     named by home address. Direction matters:
 
-    - **Morning** routes are ordered by pickup time, with the selected school
-      as the final stop.
-    - **Afternoon** routes start at the school and then visit the student
-      stops in reverse pickup order (the morning route, run backwards).
+    - **Morning** routes end at the school gate; **afternoon** routes start
+      at it (the morning route, run backwards).
 
-    A student with no coordinates still gets their own stop, labelled by home
-    address (so it shows in lists even without a map position) rather than
-    collapsing into a generic "School Pickup". A route with no school
-    generates no gate stop.
+    Opens with ``select … for update`` on the route row: every stop-rewrite
+    path (assignment, pickup-time edit, school edit, handover, recalculate)
+    contends on the same lock as the manual reorder transaction (U7), so a
+    concurrent rebuild can never interleave with a renumber.
 
-    Planner-saved routes (``custom_stops = true``) are left untouched: their
-    stops are the saved option, authoritative until a student assignment
-    flips the flag off (the sync path in student_live_dao does that before
-    calling here). Early return — no delete, no rebuild (R18).
+    Ordering authority (R9–R11, one authority per route):
+
+    - ``custom_stops`` routes are untouched: the planner's saved option is
+      authoritative until a student assignment flips the flag off (R18).
+      Early return — no delete, no rebuild.
+    - Auto routes attempt the geometry path: when every location group has
+      coordinates, the school gate is located, and BOTH provider signals are
+      Google (``optimized_order_with_provider`` for the order,
+      ``route_geometry`` — provider ``'google-routes'`` — for the legs), the
+      optimizer order is written with per-group times from cumulative leg
+      ETAs. The departure anchor is read from the students BEFORE the stop
+      delete: morning = earliest assigned ``pickup_time`` (else 07:00),
+      afternoon = always 15:30 (never student pickup times — they are
+      morning-clock values). The gate row carries the computed school
+      arrival (morning) / departure (afternoon), which doubles as the
+      durable "previously computed" marker below. ``last_recalc_degraded``
+      clears on success.
+    - Anything else falls back. Previously computed routes (their prior gate
+      row carries a scheduled_time — only the geometry path writes one, and
+      the fallback re-writes it as-is) preserve surviving location groups'
+      previous relative order AND ``scheduled_time`` from the pre-delete
+      snapshot: re-sorting by pickup time would pair a computed order's
+      times with a contradictory sequence. Genuinely new groups append
+      (before the gate on morning routes, last on afternoon) ordered by
+      pickup-time-then-name among themselves. Never-computed routes take the
+      pickup-time-then-name build wholesale — origin R10's literal fallback,
+      and byte-identical to the pre-U6 behavior. Mixed provider signals
+      (order without geometry or vice versa) take this same fallback: never
+      a partial write.
+    - Manual routes (``manual_stop_order``, U7) never call geometry and take
+      the preservation path unconditionally: an admin-frozen order is a
+      choice, not a degradation, so the degraded flag is not raised.
+
+    A degraded auto recalculation (fallback taken with students assigned)
+    persists ``last_recalc_degraded = true`` and logs a WARNING — silent
+    degradation is banned (R10). Returns ``False`` exactly in that case, so
+    callers can thread ``stops_recalculated`` into mutation responses;
+    ``True`` otherwise (geometry success, custom/authoritative, empty).
+
+    In-progress runs are untouched by construction: runs operate on their own
+    ``run_stops`` snapshot (R12).
     """
     route = conn.execute(
-        "select r.id, r.type, r.school_id, r.custom_stops, "
+        "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, "
         "s.name as school_name, s.lat as school_lat, s.lng as school_lng "
-        "from live_routes r left join live_schools s on s.id = r.school_id where r.id = %s",
+        "from live_routes r left join live_schools s on s.id = r.school_id "
+        "where r.id = %s for update of r",
         (route_id,),
     ).fetchone()
     if not route or route["custom_stops"]:
-        return
+        return True
 
     students = conn.execute(
         """
@@ -53,14 +111,23 @@ def regenerate_route_stops(conn, route_id: str) -> None:
         (route_id,),
     ).fetchall()
 
-    conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
-
     is_afternoon = route["type"] == "afternoon"
     has_gate = route["school_id"] is not None
+    gate_located = has_gate and route["school_lat"] is not None and route["school_lng"] is not None
+
+    # The departure anchor is derived from the (pre-delete) student rows, never
+    # from the stop rows about to be deleted — else every recalc would reset a
+    # morning route to the 07:00 default.
+    if is_afternoon:
+        departure = geo_service.next_departure(None, default=_AFTERNOON_DEFAULT)
+    else:
+        earliest = next((st["pickup_time"] for st in students if st["pickup_time"]), None)
+        departure = geo_service.next_departure(earliest, default=_MORNING_DEFAULT)
 
     # Group students by location, preserving morning pickup order.
     location_keys: list[str] = []
     by_key: dict[str, list[dict]] = {}
+    points: dict[str, dict] = {}  # located groups only: key -> representative point
     for st in students:
         if st["home_lat"] is None or st["home_lng"] is None:
             # No map coordinates: key by address so each distinct pickup point
@@ -70,45 +137,179 @@ def regenerate_route_stops(conn, route_id: str) -> None:
             key = f"addr:{addr}" if addr else f"student:{st['id']}"
         else:
             key = f"{st['home_lat']:.6f},{st['home_lng']:.6f}"
+            points.setdefault(key, {"key": key, "lat": st["home_lat"], "lng": st["home_lng"]})
         if key not in by_key:
             by_key[key] = []
             location_keys.append(key)
         by_key[key].append(dict(st))
 
+    # Pre-delete snapshot keyed by location-group identity (the keys above),
+    # feeding the preservation fallback. Rows are read in display order so the
+    # first row of a group defines its previous position and time.
+    prev_rows = conn.execute(
+        "select name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id "
+        "from live_route_stops where route_id = %s order by stop_order asc, name asc",
+        (route_id,),
+    ).fetchall()
+    prev_groups: dict[str, dict] = {}
+    prev_gate_time: str | None = None
+    for row in prev_rows:
+        if row["is_school_gate"]:
+            if prev_gate_time is None:
+                prev_gate_time = row["scheduled_time"]
+            continue
+        if row["lat"] is not None and row["lng"] is not None:
+            key = f"{row['lat']:.6f},{row['lng']:.6f}"
+        else:
+            # Coordinate-less rows were keyed by address, and the row name IS
+            # that address (or a surname fallback — covered by the student
+            # alias below).
+            label = (row["name"] or "").strip().lower()
+            key = f"addr:{label}" if label else None
+        rec = None
+        if key is not None:
+            rec = prev_groups.setdefault(
+                key, {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
+            )
+        if row["student_id"] is not None:
+            if rec is None:
+                rec = {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
+            rec["student_times"][str(row["student_id"])] = row["scheduled_time"]
+            # The student link is the stable alias when labels or coordinates
+            # drift (setdefault: the location key stays the primary identity).
+            prev_groups.setdefault(f"student:{row['student_id']}", rec)
+
+    conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
+
     n_locations = len(location_keys)
-    # Reserve order 1 for the school gate on afternoon routes; otherwise the
-    # gate trails the student stops.
-    student_base = 2 if (is_afternoon and has_gate) else 1
-    gate_order = 1 if (is_afternoon and has_gate) else (n_locations + 1 if has_gate else None)
+    is_auto = not route["manual_stop_order"]
+    gate_name = route["school_name"] or "School"
 
-    def location_order(idx: int) -> int:
+    # --- Geometry path (auto routes with something to compute) ---------------
+    degraded_reason = None
+    if is_auto and n_locations > 0:
+        if not all(key in points for key in location_keys):
+            degraded_reason = "location group(s) without coordinates"
+        elif not gate_located:
+            degraded_reason = "school gate has no coordinates" if has_gate else "route has no school gate"
+        else:
+            gate_point = {"lat": route["school_lat"], "lng": route["school_lng"]}
+            ordering = geo_service.optimized_order_with_provider(
+                [points[key] for key in location_keys], gate_point
+            )
+            # A single group has no ordering problem — 'trivial' is exact, not
+            # a fallback. Everything else must be the Google optimiser.
+            order_ok = ordering["provider"] == "google" or (
+                n_locations == 1 and ordering["provider"] == "trivial"
+            )
+            if not order_ok:
+                degraded_reason = f"order provider '{ordering['provider']}'"
+            else:
+                ordered_keys = [p["key"] for p in ordering["ordered"]]
+                if is_afternoon:
+                    # Existing afternoon semantics: the school gate leads and
+                    # the computed order runs backwards (first pickup of the
+                    # morning direction is dropped last).
+                    seq_keys = list(reversed(ordered_keys))
+                    seq = [gate_point] + [points[k] for k in seq_keys]
+                else:
+                    seq_keys = ordered_keys
+                    seq = [points[k] for k in seq_keys] + [gate_point]
+                geom = geo_service.route_geometry(seq, departure=departure)
+                if geom["provider"] != "google-routes" or len(geom["legs"]) != len(seq) - 1:
+                    # Mixed signals (order ok, geometry degraded/misshapen):
+                    # full fallback below — never a partial write.
+                    degraded_reason = f"geometry provider '{geom['provider']}'"
+                else:
+                    etas = [departure.strftime("%H:%M")]
+                    cumulative = 0
+                    for leg in geom["legs"]:
+                        cumulative += leg.get("duration_s") or 0
+                        etas.append((departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M"))
+                    if is_afternoon:
+                        gate_time, group_times = etas[0], dict(zip(seq_keys, etas[1:]))
+                        orders = {key: 2 + i for i, key in enumerate(seq_keys)}
+                        gate_order = 1
+                    else:
+                        gate_time, group_times = etas[-1], dict(zip(seq_keys, etas[:-1]))
+                        orders = {key: 1 + i for i, key in enumerate(seq_keys)}
+                        gate_order = n_locations + 1
+                    for key in seq_keys:
+                        for st in by_key[key]:
+                            _insert_stop(conn, route_id, _stop_label(st), orders[key],
+                                         group_times[key], st["home_lat"], st["home_lng"], False, st["id"])
+                    _insert_stop(conn, route_id, gate_name, gate_order, gate_time,
+                                 route["school_lat"], route["school_lng"], True, None)
+                    conn.execute(
+                        "update live_routes set last_recalc_degraded = false where id = %s",
+                        (route_id,),
+                    )
+                    return True
+
+    # --- Fallback / preservation ---------------------------------------------
+    # "Previously computed" is read off the prior gate row's scheduled_time:
+    # only the geometry path writes one, and this fallback re-writes it as-is,
+    # so the marker survives degraded rebuilds in between. Manual routes (U7)
+    # preserve unconditionally — the admin's order is authoritative.
+    previously_computed = prev_gate_time is not None
+    preserve = previously_computed or not is_auto
+    if preserve:
+        surviving = sorted(
+            (k for k in location_keys if k in prev_groups),
+            key=lambda k: prev_groups[k]["order"],
+        )
+        new_keys = [k for k in location_keys if k not in prev_groups]
         if is_afternoon:
-            # Reverse the morning order: first morning pickup is dropped last.
-            return student_base + (n_locations - 1 - idx)
-        return student_base + idx
+            # Direction semantics for the appended block too: the earliest
+            # new pickup is dropped last.
+            new_keys.reverse()
+        final_keys = surviving + new_keys
+    else:
+        # Never computed: the original pickup-time-then-name build, wholesale
+        # (reversed for afternoon routes — first pickup is dropped last),
+        # writing current pickup times so time edits keep applying.
+        final_keys = list(reversed(location_keys)) if is_afternoon else list(location_keys)
 
-    rows: list[tuple] = []
-    for idx, key in enumerate(location_keys):
-        order = location_order(idx)
+    student_base = 2 if (is_afternoon and has_gate) else 1
+    gate_order = 1 if (is_afternoon and has_gate) else (len(final_keys) + 1 if has_gate else None)
+    for idx, key in enumerate(final_keys):
+        rec = prev_groups.get(key) if preserve else None
         for st in by_key[key]:
-            # Labelled by home address; coordinate-less students simply have no
-            # map point (lat/lng stay null) but still appear as a named stop.
-            name = _stop_label(st)
-            rows.append((route_id, name, order, st["pickup_time"], st["home_lat"], st["home_lng"], False, st["id"]))
-
-    for row in rows:
-        conn.execute(
-            "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
-            "values (%s, %s, %s, %s, %s, %s, %s, %s)",
-            row,
-        )
-
+            if rec is None:
+                time = st["pickup_time"]
+            else:
+                # Surviving students keep their own previous time; a new
+                # sibling joining a surviving group inherits the group's.
+                fallback_time = rec["time"] if rec["time"] is not None else st["pickup_time"]
+                time = rec["student_times"].get(str(st["id"]), fallback_time)
+            _insert_stop(conn, route_id, _stop_label(st), student_base + idx, time,
+                         st["home_lat"], st["home_lng"], False, st["id"])
     if has_gate:
+        # "Gate stays as-is": the preserved time doubles as the previously-
+        # computed marker above (None on never-computed routes, as before).
+        _insert_stop(conn, route_id, gate_name, gate_order, prev_gate_time,
+                     route["school_lat"], route["school_lng"], True, None)
+
+    if is_auto and n_locations > 0:
+        # Observable degradation (R10): the durable flag drives the route
+        # card's warning badge and survives reloads; the return value threads
+        # stops_recalculated: false into the mutation response.
         conn.execute(
-            "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
-            "values (%s, %s, %s, %s, %s, %s, true, null)",
-            (route_id, route["school_name"] or "School", gate_order, None, route["school_lat"], route["school_lng"]),
+            "update live_routes set last_recalc_degraded = true where id = %s", (route_id,)
         )
+        logger.warning(
+            "route %s stop recalculation degraded (%s); fell back to %s",
+            route_id,
+            degraded_reason,
+            "preserved previous order and times" if previously_computed else "pickup-time order",
+        )
+        return False
+    if is_auto:
+        # Empty auto route: nothing to compute is not a degradation.
+        conn.execute(
+            "update live_routes set last_recalc_degraded = false where id = %s", (route_id,)
+        )
+    return True
 
 
 def _check_route_bus_conflict(
@@ -327,6 +528,7 @@ class FleetDao:
                 exclude_route_id=route_id,
             )
             custom = bool(data.get("stops"))
+            stops_recalculated = True
             if custom:
                 # Re-saving from the planner replaces the custom stops
                 # wholesale — same write path as create (R17).
@@ -349,7 +551,7 @@ class FleetDao:
                     {**data, "id": route_id},
                 ).fetchone()
                 if row:
-                    regenerate_route_stops(conn, route_id)
+                    stops_recalculated = regenerate_route_stops(conn, route_id)
             if row:
                 # A bus reassignment (incl. to/from NULL) — or a type flip,
                 # since derivation prefers morning routes — invalidates the
@@ -362,7 +564,10 @@ class FleetDao:
                     ).fetchall()
                     for s in students:
                         _derive_student_bus(conn, s["student_id"])
-        return dict(row) if row else None
+        if not row:
+            return None
+        # Observable degradation (U6/R10): false when the rebuild fell back.
+        return {**dict(row), "stops_recalculated": stops_recalculated}
 
     def delete_route(self, route_id: str) -> None:
         with get_connection() as conn:
@@ -370,8 +575,9 @@ class FleetDao:
 
     # --- stop-level edits (#1) --------------------------------------------
 
-    def remove_student_from_route(self, route_id: str, student_id: str) -> None:
-        """Cancel a stop by removing its student from the route, then rebuild."""
+    def remove_student_from_route(self, route_id: str, student_id: str) -> bool:
+        """Cancel a stop by removing its student from the route, then rebuild.
+        Returns the regeneration's ``stops_recalculated`` signal (U6/R10)."""
         from app.dao.student_live_dao import _derive_student_bus
 
         with get_connection() as conn:
@@ -379,12 +585,17 @@ class FleetDao:
                 "delete from live_student_routes where route_id = %s and student_id = %s",
                 (route_id, student_id),
             )
-            regenerate_route_stops(conn, route_id)
+            stops_recalculated = regenerate_route_stops(conn, route_id)
             _derive_student_bus(conn, student_id)
+        return stops_recalculated
 
-    def set_student_pickup_time(self, student_id: str, pickup_time: str | None) -> None:
-        """Edit a stop's pickup time (a student attribute); reorder every route
-        the student is on, since ordering is by pickup time."""
+    def set_student_pickup_time(self, student_id: str, pickup_time: str | None) -> bool:
+        """Edit a stop's pickup time (a student attribute) and regenerate every
+        route the student is on: on auto+google routes the new time re-anchors
+        the morning departure (pickup_time is otherwise input-only there);
+        never-computed routes re-sort by it as before. Manual-mode semantics
+        (write through to that one stop) land with U7 — regeneration already
+        branches on the flag. Returns False when any regeneration degraded."""
         with get_connection() as conn:
             conn.execute(
                 "update live_students set pickup_time = %s where id = %s",
@@ -396,5 +607,7 @@ class FleetDao:
                     "select route_id from live_student_routes where student_id = %s", (student_id,)
                 ).fetchall()
             ]
+            ok = True
             for route_id in route_ids:
-                regenerate_route_stops(conn, route_id)
+                ok = regenerate_route_stops(conn, route_id) and ok
+        return ok

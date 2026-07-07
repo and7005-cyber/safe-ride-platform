@@ -58,6 +58,79 @@ def test_optimized_order_offline_anchors_on_school(no_keys):
     assert [s["label"] for s in ordered] == ["Near", "Mid", "Far"]
 
 
+# Provider-signalling wrapper (U6/R10): geometry writes gate on the order
+# provider, which the bare optimized_order list return cannot carry.
+
+STUDENTS = [
+    {"lat": -1.33, "lng": 36.86, "label": "Far"},
+    {"lat": -1.30, "lng": 36.83, "label": "Mid"},
+    {"lat": -1.29, "lng": 36.82, "label": "Near"},
+]
+SCHOOL = {"lat": -1.286, "lng": 36.817, "is_school": True}
+
+
+def test_optimized_order_with_provider_offline_signals_nearest_neighbour(no_keys):
+    out = geo_service.optimized_order_with_provider(STUDENTS, SCHOOL)
+    assert out["provider"] == "nearest-neighbour"
+    assert [s["label"] for s in out["ordered"]] == ["Near", "Mid", "Far"]
+
+
+def test_optimized_order_with_provider_trivial_for_single_point(no_keys):
+    out = geo_service.optimized_order_with_provider([STUDENTS[0]], SCHOOL)
+    assert out["provider"] == "trivial"
+    assert [s["label"] for s in out["ordered"]] == ["Far"]
+    assert geo_service.optimized_order_with_provider([], SCHOOL) == {
+        "ordered": [], "provider": "trivial",
+    }
+
+
+@pytest.fixture
+def google_key(monkeypatch):
+    class _Settings:
+        google_maps_api_key = "test-key"
+        mapbox_token = ""
+
+    monkeypatch.setattr(geo_service, "get_settings", lambda: _Settings())
+
+
+def test_optimized_order_with_provider_reports_google(google_key, monkeypatch):
+    monkeypatch.setattr(
+        geo_service, "_routes_call",
+        lambda *a, **k: {"optimizedIntermediateWaypointIndex": [2, 0, 1]},
+    )
+    out = geo_service.optimized_order_with_provider(STUDENTS, SCHOOL)
+    assert out["provider"] == "google"
+    assert [s["label"] for s in out["ordered"]] == ["Near", "Far", "Mid"]
+    # The legacy list API delegates to the wrapper: same sequence.
+    assert geo_service.optimized_order(STUDENTS, SCHOOL) == out["ordered"]
+
+
+def test_optimized_order_with_provider_falls_back_on_provider_error(google_key, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(geo_service, "_routes_call", boom)
+    out = geo_service.optimized_order_with_provider(STUDENTS, SCHOOL)
+    assert out["provider"] == "nearest-neighbour"
+
+
+def test_optimized_order_with_provider_falls_back_on_short_order(google_key, monkeypatch):
+    # A malformed optimiser response (wrong index count) must not be trusted.
+    monkeypatch.setattr(
+        geo_service, "_routes_call",
+        lambda *a, **k: {"optimizedIntermediateWaypointIndex": [0]},
+    )
+    out = geo_service.optimized_order_with_provider(STUDENTS, SCHOOL)
+    assert out["provider"] == "nearest-neighbour"
+
+
+def test_optimized_order_with_provider_without_school_is_offline(google_key):
+    # The Google optimiser is anchored on the school; without one there is no
+    # google signal even with a key.
+    out = geo_service.optimized_order_with_provider(STUDENTS, None)
+    assert out["provider"] == "nearest-neighbour"
+
+
 def test_route_geometry_offline_estimates_legs(no_keys):
     seq = [
         {"lat": -1.286, "lng": 36.817, "label": "A"},
