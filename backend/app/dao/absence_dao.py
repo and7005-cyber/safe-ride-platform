@@ -22,6 +22,7 @@ mark always wins.
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.status_sql import scope_covers
 
 
 def absent_student_ids(conn, date: str | None = None, run_type: str | None = None) -> set[str]:
@@ -33,10 +34,10 @@ def absent_student_ids(conn, date: str | None = None, run_type: str | None = Non
     scope only covers its own run type.
     """
     rows = conn.execute(
-        """
+        f"""
         select student_id from live_student_absences
         where absence_date = coalesce(%s::date, (now() at time zone 'Africa/Nairobi')::date)
-          and (%s::text is null or scope in ('day', %s))
+          and (%s::text is null or {scope_covers("scope", "%s")})
         """,
         (date, run_type, run_type),
     ).fetchall()
@@ -203,14 +204,14 @@ class AbsenceDao:
                         (student_id,),
                     )
                 conn.execute(
-                    """
+                    f"""
                     insert into run_absences (run_id, student_id, student_name, reason)
                     select r.id, s.id, s.name, %s
                     from live_runs r
                     join live_students s on s.id = %s
                     where r.status <> 'completed'
                       and r.date = (now() at time zone 'Africa/Nairobi')::date
-                      and (%s = 'day' or r.type = %s)
+                      and {scope_covers("%s", "r.type")}
                       and exists (
                           select 1 from run_stops rs
                           where rs.run_id = r.id and rs.student_id = s.id
@@ -231,16 +232,39 @@ class AbsenceDao:
         qualify (both sub-statements re-check on the locked row, so a
         concurrent staff escalation wins the same way as in set_scope).
 
+        Both sub-statements also re-check that no ACTIVE (non-completed) run
+        of a type the withdrawn scope covers exists today for the student
+        (run_stops membership OR route membership — clear_absence's shape):
+        the API's run-row pre-read can race a driver starting the run, and a
+        withdrawal landing after that start would contradict the roster the
+        run already snapshotted without the child. The check is per-CTE so
+        withdrawing the not-yet-started half of a merged 'day' row stays
+        allowed while the OTHER half's run is active.
+
         Returns None when nothing was withdrawn (no row today, staff-sourced
-        row, or non-matching scope — the caller distinguishes for messaging),
-        else {'deleted': bool, 'scope': remaining scope or None}. Any exit
-        from 'day' — downgrade or delete — resets an 'absent' status to
-        'at-school' (clear_absence's reset), in the same transaction.
+        row, non-matching scope, or a covered run just started — the caller
+        distinguishes for messaging), else {'deleted': bool, 'scope':
+        remaining scope or None}. Any exit from 'day' — downgrade or delete —
+        resets an 'absent' status to 'at-school' (clear_absence's reset), in
+        the same transaction.
         """
         _validate_scope(scope)
+        run_guard = """not exists (
+                          select 1 from live_runs r
+                          where r.status <> 'completed'
+                            and r.date = (now() at time zone 'Africa/Nairobi')::date
+                            and {type_predicate}
+                            and (
+                              exists (select 1 from run_stops rs
+                                      where rs.run_id = r.id and rs.student_id = a.student_id)
+                              or exists (select 1 from live_student_routes sr
+                                         where sr.route_id = r.route_id
+                                           and sr.student_id = a.student_id)
+                            )
+                      )"""
         with get_connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 with downgraded as (
                     update live_student_absences a
                     set scope = case
@@ -253,6 +277,7 @@ class AbsenceDao:
                       and a.source = 'parent'
                       and a.scope = 'day'
                       and %(scope)s in ('morning', 'afternoon')
+                      and {run_guard.format(type_predicate="r.type = %(scope)s")}
                     returning a.scope
                 ),
                 deleted as (
@@ -262,6 +287,7 @@ class AbsenceDao:
                       and a.source = 'parent'
                       and a.scope = %(scope)s
                       and not exists (select 1 from downgraded)
+                      and {run_guard.format(type_predicate=scope_covers("%(scope)s", "r.type"))}
                     returning a.scope
                 )
                 select (select scope from downgraded) as downgraded_to,
@@ -313,11 +339,11 @@ class AbsenceDao:
                 # route they are on — their stop was excluded at snapshot
                 # time by this absence.
                 active = conn.execute(
-                    """
+                    f"""
                     select 1 from live_runs r
                     where r.status <> 'completed'
                       and r.date = (now() at time zone 'Africa/Nairobi')::date
-                      and (%s = 'day' or r.type = %s)
+                      and {scope_covers("%s", "r.type")}
                       and (
                         exists (select 1 from run_stops rs
                                 where rs.run_id = r.id and rs.student_id = %s)

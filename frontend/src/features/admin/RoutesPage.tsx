@@ -45,6 +45,10 @@ interface StopGroup {
   order: number;
   name: string;
   scheduled_time: string | null;
+  /** The student's own pickup_time attribute (the INPUT the time editor
+   * edits), as opposed to scheduled_time (often a computed ETA). Null on
+   * the school gate and planner stops. */
+  student_pickup_time: string | null;
   is_school_gate: boolean;
   /** Server-issued location-group key; null on the school gate and planner stops. */
   group_key: string | null;
@@ -60,6 +64,13 @@ export const DEGRADED_MESSAGE =
 
 /** Client mirror of the server's broadcast body cap (R23). */
 export const BROADCAST_MAX_CHARS = 500;
+
+/** The broadcast dialog's Send-disabled predicate (R23 client edge): blocked
+ * for an empty/whitespace-only body or one past the 500-char cap — exactly
+ * the two shapes the server 400s. */
+export function broadcastSendDisabled(body: string): boolean {
+  return !body.trim() || body.length > BROADCAST_MAX_CHARS;
+}
 
 export interface ReorderableStop {
   group_key: string | null;
@@ -205,6 +216,7 @@ export function RoutesPage() {
         order: s.stop_order,
         name: s.name,
         scheduled_time: s.scheduled_time,
+        student_pickup_time: s.student_pickup_time ?? null,
         is_school_gate: s.is_school_gate,
         group_key: s.group_key ?? null,
         studentIds: [],
@@ -271,12 +283,16 @@ export function RoutesPage() {
     }
   };
 
+  // Both stop-level mutations sit behind the same busyRouteId gate as
+  // reorder/recalculate: a double-fired delete or time write would race the
+  // in-flight rebuild the first request already triggered.
   const cancelStop = async (routeId: string, g: StopGroup) => {
     if (!(await confirm({
       title: `Cancel the ${g.name} stop?`,
       description: "The student(s) at this stop will be removed from the route.",
       confirmLabel: "Cancel stop",
     }))) return;
+    setBusyRouteId(routeId);
     try {
       const responses = [];
       for (const sid of g.studentIds) {
@@ -287,11 +303,14 @@ export function RoutesPage() {
       notifyIfDegraded(...responses);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setBusyRouteId(null);
     }
   };
 
   const saveStopTime = async () => {
     if (!stopEdit) return;
+    setBusyRouteId(stopEdit.routeId);
     try {
       const responses = [];
       for (const sid of stopEdit.studentIds) {
@@ -303,11 +322,11 @@ export function RoutesPage() {
       }
       await qc.invalidateQueries({ queryKey: ["routes"] });
       setStopEdit(null);
-      // Today this endpoint returns bare {ok}; the durable card badge still
-      // surfaces a degraded rebuild via the invalidated payload.
       notifyIfDegraded(...responses);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setBusyRouteId(null);
     }
   };
 
@@ -432,7 +451,12 @@ export function RoutesPage() {
                                   routeId: route.id,
                                   studentIds: s.studentIds,
                                   name: s.name,
-                                  time: s.scheduled_time ?? "",
+                                  // Prefill the INPUT (the student's own
+                                  // pickup_time), never scheduled_time — on
+                                  // computed routes that's a derived ETA and
+                                  // re-saving it as the pickup time would
+                                  // corrupt the anchor.
+                                  time: s.student_pickup_time ?? "",
                                 })
                               }
                             >
@@ -524,7 +548,12 @@ export function RoutesPage() {
           )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setStopEdit(null)}>Cancel</Button>
-            <Button onClick={saveStopTime}>Save</Button>
+            <Button
+              onClick={saveStopTime}
+              disabled={!!stopEdit && busyRouteId === stopEdit.routeId}
+            >
+              Save
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -569,7 +598,7 @@ export function RoutesPage() {
             </Button>
             <Button
               onClick={sendBroadcast}
-              disabled={sending || !broadcastBody.trim() || broadcastBody.length > BROADCAST_MAX_CHARS}
+              disabled={sending || broadcastSendDisabled(broadcastBody)}
               data-testid="broadcast-send"
             >
               Send

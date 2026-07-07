@@ -11,7 +11,8 @@ rejection, the staff-sourced 409, side effects gated on real transitions —
 exactly one student-stamped 'cancellation' incident carrying the covered
 route's bus and NULL driver, plus one 'ride-cancelled' confirmation per
 linked parent and never a bus-wide fan-out — the mid-run run_absences
-append, withdrawal guards keyed on run-row EXISTENCE, the list_children
+append, withdrawal guards keyed on run-row EXISTENCE, the DAO statement's
+own active-run fold (the pre-read's race window), the list_children
 ``cancellation`` key, and the shared per-account limiter.
 
 Isolation: a throwaway fleet (driver with a known PIN + bus + school +
@@ -72,6 +73,20 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 @pytest.fixture(scope="module")
 def admin_headers(client):
     return login(client, ADMIN["email"], ADMIN["password"])
+
+
+@pytest.fixture(scope="module")
+def absence_dao():
+    """The working-tree AbsenceDao wired to the stack's published Postgres
+    (test_driver_lifecycle's pattern). withdraw_scope's run guard is a DAO-
+    internal race net with no clean HTTP surface — the API's pre-read 409s
+    first — so the TOCTOU coverage drives the DAO directly against the same
+    database the containerized API serves. The env override must land before
+    the app's lazy pool first opens."""
+    os.environ["DATABASE_URL"] = DB_URL
+    from app.dao.absence_dao import AbsenceDao
+
+    return AbsenceDao()
 
 
 def signup_parent(client, marker: str, tag: str) -> dict:
@@ -646,6 +661,63 @@ def test_mid_run_not_boarded_cancel_appends_run_absences(client, admin_headers, 
         report = client.get(f"/api/runs/{run_id}/report", headers=admin_headers).json()
         listed = {a["student_id"]: a["reason"] for a in report["absent_students"]}
         assert listed == {s1["id"]: CANCELLED_BY_PARENT}
+    finally:
+        _end_and_delete(client, admin_headers, driver_headers, run_id)
+        _clear_absences_for(client, admin_headers, s1["id"])
+        _purge_cancellation_incidents(client, admin_headers, s1["id"])
+
+
+# Withdraw-vs-run-start race: the DAO's own run guard (R18 TOCTOU fold) ----------
+
+def test_withdraw_scope_dao_guard_blocks_after_covered_run_starts(
+    client, admin_headers, fleet, absence_dao
+):
+    """The atomic withdraw statement re-checks run existence itself: a covered
+    run STARTING between the API's pre-read and the statement folds the
+    withdrawal to None (the friendly 409) instead of deleting the row out
+    from under a run that already snapshotted its roster without the child.
+    Driven DAO-direct — through the API the pre-read already 409s, so only
+    the DAO call reaches the race window. The not-yet-started half of a
+    merged 'day' row stays withdrawable while the other half's run is active
+    (the guard is per-CTE, keyed on the withdrawn half's run type)."""
+    driver_headers = fleet["driver_headers"]
+    p1, s1 = fleet["p1"], fleet["s1"]
+    run_id = None
+    try:
+        assert absence_dao.set_scope(
+            s1["id"], "morning", p1["id"], reason=CANCELLED_BY_PARENT
+        ) is not None
+
+        # The covered run starts AFTER the cancellation: the snapshot excluded
+        # s1's stop, so the guard's membership arm is the student's route.
+        run_id = _start_run(client, driver_headers, fleet["morning"]["id"])["id"]
+
+        # DAO-level withdrawal of the covered half: the fold refuses.
+        assert absence_dao.withdraw_scope(s1["id"], "morning", p1["id"]) is None
+        row = absence_row(client, admin_headers, s1["id"])
+        assert (row["scope"], row["source"]) == ("morning", "parent")  # untouched
+
+        # Merge to 'day', then withdraw the NOT-started half: still allowed.
+        merged = absence_dao.set_scope(
+            s1["id"], "afternoon", p1["id"], reason=CANCELLED_BY_PARENT
+        )
+        assert merged is not None and merged["scope"] == "day"
+        downgraded = absence_dao.withdraw_scope(s1["id"], "afternoon", p1["id"])
+        assert downgraded == {"deleted": False, "scope": "morning"}
+
+        # The remaining half covers the active run: still refused.
+        assert absence_dao.withdraw_scope(s1["id"], "morning", p1["id"]) is None
+
+        # Once the run completes the DAO guard steps aside (status <>
+        # 'completed') — post-completion policy is the API pre-read's
+        # stricter run-row EXISTENCE check, not the DAO's.
+        ended = client.post(
+            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
+        )
+        assert ended.status_code == 200, ended.text
+        removed = absence_dao.withdraw_scope(s1["id"], "morning", p1["id"])
+        assert removed == {"deleted": True, "scope": None}
+        assert absence_row(client, admin_headers, s1["id"]) is None
     finally:
         _end_and_delete(client, admin_headers, driver_headers, run_id)
         _clear_absences_for(client, admin_headers, s1["id"])

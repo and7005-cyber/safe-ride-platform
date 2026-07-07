@@ -1,7 +1,7 @@
-"""Shared SQL fragment for the derived student ``display_status`` (R1–R4).
+"""Shared SQL fragments: the derived student ``display_status`` (R1–R4) and
+the scope-covers-run-type predicate (U4).
 
-Leaf module imported by both ``parent_live_dao`` (parent-portal children) and
-``student_live_dao`` (admin students list). It must import nothing from
+Leaf module imported across ``app.dao``. It must import nothing from
 ``app.dao``: the student_live_dao↔fleet_dao pair already needs a lazy import
 to dodge a cycle, and this module must never grow another.
 
@@ -27,6 +27,16 @@ The admin students list wraps this expression with its own 'unassigned' rule
 (no live_student_routes rows → 'unassigned', overriding everything); that
 wrap is admin-side only and lives in student_live_dao.
 """
+
+def scope_covers(scope_sql: str, run_type_sql: str) -> str:
+    """SQL predicate: the absence ``scope`` covers a run type (U4) — 'day'
+    covers every run, a partial scope only its own type. Both arguments are
+    SQL fragments (a column reference or a placeholder), so the one covering
+    rule reads identically whether the scope or the run type is the column:
+    ``scope_covers("a.scope", "%s")`` or ``scope_covers("%(scope)s", "r.type")``.
+    """
+    return f"({scope_sql} = 'day' or {scope_sql} = {run_type_sql})"
+
 
 _DISPLAY_STATUS_CASE = """case
                            when exists (

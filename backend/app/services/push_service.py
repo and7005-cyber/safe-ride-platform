@@ -199,7 +199,10 @@ class PushService:
         the caller only fires this on an actual set_scope transition.
         run_type maps from the recorded scope ('morning'/'afternoon';
         whole-day → NULL) so the feed's period filter surfaces the row under
-        the period the parent cancelled."""
+        the period the parent cancelled.
+
+        Failure isolation is per recipient: one co-parent's failing insert or
+        send must not cost the other their confirmation."""
         try:
             student_id = str(student["id"])
             phrases = {
@@ -208,16 +211,29 @@ class PushService:
                 "day": "rides for the rest of today have been cancelled",
             }
             phrase = phrases.get(scope, "ride today has been cancelled")
+            delivered = intended = 0
             for link in self.dao.parents_of_students([student_id]):
-                self._notify(
-                    link["parent_id"],
-                    type="ride-cancelled",
-                    title="Ride cancelled",
-                    body=f"{link['student_name']}'s {phrase} by a parent on the account.",
-                    student_id=student_id,
-                    run_id=None,
-                    bus_id=student.get("bus_id"),
-                    run_type=scope if scope in ("morning", "afternoon") else None,
+                intended += 1
+                try:
+                    self._notify(
+                        link["parent_id"],
+                        type="ride-cancelled",
+                        title="Ride cancelled",
+                        body=f"{link['student_name']}'s {phrase} by a parent on the account.",
+                        student_id=student_id,
+                        run_id=None,
+                        bus_id=student.get("bus_id"),
+                        run_type=scope if scope in ("morning", "afternoon") else None,
+                    )
+                    delivered += 1
+                except Exception:
+                    logger.exception(
+                        "ride-cancelled confirmation failed for parent %s", link["parent_id"]
+                    )
+            if delivered < intended:
+                logger.warning(
+                    "ride-cancelled fan-out for student %s reached %d of %d linked parents",
+                    student_id, delivered, intended,
                 )
         except Exception:
             logger.exception("notify_ride_cancelled failed")
@@ -306,26 +322,39 @@ class PushService:
         run-scoped dedup: two identical sends are two rows) — and run_type
         stays NULL (R22: the notice is period-agnostic). body arrives
         validated and stored as-is; the title is length-bounded because
-        web-push services reject ~4KB payloads."""
+        web-push services reject ~4KB payloads.
+
+        Failure isolation is per recipient: one failing insert or send must
+        not cut off the rest of the route's parents."""
         try:
             title = f"School notice — {route.get('name') or 'your route'}"
             if len(title) > BROADCAST_TITLE_MAX_CHARS:
                 title = title[: BROADCAST_TITLE_MAX_CHARS - 1] + "…"
             notified: set[str] = set()
+            delivered = 0
             for parent_id in parent_ids:
                 parent_id = str(parent_id)
                 if parent_id in notified:
                     continue
                 notified.add(parent_id)
-                self._notify(
-                    parent_id,
-                    type="admin-notice",
-                    title=title,
-                    body=body,
-                    student_id=None,
-                    run_id=None,
-                    bus_id=route.get("bus_id"),
-                    run_type=None,
+                try:
+                    self._notify(
+                        parent_id,
+                        type="admin-notice",
+                        title=title,
+                        body=body,
+                        student_id=None,
+                        run_id=None,
+                        bus_id=route.get("bus_id"),
+                        run_type=None,
+                    )
+                    delivered += 1
+                except Exception:
+                    logger.exception("admin broadcast failed for parent %s", parent_id)
+            if delivered < len(notified):
+                logger.warning(
+                    "admin broadcast for route %s reached %d of %d recipients",
+                    route.get("id"), delivered, len(notified),
                 )
         except Exception:
             logger.exception("notify_admin_broadcast failed")

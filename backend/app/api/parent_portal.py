@@ -260,10 +260,11 @@ def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent
         result = absence_dao.withdraw_scope(payload.student_id, payload.scope, user["id"])
         if result is None:
             # The atomic statement refused despite the pre-reads: a staff
-            # escalation (or concurrent withdrawal) landed in between.
+            # escalation, a concurrent withdrawal, or a covered run starting
+            # landed in between.
             raise ConflictError(
-                f"Could not withdraw — {name}'s absence was just updated. "
-                "Please refresh and try again."
+                f"Could not withdraw — {name}'s absence was just updated or "
+                "a run has just started. Please refresh and try again."
             )
         return result
 

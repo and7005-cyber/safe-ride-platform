@@ -145,7 +145,13 @@ export function StudentsPage() {
   const { data: students = [] } = useStudents();
   const { data: routes = [] } = useRoutes();
   const { data: schools = [] } = useSchools();
-  const { data: absences = [] } = useAbsences();
+  // The badge and the escalate/remove dialog act on TODAY's absence row, so
+  // the query is scoped to the Nairobi day the server keys absences on —
+  // an unscoped list would let a past/future-dated row wear today's badge.
+  // Kenya is UTC+3 year-round (no DST), so a fixed offset is exact; this
+  // still trusts the client clock to be roughly right.
+  const nairobiToday = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+  const { data: absences = [] } = useAbsences(nairobiToday);
   const [open, setOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);

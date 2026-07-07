@@ -177,7 +177,10 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
         if route_id not in wanted:
             conn.execute("delete from live_student_routes where id = %s", (row_id,))
             affected.add(route_id)
-    for route_id in added:
+    # sorted(): route ids are UUID strings, so iteration order is a global
+    # total order — every multi-route writer takes the route-row locks in the
+    # same sequence and two concurrent edits cannot deadlock across routes.
+    for route_id in sorted(added):
         # Handover (R18): assigning a student to a planner-saved route hands
         # ownership back to the students — flip custom_stops off and drop the
         # stored polyline/totals (now stale) so the regeneration below rebuilds
@@ -189,7 +192,7 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
             (route_id,),
         )
     stops_recalculated = True
-    for route_id in affected:
+    for route_id in sorted(affected):
         stops_recalculated = regenerate_route_stops(conn, route_id) and stops_recalculated
     _derive_student_bus(conn, student_id)
     return stops_recalculated
@@ -294,11 +297,14 @@ class StudentLiveDao:
         with get_connection() as conn:
             # Cancelling a student must also cancel their stop on every route
             # they were on (#1, #6) — regenerate after the cascade delete clears
-            # their live_student_routes rows.
+            # their live_student_routes rows. order by route_id: the same
+            # global lock order every multi-route writer uses (_sync_routes).
             affected = [
                 r["route_id"]
                 for r in conn.execute(
-                    "select route_id from live_student_routes where student_id = %s", (student_id,)
+                    "select route_id from live_student_routes where student_id = %s "
+                    "order by route_id",
+                    (student_id,),
                 ).fetchall()
             ]
             conn.execute("delete from live_students where id = %s", (student_id,))

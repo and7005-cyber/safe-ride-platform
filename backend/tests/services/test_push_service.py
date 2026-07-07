@@ -431,6 +431,50 @@ def test_admin_broadcast_one_row_per_distinct_parent(
         assert note["bus_id"] == "bus-1"
 
 
+def test_admin_broadcast_isolates_per_recipient_failures(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """One recipient's failing insert must not cut off the rest of the route:
+    recipients before AND after the failure still get their rows (review C1)."""
+    real_insert = dao.insert_notification
+
+    def flaky_insert(user_id, *args, **kwargs):
+        if user_id == "p2":
+            raise RuntimeError("db hiccup")
+        return real_insert(user_id, *args, **kwargs)
+
+    dao.insert_notification = flaky_insert  # type: ignore[assignment]
+
+    service.notify_admin_broadcast(
+        {"id": "r1", "name": "Express 1", "bus_id": "bus-1"}, "hi", ["p1", "p2", "p3"]
+    )
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p3"]
+
+
+def test_ride_cancelled_isolates_per_recipient_failures(
+    service: PushService, dao: FakePushDao
+) -> None:
+    """A failing co-parent insert must not cost the other linked parents
+    their confirmation (review C1)."""
+    dao.parents = {
+        "s1": [link("p1", "s1", "Leila"), link("p2", "s1", "Leila"), link("p3", "s1", "Leila")],
+    }
+    real_insert = dao.insert_notification
+
+    def flaky_insert(user_id, *args, **kwargs):
+        if user_id == "p2":
+            raise RuntimeError("db hiccup")
+        return real_insert(user_id, *args, **kwargs)
+
+    dao.insert_notification = flaky_insert  # type: ignore[assignment]
+
+    service.notify_ride_cancelled({"id": "s1", "name": "Leila", "bus_id": "bus-1"}, "morning")
+
+    assert [n["user_id"] for n in dao.notifications] == ["p1", "p3"]
+    assert all(n["type"] == "ride-cancelled" for n in dao.notifications)
+
+
 def test_admin_broadcast_title_is_length_bounded(
     service: PushService, dao: FakePushDao
 ) -> None:

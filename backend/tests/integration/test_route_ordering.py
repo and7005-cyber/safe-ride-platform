@@ -325,6 +325,9 @@ def test_degraded_mutations_signal_and_fall_back_to_pickup_order(client, admin_h
             headers=admin_headers,
         )
         assert retimed.status_code == 200, retimed.text
+        # The time-edit endpoint threads the recalc signal too (B3): the
+        # key-less container's rebuild is the degraded fallback.
+        assert retimed.json() == {"ok": True, "stops_recalculated": False}
         stops = _stops(_get_route(client, admin_headers, route["id"]))
         assert [s["scheduled_time"] for s in stops] == ["06:20", "06:30", None]
         assert stops[0]["name"] == f"IT RO B Lane {marker}"
@@ -451,6 +454,43 @@ def test_google_afternoon_gate_first_reversed_and_anchored_at_1530(
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
 
+def test_single_location_route_computes_with_trivial_order(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """A one-group auto route has no ordering problem: the real optimiser
+    reports provider 'trivial' for a single located point (mirrored by the
+    fake here), and with google geometry that is a FULL computed write —
+    anchored times land on both stops and last_recalc_degraded is never
+    raised."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kid = None
+    try:
+        kid = _make_student(
+            client, admin_headers,
+            _student_payload(marker, "A", "06:30", -1.2800, 36.7900), [route["id"]],
+        )
+        patch_google(monkeypatch, geo)  # geometry: google-routes, 5-min legs
+        monkeypatch.setattr(  # the real single-point order signal
+            geo, "optimized_order_with_provider",
+            lambda points, school_point: {"ordered": list(points), "provider": "trivial"},
+        )
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["last_recalc_degraded"] is False
+        stops = _stops(listed)
+        assert [s["name"] for s in stops] == [
+            f"IT RO A Lane {marker}", f"IT RO School {marker}",
+        ]
+        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35"]
+        assert stops[-1]["is_school_gate"] is True
+    finally:
+        _cleanup(client, admin_headers, students=(kid,), routes=(route,), schools=(school,))
+
+
 # Degraded fallback preserves computed state (API + in-process) ---------------------
 
 def test_degraded_recalc_preserves_computed_order_times_and_gate(
@@ -525,6 +565,117 @@ def test_degraded_recalc_preserves_computed_order_times_and_gate(
         assert _get_route(client, admin_headers, route["id"])["last_recalc_degraded"] is False
     finally:
         _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,), schools=(school,))
+
+
+def test_coordinate_edit_keeps_preserved_order_via_student_alias(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """A coordinate-only student edit re-keys their location group while the
+    stale stop rows still carry the old coords (the stale-stop state — e.g. a
+    direct DAO/SQL write with no regeneration). The next degraded rebuild
+    must resolve the group through the per-student alias: preserved order and
+    time survive instead of the student being appended as new."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        patch_google(monkeypatch, geo, order=[2, 0, 1])  # computed: C,A,B
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        computed = [
+            (s["name"], s["stop_order"], s["scheduled_time"])
+            for s in _stops(_get_route(client, admin_headers, route["id"]))
+        ]
+
+        # Coordinate-only edit, no regeneration: the stop rows go stale.
+        db.execute(
+            "update live_students set home_lat = -1.3500, home_lng = 36.8500 where id = %s",
+            (kids[0]["id"],),  # kid A — the group computed at order 2
+        )
+        db.commit()
+
+        patch_offline(monkeypatch, geo)
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["last_recalc_degraded"] is True
+        after = [
+            (s["name"], s["stop_order"], s["scheduled_time"]) for s in _stops(listed)
+        ]
+        assert after == computed  # alias-resolved: same order, same times
+        # The stop row itself carries the fresh coordinates.
+        moved = next(
+            s for s in listed["route_stops"] if s["student_id"] == kids[0]["id"]
+        )
+        assert (moved["lat"], moved["lng"]) == (-1.35, 36.85)
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_sibling_split_inherits_the_shared_record_exactly_once(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """Two siblings shared one location group (one record, two student
+    aliases). After one sibling's coordinates move, the degraded rebuild must
+    hand the record to exactly ONE group — the unmoved sibling wins by exact
+    location key — and treat the moved sibling as new (appended before the
+    gate with their own pickup time). Never two groups with the inherited
+    stop_order."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("A2", "06:35", -1.2800, 36.7900),  # sibling location: same group
+            ("B", "06:40", -1.2900, 36.8000),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])  # groups: (A,A2), B
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        # Split the siblings: A2 moves, stop rows stay stale.
+        db.execute(
+            "update live_students set home_lat = -1.3500, home_lng = 36.8500 where id = %s",
+            (kids[1]["id"],),
+        )
+        db.commit()
+
+        patch_offline(monkeypatch, geo)
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        by_name = {
+            s["name"]: (s["stop_order"], s["scheduled_time"]) for s in listed["route_stops"]
+        }
+        assert by_name == {
+            f"IT RO A Lane {marker}": (1, "06:30"),   # kept the shared record
+            f"IT RO B Lane {marker}": (2, "06:35"),   # preserved
+            f"IT RO A2 Lane {marker}": (3, "06:35"),  # new group: own pickup time
+            f"IT RO School {marker}": (4, "06:40"),   # gate as-is
+        }
+        # Exactly one inheritance: every group got a distinct order.
+        orders = [s["stop_order"] for s in listed["route_stops"]]
+        assert len(orders) == len(set(orders))
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
 
 def test_mixed_provider_signals_take_the_full_fallback(
@@ -657,6 +808,74 @@ def test_regeneration_locks_the_route_row(
             db.rollback()
     finally:
         _cleanup(client, admin_headers, students=(kid,), routes=(route,), schools=(school,))
+
+
+def test_geometry_drift_between_phases_discards_and_degrades(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch, caplog
+):
+    """The provider calls run BEFORE the route-row lock (phase 1); when the
+    students drift before the locked write (phase 2), the stale computed
+    geometry is DISCARDED: the write is the observable degraded fallback
+    (preserved order and times, flag raised, WARNING names the drift) —
+    never a partial or stale mix. The drift lands via a second committed
+    connection inside the faked order call, i.e. exactly between phases."""
+    import psycopg
+
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        # Honest computed pass first — the preservation baseline.
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        computed = [
+            (s["name"], s["stop_order"], s["scheduled_time"])
+            for s in _stops(_get_route(client, admin_headers, route["id"]))
+        ]
+
+        # Phase-1 provider whose order is REVERSED (it must never land) and
+        # which mutates a student's coordinates through a second committed
+        # connection before returning.
+        patch_google(monkeypatch, geo, order=[0, 1])
+
+        def order_and_mutate(points, school_point):
+            with psycopg.connect(DB_URL) as side:
+                side.execute(
+                    "update live_students set home_lat = -1.5000 where id = %s",
+                    (kids[0]["id"],),
+                )
+                side.commit()
+            return {"ordered": list(reversed(points)), "provider": "google"}
+
+        monkeypatch.setattr(geo, "optimized_order_with_provider", order_and_mutate)
+
+        with caplog.at_level(logging.WARNING, logger="saferide.fleet"):
+            assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+        assert any("drifted" in r.getMessage() for r in caplog.records), (
+            [r.getMessage() for r in caplog.records]
+        )
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["last_recalc_degraded"] is True
+        after = [
+            (s["name"], s["stop_order"], s["scheduled_time"]) for s in _stops(listed)
+        ]
+        # The stale reversed order was discarded wholesale: the previously
+        # computed order and times survive (A's group via its student alias).
+        assert after == computed
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
 
 # _sync_routes threads the aggregate signal (assignment plumbing) --------------------
@@ -1160,7 +1379,9 @@ def test_manual_pickup_time_edit_writes_through_to_that_stop_only(
             headers=admin_headers,
         )
         assert response.status_code == 200, response.text
-        assert response.json() == {"ok": True}
+        # Manual write-through touches no auto rebuild: the threaded signal
+        # stays true (set_student_pickup_time only reports a degraded pass).
+        assert response.json() == {"ok": True, "stops_recalculated": True}
 
         listed = _get_route(client, admin_headers, route["id"])
         assert listed["manual_stop_order"] is True

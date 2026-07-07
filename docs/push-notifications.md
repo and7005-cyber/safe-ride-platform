@@ -15,12 +15,18 @@ PWA on phones (Android Chrome and iOS 16.4+ Safari via "Add to Home Screen").
 | `dropped-off` | An afternoon run ends | Same |
 | `student-absent` | Driver marks a student absent at pickup | That student's parents only |
 | `incident` | Driver reports breakdown / accident / traffic / student issue / notice | Parents of every student on that bus |
+| `ride-cancelled` | A parent cancels the child's ride (Cancel-a-Ride) | That student's linked parents only |
+| `admin-notice` | Office broadcasts a message to a route | Every parent with a child assigned to the route (one copy per parent) |
 
 Run-scoped types (`run-started`, `on-way-home`, `student-boarded`,
 `bus-approaching`, `reached-school`, `dropped-off`, `student-absent`) are
 deduplicated per
 (parent, run, student, type), so a parent gets each at most once per run.
-Incident notifications are never deduplicated — every report matters.
+Incident notifications are never deduplicated — every report matters. The
+same goes for `ride-cancelled` and `admin-notice`: their `run_id` stays NULL
+(they are not tied to a run), so every emission is a real row — the
+cancellation confirmation fires only on a real scope transition, and two
+identical broadcasts are deliberately two rows.
 
 Every notification is stored in `live_notifications` and shown in the parent
 **Alerts** tab even when push is unavailable. Push delivery (FCM and/or Web

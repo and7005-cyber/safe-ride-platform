@@ -150,8 +150,13 @@ class StopTimePayload(BaseModel):
 def set_stop_time(
     route_id: str, student_id: str, payload: StopTimePayload, user: dict = Depends(admin_only)
 ):
+    # stops_recalculated: false = an affected auto route's rebuild fell back
+    # instead of recomputing geometry (U6/R10) — the sibling cancel_stop shape.
     return safe_call(
-        lambda: (dao.set_student_pickup_time(student_id, payload.pickup_time), {"ok": True})[1]
+        lambda: {
+            "ok": True,
+            "stops_recalculated": dao.set_student_pickup_time(student_id, payload.pickup_time),
+        }
     )
 
 

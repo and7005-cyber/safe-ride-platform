@@ -2,6 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.absence_dao import absent_student_ids
+from app.dao.status_sql import scope_covers
 
 
 class RunDao:
@@ -174,14 +175,14 @@ class RunDao:
                     # count — a morning-cancelled child is not absent from the
                     # afternoon run.
                     absent = conn.execute(
-                        """
+                        f"""
                         select a.student_id, s.name as student_name, a.reason
                         from live_student_absences a
                         join live_students s on s.id = a.student_id
                         join live_student_routes sr
                             on sr.student_id = a.student_id and sr.route_id = %s
                         where a.absence_date = %s
-                          and a.scope in ('day', %s)
+                          and {scope_covers("a.scope", "%s")}
                         order by s.name asc
                         """,
                         (run["route_id"], run["date"], run["type"]),
@@ -241,12 +242,12 @@ class RunDao:
             # run to match, so only whole-day rows flag (the %s arm is NULL
             # then, and `a.scope = null` matches nothing).
             active_dict = dict(active) if active else None
-            absent_flag_sql = """
+            absent_flag_sql = f"""
                 select s.*, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                      and (a.scope = 'day' or a.scope = %s)
+                      and {scope_covers("a.scope", "%s")}
                 ) as absent
                 from live_students s
             """
@@ -392,7 +393,7 @@ class RunDao:
                 # 'on-way-home' notification covers the start. Stale-'absent'
                 # students join the auto-board set here.
                 conn.execute(
-                    """
+                    f"""
                     update live_students set status = 'on-bus'
                     where id in (
                         select student_id from run_stops
@@ -401,10 +402,10 @@ class RunDao:
                       and id not in (
                           select student_id from live_student_absences
                           where absence_date = (now() at time zone 'Africa/Nairobi')::date
-                            and scope in ('day', 'afternoon')
+                            and {scope_covers("scope", "%s")}
                       )
                     """,
-                    (run["id"],),
+                    (run["id"], route["type"]),
                 )
             else:
                 # Morning: reset stale-'absent' roster students to 'at-school'
@@ -413,7 +414,7 @@ class RunDao:
                 # the child absent from the morning, so it never blocks the
                 # heal — and a covering row means genuinely absent, no heal.
                 conn.execute(
-                    """
+                    f"""
                     update live_students set status = 'at-school'
                     where status = 'absent'
                       and id in (
@@ -423,10 +424,10 @@ class RunDao:
                       and id not in (
                           select student_id from live_student_absences
                           where absence_date = (now() at time zone 'Africa/Nairobi')::date
-                            and scope in ('day', 'morning')
+                            and {scope_covers("scope", "%s")}
                       )
                     """,
-                    (run["id"],),
+                    (run["id"], route["type"]),
                 )
             # Recount students_boarded (never increment): morning counts who is
             # on the bus, afternoon counts confirmed drop-offs — both 0 at
@@ -445,7 +446,7 @@ class RunDao:
             # run_absences.student_id is ON DELETE SET NULL; a name-less
             # snapshot would rot after student deletion.
             conn.execute(
-                """
+                f"""
                 insert into run_absences (run_id, student_id, student_name, reason)
                 select %s, s.id, s.name, a.reason
                 from live_student_absences a
@@ -453,7 +454,7 @@ class RunDao:
                 join live_student_routes sr
                     on sr.student_id = a.student_id and sr.route_id = %s
                 where a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                  and a.scope in ('day', %s)
+                  and {scope_covers("a.scope", "%s")}
                 on conflict (run_id, student_id) do nothing
                 """,
                 (run["id"], route_id, route["type"]),

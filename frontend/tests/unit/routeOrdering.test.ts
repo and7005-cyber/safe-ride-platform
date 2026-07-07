@@ -3,12 +3,14 @@
 // shifted (gate/planner rows pinned, boundary moves are no-ops, sibling keys
 // collapse to one slot), the mode chip follows the one-ordering-authority
 // precedence (custom > manual > auto), Recalculate shows exactly when there is
-// something to recompute or retry, and the degraded badge renders purely from
-// the persisted route flag.
+// something to recompute or retry, the degraded badge renders purely from
+// the persisted route flag, and the broadcast Send gate blocks exactly the
+// two bodies the server 400s (empty-after-trim, past the 500 cap).
 import { describe, expect, it } from "vitest";
 import {
   BROADCAST_MAX_CHARS,
   DEGRADED_MESSAGE,
+  broadcastSendDisabled,
   buildReorderPayload,
   routeModeLabel,
   showDegradedBadge,
@@ -115,5 +117,26 @@ describe("degraded badge", () => {
   it("pins the R10 message and the R23 cap the dialog enforces", () => {
     expect(DEGRADED_MESSAGE).toBe("Order/times not recalculated — check addresses/maps key");
     expect(BROADCAST_MAX_CHARS).toBe(500);
+  });
+});
+
+describe("broadcastSendDisabled", () => {
+  it("blocks empty and whitespace-only bodies", () => {
+    expect(broadcastSendDisabled("")).toBe(true);
+    expect(broadcastSendDisabled("   ")).toBe(true);
+    expect(broadcastSendDisabled("\n\t ")).toBe(true);
+    expect(broadcastSendDisabled("hi")).toBe(false);
+  });
+
+  it("enforces the 500-char cap at the exact boundary", () => {
+    expect(broadcastSendDisabled("a".repeat(500))).toBe(false);
+    expect(broadcastSendDisabled("a".repeat(501))).toBe(true);
+  });
+
+  it("counts raw length like the counter, but trims only for emptiness", () => {
+    // 499 chars + a trailing space = 500 raw → allowed (server trims later);
+    // 500 chars + a space = 501 raw → blocked, matching the visible counter.
+    expect(broadcastSendDisabled("a".repeat(499) + " ")).toBe(false);
+    expect(broadcastSendDisabled("a".repeat(500) + " ")).toBe(true);
   });
 });
