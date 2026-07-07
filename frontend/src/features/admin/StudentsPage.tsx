@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -39,24 +40,85 @@ import { api } from "@/lib/apiClient";
 import { emailError, parentContactErrors, phoneError } from "@/lib/validation";
 import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
 
-const STUDENT_STATUS_FILTERS = [
-  { value: "all", label: "All statuses" },
-  { value: "at-school", label: "At school" },
-  { value: "on-bus", label: "On bus" },
-  { value: "dropped-off", label: "Dropped off" },
-  { value: "absent", label: "Absent" },
-];
+// --- Pure status pieces (unit-tested in tests/unit/studentStatus.test.ts) ---
 
-function initials(name: string): string {
-  return name.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
-}
+// The derived, day-scoped status computed by the backend (U3/U4). The raw
+// `status` column still travels in the payload but never renders here (R1–R4).
+export type StudentDisplayStatus =
+  | "at-school"
+  | "on-bus"
+  | "dropped-off"
+  | "absent"
+  | "at-home"
+  | "unassigned";
 
-const STATUS_VARIANT: Record<string, "secondary" | "success" | "warning" | "destructive"> = {
+export const STUDENT_STATUS_LABEL: Record<StudentDisplayStatus, string> = {
+  "at-school": "At school",
+  "on-bus": "On bus",
+  "dropped-off": "Dropped off",
+  absent: "Absent today",
+  "at-home": "At home",
+  unassigned: "Unassigned",
+};
+
+export const STUDENT_STATUS_VARIANT: Record<
+  StudentDisplayStatus,
+  "secondary" | "success" | "warning" | "destructive" | "outline"
+> = {
   "at-school": "secondary",
   "on-bus": "success",
   "dropped-off": "warning",
   absent: "destructive",
+  "at-home": "secondary",
+  unassigned: "outline",
 };
+
+// Filter options are the derived value set (R4) — one option per label entry.
+export const STUDENT_STATUS_FILTERS = [
+  { value: "all", label: "All statuses" },
+  ...Object.entries(STUDENT_STATUS_LABEL).map(([value, label]) => ({ value, label })),
+];
+
+// The status filter matches the derived display_status, never the raw status (R4).
+export function studentMatchesFilter(
+  student: { display_status?: string | null },
+  filter: string,
+): boolean {
+  return filter === "all" || student.display_status === filter;
+}
+
+// Absence badge text: whole-day keeps the historical wording; partial-scope
+// parent cancellations (U4) name their half of the day.
+export function absenceBadgeLabel(scope?: string | null): string {
+  if (scope === "morning") return "Absent (AM)";
+  if (scope === "afternoon") return "Absent (PM)";
+  return "Absent today";
+}
+
+// Copy for the scope-aware toggle's dialog: a parent cancellation is named
+// with its scope before the office escalates or removes it (U10).
+export function parentCancellationDescription(
+  studentName: string,
+  scope?: string | null,
+): string {
+  const what =
+    scope === "morning"
+      ? "the morning ride"
+      : scope === "afternoon"
+        ? "the afternoon ride"
+        : "today's rides";
+  return (
+    `A parent cancelled ${what} for ${studentName}. Escalate it to a full-day ` +
+    "absence recorded by the office, or remove the cancellation so the student " +
+    "is expected on the bus again."
+  );
+}
+
+// --- Component ---------------------------------------------------------------
+
+function initials(name: string): string {
+  return name.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+}
 
 const EMPTY = {
   name: "",
@@ -89,6 +151,9 @@ export function StudentsPage() {
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
   const [saving, setSaving] = useState(false);
+  // A parent-sourced absence row awaiting the escalate/remove decision (U10).
+  const [parentAbsence, setParentAbsence] = useState<{ student: any; absence: any } | null>(null);
+  const [absenceBusy, setAbsenceBusy] = useState(false);
   // Invariant messages (parent 1 name / ≥1 phone / ≥1 email) only show after a
   // blocked save attempt — a fresh dialog shouldn't open covered in red.
   const [showContactErrors, setShowContactErrors] = useState(false);
@@ -103,9 +168,11 @@ export function StudentsPage() {
   const schoolName = (id: string | null) =>
     (schools as any[]).find((s) => s.id === id)?.name ?? "—";
 
+  // The whole absence row per student — scope drives the badge text, source
+  // gates the toggle (parent-sourced rows get the escalate/remove dialog).
   const absenceByStudent = useMemo(() => {
-    const m = new Map<string, string>();
-    (absences as any[]).forEach((a) => m.set(a.student_id, a.id));
+    const m = new Map<string, any>();
+    (absences as any[]).forEach((a) => m.set(a.student_id, a));
     return m;
   }, [absences]);
 
@@ -120,7 +187,7 @@ export function StudentsPage() {
   const filtered = useMemo(
     () =>
       (students as any[]).filter((s) => {
-        const matchesStatus = statusFilter === "all" || s.status === statusFilter;
+        const matchesStatus = studentMatchesFilter(s, statusFilter);
         const matchesSchool = schoolFilter === "all" || s.school_id === schoolFilter;
         const q = search.toLowerCase();
         const matchesSearch =
@@ -214,10 +281,23 @@ export function StudentsPage() {
     await qc.invalidateQueries({ queryKey: ["routes"] });
   };
 
+  // display_status derives from the absence rows (day scope → absent), so the
+  // Status column refreshes together with the badge after any absence change.
+  const refreshAfterAbsenceChange = async () => {
+    await qc.invalidateQueries({ queryKey: ["absences"] });
+    await qc.invalidateQueries({ queryKey: ["students"] });
+  };
+
   const toggleAbsence = async (s: any) => {
     const existing = absenceByStudent.get(s.id);
     if (existing) {
-      await api.del(`/api/students/absences/${existing}`);
+      if (existing.source === "parent") {
+        // A parent cancellation (partial or whole-day) is never silently
+        // deleted — the office explicitly escalates or removes it (U10).
+        setParentAbsence({ student: s, absence: existing });
+        return;
+      }
+      await api.del(`/api/students/absences/${existing.id}`);
     } else {
       if (!(await confirm({
         title: `Mark ${s.name} absent today?`,
@@ -228,7 +308,27 @@ export function StudentsPage() {
       }))) return;
       await api.post("/api/students/absences", { student_id: s.id });
     }
-    await qc.invalidateQueries({ queryKey: ["absences"] });
+    await refreshAfterAbsenceChange();
+  };
+
+  const resolveParentAbsence = async (action: "escalate" | "remove") => {
+    if (!parentAbsence) return;
+    setAbsenceBusy(true);
+    try {
+      if (action === "escalate") {
+        // The existing admin mark endpoint escalates the row to scope='day',
+        // source='admin' (U4's staff transition rule).
+        await api.post("/api/students/absences", { student_id: parentAbsence.student.id });
+      } else {
+        await api.del(`/api/students/absences/${parentAbsence.absence.id}`);
+      }
+      await refreshAfterAbsenceChange();
+      setParentAbsence(null);
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setAbsenceBusy(false);
+    }
   };
 
   return (
@@ -276,7 +376,7 @@ export function StudentsPage() {
             ) : (
               filtered.map((s: any) => {
                 const names = (s.route_ids ?? []).map(routeName).filter(Boolean);
-                const absentToday = absenceByStudent.has(s.id);
+                const absence = absenceByStudent.get(s.id);
                 return (
                   <TableRow key={s.id}>
                     <TableCell>
@@ -285,7 +385,11 @@ export function StudentsPage() {
                           {initials(s.name)}
                         </span>
                         <span className="font-medium">{s.name}</span>
-                        {absentToday && <Badge variant="destructive" className="ml-1">Absent today</Badge>}
+                        {absence && (
+                          <Badge variant="destructive" className="ml-1">
+                            {absenceBadgeLabel(absence.scope)}
+                          </Badge>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell>{s.grade ?? "—"}</TableCell>
@@ -299,15 +403,24 @@ export function StudentsPage() {
                         {s.parent_phone && <p className="text-xs text-muted-foreground">{s.parent_phone}</p>}
                       </div>
                     </TableCell>
-                    <TableCell><Badge variant={STATUS_VARIANT[s.status] ?? "secondary"}>{s.status}</Badge></TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={STUDENT_STATUS_VARIANT[s.display_status as StudentDisplayStatus] ?? "secondary"}
+                        className={s.display_status === "unassigned" ? "text-muted-foreground" : undefined}
+                      >
+                        {STUDENT_STATUS_LABEL[s.display_status as StudentDisplayStatus] ?? s.display_status}
+                      </Badge>
+                    </TableCell>
                     <TableCell className="text-right">
+                      {/* Action order [absence toggle, edit, delete] is load-bearing:
+                          admin-crud.spec.ts selects these buttons positionally. */}
                       <Button
                         variant="ghost"
                         size="icon"
-                        title={absentToday ? "Mark present today" : "Mark absent today"}
+                        title={absence ? "Mark present today" : "Mark absent today"}
                         onClick={() => toggleAbsence(s)}
                       >
-                        {absentToday ? <UserCheck className="h-4 w-4 text-success" /> : <UserX className="h-4 w-4" />}
+                        {absence ? <UserCheck className="h-4 w-4 text-success" /> : <UserX className="h-4 w-4" />}
                       </Button>
                       <Button variant="ghost" size="icon" onClick={() => startEdit(s)}><Pencil className="h-4 w-4" /></Button>
                       <Button variant="ghost" size="icon" onClick={() => remove(s)}><Trash2 className="h-4 w-4" /></Button>
@@ -450,6 +563,32 @@ export function StudentsPage() {
               }
             >
               {saving ? "Saving…" : "Save"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Scope-aware "mark present" on a parent-sourced absence (U10): the
+          office chooses — never a silent delete of the parent's cancellation. */}
+      <Dialog open={!!parentAbsence} onOpenChange={(next) => (next ? null : setParentAbsence(null))}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Parent ride cancellation</DialogTitle>
+            <DialogDescription>
+              {parentAbsence &&
+                parentCancellationDescription(parentAbsence.student.name, parentAbsence.absence.scope)}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={absenceBusy}
+              onClick={() => resolveParentAbsence("remove")}
+            >
+              Remove the cancellation
+            </Button>
+            <Button disabled={absenceBusy} onClick={() => resolveParentAbsence("escalate")}>
+              Escalate to full-day absence
             </Button>
           </DialogFooter>
         </DialogContent>
