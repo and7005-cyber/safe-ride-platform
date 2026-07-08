@@ -46,14 +46,19 @@ fi
 # db-password/pin-pepper these cannot be auto-generated. Empty is fine: the
 # code degrades (FCM off / web push off) and the in-app feed still works.
 ssm_seeded() { # ssm_name env_key -> value ("" if neither SSM nor .env has it)
+  # Pinned to BACKEND_REGION: the two Firebase JSON params are read from SSM by
+  # the Lambda at runtime (in BACKEND_REGION), so they must live there — not in
+  # the operator's default CLI region. (ssm_secret above is region-agnostic: its
+  # values flow through CFN params into the env, never read from SSM at runtime.)
   local name="$1" env_key="$2" val
-  val="$(aws ssm get-parameter --name "$name" --with-decryption \
+  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$BACKEND_REGION" \
     --query Parameter.Value --output text 2>/dev/null || true)"
   if [ -z "$val" ] || [ "$val" = "None" ]; then
     val="$(sed -n "s/^${env_key}=//p" "$REPO_DIR/backend/.env" 2>/dev/null | head -1)"
     if [ -n "$val" ]; then
-      aws ssm put-parameter --name "$name" --type SecureString --value "$val" >/dev/null
-      echo "==> Seeded SSM $name from backend/.env" >&2
+      aws ssm put-parameter --name "$name" --type SecureString --value "$val" \
+        --region "$BACKEND_REGION" >/dev/null
+      echo "==> Seeded SSM $name ($BACKEND_REGION) from backend/.env" >&2
     fi
   fi
   printf '%s' "$val"
