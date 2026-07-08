@@ -53,7 +53,7 @@ ssm_seeded() { # ssm_name env_key -> value ("" if neither SSM nor .env has it)
     val="$(sed -n "s/^${env_key}=//p" "$REPO_DIR/backend/.env" 2>/dev/null | head -1)"
     if [ -n "$val" ]; then
       aws ssm put-parameter --name "$name" --type SecureString --value "$val" >/dev/null
-      echo "==> Seeded SSM $name from backend/.env"
+      echo "==> Seeded SSM $name from backend/.env" >&2
     fi
   fi
   printf '%s' "$val"
