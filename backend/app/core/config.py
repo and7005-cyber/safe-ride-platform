@@ -1,7 +1,28 @@
+import base64
+import binascii
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _maybe_b64_json(value: str) -> str:
+    """Accept a JSON secret either raw or base64url-encoded.
+
+    Raw JSON (starts with ``{``) is used as-is — that is what ``backend/.env``
+    and a file path both look like. CloudFormation's ``--parameter-overrides``
+    shorthand mangles values containing quotes/commas/braces, so the deploy
+    script base64url-encodes these JSON blobs before injecting them into the
+    Lambda env; here we decode them back. Anything that is not valid
+    base64url-of-JSON is returned untouched (e.g. a real file path)."""
+    v = value.strip()
+    if not v or v.startswith("{"):
+        return v
+    try:
+        decoded = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4)).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return v
+    return decoded if decoded.lstrip().startswith("{") else v
 
 
 class Settings(BaseSettings):
@@ -37,6 +58,11 @@ class Settings(BaseSettings):
     vapid_private_key: str = Field(default="", alias="VAPID_PRIVATE_KEY")
     vapid_subject: str = Field(default="mailto:admin@saferidekenya.com", alias="VAPID_SUBJECT")
     bus_approaching_radius_m: int = Field(default=1000, alias="BUS_APPROACHING_RADIUS_M")
+
+    @field_validator("firebase_service_account_json", "firebase_web_config_json", mode="after")
+    @classmethod
+    def _decode_json_secret(cls, v: str) -> str:
+        return _maybe_b64_json(v)
 
     model_config = SettingsConfigDict(env_file=(".env", ".env.local"), extra="ignore")
 

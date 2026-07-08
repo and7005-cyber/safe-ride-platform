@@ -81,8 +81,12 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}")
 [ -n "$GOOGLE_MAPS_KEY" ] && DEPLOY_PARAMS+=("GoogleMapsApiKey=${GOOGLE_MAPS_KEY}")
 # Push params: only pass non-empty (SAM rejects empty Key= overrides; the
 # template Default "" applies when omitted). VapidSubject has a template default.
-[ -n "$FIREBASE_SA_JSON" ] && DEPLOY_PARAMS+=("FirebaseServiceAccountJson=${FIREBASE_SA_JSON}")
-[ -n "$FIREBASE_WEB_JSON" ] && DEPLOY_PARAMS+=("FirebaseWebConfigJson=${FIREBASE_WEB_JSON}")
+# The two JSON blobs contain quotes/commas/braces that CloudFormation's
+# --parameter-overrides shorthand mangles, so encode them base64url (no
+# padding, +/ -> -_ : a shell/CLI-safe alphabet). config.py decodes them back.
+b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
+[ -n "$FIREBASE_SA_JSON" ] && DEPLOY_PARAMS+=("FirebaseServiceAccountJson=$(printf '%s' "$FIREBASE_SA_JSON" | b64url)")
+[ -n "$FIREBASE_WEB_JSON" ] && DEPLOY_PARAMS+=("FirebaseWebConfigJson=$(printf '%s' "$FIREBASE_WEB_JSON" | b64url)")
 [ -n "$FIREBASE_VAPID" ] && DEPLOY_PARAMS+=("FirebaseVapidKey=${FIREBASE_VAPID}")
 [ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
