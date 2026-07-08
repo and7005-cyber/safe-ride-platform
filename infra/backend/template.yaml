@@ -27,6 +27,32 @@ Parameters:
       Server-side Google Maps Platform key (Geocoding, Places, Routes v2).
       Injected at deploy time from SSM /saferide/google-maps-api-key. Empty
       disables Google-backed geo features (autocomplete, road routing).
+  FirebaseVapidKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      FCM web-push certificate public key (console-generated). From SSM
+      /saferide/firebase-vapid-key. Empty makes web clients use the plain
+      Web Push (VAPID) path below instead of native FCM tokens.
+  VapidPublicKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Plain Web Push VAPID public key. From SSM /saferide/vapid-public-key.
+      Standard Web Push delivery to installed PWAs (Android + iOS 16.4+).
+  VapidPrivateKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Plain Web Push VAPID private key. From SSM /saferide/vapid-private-key.
+      Signs web-push sends; empty disables the plain Web Push path.
+  VapidSubject:
+    Type: String
+    Default: "mailto:and7005@gmail.com"
+    Description: VAPID subject (mailto:/https:) sent with web-push requests.
   CorsOrigins:
     Type: String
     Default: https://saferidelive.co.ke,https://www.saferidelive.co.ke
@@ -284,6 +310,29 @@ Resources:
           PIN_PEPPER: !Ref PinPepper
           APP_BASE_URL: !Ref AppBaseUrl
           GOOGLE_MAPS_API_KEY: !Ref GoogleMapsApiKey
+          # The two Firebase JSON blobs are too large / special-char-laden for a
+          # CFN parameter (SA JSON is ~2.3 KB with a private key); the app pulls
+          # them from these SSM SecureString params at startup. VAPID keys are
+          # small and shell-safe, so they pass as parameters directly.
+          FIREBASE_SERVICE_ACCOUNT_SSM: /saferide/firebase-service-account-json
+          FIREBASE_WEB_CONFIG_SSM: /saferide/firebase-web-config-json
+          FIREBASE_VAPID_KEY: !Ref FirebaseVapidKey
+          VAPID_PUBLIC_KEY: !Ref VapidPublicKey
+          VAPID_PRIVATE_KEY: !Ref VapidPrivateKey
+          VAPID_SUBJECT: !Ref VapidSubject
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/saferide/firebase-service-account-json"
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/saferide/firebase-web-config-json"
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
       Events:
         Proxy:
           Type: HttpApi

@@ -41,6 +41,39 @@ if [ -z "$GOOGLE_MAPS_KEY" ] || [ "$GOOGLE_MAPS_KEY" = "None" ]; then
   fi
 fi
 
+# Push secrets: prefer SSM; seed each from backend/.env when missing (they are
+# provisioned once — Firebase service account, web config, VAPID pair). Unlike
+# db-password/pin-pepper these cannot be auto-generated. Empty is fine: the
+# code degrades (FCM off / web push off) and the in-app feed still works.
+ssm_seeded() { # ssm_name env_key -> value ("" if neither SSM nor .env has it)
+  # Pinned to BACKEND_REGION: the two Firebase JSON params are read from SSM by
+  # the Lambda at runtime (in BACKEND_REGION), so they must live there — not in
+  # the operator's default CLI region. (ssm_secret above is region-agnostic: its
+  # values flow through CFN params into the env, never read from SSM at runtime.)
+  local name="$1" env_key="$2" val
+  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$BACKEND_REGION" \
+    --query Parameter.Value --output text 2>/dev/null || true)"
+  if [ -z "$val" ] || [ "$val" = "None" ]; then
+    val="$(sed -n "s/^${env_key}=//p" "$REPO_DIR/backend/.env" 2>/dev/null | head -1)"
+    if [ -n "$val" ]; then
+      aws ssm put-parameter --name "$name" --type SecureString --value "$val" \
+        --region "$BACKEND_REGION" >/dev/null
+      echo "==> Seeded SSM $name ($BACKEND_REGION) from backend/.env" >&2
+    fi
+  fi
+  printf '%s' "$val"
+}
+
+FIREBASE_SA_JSON="$(ssm_seeded /saferide/firebase-service-account-json FIREBASE_SERVICE_ACCOUNT_JSON)"
+FIREBASE_WEB_JSON="$(ssm_seeded /saferide/firebase-web-config-json FIREBASE_WEB_CONFIG_JSON)"
+FIREBASE_VAPID="$(ssm_seeded /saferide/firebase-vapid-key FIREBASE_VAPID_KEY)"
+VAPID_PUB="$(ssm_seeded /saferide/vapid-public-key VAPID_PUBLIC_KEY)"
+VAPID_PRIV="$(ssm_seeded /saferide/vapid-private-key VAPID_PRIVATE_KEY)"
+VAPID_SUBJ="$(ssm_seeded /saferide/vapid-subject VAPID_SUBJECT)"
+if [ -z "$FIREBASE_SA_JSON" ] && [ -z "$VAPID_PRIV" ]; then
+  echo "WARN: no push credentials in SSM or backend/.env — push delivery stays simulated (feed still works)." >&2
+fi
+
 cd "$INFRA_DIR/backend"
 
 echo "==> sam build (containerized arm64)"
@@ -51,6 +84,16 @@ echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_A
 DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}")
 [ -n "$API_CERT_ARN" ] && DEPLOY_PARAMS+=("ApiCertificateArn=${API_CERT_ARN}")
 [ -n "$GOOGLE_MAPS_KEY" ] && DEPLOY_PARAMS+=("GoogleMapsApiKey=${GOOGLE_MAPS_KEY}")
+# Push params: only pass non-empty (SAM rejects empty Key= overrides; the
+# template Default "" applies when omitted). VapidSubject has a template default.
+# The two Firebase JSON blobs are NOT passed as parameters — they are read from
+# SSM at runtime by the app (too large for the 4 KB Lambda env once encoded, and
+# CFN's --parameter-overrides shorthand mangles JSON). ssm_seeded above already
+# ensured /saferide/firebase-{service-account,web-config}-json exist in SSM.
+[ -n "$FIREBASE_VAPID" ] && DEPLOY_PARAMS+=("FirebaseVapidKey=${FIREBASE_VAPID}")
+[ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
+[ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
+[ -n "$VAPID_SUBJ" ] && DEPLOY_PARAMS+=("VapidSubject=${VAPID_SUBJ}")
 sam deploy --parameter-overrides "${DEPLOY_PARAMS[@]}"
 
 API_URL="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" HttpApiUrl)"
