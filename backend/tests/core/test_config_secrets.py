@@ -51,3 +51,68 @@ def test_settings_validator_decodes_both_json_fields():
     assert s.firebase_service_account_json == SAMPLE
     assert s.firebase_web_config_json == SAMPLE
     assert s.vapid_public_key == "untouched-key"  # non-JSON fields not decoded
+
+
+class _FakeSSM:
+    def __init__(self, values):
+        self.values = values
+        self.calls = []
+
+    def get_parameter(self, Name, WithDecryption):  # noqa: N803 — boto3 kwarg name
+        self.calls.append((Name, WithDecryption))
+        return {"Parameter": {"Value": self.values[Name]}}
+
+
+def _inject_fake_boto3(monkeypatch, ssm):
+    import sys
+    import types
+
+    fake = types.ModuleType("boto3")
+    fake.client = lambda service: ssm  # noqa: ARG005
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+
+
+def test_ssm_fetch_populates_empty_json_fields(monkeypatch):
+    ssm = _FakeSSM({
+        "/saferide/firebase-service-account-json": SAMPLE,
+        "/saferide/firebase-web-config-json": SAMPLE,
+    })
+    _inject_fake_boto3(monkeypatch, ssm)
+    s = Settings(
+        FIREBASE_SERVICE_ACCOUNT_SSM="/saferide/firebase-service-account-json",
+        FIREBASE_WEB_CONFIG_SSM="/saferide/firebase-web-config-json",
+    )
+    assert s.firebase_service_account_json == SAMPLE
+    assert s.firebase_web_config_json == SAMPLE
+    assert all(decrypt is True for _, decrypt in ssm.calls)  # SecureString
+
+
+def test_direct_json_wins_over_ssm_name(monkeypatch):
+    # When the JSON is already provided (local .env), SSM is never consulted.
+    ssm = _FakeSSM({"/x": "should-not-be-read"})
+    _inject_fake_boto3(monkeypatch, ssm)
+    s = Settings(
+        FIREBASE_SERVICE_ACCOUNT_JSON=SAMPLE,
+        FIREBASE_SERVICE_ACCOUNT_SSM="/x",
+    )
+    assert s.firebase_service_account_json == SAMPLE
+    assert ssm.calls == []
+
+
+def test_ssm_fetch_failure_degrades_to_empty(monkeypatch):
+    class _Boom:
+        def get_parameter(self, **_):
+            raise RuntimeError("ssm unavailable")
+
+    _inject_fake_boto3(monkeypatch, _Boom())
+    s = Settings(FIREBASE_SERVICE_ACCOUNT_SSM="/saferide/firebase-service-account-json")
+    assert s.firebase_service_account_json == ""  # boot survives; FCM stays off
+
+
+def test_no_ssm_name_never_imports_boto3(monkeypatch):
+    # The common local case: no SSM names set → the boto3 path is never taken.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "boto3", None)  # would raise if imported
+    s = Settings(FIREBASE_SERVICE_ACCOUNT_JSON=SAMPLE)
+    assert s.firebase_service_account_json == SAMPLE

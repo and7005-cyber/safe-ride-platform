@@ -27,22 +27,6 @@ Parameters:
       Server-side Google Maps Platform key (Geocoding, Places, Routes v2).
       Injected at deploy time from SSM /saferide/google-maps-api-key. Empty
       disables Google-backed geo features (autocomplete, road routing).
-  FirebaseServiceAccountJson:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: >
-      Firebase Admin SDK service-account JSON (single line) for sending FCM.
-      Injected at deploy time from SSM /saferide/firebase-service-account-json.
-      Empty disables FCM sends (feed rows still written; web push independent).
-  FirebaseWebConfigJson:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: >
-      Firebase web SDK config JSON served to the browser via /api/push/config.
-      From SSM /saferide/firebase-web-config-json. Public web app config only;
-      empty disables the FCM client path.
   FirebaseVapidKey:
     Type: String
     NoEcho: true
@@ -326,12 +310,29 @@ Resources:
           PIN_PEPPER: !Ref PinPepper
           APP_BASE_URL: !Ref AppBaseUrl
           GOOGLE_MAPS_API_KEY: !Ref GoogleMapsApiKey
-          FIREBASE_SERVICE_ACCOUNT_JSON: !Ref FirebaseServiceAccountJson
-          FIREBASE_WEB_CONFIG_JSON: !Ref FirebaseWebConfigJson
+          # The two Firebase JSON blobs are too large / special-char-laden for a
+          # CFN parameter (SA JSON is ~2.3 KB with a private key); the app pulls
+          # them from these SSM SecureString params at startup. VAPID keys are
+          # small and shell-safe, so they pass as parameters directly.
+          FIREBASE_SERVICE_ACCOUNT_SSM: /saferide/firebase-service-account-json
+          FIREBASE_WEB_CONFIG_SSM: /saferide/firebase-web-config-json
           FIREBASE_VAPID_KEY: !Ref FirebaseVapidKey
           VAPID_PUBLIC_KEY: !Ref VapidPublicKey
           VAPID_PRIVATE_KEY: !Ref VapidPrivateKey
           VAPID_SUBJECT: !Ref VapidSubject
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/saferide/firebase-service-account-json"
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/saferide/firebase-web-config-json"
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
       Events:
         Proxy:
           Type: HttpApi

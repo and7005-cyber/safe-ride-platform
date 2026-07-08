@@ -81,12 +81,10 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}")
 [ -n "$GOOGLE_MAPS_KEY" ] && DEPLOY_PARAMS+=("GoogleMapsApiKey=${GOOGLE_MAPS_KEY}")
 # Push params: only pass non-empty (SAM rejects empty Key= overrides; the
 # template Default "" applies when omitted). VapidSubject has a template default.
-# The two JSON blobs contain quotes/commas/braces that CloudFormation's
-# --parameter-overrides shorthand mangles, so encode them base64url (no
-# padding, +/ -> -_ : a shell/CLI-safe alphabet). config.py decodes them back.
-b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
-[ -n "$FIREBASE_SA_JSON" ] && DEPLOY_PARAMS+=("FirebaseServiceAccountJson=$(printf '%s' "$FIREBASE_SA_JSON" | b64url)")
-[ -n "$FIREBASE_WEB_JSON" ] && DEPLOY_PARAMS+=("FirebaseWebConfigJson=$(printf '%s' "$FIREBASE_WEB_JSON" | b64url)")
+# The two Firebase JSON blobs are NOT passed as parameters — they are read from
+# SSM at runtime by the app (too large for the 4 KB Lambda env once encoded, and
+# CFN's --parameter-overrides shorthand mangles JSON). ssm_seeded above already
+# ensured /saferide/firebase-{service-account,web-config}-json exist in SSM.
 [ -n "$FIREBASE_VAPID" ] && DEPLOY_PARAMS+=("FirebaseVapidKey=${FIREBASE_VAPID}")
 [ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
