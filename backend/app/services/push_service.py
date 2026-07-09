@@ -6,9 +6,13 @@ the same notification goes out through FCM to registered device tokens; when
 VAPID keys are configured, raw Web Push subscriptions get it too. With neither
 configured (local dev default) delivery is simulated via a log line.
 
-Delivery runs on a small dedicated thread pool so request worker threads are
-never tied up by push-service HTTP calls, and every outbound call carries a
-timeout.
+Delivery is dispatched from routers via FastAPI BackgroundTasks and runs
+synchronously within that task, so it completes inside the request lifecycle.
+On Lambda this is required: a fire-and-forget background thread is frozen the
+instant the handler returns, so its send never happens — the feed row lands
+but the phone never rings. Every outbound call carries a timeout, and the
+feed row is always written first, so a slow or failing provider only delays
+the push, never the notification itself.
 
 Notification types:
   run-started      morning run began — get the child ready for pickup
@@ -31,7 +35,6 @@ import ipaddress
 import json
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -56,10 +59,6 @@ INCIDENT_TITLES = {
 # the endpoint (500 chars) and the composed title is bounded here — a very long
 # route name must not push the payload over the edge.
 BROADCAST_TITLE_MAX_CHARS = 120
-
-# Shared across service instances: delivery must not monopolize the request
-# thread pool, and a slow push provider must not back up driver requests.
-_send_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="saferide-push")
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -458,14 +457,19 @@ class PushService:
         self.send_to_user(str(parent_id), title, body, type)
 
     def send_to_user(self, user_id: str, title: str, body: str, type: str) -> None:
-        """Queue best-effort delivery through every configured channel."""
+        """Best-effort delivery through every configured channel.
+
+        Synchronous by design: this is invoked from a BackgroundTask that
+        Mangum awaits within the Lambda invocation. Offloading to a background
+        thread would let Lambda freeze the send before it runs. Each channel
+        carries its own timeout, so a slow provider bounds the delay."""
         settings = get_settings()
         fcm_enabled = bool(settings.firebase_service_account_json.strip()) and not self._firebase_failed
         webpush_enabled = bool(settings.vapid_private_key and settings.vapid_public_key)
         if not fcm_enabled and not webpush_enabled:
             logger.info("push (simulated) -> user=%s type=%s title=%r", user_id, type, title)
             return
-        _send_executor.submit(self._deliver, user_id, title, body, type)
+        self._deliver(user_id, title, body, type)
 
     def _deliver(self, user_id: str, title: str, body: str, type: str) -> None:
         try:
