@@ -598,3 +598,40 @@ def test_push_endpoint_ssrf_guard() -> None:
     assert not is_safe_push_endpoint("https://internal.local/push")
     assert not is_safe_push_endpoint("ftp://example.com/x")
     assert not is_safe_push_endpoint("not a url")
+
+
+def test_send_to_user_delivers_synchronously(service: PushService, dao: FakePushDao, monkeypatch) -> None:
+    """Delivery must run inline within the call (Lambda freezes background
+    threads once the handler returns, so a deferred send never fires)."""
+    from app.services import push_service as ps
+
+    class _S:
+        firebase_service_account_json = ""
+        vapid_private_key = "priv"
+        vapid_public_key = "pub"
+
+    monkeypatch.setattr(ps, "get_settings", lambda: _S())
+    calls: list[tuple] = []
+    monkeypatch.setattr(service, "_deliver", lambda *a: calls.append(a))
+
+    service.send_to_user("p1", "Title", "Body", "run-started")
+
+    # Synchronous: _deliver has already run by the time send_to_user returns.
+    assert calls == [("p1", "Title", "Body", "run-started")]
+
+
+def test_send_to_user_simulated_when_no_channel(service: PushService, monkeypatch) -> None:
+    from app.services import push_service as ps
+
+    class _S:
+        firebase_service_account_json = ""
+        vapid_private_key = ""
+        vapid_public_key = ""
+
+    monkeypatch.setattr(ps, "get_settings", lambda: _S())
+    called: list[tuple] = []
+    monkeypatch.setattr(service, "_deliver", lambda *a: called.append(a))
+
+    service.send_to_user("p1", "Title", "Body", "run-started")
+
+    assert called == []  # neither channel configured -> simulated, no delivery attempt
