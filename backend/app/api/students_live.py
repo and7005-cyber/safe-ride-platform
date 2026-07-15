@@ -61,6 +61,10 @@ class StudentPayload(BaseModel):
     home_address: str | None = None
     home_lat: float | None = None
     home_lng: float | None = None
+    # How the home coordinates were resolved (U4/R11): typed/picked/imported/
+    # legacy. 'picked' is the operator's deliberate pin — a later address edit or
+    # background re-geocode must not overwrite it (guarded in PlacePicker/geocode).
+    provenance: str | None = None
     pickup_time: str | None = None
     # Still accepted for backwards compatibility, but PUT ignores it: admin
     # edits must never reset a live status (R7).

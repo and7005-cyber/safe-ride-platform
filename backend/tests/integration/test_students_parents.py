@@ -721,3 +721,171 @@ def test_stale_absent_decays_to_at_home(client, admin_headers, driver_headers):
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+
+
+# One-per-type allocation (U5, R21-R23) --------------------------------------------
+
+def _u5_school_and_route_factory(client, admin_headers, marker):
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT U5 School {marker}", "lat": -1.30, "lng": 36.82},
+        headers=admin_headers,
+    ).json()
+
+    def make_route(name, rtype):
+        r = client.post(
+            "/api/fleet/routes",
+            json={"name": f"IT U5 {name} {marker}", "type": rtype, "school_id": school["id"]},
+            headers=admin_headers,
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    return school, make_route
+
+
+def _route_ids_of(client, admin_headers, student_id):
+    for s in client.get("/api/students", headers=admin_headers).json():
+        if s["id"] == student_id:
+            return [str(r) for r in (s.get("route_ids") or [])]
+    return None
+
+
+def test_same_period_move_is_not_a_409(client, admin_headers):
+    """U5/R22: moving a student from one morning route to another (delete-before
+    -insert) succeeds — the deferrable backstop is never tripped by the move."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
+    created = []
+    try:
+        s = client.post(
+            "/api/students", json=student_payload(marker, route_ids=[m_a["id"]]), headers=admin_headers
+        )
+        assert s.status_code == 200, s.text
+        student = s.json()
+        created.append(student)
+        upd = client.put(
+            f"/api/students/{student['id']}",
+            json=student_payload(marker, route_ids=[m_b["id"]]),
+            headers=admin_headers,
+        )
+        assert upd.status_code == 200, upd.text  # a move, not a conflict
+        assert _route_ids_of(client, admin_headers, student["id"]) == [str(m_b["id"])]
+    finally:
+        for st in created:
+            client.delete(f"/api/students/{st['id']}", headers=admin_headers)
+        for r in (m_a, m_b):
+            client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_two_same_period_routes_in_one_payload_is_a_friendly_409(client, admin_headers):
+    """U5/R21: a payload naming two morning routes is refused with a friendly
+    409, not a raw deferred-constraint 500."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
+    try:
+        s = client.post(
+            "/api/students",
+            json=student_payload(marker, route_ids=[m_a["id"], m_b["id"]]),
+            headers=admin_headers,
+        )
+        assert s.status_code == 409, s.text
+    finally:
+        for r in (m_a, m_b):
+            client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_one_morning_and_one_afternoon_is_allowed(client, admin_headers):
+    """U5/R23: the constraint is per-period — a student may hold one morning AND
+    one afternoon route at once."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    m, a = make_route("Morning", "morning"), make_route("Afternoon", "afternoon")
+    created = []
+    try:
+        s = client.post(
+            "/api/students",
+            json=student_payload(marker, route_ids=[m["id"], a["id"]]),
+            headers=admin_headers,
+        )
+        assert s.status_code == 200, s.text
+        created.append(s.json())
+        assert set(_route_ids_of(client, admin_headers, s.json()["id"])) == {str(m["id"]), str(a["id"])}
+    finally:
+        for st in created:
+            client.delete(f"/api/students/{st['id']}", headers=admin_headers)
+        for r in (m, a):
+            client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_home_provenance_round_trips_on_create(client, admin_headers):
+    """U4/R11: the student home provenance (PlacePicker sends 'picked' for a
+    deliberate pin) is stored and read back."""
+    marker = uuid.uuid4().hex[:6]
+    created = []
+    try:
+        s = client.post(
+            "/api/students",
+            json=student_payload(
+                marker, home_address="Pin Lane", home_lat=-1.3, home_lng=36.8, provenance="picked"
+            ),
+            headers=admin_headers,
+        )
+        assert s.status_code == 200, s.text
+        created.append(s.json())
+        row = next(x for x in client.get("/api/students", headers=admin_headers).json()
+                   if x["id"] == s.json()["id"])
+        assert row["provenance"] == "picked"
+    finally:
+        for st in created:
+            client.delete(f"/api/students/{st['id']}", headers=admin_headers)
+
+
+def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_headers):
+    """U2/U5 System-Wide Impact: flipping a route's type cascades route_type to
+    its student links (the AFTER UPDATE trigger), so the student's morning slot
+    is freed and a different morning route can be added without a phantom 409."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
+    created = []
+    try:
+        s = client.post(
+            "/api/students", json=student_payload(marker, route_ids=[m_a["id"]]), headers=admin_headers
+        )
+        assert s.status_code == 200, s.text
+        student = s.json()
+        created.append(student)
+
+        flip = client.put(
+            f"/api/fleet/routes/{m_a['id']}",
+            json={"name": f"IT U5 MorningA {marker}", "type": "afternoon", "school_id": school["id"]},
+            headers=admin_headers,
+        )
+        assert flip.status_code == 200, flip.text
+
+        with psycopg.connect(DB_URL) as conn:
+            rt = conn.execute(
+                "select route_type from live_student_routes where student_id=%s and route_id=%s",
+                (student["id"], m_a["id"]),
+            ).fetchone()
+            assert rt[0] == "afternoon"  # cascaded from the route type-flip
+
+        # The morning slot is now free -> adding morning-B alongside is allowed.
+        upd = client.put(
+            f"/api/students/{student['id']}",
+            json=student_payload(marker, route_ids=[m_a["id"], m_b["id"]]),
+            headers=admin_headers,
+        )
+        assert upd.status_code == 200, upd.text  # m_a is afternoon, m_b morning -> one each
+    finally:
+        for st in created:
+            client.delete(f"/api/students/{st['id']}", headers=admin_headers)
+        for r in (m_a, m_b):
+            client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)

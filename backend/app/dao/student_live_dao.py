@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.core.errors import ConflictError
 from app.dao.fleet_dao import regenerate_route_stops
 from app.dao.status_sql import display_status_case
 
@@ -163,8 +164,31 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
     existing_by_route = {str(r["route_id"]): r["id"] for r in existing}
     wanted = {str(rid) for rid in route_ids if rid}
 
+    # Friendly guard (U5, R21/R23): at most one morning + one afternoon route per
+    # student. A single payload naming two routes of the same period is rejected
+    # up front — the deferrable unique(student_id, route_type) is the race-proof
+    # backstop, but a raw violation would surface at commit as a 500.
+    if wanted:
+        dup = conn.execute(
+            "select 1 from live_routes where id::text = any(%s) "
+            "group by type having count(*) > 1 limit 1",
+            (list(wanted),),
+        ).fetchone()
+        if dup:
+            raise ConflictError(
+                "A student can be assigned to at most one morning and one afternoon route."
+            )
+
     affected: set[str] = set()
     added: set[str] = set()
+    # Delete-before-insert (U5): the PRIMARY guarantee that a same-period move
+    # (drop morning-A, add morning-B in one sync) never transiently holds two
+    # links of one period — so the deferrable backstop is never tripped even
+    # mid-transaction. route_type is set by the U2 trigger on insert.
+    for route_id, row_id in existing_by_route.items():
+        if route_id not in wanted:
+            conn.execute("delete from live_student_routes where id = %s", (row_id,))
+            affected.add(route_id)
     for route_id in wanted - set(existing_by_route):
         conn.execute(
             "insert into live_student_routes (student_id, route_id) values (%s, %s) "
@@ -173,10 +197,6 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
         )
         added.add(route_id)
         affected.add(route_id)
-    for route_id, row_id in existing_by_route.items():
-        if route_id not in wanted:
-            conn.execute("delete from live_student_routes where id = %s", (row_id,))
-            affected.add(route_id)
     # sorted(): route ids are UUID strings, so iteration order is a global
     # total order — every multi-route writer takes the route-row locks in the
     # same sequence and two concurrent edits cannot deadlock across routes.
@@ -237,12 +257,12 @@ class StudentLiveDao:
                 insert into live_students
                     (name, grade, parent_name, parent_phone, parent_phone2, parent_email,
                      parent2_name, parent2_email,
-                     home_address, home_lat, home_lng, pickup_time, status, school_id)
+                     home_address, home_lat, home_lng, pickup_time, status, school_id, provenance)
                 values
                     (%(name)s, %(grade)s, %(parent_name)s, %(parent_phone)s, %(parent_phone2)s,
                      %(parent_email)s, %(parent2_name)s, %(parent2_email)s,
                      %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s,
-                     coalesce(%(status)s,'at-school'), %(school_id)s)
+                     coalesce(%(status)s,'at-school'), %(school_id)s, %(provenance)s)
                 returning *
                 """,
                 data,
@@ -273,7 +293,7 @@ class StudentLiveDao:
                     parent_email=%(parent_email)s, parent2_name=%(parent2_name)s,
                     parent2_email=%(parent2_email)s, home_address=%(home_address)s,
                     home_lat=%(home_lat)s, home_lng=%(home_lng)s, pickup_time=%(pickup_time)s,
-                    school_id=%(school_id)s
+                    school_id=%(school_id)s, provenance=%(provenance)s
                 where id=%(id)s returning *
                 """,
                 {**data, "id": student_id},
