@@ -28,7 +28,7 @@ import {
 import { ToastAction } from "@/components/ui/toast";
 import { useToast } from "@/components/ui/use-toast";
 import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
-import { AddressAutocomplete } from "@/features/admin/components/AddressAutocomplete";
+import { PlacePicker, type Provenance } from "@/features/admin/components/PlacePicker";
 import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
@@ -68,7 +68,16 @@ function StopGlyph({ seq, school }: { seq: number; school?: boolean }) {
   );
 }
 
-interface PlanRow { address: string; pickup_time: string; lat?: number | null; lng?: number | null }
+interface PlanRow {
+  address: string;
+  pickup_time: string;
+  lat?: number | null;
+  lng?: number | null;
+  // Coordinate provenance for the PlacePicker control (R8/R11). Carried only so
+  // the picker stays a controlled value — the planner persists label+lat/lng
+  // per stop, not provenance, so it is not sent to /route-options or /routes.
+  provenance?: Provenance;
+}
 interface OptionStop {
   seq: number; label: string; lat: number; lng: number;
   pickup_time?: string | null; is_school?: boolean;
@@ -106,6 +115,11 @@ export function FleetMapPage() {
   const [rows, setRows] = useState<PlanRow[]>([{ address: "", pickup_time: "" }]);
   const [type, setType] = useState("morning");
   const [schoolId, setSchoolId] = useState("none");
+  // Route gate anchor (HH:MM, R3-UI/U4): the bell time the schedule is solved
+  // backwards from. Empty = inherit the school bell (then the system default).
+  // Sent as `gate_anchor` on /route-options (so the preview is bell-anchored)
+  // and on the route save (so the saved route persists it).
+  const [gateAnchor, setGateAnchor] = useState("");
   const [options, setOptions] = useState<RouteOption[] | null>(null);
   const [unresolved, setUnresolved] = useState<string[]>([]);
   const [provider, setProvider] = useState("");
@@ -138,6 +152,7 @@ export function FleetMapPage() {
     setRows([{ address: "", pickup_time: "" }]);
     setType("morning");
     setSchoolId("none");
+    setGateAnchor("");
     setOptions(null);
     setUnresolved([]);
     setProvider("");
@@ -159,6 +174,7 @@ export function FleetMapPage() {
       const res = await api.post("/api/fleet/route-options", {
         type,
         school_id: schoolId === "none" ? null : schoolId,
+        gate_anchor: gateAnchor || null,
         stops: stops.map((s) => ({
           address: s.address,
           pickup_time: s.pickup_time || null,
@@ -204,6 +220,7 @@ export function FleetMapPage() {
       const res = await api.post("/api/fleet/route-options", {
         type,
         preserve_order: true,
+        gate_anchor: gateAnchor || null,
         stops: stops.map((s) => ({
           label: s.label, lat: s.lat, lng: s.lng,
           pickup_time: s.pickup_time ?? null, is_school: !!s.is_school,
@@ -254,6 +271,7 @@ export function FleetMapPage() {
         type,
         school_id: saveSchoolId,
         bus_id: saveBusId === "none" ? null : saveBusId,
+        gate_anchor: gateAnchor || null,
         stops: option.stops.map((s) => ({
           label: s.label,
           lat: s.lat,
@@ -399,23 +417,40 @@ export function FleetMapPage() {
 
               <div className="space-y-2">
                 {rows.map((r, i) => (
-                  <div key={i} className="flex items-center gap-2">
-                    <AddressAutocomplete
-                      value={r.address}
+                  <div key={i} className="space-y-2 rounded-md border p-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">Stop {i + 1}</span>
+                      <Input
+                        type="time"
+                        className="ml-auto w-28"
+                        value={r.pickup_time}
+                        onChange={(e) => setRow(i, { pickup_time: e.target.value })}
+                      />
+                      <Button variant="ghost" size="icon" onClick={() => removeRow(i)} disabled={rows.length === 1}>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    {/* One place-picking control per stop: add a stop by autocomplete
+                        OR by dropping a map pin, interchangeably (R9). The resolved
+                        {label, lat, lng} is what the planner pushes downstream. */}
+                    <PlacePicker
                       placeholder="Address"
                       testId={`address-input-${i}`}
-                      onChange={(address) => setRow(i, { address, lat: null, lng: null })}
-                      onResolve={(address, lat, lng) => setRow(i, { address, lat, lng })}
+                      value={{
+                        address: r.address,
+                        lat: r.lat ?? null,
+                        lng: r.lng ?? null,
+                        provenance: r.provenance ?? "typed",
+                      }}
+                      onChange={(next) =>
+                        setRow(i, {
+                          address: next.address,
+                          lat: next.lat,
+                          lng: next.lng,
+                          provenance: next.provenance,
+                        })
+                      }
                     />
-                    <Input
-                      type="time"
-                      className="w-28"
-                      value={r.pickup_time}
-                      onChange={(e) => setRow(i, { pickup_time: e.target.value })}
-                    />
-                    <Button variant="ghost" size="icon" onClick={() => removeRow(i)} disabled={rows.length === 1}>
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
                   </div>
                 ))}
                 <div className="flex gap-2">
@@ -447,6 +482,25 @@ export function FleetMapPage() {
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              {/* Gate anchor (R3-UI/U4): the bell time the schedule is solved
+                  backwards from. Direction picks the wording — morning = arrival,
+                  afternoon = departure. Empty inherits the school bell. */}
+              <div className="space-y-1">
+                <Label>
+                  {type === "afternoon" ? "Departure from school gate" : "Arrival at school gate"}
+                </Label>
+                <Input
+                  type="time"
+                  className="w-32"
+                  value={gateAnchor}
+                  data-testid="gate-anchor"
+                  onChange={(e) => setGateAnchor(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Leave empty to use the school bell time.
+                </p>
               </div>
 
               <div className="flex gap-2">
@@ -495,6 +549,15 @@ export function FleetMapPage() {
                           </Badge>
                         )}
                       </div>
+
+                      {/* Degraded signal (R10): when the schedule was solved
+                          without live traffic (provider not google-routes) the
+                          ETAs are approximate. Non-blocking — saving stays allowed. */}
+                      {activeOption.provider && activeOption.provider !== "google-routes" && (
+                        <p className="text-xs text-amber-600" data-testid="degraded-warning">
+                          Schedule couldn't be fully optimised — times are approximate.
+                        </p>
+                      )}
 
                       <ol className="space-y-1 text-sm" data-testid="route-stops">
                         {activeOption.stops.map((s, i) => (
