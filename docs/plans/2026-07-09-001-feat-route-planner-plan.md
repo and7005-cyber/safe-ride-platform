@@ -302,6 +302,15 @@ Carried from origin: no joint bell-time optimization; no nightly automatic rebui
 - Per-bus rotation-strip visualization (all trips + layovers on one timeline). The trip-chain data model (U6) supports it; the Gantt UI is a follow-up surface.
 - Per-route or traffic-aware turnaround buffers (global constant this pass).
 - Corner/shared named stops with walk-to policies (coordinate coherence is enforced by provenance, not a new entity).
+- **Depot editing surface:** U13 placed the depot PlacePicker on the Fleet Map ("Bus depots" card) to stay within its file scope; consolidating it into the main Buses editor (`BusesPage.tsx`) is a UX follow-up.
+
+### Known Limitations from the Post-Implementation Adversarial Review
+
+Two confirmed P2s were fixed in review (a malformed free-text `gate_anchor`/bell is now rejected 422 instead of 500-ing the feasibility math; the migration dedup now ranks a bus-carrying link ahead of a bus-less one so it never silently blanks a rider's bus). The following are **narrow multi-trip-plus-depot-plus-feasibility interaction edge cases** — none affect single-trip buses, valid anchors, feasible chains, or safety; the common paths are certified green. Deferred as follow-ups:
+
+- **Depot boundary not recomputed on sibling trip-membership change (P2).** `_depot_leg` picks the boundary via `min/max(trip_index)` across a bus's routes, but only `update_bus` (depot move) fans out regeneration to all the bus's routes. Deleting / creating-out-of-order / trip_index-editing a route regenerates only that one route, so the *other* trip that gained/lost boundary status keeps a stale depot leg (wrong polyline / `total_duration_s`). Geometry-only, multi-trip+depot buses. Fix: fan out regeneration to the period's boundary trips on any trip-membership change.
+- **Turnaround feasibility flag is set-only, never cleared (P2/P3, findings #3/#6).** `_check_turnaround_feasibility` only sets `last_recalc_degraded=true`; the sole clearer is a successful `regenerate_route_stops`. A trip flagged infeasible that later becomes feasible via an edit to a *sibling* trip is not itself regenerated, so its warning badge persists. Rooted in `last_recalc_degraded` conflating geometry-degradation and turnaround-infeasibility in one column; a clean fix needs a separate flag or a chain-wide re-evaluation.
+- **Feasibility drive terms can be stale/asymmetric (P3, findings #5/#7).** The afternoon depot destination leg inflates a non-last trip's `total_duration_s` when trip_index and anchor order disagree (false infeasible); a degraded route's `total_duration_s` is not refreshed on the fallback path, so feasibility can read it as a 0-minute drive (false feasible). Both are bounded to multi-trip chains and surface only as an over-/under-eager warning badge, never a hard block.
 
 ---
 

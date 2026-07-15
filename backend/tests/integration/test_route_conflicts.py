@@ -354,3 +354,28 @@ def test_turnaround_infeasible_flags_degraded_not_409(client, admin_headers):
         for rid in ids:
             client.delete(f"/api/fleet/routes/{rid}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+
+
+def test_malformed_gate_anchor_is_rejected_not_500(client, admin_headers):
+    """Review #4: a malformed gate_anchor (free-text column) is rejected with a
+    422, not a 500 from the turnaround-feasibility HH:MM parse."""
+    marker = uuid.uuid4().hex[:6]
+    bus = _create_bus(client, admin_headers, f"IT GA Bus {marker}")
+    ids = []
+    try:
+        bad = _route(client, admin_headers, name=f"IT GA {marker}", type="morning",
+                     bus_id=bus["id"], gate_anchor="8am")
+        assert bad.status_code == 422, bad.text  # rejected up front, never a 500
+        good = _route(client, admin_headers, name=f"IT GA {marker}", type="morning",
+                      bus_id=bus["id"], gate_anchor="07:45")
+        assert good.status_code == 200, good.text
+        ids.append(good.json()["id"])
+        # A second valid trip triggers feasibility (the crash site) — must be fine.
+        two = _route(client, admin_headers, name=f"IT GA2 {marker}", type="morning",
+                     bus_id=bus["id"], trip_index=2, gate_anchor="08:30")
+        assert two.status_code == 200, two.text
+        ids.append(two.json()["id"])
+    finally:
+        for rid in ids:
+            client.delete(f"/api/fleet/routes/{rid}", headers=admin_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)

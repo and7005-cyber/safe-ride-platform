@@ -1,7 +1,21 @@
 import datetime as dt
+import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _validate_hhmm(v: str | None) -> str | None:
+    """Reject a malformed gate anchor / bell time up front (the DB columns are
+    free-text): a value without a valid HH:MM shape would otherwise reach the
+    turnaround-feasibility math and 500. Empty -> None (inherit)."""
+    if v is None or v.strip() == "":
+        return None
+    if not _HHMM_RE.match(v.strip()):
+        raise ValueError("time must be HH:MM (00:00–23:59)")
+    return v.strip()
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
@@ -55,6 +69,8 @@ class SchoolPayload(BaseModel):
     morning_bell: str | None = None
     afternoon_bell: str | None = None
 
+    _v_bells = field_validator("morning_bell", "afternoon_bell")(_validate_hhmm)
+
 
 class RouteStopPayload(BaseModel):
     label: str
@@ -77,6 +93,8 @@ class RoutePayload(BaseModel):
     # A bus may run several trips per period, each a distinct (bus, type,
     # trip_index). Defaults to 1 (single-trip, the previous behavior).
     trip_index: int | None = 1
+
+    _v_gate_anchor = field_validator("gate_anchor")(_validate_hhmm)
     # Planner persistence (R17/R18): a saved option carries its own ordered
     # stops plus the road polyline and totals. Presence of `stops` marks the
     # route custom (custom_stops = true) and skips student-based regeneration.
@@ -323,6 +341,8 @@ class RouteOptionsPayload(BaseModel):
     # from this gate time exactly as the saved route does — one authority. Null
     # inherits the school bell for the direction, else the system default.
     gate_anchor: str | None = None
+
+    _v_gate_anchor = field_validator("gate_anchor")(_validate_hhmm)
 
 
 @router.post("/geocode")

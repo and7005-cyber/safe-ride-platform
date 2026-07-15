@@ -126,14 +126,17 @@ where provenance is null
   and (home_lat is not null or nullif(btrim(coalesce(home_address, '')), '') is not null);
 
 -- 4. One-time allocation dedup + reconciliation -------------------------------
--- Keep the earliest link per (student, route_type) — ordered by the route's
--- creation (live_student_routes has no timestamp of its own) — and detach the
--- rest, so the deferrable unique below can be created against clean data.
+-- Keep one link per (student, route_type) and detach the rest, so the deferrable
+-- unique below can be created against clean data. A BUS-CARRYING route wins over
+-- a bus-less one first (then earliest route creation, then id): this matches the
+-- _derive_student_bus rule below, so the dedup never strips the link that carries
+-- the student's actual bus and silently blanks their bus_id. live_student_routes
+-- has no timestamp of its own, so the route's created_at is the age proxy.
 with ranked as (
   select sr.id,
          row_number() over (
            partition by sr.student_id, r.type
-           order by r.created_at asc, sr.id asc
+           order by (r.bus_id is not null) desc, r.created_at asc, sr.id asc
          ) as rn
   from live_student_routes sr
   join live_routes r on r.id = sr.route_id

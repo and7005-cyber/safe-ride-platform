@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import re
 from typing import Any
 
 from app.core.db import get_connection
@@ -7,6 +8,9 @@ from app.core.errors import BadRequestError, ConflictError, NotFoundError
 from app.services import geo_service
 
 logger = logging.getLogger("saferide.fleet")
+
+# HH:MM (00:00–23:59) — the only shape resolve_gate_anchor / _hhmm_to_min accept.
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
 # System-default gate anchors (Africa/Nairobi wall clock), the fallback of last
 # resort beneath the one authority (route.gate_anchor override -> school bell ->
@@ -19,12 +23,18 @@ def resolve_gate_anchor(route: dict) -> str:
     """The route's gate anchor (HH:MM), one authority: the route-level override
     if set, else the school's bell for the direction, else the system default.
     ``route`` carries gate_anchor + morning_bell/afternoon_bell (joined in
-    ``_ROUTE_GEOMETRY_INPUTS_SQL``)."""
-    if route.get("gate_anchor"):
-        return route["gate_anchor"]
+    ``_ROUTE_GEOMETRY_INPUTS_SQL``). ALWAYS returns a valid HH:MM: a malformed
+    stored anchor/bell (the columns are free-text) is skipped rather than
+    propagated, so downstream _hhmm_to_min / next_departure never crash on
+    legacy bad data (payload validation rejects new bad values up front)."""
     is_afternoon = route["type"] == "afternoon"
+    anchor = route.get("gate_anchor")
+    if anchor and _HHMM_RE.match(anchor):
+        return anchor
     bell = route.get("afternoon_bell") if is_afternoon else route.get("morning_bell")
-    return bell or (_AFTERNOON_DEFAULT if is_afternoon else _MORNING_DEFAULT)
+    if bell and _HHMM_RE.match(bell):
+        return bell
+    return _AFTERNOON_DEFAULT if is_afternoon else _MORNING_DEFAULT
 
 
 def _stop_label(st: dict) -> str:
