@@ -45,6 +45,9 @@ class Settings(BaseSettings):
         alias="DEMO_SCHOOL_ID",
     )
     trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    # Minimum turnaround between a bus's back-to-back trips in one period (U6/R20):
+    # stands in for the unmodeled gate<->wave deadhead. Global for this pass.
+    turnaround_buffer_min: int = Field(default=15, alias="TURNAROUND_BUFFER_MIN")
     # Maps provider for geocoding + route optimisation (#4, #9). When neither
     # key is set the app falls back to free OSM Nominatim geocoding and an
     # offline nearest-neighbour optimiser.

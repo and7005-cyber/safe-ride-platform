@@ -574,30 +574,89 @@ def recalculate_route_stops(conn, route_id: str) -> bool:
 
 
 def _check_route_bus_conflict(
-    conn, bus_id: str | None, route_type: str, exclude_route_id: str | None = None
+    conn, bus_id: str | None, route_type: str, trip_index: int = 1,
+    exclude_route_id: str | None = None,
 ) -> None:
-    """One route per (bus, type) (R1). This friendly pre-check names the
-    conflicting route and bus; the partial unique index
-    live_routes_bus_type_key (migration 007) is the race-proof backstop."""
+    """One route per (bus, type, trip_index) (U6/R19: multi-trip). This friendly
+    pre-check names the conflicting route and bus; the partial unique index
+    live_routes_bus_type_key (now 3-column, migration 009) is the race-proof
+    backstop. A bus may hold several trips per period as long as each carries a
+    distinct trip_index."""
     from app.core.errors import ConflictError
 
     if not bus_id:
         return
     exclude_sql = " and r.id <> %s" if exclude_route_id else ""
-    params: list = [bus_id, route_type]
+    params: list = [bus_id, route_type, trip_index]
     if exclude_route_id:
         params.append(exclude_route_id)
     existing = conn.execute(
         "select r.name as route_name, b.name as bus_name "
         "from live_routes r join live_buses b on b.id = r.bus_id "
-        f"where r.bus_id = %s and r.type = %s{exclude_sql} limit 1",
+        f"where r.bus_id = %s and r.type = %s and r.trip_index = %s{exclude_sql} limit 1",
         params,
     ).fetchone()
     if existing:
         raise ConflictError(
-            f"Bus {existing['bus_name']} already has a {route_type} route "
-            f"({existing['route_name']})"
+            f"Bus {existing['bus_name']} already has a {route_type} trip {trip_index} "
+            f"({existing['route_name']}) — give this trip a different trip number"
         )
+
+
+_TURNAROUND_BUFFER_MIN_DEFAULT = 15
+
+
+def _hhmm_to_min(hhmm: str) -> int:
+    h, m = (int(x) for x in hhmm.split(":")[:2])
+    return h * 60 + m
+
+
+def _check_turnaround_feasibility(conn, bus_id: str | None, route_type: str) -> None:
+    """Flag an infeasible multi-trip chain for one (bus, period) (U6/R20). Each
+    later trip's solved departure must be >= the prior trip's BUS-FREE time plus
+    the turnaround buffer. Bus-free is period-asymmetric: morning = the gate
+    ARRIVAL (the anchor); afternoon = last-dropoff ETA + the return-to-gate
+    deadhead — the buffer stands in for that unmodeled return leg. Infeasible
+    trips persist last_recalc_degraded=true + WARN through the durable channel;
+    never a hard block (an admin may knowingly stage a tight chain). Runs after
+    regeneration, which clears the flag on a converged solve, so this is the
+    authority on chain feasibility."""
+    if not bus_id:
+        return
+    from app.core.config import get_settings
+
+    buffer_min = getattr(get_settings(), "turnaround_buffer_min", _TURNAROUND_BUFFER_MIN_DEFAULT)
+    is_afternoon = route_type == "afternoon"
+    trips = conn.execute(
+        "select r.id, r.gate_anchor, r.type, r.total_duration_s, "
+        "s.morning_bell, s.afternoon_bell "
+        "from live_routes r left join live_schools s on s.id = r.school_id "
+        "where r.bus_id = %s and r.type = %s",
+        (bus_id, route_type),
+    ).fetchall()
+    if len(trips) < 2:
+        return  # a single trip is always feasible
+    trips = sorted(trips, key=lambda t: _hhmm_to_min(resolve_gate_anchor(t)))
+    for prev, cur in zip(trips, trips[1:]):
+        prev_anchor, cur_anchor = _hhmm_to_min(resolve_gate_anchor(prev)), _hhmm_to_min(resolve_gate_anchor(cur))
+        prev_drive = round((prev["total_duration_s"] or 0) / 60)
+        cur_drive = round((cur["total_duration_s"] or 0) / 60)
+        if is_afternoon:
+            # bus is free after driving the whole route out (return deadhead in
+            # the buffer); the next afternoon trip departs at its own anchor.
+            bus_free, cur_departure = prev_anchor + prev_drive, cur_anchor
+        else:
+            # bus is free at the gate arrival (the anchor); the next morning trip
+            # departs its solved drive before its anchor.
+            bus_free, cur_departure = prev_anchor, cur_anchor - cur_drive
+        if cur_departure < bus_free + buffer_min:
+            conn.execute(
+                "update live_routes set last_recalc_degraded = true where id = %s", (cur["id"],)
+            )
+            logger.warning(
+                "turnaround infeasible: bus %s %s trip %s departs before the prior "
+                "trip is free + %d min buffer", bus_id, route_type, cur["id"], buffer_min
+            )
 
 
 def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
@@ -804,17 +863,19 @@ class FleetDao:
 
     def create_route(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
-            _check_route_bus_conflict(conn, data.get("bus_id"), data.get("type") or "morning")
+            _check_route_bus_conflict(
+                conn, data.get("bus_id"), data.get("type") or "morning", data.get("trip_index") or 1
+            )
             # A planner save carries its own stops: flag the route custom,
             # keep the polyline/totals, write the stops verbatim and skip
             # student-based regeneration (R17/R18).
             custom = bool(data.get("stops"))
             row = conn.execute(
-                "insert into live_routes (name, type, bus_id, school_id, gate_anchor, "
+                "insert into live_routes (name, type, bus_id, school_id, gate_anchor, trip_index, "
                 "custom_stops, polyline, total_distance_m, total_duration_s) "
                 "values (%(name)s, coalesce(%(type)s,'morning'), %(bus_id)s, %(school_id)s, "
-                "%(gate_anchor)s, %(custom_stops)s, %(polyline)s, %(total_distance_m)s, "
-                "%(total_duration_s)s) returning *",
+                "%(gate_anchor)s, coalesce(%(trip_index)s, 1), %(custom_stops)s, %(polyline)s, "
+                "%(total_distance_m)s, %(total_duration_s)s) returning *",
                 {
                     **data,
                     "custom_stops": custom,
@@ -828,6 +889,9 @@ class FleetDao:
                 _write_custom_stops(conn, row["id"], data["stops"])
             else:
                 stops_recalculated = regenerate_route_stops(conn, row["id"])
+            # Turnaround feasibility across this bus's period chain (U6/R20) —
+            # after regeneration, which clears the flag on a converged solve.
+            _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
         # Observable degradation (U6/R10): false when the rebuild fell back —
         # same signal shape as update_route.
         return {**dict(row), "stops_recalculated": stops_recalculated}
@@ -843,7 +907,7 @@ class FleetDao:
                 return None
             _check_route_bus_conflict(
                 conn, data.get("bus_id"), data.get("type") or "morning",
-                exclude_route_id=route_id,
+                data.get("trip_index") or 1, exclude_route_id=route_id,
             )
             custom = bool(data.get("stops"))
             stops_recalculated = True
@@ -858,6 +922,7 @@ class FleetDao:
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
                     "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
+                    "trip_index=coalesce(%(trip_index)s, 1), "
                     "custom_stops=true, manual_stop_order=false, last_recalc_degraded=false, "
                     "polyline=%(polyline)s, total_distance_m=%(total_distance_m)s, "
                     "total_duration_s=%(total_duration_s)s where id=%(id)s returning *",
@@ -871,8 +936,8 @@ class FleetDao:
                 # for it); normal routes rebuild from students as before.
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s "
-                    "where id=%(id)s returning *",
+                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
+                    "trip_index=coalesce(%(trip_index)s, 1) where id=%(id)s returning *",
                     {**data, "id": route_id},
                 ).fetchone()
                 if row:
@@ -889,6 +954,11 @@ class FleetDao:
                     ).fetchall()
                     for s in students:
                         _derive_student_bus(conn, s["student_id"])
+                # Re-evaluate turnaround feasibility for the route's (new) chain,
+                # and for the chain it may have left (bus/type change).
+                _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
+                if current["bus_id"] != row["bus_id"] or current["type"] != row["type"]:
+                    _check_turnaround_feasibility(conn, current["bus_id"], current["type"])
         if not row:
             return None
         # Observable degradation (U6/R10): false when the rebuild fell back.

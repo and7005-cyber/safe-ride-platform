@@ -66,6 +66,10 @@ class RoutePayload(BaseModel):
     # bell for the direction, else the system default. The schedule is solved
     # backwards from this gate time.
     gate_anchor: str | None = None
+    # Ordinal of this trip within the bus's period (U6/R19): 1 = first wave.
+    # A bus may run several trips per period, each a distinct (bus, type,
+    # trip_index). Defaults to 1 (single-trip, the previous behavior).
+    trip_index: int | None = 1
     # Planner persistence (R17/R18): a saved option carries its own ordered
     # stops plus the road polyline and totals. Presence of `stops` marks the
     # route custom (custom_stops = true) and skips student-based regeneration.
