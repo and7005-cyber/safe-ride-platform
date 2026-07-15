@@ -42,6 +42,11 @@ class SchoolPayload(BaseModel):
     phone: str | None = None
     lat: float | None = None
     lng: float | None = None
+    # Bell times (Africa/Nairobi HH:MM, U4): the school-level default gate
+    # anchor — morning arrival, afternoon departure. A route's gate_anchor
+    # overrides these; null here inherits the system default.
+    morning_bell: str | None = None
+    afternoon_bell: str | None = None
 
 
 class RouteStopPayload(BaseModel):
@@ -57,6 +62,10 @@ class RoutePayload(BaseModel):
     type: str | None = "morning"
     bus_id: str | None = None
     school_id: str | None = None
+    # Route-level gate anchor override (HH:MM, U4): null inherits the school
+    # bell for the direction, else the system default. The schedule is solved
+    # backwards from this gate time.
+    gate_anchor: str | None = None
     # Planner persistence (R17/R18): a saved option carries its own ordered
     # stops plus the road polyline and totals. Presence of `stops` marks the
     # route custom (custom_stops = true) and skips student-based regeneration.
@@ -299,6 +308,10 @@ class RouteOptionsPayload(BaseModel):
     # When true the stops are used in the exact order given (drag-to-reorder):
     # no re-optimisation, just road geometry + ETAs for that sequence.
     preserve_order: bool = False
+    # Gate anchor override (HH:MM, U4): the preview solves the schedule backwards
+    # from this gate time exactly as the saved route does — one authority. Null
+    # inherits the school bell for the direction, else the system default.
+    gate_anchor: str | None = None
 
 
 @router.post("/geocode")
@@ -342,10 +355,16 @@ def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)
         default_anchor = "15:30" if is_afternoon else "07:00"
 
         school = None
+        school_bell = None
         if payload.school_id:
             row = next((s for s in dao.list_schools() if str(s["id"]) == payload.school_id), None)
-            if row and row.get("lat") is not None and row.get("lng") is not None:
-                school = {"lat": row["lat"], "lng": row["lng"], "label": row["name"], "is_school": True}
+            if row:
+                school_bell = row.get("afternoon_bell") if is_afternoon else row.get("morning_bell")
+                if row.get("lat") is not None and row.get("lng") is not None:
+                    school = {"lat": row["lat"], "lng": row["lng"], "label": row["name"], "is_school": True}
+        # One authority (U4): route override -> school bell -> system default.
+        # The preview solves against this gate time exactly as the saved route.
+        anchor_hhmm = payload.gate_anchor or school_bell or default_anchor
 
         located: list[dict] = []
         unresolved: list[str] = []
@@ -366,9 +385,16 @@ def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)
 
         def build_option(strategy: str, sequence: list[dict]) -> dict:
             seq = [s for s in sequence if s]
-            anchor = next((s.get("pickup_time") for s in seq if s.get("pickup_time")), None)
-            departure = geo_service.next_departure(anchor, default=default_anchor)
-            geom = geo_service.route_geometry(seq, departure=departure)
+            # Backward-solve from the gate anchor, same authority as the saved
+            # route (U4): morning solves the departure so the last-stop (gate)
+            # ETA hits the anchor; afternoon anchors the leading gate departure
+            # directly. Never anchors on a student pickup time (the retired model).
+            if is_afternoon:
+                departure = geo_service.next_departure(anchor_hhmm, default=default_anchor)
+                geom = geo_service.route_geometry(seq, departure=departure)
+            else:
+                anchor_dt = geo_service.next_departure(anchor_hhmm, default=default_anchor)
+                departure, geom, _converged = geo_service.solve_morning_departure(seq, anchor_dt)
             legs = geom["legs"]
             stops_out: list[dict] = []
             cumulative = 0

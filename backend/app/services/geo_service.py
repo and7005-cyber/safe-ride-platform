@@ -259,6 +259,50 @@ def next_departure(anchor_hhmm: str | None, *, default: str) -> dt.datetime:
     return cand
 
 
+def ensure_future(when: dt.datetime) -> dt.datetime:
+    """Roll a departure to the next day if it is in the past — the Routes API
+    rejects a past ``departureTime``. The backward-scheduling solve derives
+    candidate departures as ``gate_anchor - drive`` which can land just before
+    ``now`` when a roster is edited close to the bell; predictive traffic at the
+    same wall-clock tomorrow is a fine stand-in, and the written stop times are
+    wall-clock HH:MM (date-independent)."""
+    now = dt.datetime.now(tz=_EAT)
+    return when if when > now + dt.timedelta(seconds=30) else when + dt.timedelta(days=1)
+
+
+# Backward-solve bounds (U4): the morning departure is found by fixed-point
+# iteration (Google Routes has no arrive-by parameter). Both the shift and the
+# convergence test run on raw cumulative seconds, never minute-truncated HH:MM.
+SOLVE_MAX_ITERS = 4
+SOLVE_TOL_S = 60
+
+
+def solve_morning_departure(seq: list[dict], anchor_dt: dt.datetime) -> tuple[dt.datetime, dict, bool]:
+    """Fixed-point solve for a morning departure so the gate-arrival ETA hits
+    ``anchor_dt`` (the gate is the LAST point of ``seq``). Google Routes has no
+    arrive-by, so iterate a forward solve: probe a departure, measure the drive,
+    shift by the gate-time error, repeat — bounded at ``SOLVE_MAX_ITERS`` with a
+    ``SOLVE_TOL_S`` tolerance on raw seconds. Returns ``(departure, geom,
+    converged)``; on non-convergence the argmin-error iterate (best across ALL
+    iterations, not the last, which can be the worse side of a rush-hour
+    discontinuity). Each geo call is future-rolled so it never sends a past time;
+    ``departure`` is the solved wall-clock the ETAs are computed from."""
+    probe = anchor_dt  # first probe departs at the anchor and measures the drive
+    best: tuple[float, dt.datetime, dict] | None = None
+    for _ in range(SOLVE_MAX_ITERS):
+        geom = route_geometry(seq, departure=ensure_future(probe))
+        if geom["provider"] != "google-routes" or len(geom["legs"]) != len(seq) - 1:
+            return probe, geom, False  # geometry degraded — caller falls back
+        drive_s = sum((leg.get("duration_s") or 0) for leg in geom["legs"])
+        err_s = (anchor_dt - (probe + dt.timedelta(seconds=drive_s))).total_seconds()
+        if best is None or abs(err_s) < best[0]:
+            best = (abs(err_s), probe, geom)
+        if abs(err_s) <= SOLVE_TOL_S:
+            return probe, geom, True
+        probe = probe + dt.timedelta(seconds=err_s)  # shift departure by the gate error
+    return best[1], best[2], False  # non-convergent: the argmin-error iterate
+
+
 def _to_rfc3339(when: dt.datetime) -> str:
     return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
