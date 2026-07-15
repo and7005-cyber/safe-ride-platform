@@ -84,7 +84,7 @@ def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
 
 
 _ROUTE_GEOMETRY_INPUTS_SQL = (
-    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, "
+    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, r.stops_computed, "
     "s.name as school_name, s.lat as school_lat, s.lng as school_lng "
     "from live_routes r left join live_schools s on s.id = r.school_id "
     "where r.id = %s"
@@ -202,6 +202,9 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
     result["computed"] = {
         "seq_keys": seq_keys, "orders": orders, "group_times": group_times,
         "gate_time": gate_time, "gate_order": gate_order,
+        # Persisted on the auto route (U3): the turnaround feasibility gate (U6)
+        # needs the drive duration of auto routes, not just planner-saved ones.
+        "total_duration_s": geom.get("total_duration_s"),
     }
     return result
 
@@ -350,8 +353,9 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
                              computed["gate_time"],
                              route["school_lat"], route["school_lng"], True, None)
                 conn.execute(
-                    "update live_routes set last_recalc_degraded = false where id = %s",
-                    (route_id,),
+                    "update live_routes set last_recalc_degraded = false, "
+                    "stops_computed = true, total_duration_s = %s where id = %s",
+                    (computed.get("total_duration_s"), route_id),
                 )
                 return True
             degraded_reason = pre["degraded_reason"]
@@ -367,7 +371,12 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     # only the geometry path writes one, and this fallback re-writes it as-is,
     # so the marker survives degraded rebuilds in between. Manual routes (U7)
     # preserve unconditionally — the admin's order is authoritative.
-    previously_computed = prev_gate_time is not None
+    # U3: read the explicit marker, not the gate-row-time inference. Once admins
+    # can type a gate time (U4), "the gate row carries a scheduled_time" no longer
+    # means "geometry was computed"; the column is backfilled at 009 to match the
+    # old inference exactly at the cutover. prev_gate_time is still used below to
+    # re-write the gate row's preserved time.
+    previously_computed = bool(route["stops_computed"])
     preserve = previously_computed or not is_auto
     resolved: dict[str, dict] = {}
     if preserve:
@@ -583,6 +592,17 @@ def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
                 bool(stop.get("is_school")),
             ),
         )
+    # U3: a planner-saved route is "computed" — mark it so a later
+    # student-assignment handover (which flips custom_stops off and regenerates)
+    # takes the preservation path rather than a wholesale rebuild. Mirrors the
+    # marker's gate-time semantics (true iff the gate row carries a time).
+    conn.execute(
+        "update live_routes set stops_computed = exists ("
+        "select 1 from live_route_stops s where s.route_id = %s "
+        "and s.is_school_gate and s.scheduled_time is not null"
+        ") where id = %s",
+        (route_id, route_id),
+    )
 
 
 class FleetDao:

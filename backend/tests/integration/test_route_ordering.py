@@ -383,6 +383,16 @@ def test_google_morning_writes_optimizer_order_and_anchored_times(
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
 
+        # U3: google success sets the explicit stops_computed marker and persists
+        # the auto route's drive duration (3 legs x LEG_SECONDS) — auto routes now
+        # write total_duration_s, not just planner-saved custom routes.
+        marker_row = db.execute(
+            "select stops_computed, total_duration_s from live_routes where id = %s",
+            (route["id"],),
+        ).fetchone()
+        assert marker_row["stops_computed"] is True
+        assert marker_row["total_duration_s"] == LEG_SECONDS * 3
+
         listed = _get_route(client, admin_headers, route["id"])
         assert listed["last_recalc_degraded"] is False  # google success clears (R10)
         stops = _stops(listed)
@@ -411,6 +421,53 @@ def test_google_morning_writes_optimizer_order_and_anchored_times(
         db.commit()
         stops = _stops(_get_route(client, admin_headers, route["id"]))
         assert [s["scheduled_time"] for s in stops] == ["06:00", "06:05", "06:10", "06:15"]
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_stops_computed_marker_false_true_then_preserved_on_degrade(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U3: the explicit stops_computed marker replaces the gate-row-time
+    inference. A never-computed route reads false (not inferred from a gate
+    time); a google recompute flips it true and persists total_duration_s; a
+    subsequent degraded recompute preserves the marker instead of resetting it."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        kids.append(_make_student(
+            client, admin_headers,
+            _student_payload(marker, "A", "06:30", -1.2800, 36.7900), [route["id"]],
+        ))
+        # Never geometry-computed (key-less container -> degraded create): the
+        # marker is an explicit false, not inferred from a written gate time.
+        db.rollback()
+        assert db.execute(
+            "select stops_computed from live_routes where id = %s", (route["id"],)
+        ).fetchone()["stops_computed"] is False
+
+        # Google recompute -> marker true, drive duration persisted (1 stop -> 1
+        # leg to the gate).
+        patch_google(monkeypatch, geo, order=[0])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        row = db.execute(
+            "select stops_computed, total_duration_s from live_routes where id = %s",
+            (route["id"],),
+        ).fetchone()
+        assert row["stops_computed"] is True
+        assert row["total_duration_s"] == LEG_SECONDS
+
+        # Degraded recompute preserves the marker (stays true) — the preservation
+        # path keys off the column, not a re-derived gate time.
+        patch_offline(monkeypatch, geo)
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+        assert db.execute(
+            "select stops_computed from live_routes where id = %s", (route["id"],)
+        ).fetchone()["stops_computed"] is True
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
