@@ -199,6 +199,16 @@ export function PlannerCsvDialog({
                 <span className="font-medium text-success">{result.added}</span>{" "}
                 stop{result.added === 1 ? "" : "s"} added to the planner.
               </p>
+              {/* U12 / spec 4: point the operator at the repair table. Rows
+                  without coordinates are geocoded on "Get route options"; any
+                  that can't be located surface there as fixable map-pick rows. */}
+              {result.added > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Addresses without coordinates are geocoded when you calculate the
+                  route. Any that can't be located appear in a repair table on the
+                  planner, where you can pin them on the map before saving.
+                </p>
+              )}
               {result.errors.length > 0 && (
                 <div>
                   <p className="font-medium text-destructive">{result.errors.length} row error(s):</p>

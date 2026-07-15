@@ -39,7 +39,17 @@ import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
 import { useBuses, useRoutes, useSchools } from "@/lib/queries";
 
-const EMPTY = { name: "", type: "morning", bus_id: "none", school_id: "none" };
+const EMPTY = {
+  name: "",
+  type: "morning",
+  bus_id: "none",
+  school_id: "none",
+  // Ordinal of this trip within the bus's period (R19): 1 = first wave. A bus
+  // may hold several trips per period, each a distinct (bus, type, trip_index).
+  trip_index: 1,
+  // Route-level gate-anchor override (R3, HH:MM); "" inherits the school bell.
+  gate_anchor: "",
+};
 
 interface StopGroup {
   order: number;
@@ -175,7 +185,17 @@ export function RoutesPage() {
   const startCreate = () => { setEditId(null); setForm({ ...EMPTY }); setOpen(true); };
   const startEdit = (r: any) => {
     setEditId(r.id);
-    setForm({ name: r.name, type: r.type, bus_id: r.bus_id ?? "none", school_id: r.school_id ?? "none" });
+    setForm({
+      name: r.name,
+      type: r.type,
+      bus_id: r.bus_id ?? "none",
+      school_id: r.school_id ?? "none",
+      // Prefill both from the saved route (deferred from U10, which only did the
+      // create planner) — a bare PUT would otherwise reset trip_index to 1 and
+      // wipe the gate anchor server-side (both default when omitted).
+      trip_index: r.trip_index ?? 1,
+      gate_anchor: r.gate_anchor ?? "",
+    });
     setOpen(true);
   };
 
@@ -186,6 +206,10 @@ export function RoutesPage() {
         type: form.type,
         bus_id: form.bus_id === "none" ? null : form.bus_id,
         school_id: form.school_id === "none" ? null : form.school_id,
+        // A blank/NaN trip number falls back to 1 (single-trip). Same (bus,
+        // type, trip_index) 409s; the catch below surfaces the API detail.
+        trip_index: Number(form.trip_index) || 1,
+        gate_anchor: form.gate_anchor || null,
       };
       const res = editId
         ? await api.put(`/api/fleet/routes/${editId}`, payload)
@@ -358,6 +382,12 @@ export function RoutesPage() {
                     >
                       {mode}
                     </Badge>
+                    {/* Trip ordinal (R19): makes two trips of one bus/period
+                        legible on the card — a bus can hold e.g. a morning
+                        trip 1 and a morning trip 2. */}
+                    <Badge variant="outline" data-testid="route-trip-index">
+                      Trip {route.trip_index ?? 1}
+                    </Badge>
                     <span className="text-xs text-muted-foreground">{busName(route.bus_id)}</span>
                   </div>
                 </div>
@@ -502,15 +532,31 @@ export function RoutesPage() {
                 Morning routes end at the school; afternoon routes start at the school (reverse order).
               </p>
             </div>
-            <div className="space-y-2">
-              <Label>Bus</Label>
-              <Select value={form.bus_id} onValueChange={(v) => setForm({ ...form, bus_id: v })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">— Unassigned —</SelectItem>
-                  {buses.map((b: any) => <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>Bus</Label>
+                <Select value={form.bus_id} onValueChange={(v) => setForm({ ...form, bus_id: v })}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">— Unassigned —</SelectItem>
+                    {buses.map((b: any) => <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              {/* Trip number (R19): a bus can hold more than one trip per period
+                  as long as each has a distinct number. Saving a duplicate
+                  (same bus, type, trip) 409s with the API's friendly detail. */}
+              <div className="space-y-2">
+                <Label>Trip number</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={form.trip_index}
+                  data-testid="route-trip-index-input"
+                  onChange={(e) => setForm({ ...form, trip_index: Number(e.target.value) })}
+                />
+              </div>
             </div>
             <div className="space-y-2">
               <Label>School</Label>
@@ -521,6 +567,24 @@ export function RoutesPage() {
                   {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
                 </SelectContent>
               </Select>
+            </div>
+            {/* Gate anchor (R3): the bell time the schedule solves backwards
+                from — morning = arrival, afternoon = departure. Prefilled from
+                the saved route; empty inherits the school bell. */}
+            <div className="space-y-2">
+              <Label>
+                {form.type === "afternoon" ? "Departure from school gate" : "Arrival at school gate"}
+              </Label>
+              <Input
+                type="time"
+                className="w-32"
+                value={form.gate_anchor}
+                data-testid="route-gate-anchor"
+                onChange={(e) => setForm({ ...form, gate_anchor: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Leave empty to use the school bell time.
+              </p>
             </div>
           </div>
           <DialogFooter>

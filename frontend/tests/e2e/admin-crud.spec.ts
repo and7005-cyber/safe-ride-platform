@@ -118,6 +118,10 @@ test("admin can create and delete a route attached to a bus and school", async (
 
   await page.getByRole("button", { name: "Add Route" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
+  // Spec 6 / R19: multi-trip — the route editor exposes a Trip number, and
+  // spec 1 / R3 the gate-anchor time. Both are optional (trip defaults to 1).
+  await expect(fieldInput(dialog(page), "Trip number")).toBeVisible();
+  await expect(dialog(page).getByTestId("route-gate-anchor")).toBeVisible();
   await pickSelectOption(dialog(page), "Type", "Afternoon");
   await pickSelectOption(dialog(page), "Bus", busName);
   await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
@@ -150,6 +154,11 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
   await page.getByRole("button", { name: "Add Student" }).click();
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Grade").fill("Grade 4");
+  // Spec 5 / R10: the redundant "Home location" field is gone — a single
+  // PlacePicker (label "Home", testid student-address, with map-picking inside)
+  // is the only home control.
+  await expect(dialog(page).getByTestId("student-address")).toBeVisible();
+  await expect(dialog(page).locator('label:text-is("Home location")')).toHaveCount(0);
   // Parent contact fields live in two labeled groups (Parent 1 / Parent 2).
   const parent1 = dialog(page).getByTestId("parent1-group");
   const parent2 = dialog(page).getByTestId("parent2-group");
@@ -179,7 +188,10 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
     await dialog(page).getByTestId("map-picker").click({ position: { x: 150, y: 120 } });
     const response = await reverse;
     if (response && (await response.json()).found) {
-      await expect(fieldInput(dialog(page), "Home address")).not.toHaveValue("");
+      // U11: the split Home address + Home location fields are now one
+      // PlacePicker (label "Home"); its address input carries the student-address
+      // testid. A picked pin reverse-geocodes into it.
+      await expect(dialog(page).getByTestId("student-address")).not.toHaveValue("");
     }
   }
 
@@ -379,6 +391,9 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
   await adminLogin(page);
   await page.goto("/fleet-map");
   await expect(page.getByText("Route planner")).toBeVisible();
+  // Spec 1 / R3: the planner exposes the gate-anchor time the schedule is
+  // optimised against (arrival/departure at the school gate).
+  await expect(page.getByTestId("gate-anchor")).toBeVisible();
 
   // Two real Nairobi addresses (free text — the backend geocodes them).
   await page.getByTestId("address-input-0").fill("Yaya Centre, Nairobi");

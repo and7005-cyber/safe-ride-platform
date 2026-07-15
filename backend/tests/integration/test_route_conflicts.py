@@ -279,3 +279,103 @@ def test_active_filter_excludes_completed_and_prior_date_runs(client, admin_head
         for run in (active_today, completed_today, stale_in_progress):
             client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+
+
+# Multi-trip chains (U6, R19-R20) -----------------------------------------------
+
+def _route(client, admin_headers, **body):
+    r = client.post("/api/fleet/routes", json=body, headers=admin_headers)
+    return r
+
+
+def _route_by_id(client, admin_headers, route_id):
+    return next(r for r in client.get("/api/fleet/routes", headers=admin_headers).json()
+               if r["id"] == route_id)
+
+
+def test_multi_trip_distinct_index_coexists_same_index_conflicts(client, admin_headers):
+    """U6/R19: a bus may run several morning trips as long as each carries a
+    distinct trip_index; a second route with the SAME (bus, type, trip_index)
+    still 409s."""
+    marker = uuid.uuid4().hex[:6]
+    bus = _create_bus(client, admin_headers, f"IT MT Bus {marker}")
+    ids = []
+    try:
+        t1 = _route(client, admin_headers, name=f"IT MT AM1 {marker}", type="morning",
+                    bus_id=bus["id"], trip_index=1)
+        assert t1.status_code == 200, t1.text
+        ids.append(t1.json()["id"])
+        # Distinct trip_index on the same bus/period -> allowed now.
+        t2 = _route(client, admin_headers, name=f"IT MT AM2 {marker}", type="morning",
+                    bus_id=bus["id"], trip_index=2)
+        assert t2.status_code == 200, t2.text
+        ids.append(t2.json()["id"])
+        # Same trip_index -> still a friendly 409.
+        dup = _route(client, admin_headers, name=f"IT MT AM2dup {marker}", type="morning",
+                     bus_id=bus["id"], trip_index=2)
+        if dup.status_code == 200:
+            ids.append(dup.json()["id"])
+        assert dup.status_code == 409, dup.text
+        assert "trip 2" in dup.json()["detail"], dup.json()["detail"]
+    finally:
+        for rid in ids:
+            client.delete(f"/api/fleet/routes/{rid}", headers=admin_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+
+
+def test_turnaround_infeasible_flags_degraded_not_409(client, admin_headers):
+    """U6/R20: an infeasible trip chain (the later trip departs before the
+    earlier one is free + the buffer) flags the later trip's durable degradation
+    badge — it is never a hard 409. A feasible chain leaves both clear."""
+    marker = uuid.uuid4().hex[:6]
+    bus = _create_bus(client, admin_headers, f"IT TA Bus {marker}")
+    ids = []
+    try:
+        t1 = _route(client, admin_headers, name=f"IT TA AM1 {marker}", type="morning",
+                    bus_id=bus["id"], trip_index=1, gate_anchor="07:30").json()
+        ids.append(t1["id"])
+        # Feasible: trip2 gate 08:15 departs (>= 07:30 + 15 buffer) comfortably.
+        t2 = _route(client, admin_headers, name=f"IT TA AM2 {marker}", type="morning",
+                    bus_id=bus["id"], trip_index=2, gate_anchor="08:15").json()
+        ids.append(t2["id"])
+        assert _route_by_id(client, admin_headers, t2["id"])["last_recalc_degraded"] is False
+
+        # Tighten trip2's gate to 07:40: it would now depart before trip1's gate
+        # arrival (07:30) + 15 min buffer = 07:45 -> infeasible.
+        edit = client.put(
+            f"/api/fleet/routes/{t2['id']}",
+            json={"name": f"IT TA AM2 {marker}", "type": "morning", "bus_id": bus["id"],
+                  "trip_index": 2, "gate_anchor": "07:40"},
+            headers=admin_headers,
+        )
+        assert edit.status_code == 200, edit.text  # a warning, never a block
+        assert _route_by_id(client, admin_headers, t2["id"])["last_recalc_degraded"] is True
+    finally:
+        for rid in ids:
+            client.delete(f"/api/fleet/routes/{rid}", headers=admin_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+
+
+def test_malformed_gate_anchor_is_rejected_not_500(client, admin_headers):
+    """Review #4: a malformed gate_anchor (free-text column) is rejected with a
+    422, not a 500 from the turnaround-feasibility HH:MM parse."""
+    marker = uuid.uuid4().hex[:6]
+    bus = _create_bus(client, admin_headers, f"IT GA Bus {marker}")
+    ids = []
+    try:
+        bad = _route(client, admin_headers, name=f"IT GA {marker}", type="morning",
+                     bus_id=bus["id"], gate_anchor="8am")
+        assert bad.status_code == 422, bad.text  # rejected up front, never a 500
+        good = _route(client, admin_headers, name=f"IT GA {marker}", type="morning",
+                      bus_id=bus["id"], gate_anchor="07:45")
+        assert good.status_code == 200, good.text
+        ids.append(good.json()["id"])
+        # A second valid trip triggers feasibility (the crash site) — must be fine.
+        two = _route(client, admin_headers, name=f"IT GA2 {marker}", type="morning",
+                     bus_id=bus["id"], trip_index=2, gate_anchor="08:30")
+        assert two.status_code == 200, two.text
+        ids.append(two.json()["id"])
+    finally:
+        for rid in ids:
+            client.delete(f"/api/fleet/routes/{rid}", headers=admin_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)

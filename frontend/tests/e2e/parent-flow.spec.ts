@@ -41,13 +41,17 @@ test("parent profile shows account, children, and push state", async ({ page }) 
   // My Children rows carry the same derived status badge as Home (R36).
   await expect(page.getByTestId("child-status-badge").first()).toHaveText(STATUS_BADGE_LABEL);
 
-  // Local stack has no FCM/VAPID config, so the push toggle reports exactly that.
+  // The push toggle renders one of five state labels depending on browser push
+  // support, server FCM/VAPID config, notification permission, and subscription
+  // — all of which vary by machine and by what earlier specs did to the shared
+  // browser's push state. Assert the control renders in ANY of its valid states
+  // (the test's intent: the profile surfaces push state), not one hard-coded
+  // state — the old "not configured" assumption broke once push was provisioned.
   await expect(
-    page.getByRole("button", { name: /Push not configured on this server/ }),
+    page.getByRole("button", {
+      name: /Push not supported on this device|Push not configured on this server|Notifications blocked in browser|Enable Push Notifications|Disable Push Notifications/,
+    }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: /Push not configured on this server/ }),
-  ).toBeDisabled();
 });
 
 // Cancel-a-Ride journey (R14, R17, R18; AE4): cancel the afternoon ride from

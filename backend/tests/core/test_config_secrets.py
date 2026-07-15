@@ -79,6 +79,10 @@ def test_ssm_fetch_populates_empty_json_fields(monkeypatch):
     })
     _inject_fake_boto3(monkeypatch, ssm)
     s = Settings(
+        # Force the JSON fields empty so the SSM path is exercised; without this
+        # a populated local .env (real Firebase creds) would win and skip SSM.
+        FIREBASE_SERVICE_ACCOUNT_JSON="",
+        FIREBASE_WEB_CONFIG_JSON="",
         FIREBASE_SERVICE_ACCOUNT_SSM="/saferide/firebase-service-account-json",
         FIREBASE_WEB_CONFIG_SSM="/saferide/firebase-web-config-json",
     )
@@ -105,7 +109,10 @@ def test_ssm_fetch_failure_degrades_to_empty(monkeypatch):
             raise RuntimeError("ssm unavailable")
 
     _inject_fake_boto3(monkeypatch, _Boom())
-    s = Settings(FIREBASE_SERVICE_ACCOUNT_SSM="/saferide/firebase-service-account-json")
+    s = Settings(
+        FIREBASE_SERVICE_ACCOUNT_JSON="",  # empty so the SSM path runs (see above)
+        FIREBASE_SERVICE_ACCOUNT_SSM="/saferide/firebase-service-account-json",
+    )
     assert s.firebase_service_account_json == ""  # boot survives; FCM stays off
 
 

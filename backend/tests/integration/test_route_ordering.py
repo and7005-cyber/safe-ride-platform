@@ -152,11 +152,12 @@ def _make_school(client, admin_headers, marker: str) -> dict:
     return response.json()
 
 
-def _make_route(client, admin_headers, marker: str, route_type: str, school_id, bus_id=None) -> dict:
+def _make_route(client, admin_headers, marker: str, route_type: str, school_id,
+                bus_id=None, gate_anchor=None) -> dict:
     response = client.post(
         "/api/fleet/routes",
         json={"name": f"IT RO {route_type} {marker}", "type": route_type,
-              "school_id": school_id, "bus_id": bus_id},
+              "school_id": school_id, "bus_id": bus_id, "gate_anchor": gate_anchor},
         headers=admin_headers,
     )
     assert response.status_code == 200, response.text
@@ -357,15 +358,16 @@ def test_degraded_mutations_signal_and_fall_back_to_pickup_order(client, admin_h
 def test_google_morning_writes_optimizer_order_and_anchored_times(
     client, admin_headers, db, fleet_dao, geo, monkeypatch
 ):
-    """Covers AE3 (auto half): the optimizer order lands with per-group times
-    from cumulative leg ETAs anchored on the earliest assigned pickup_time;
-    the gate row carries the computed school arrival; the flag clears. A
-    second recalculation keeps the same anchor (read from the students before
-    the stop delete — never from the deleted stops or the default), and a
-    pickup-time edit re-anchors the morning departure."""
+    """Covers AE1/AE3 (auto half): the optimizer order lands with per-group
+    times BACKWARD-SOLVED from the route's gate anchor (U4) — the gate row
+    carries the anchor as the school arrival, each earlier stop one fake leg
+    before; the flag clears. A second recalculation keeps the same gate; a
+    pickup-time edit does NOT move a computed bell-anchored morning schedule."""
     marker = uuid.uuid4().hex[:6]
     school = _make_school(client, admin_headers, marker)
-    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    # gate_anchor 07:45: with 3 stops (3 fake legs x 5 min) the departure solves
+    # back to 07:30 and the gate arrival lands exactly on 07:45.
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], gate_anchor="07:45")
     kids = []
     try:
         for letter, pickup, lat, lng in (
@@ -383,6 +385,16 @@ def test_google_morning_writes_optimizer_order_and_anchored_times(
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
 
+        # U3: google success sets the explicit stops_computed marker and persists
+        # the auto route's drive duration (3 legs x LEG_SECONDS) — auto routes now
+        # write total_duration_s, not just planner-saved custom routes.
+        marker_row = db.execute(
+            "select stops_computed, total_duration_s from live_routes where id = %s",
+            (route["id"],),
+        ).fetchone()
+        assert marker_row["stops_computed"] is True
+        assert marker_row["total_duration_s"] == LEG_SECONDS * 3
+
         listed = _get_route(client, admin_headers, route["id"])
         assert listed["last_recalc_degraded"] is False  # google success clears (R10)
         stops = _stops(listed)
@@ -391,26 +403,73 @@ def test_google_morning_writes_optimizer_order_and_anchored_times(
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
             f"IT RO B Lane {marker}", f"IT RO School {marker}",
         ]
-        # Anchor = earliest assigned pickup (06:30), +5 min per fake leg; the
-        # gate gets the computed school arrival.
-        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35", "06:40", "06:45"]
+        # Backward-solved from gate_anchor 07:45: departure 07:30, +5 min per
+        # fake leg, gate arrival lands ON the anchor (U4).
+        assert [s["scheduled_time"] for s in stops] == ["07:30", "07:35", "07:40", "07:45"]
         assert stops[-1]["is_school_gate"] is True
 
-        # Second recalc: same anchor, same times — not the 07:00 default.
+        # Second recalc: same gate anchor -> same times.
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
         stops = _stops(_get_route(client, admin_headers, route["id"]))
-        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35", "06:40", "06:45"]
+        assert [s["scheduled_time"] for s in stops] == ["07:30", "07:35", "07:40", "07:45"]
 
-        # Pickup-time edit re-anchors the morning departure (its only effect
-        # while geometry owns the times).
+        # A pickup-time edit does NOT re-anchor a computed bell-anchored morning
+        # schedule (U4 retired that): the gate stays 07:45 and every time holds.
         db.execute(
             "update live_students set pickup_time = '06:00' where id = %s", (kids[0]["id"],)
         )
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
         stops = _stops(_get_route(client, admin_headers, route["id"]))
-        assert [s["scheduled_time"] for s in stops] == ["06:00", "06:05", "06:10", "06:15"]
+        assert [s["scheduled_time"] for s in stops] == ["07:30", "07:35", "07:40", "07:45"]
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_stops_computed_marker_false_true_then_preserved_on_degrade(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U3: the explicit stops_computed marker replaces the gate-row-time
+    inference. A never-computed route reads false (not inferred from a gate
+    time); a google recompute flips it true and persists total_duration_s; a
+    subsequent degraded recompute preserves the marker instead of resetting it."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        kids.append(_make_student(
+            client, admin_headers,
+            _student_payload(marker, "A", "06:30", -1.2800, 36.7900), [route["id"]],
+        ))
+        # Never geometry-computed (key-less container -> degraded create): the
+        # marker is an explicit false, not inferred from a written gate time.
+        db.rollback()
+        assert db.execute(
+            "select stops_computed from live_routes where id = %s", (route["id"],)
+        ).fetchone()["stops_computed"] is False
+
+        # Google recompute -> marker true, drive duration persisted (1 stop -> 1
+        # leg to the gate).
+        patch_google(monkeypatch, geo, order=[0])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        row = db.execute(
+            "select stops_computed, total_duration_s from live_routes where id = %s",
+            (route["id"],),
+        ).fetchone()
+        assert row["stops_computed"] is True
+        assert row["total_duration_s"] == LEG_SECONDS
+
+        # Degraded recompute preserves the marker (stays true) — the preservation
+        # path keys off the column, not a re-derived gate time.
+        patch_offline(monkeypatch, geo)
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+        assert db.execute(
+            "select stops_computed from live_routes where id = %s", (route["id"],)
+        ).fetchone()["stops_computed"] is True
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
@@ -454,6 +513,109 @@ def test_google_afternoon_gate_first_reversed_and_anchored_at_1530(
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
 
+def test_gate_anchor_override_backward_solves_to_that_gate(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U4: an explicit route gate_anchor is the arrival the morning schedule is
+    solved back from — the gate lands on it regardless of the students' pickup
+    times (which the pre-U4 model would have anchored on)."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], gate_anchor="08:10")
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (("A", "06:30", -1.28, 36.79), ("B", "06:40", -1.29, 36.80)):
+            kids.append(_make_student(
+                client, admin_headers, _student_payload(marker, letter, pickup, lat, lng), [route["id"]]
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        # 2 stops -> 2 fake legs -> departure 08:00, gate arrival ON 08:10.
+        assert [s["scheduled_time"] for s in stops] == ["08:00", "08:05", "08:10"]
+        assert stops[-1]["is_school_gate"] is True and stops[-1]["scheduled_time"] == "08:10"
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_school_morning_bell_is_the_default_gate_anchor(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U4: with no route override, the school's morning_bell is the anchor (one
+    authority: route override -> school bell -> system default)."""
+    marker = uuid.uuid4().hex[:6]
+    resp = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT RO Bell {marker}", "lat": -1.30, "lng": 36.82, "morning_bell": "07:20"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    school = resp.json()
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])  # no override
+    kids = []
+    try:
+        kids.append(_make_student(
+            client, admin_headers, _student_payload(marker, "A", "06:30", -1.28, 36.79), [route["id"]]
+        ))
+        patch_google(monkeypatch, geo, order=[0])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        # 1 stop -> 1 leg -> departure 07:15, gate 07:20 (the school bell).
+        assert [s["scheduled_time"] for s in stops] == ["07:15", "07:20"]
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_non_convergent_solve_writes_best_iterate_and_flags_degraded(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U4: when the backward solve oscillates across a (simulated) traffic
+    discontinuity and never lands within tolerance, the best-error iterate is
+    still written but last_recalc_degraded is set — never silent."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], gate_anchor="07:30")
+    kids = []
+    try:
+        kids.append(_make_student(
+            client, admin_headers, _student_payload(marker, "A", "06:30", -1.28, 36.79), [route["id"]]
+        ))
+
+        # Fake optimiser = google; geometry drive OSCILLATES per call (10 vs 40
+        # min) so the fixed point never settles inside the 60s tolerance.
+        monkeypatch.setattr(
+            geo, "optimized_order_with_provider",
+            lambda points, s: {"ordered": list(points), "provider": "google"},
+        )
+        calls = {"n": 0}
+
+        def oscillating_geometry(seq, departure=None):
+            calls["n"] += 1
+            dur = 600 if calls["n"] % 2 else 2400  # alternate 10 / 40 min
+            legs = [{"distance_m": 1000, "duration_s": dur} for _ in range(max(len(seq) - 1, 0))]
+            return {"polyline": "x", "total_distance_m": 1000 * len(legs),
+                    "total_duration_s": dur * len(legs), "legs": legs, "provider": "google-routes"}
+
+        monkeypatch.setattr(geo, "route_geometry", oscillating_geometry)
+
+        # Degraded return (False): the solve did not converge.
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is False
+        db.commit()
+        row = db.execute(
+            "select last_recalc_degraded, stops_computed from live_routes where id = %s",
+            (route["id"],),
+        ).fetchone()
+        assert row["last_recalc_degraded"] is True   # flagged, never silent
+        assert row["stops_computed"] is True          # best iterate WAS written
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        assert stops[-1]["is_school_gate"] is True     # a full computed set exists
+        assert len([s for s in stops if not s["is_school_gate"]]) == 1
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
 def test_single_location_route_computes_with_trivial_order(
     client, admin_headers, db, fleet_dao, geo, monkeypatch
 ):
@@ -485,7 +647,9 @@ def test_single_location_route_computes_with_trivial_order(
         assert [s["name"] for s in stops] == [
             f"IT RO A Lane {marker}", f"IT RO School {marker}",
         ]
-        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35"]
+        # Backward-solved from the 07:00 default gate anchor (U4): one group,
+        # one fake leg -> departure 06:55, gate arrival lands on 07:00.
+        assert [s["scheduled_time"] for s in stops] == ["06:55", "07:00"]
         assert stops[-1]["is_school_gate"] is True
     finally:
         _cleanup(client, admin_headers, students=(kid,), routes=(route,), schools=(school,))
@@ -540,12 +704,14 @@ def test_degraded_recalc_preserves_computed_order_times_and_gate(
         assert [s["name"] for s in stops[:3]] == [
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}", f"IT RO B Lane {marker}",
         ]
-        assert [s["scheduled_time"] for s in stops[:3]] == ["06:30", "06:35", "06:40"]
+        # Computed backward from the 07:00 default anchor (3 legs): C 06:45,
+        # A 06:50, B 06:55, gate 07:00.
+        assert [s["scheduled_time"] for s in stops[:3]] == ["06:45", "06:50", "06:55"]
         assert stops[3]["student_id"] == kid_d["id"]
         assert stops[3]["scheduled_time"] == "06:35"
         assert stops[3]["lat"] is None  # coordinate-less, still a named stop
         assert stops[4]["is_school_gate"] is True
-        assert stops[4]["scheduled_time"] == "06:45"
+        assert stops[4]["scheduled_time"] == "07:00"
 
         # Removing the new student through the container preserves again.
         removed = client.delete(
@@ -554,7 +720,7 @@ def test_degraded_recalc_preserves_computed_order_times_and_gate(
         assert removed.status_code == 200, removed.text
         assert removed.json() == {"ok": True, "stops_recalculated": False}
         stops = _stops(_get_route(client, admin_headers, route["id"]))
-        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35", "06:40", "06:45"]
+        assert [s["scheduled_time"] for s in stops] == ["06:45", "06:50", "06:55", "07:00"]
         assert [s["name"] for s in stops[:3]] == [
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}", f"IT RO B Lane {marker}",
         ]
@@ -665,11 +831,13 @@ def test_sibling_split_inherits_the_shared_record_exactly_once(
         by_name = {
             s["name"]: (s["stop_order"], s["scheduled_time"]) for s in listed["route_stops"]
         }
+        # Computed backward from the 07:00 default anchor (2 legs): the shared
+        # (A,A2) group 06:50, B 06:55, gate 07:00. The split preserves those.
         assert by_name == {
-            f"IT RO A Lane {marker}": (1, "06:30"),   # kept the shared record
-            f"IT RO B Lane {marker}": (2, "06:35"),   # preserved
+            f"IT RO A Lane {marker}": (1, "06:50"),   # kept the shared record
+            f"IT RO B Lane {marker}": (2, "06:55"),   # preserved
             f"IT RO A2 Lane {marker}": (3, "06:35"),  # new group: own pickup time
-            f"IT RO School {marker}": (4, "06:40"),   # gate as-is
+            f"IT RO School {marker}": (4, "07:00"),   # gate as-is
         }
         # Exactly one inheritance: every group got a distinct order.
         orders = [s["stop_order"] for s in listed["route_stops"]]
@@ -1213,7 +1381,8 @@ def test_manual_order_survives_assignment_and_unassignment(
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
 
-        # Computed state: C 06:30, A 06:35, B 06:40, gate 06:45.
+        # Computed state (backward from the 07:00 default anchor, 3 legs):
+        # C 06:45, A 06:50, B 06:55, gate 07:00.
         stops = _stops(_get_route(client, admin_headers, route["id"]))
         key_c, key_a, key_b = _ordered_group_keys(stops)
 
@@ -1224,10 +1393,10 @@ def test_manual_order_survives_assignment_and_unassignment(
         assert listed["last_recalc_degraded"] is False
         # Times travelled with their stops — deliberately non-monotonic now.
         assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
-            (f"IT RO B Lane {marker}", "06:40"),
-            (f"IT RO C Lane {marker}", "06:30"),
-            (f"IT RO A Lane {marker}", "06:35"),
-            (f"IT RO School {marker}", "06:45"),
+            (f"IT RO B Lane {marker}", "06:55"),
+            (f"IT RO C Lane {marker}", "06:45"),
+            (f"IT RO A Lane {marker}", "06:50"),
+            (f"IT RO School {marker}", "07:00"),
         ]
 
         # Assignment through the degraded container: appends before the gate,
@@ -1246,11 +1415,11 @@ def test_manual_order_survives_assignment_and_unassignment(
         assert listed["manual_stop_order"] is True
         assert listed["last_recalc_degraded"] is False
         assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
-            (f"IT RO B Lane {marker}", "06:40"),
-            (f"IT RO C Lane {marker}", "06:30"),
-            (f"IT RO A Lane {marker}", "06:35"),
+            (f"IT RO B Lane {marker}", "06:55"),
+            (f"IT RO C Lane {marker}", "06:45"),
+            (f"IT RO A Lane {marker}", "06:50"),
             (f"IT RO D Lane {marker}", "06:35"),  # appended, own pickup time
-            (f"IT RO School {marker}", "06:45"),  # gate untouched
+            (f"IT RO School {marker}", "07:00"),  # gate untouched
         ]
 
         # Unassignment preserves the manual order and surviving times too.
@@ -1263,10 +1432,10 @@ def test_manual_order_survives_assignment_and_unassignment(
         assert listed["manual_stop_order"] is True
         assert listed["last_recalc_degraded"] is False
         assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
-            (f"IT RO B Lane {marker}", "06:40"),
-            (f"IT RO C Lane {marker}", "06:30"),
-            (f"IT RO A Lane {marker}", "06:35"),
-            (f"IT RO School {marker}", "06:45"),
+            (f"IT RO B Lane {marker}", "06:55"),
+            (f"IT RO C Lane {marker}", "06:45"),
+            (f"IT RO A Lane {marker}", "06:50"),
+            (f"IT RO School {marker}", "07:00"),
         ]
     finally:
         _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,),
@@ -1330,10 +1499,10 @@ def test_recalculate_clears_manual_and_recomputes(
         assert listed["manual_stop_order"] is False
         assert listed["last_recalc_degraded"] is False
         assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
-            (f"IT RO B Lane {marker}", "06:30"),
-            (f"IT RO A Lane {marker}", "06:35"),
-            (f"IT RO C Lane {marker}", "06:40"),
-            (f"IT RO School {marker}", "06:45"),
+            (f"IT RO B Lane {marker}", "06:45"),
+            (f"IT RO A Lane {marker}", "06:50"),
+            (f"IT RO C Lane {marker}", "06:55"),
+            (f"IT RO School {marker}", "07:00"),
         ]
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
@@ -1360,7 +1529,7 @@ def test_manual_pickup_time_edit_writes_through_to_that_stop_only(
                 client, admin_headers,
                 _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
             ))
-        patch_google(monkeypatch, geo)  # computed: A 06:30, B 06:35, C 06:40
+        patch_google(monkeypatch, geo)  # computed (07:00 anchor, 3 legs): A 06:45, B 06:50, C 06:55, gate 07:00
         assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
         db.commit()
 
@@ -1387,10 +1556,10 @@ def test_manual_pickup_time_edit_writes_through_to_that_stop_only(
         assert listed["manual_stop_order"] is True
         assert listed["last_recalc_degraded"] is False  # nothing regenerated
         assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
-            (f"IT RO C Lane {marker}", "06:40"),
+            (f"IT RO C Lane {marker}", "06:55"),
             (f"IT RO A Lane {marker}", "05:50"),  # written through in place
-            (f"IT RO B Lane {marker}", "06:35"),
-            (f"IT RO School {marker}", "06:45"),  # gate untouched
+            (f"IT RO B Lane {marker}", "06:50"),
+            (f"IT RO School {marker}", "07:00"),  # gate untouched
         ]
 
         students = client.get("/api/students", headers=admin_headers).json()
@@ -1505,7 +1674,9 @@ def test_custom_to_auto_handover_lands_in_auto_and_recalculates_immediately(
         stops = _stops(listed)
         assert [s["is_school_gate"] for s in stops] == [False, True]
         assert stops[0]["student_id"] == kid["id"]  # student stops, not planner rows
-        assert [s["scheduled_time"] for s in stops] == ["06:30", "06:35"]  # computed now
+        # Computed backward from the 07:00 default anchor (one group, one leg):
+        # departure 06:55, gate arrival 07:00.
+        assert [s["scheduled_time"] for s in stops] == ["06:55", "07:00"]  # computed now
     finally:
         _cleanup(client, admin_headers, students=(kid,), routes=(route,), schools=(school,))
 
@@ -1600,3 +1771,116 @@ def test_ordering_endpoints_require_admin(client):
     assert response.status_code == 403, response.text
     response = client.post(f"/api/fleet/routes/{bogus}/recalculate", headers=parent_headers)
     assert response.status_code == 403, response.text
+
+
+# Depot as geometry legs (U7, R12-R14) -------------------------------------------
+
+def _make_bus_with_depot(client, admin_headers, marker, depot_lat=-1.35, depot_lng=36.70):
+    r = client.post(
+        "/api/fleet/buses",
+        json={"name": f"IT Depot Bus {marker}", "depot_lat": depot_lat, "depot_lng": depot_lng,
+              "depot_address": "IT Depot", "depot_provenance": "picked"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_morning_depot_prepend_offsets_etas_first_stop_is_not_depot(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7/F10-F11: a morning depot prepends an ORIGIN leg. The gate still lands
+    on the anchor and each student's stop time is pinned to the gate (unchanged
+    by the depot) — the first pickup is NOT the depot departure. The depot is
+    never a stop row; total_duration_s carries the extra leg."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"],
+                        bus_id=bus["id"], gate_anchor="07:30")
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (("A", "06:30", -1.28, 36.79), ("B", "06:40", -1.29, 36.80)):
+            kids.append(_make_student(
+                client, admin_headers, _student_payload(marker, letter, pickup, lat, lng), [route["id"]]
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        # 2 stops + gate = 3 pts; +depot origin = 4 pts / 3 legs. gate anchored at
+        # 07:30; stops pinned one/two legs before it -> 07:20, 07:25 (NOT 07:15,
+        # which is the unwritten depot departure). No depot stop row.
+        non_gate = [s for s in stops if not s["is_school_gate"]]
+        assert len(non_gate) == 2  # depot is NOT a stop row
+        assert [s["scheduled_time"] for s in non_gate] == ["07:20", "07:25"]
+        assert non_gate[0]["scheduled_time"] != "07:15"  # first pickup != depot departure
+        assert stops[-1]["is_school_gate"] and stops[-1]["scheduled_time"] == "07:30"
+        # The depot leg is in the drive total (3 legs x LEG_SECONDS).
+        row = db.execute("select total_duration_s from live_routes where id=%s", (route["id"],)).fetchone()
+        assert row["total_duration_s"] == LEG_SECONDS * 3
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,), buses=(bus,))
+
+
+def test_afternoon_depot_append_is_zip_safe(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7: an afternoon depot appends a DESTINATION leg. The gate stays the
+    departure, drop times are unaffected (the trailing depot ETA is truncated by
+    the zip), and the depot is never a stop row."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "afternoon", school["id"], bus_id=bus["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (("A", "06:40", -1.28, 36.79), ("B", "06:48", -1.29, 36.80)):
+            kids.append(_make_student(
+                client, admin_headers, _student_payload(marker, letter, pickup, lat, lng), [route["id"]]
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        non_gate = [s for s in stops if not s["is_school_gate"]]
+        assert len(non_gate) == 2  # depot is NOT a stop row
+        assert stops[0]["is_school_gate"] and stops[0]["scheduled_time"] == "15:30"  # gate departs
+        assert [s["scheduled_time"] for s in stops] == ["15:30", "15:35", "15:40"]  # depot ETA truncated
+        row = db.execute("select total_duration_s from live_routes where id=%s", (route["id"],)).fetchone()
+        assert row["total_duration_s"] == LEG_SECONDS * 3  # gate->B->A->depot = 3 legs
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,), buses=(bus,))
+
+
+def test_only_the_boundary_trip_gets_the_depot_leg(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7: on a multi-trip bus the depot attaches only to the FIRST morning trip
+    (min trip_index); a later morning trip gets no depot leg."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    t1 = client.post("/api/fleet/routes", json={"name": f"IT Depot T1 {marker}", "type": "morning",
+                     "school_id": school["id"], "bus_id": bus["id"], "trip_index": 1,
+                     "gate_anchor": "07:30"}, headers=admin_headers).json()
+    t2 = client.post("/api/fleet/routes", json={"name": f"IT Depot T2 {marker}", "type": "morning",
+                     "school_id": school["id"], "bus_id": bus["id"], "trip_index": 2,
+                     "gate_anchor": "08:30"}, headers=admin_headers).json()
+    kids = []
+    try:
+        k1 = _make_student(client, admin_headers, _student_payload(marker, "A", "06:30", -1.28, 36.79), [t1["id"]])
+        k2 = _make_student(client, admin_headers, _student_payload(marker, "B", "07:30", -1.29, 36.80), [t2["id"]])
+        kids += [k1, k2]
+        patch_google(monkeypatch, geo, order=[0])
+        assert fleet_dao.regenerate_route_stops(db, t1["id"]) is True
+        assert fleet_dao.regenerate_route_stops(db, t2["id"]) is True
+        db.commit()
+        # trip1 (boundary): 1 stop + gate + depot = 2 legs.
+        r1 = db.execute("select total_duration_s from live_routes where id=%s", (t1["id"],)).fetchone()
+        assert r1["total_duration_s"] == LEG_SECONDS * 2
+        # trip2 (not boundary): 1 stop + gate = 1 leg, no depot.
+        r2 = db.execute("select total_duration_s from live_routes where id=%s", (t2["id"],)).fetchone()
+        assert r2["total_duration_s"] == LEG_SECONDS * 1
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(t1, t2), schools=(school,), buses=(bus,))

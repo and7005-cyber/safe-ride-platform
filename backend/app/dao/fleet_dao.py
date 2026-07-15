@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import re
 from typing import Any
 
 from app.core.db import get_connection
@@ -8,13 +9,32 @@ from app.services import geo_service
 
 logger = logging.getLogger("saferide.fleet")
 
-# Departure anchors (Africa/Nairobi wall clock) for the geometry ETAs (U6).
-# Morning anchors on the earliest assigned pickup_time when one exists;
-# afternoon ALWAYS anchors on its type default — pickup_time is a
-# morning-clock attribute, so an afternoon route anchored on it would write
-# dawn-clock drop-off times that look derived.
+# HH:MM (00:00–23:59) — the only shape resolve_gate_anchor / _hhmm_to_min accept.
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+# System-default gate anchors (Africa/Nairobi wall clock), the fallback of last
+# resort beneath the one authority (route.gate_anchor override -> school bell ->
+# these). Under bell-anchoring (U4) the gate time is an INPUT the schedule is
+# solved against, not an output derived from pickup times.
 _MORNING_DEFAULT = "07:00"
 _AFTERNOON_DEFAULT = "15:30"
+
+def resolve_gate_anchor(route: dict) -> str:
+    """The route's gate anchor (HH:MM), one authority: the route-level override
+    if set, else the school's bell for the direction, else the system default.
+    ``route`` carries gate_anchor + morning_bell/afternoon_bell (joined in
+    ``_ROUTE_GEOMETRY_INPUTS_SQL``). ALWAYS returns a valid HH:MM: a malformed
+    stored anchor/bell (the columns are free-text) is skipped rather than
+    propagated, so downstream _hhmm_to_min / next_departure never crash on
+    legacy bad data (payload validation rejects new bad values up front)."""
+    is_afternoon = route["type"] == "afternoon"
+    anchor = route.get("gate_anchor")
+    if anchor and _HHMM_RE.match(anchor):
+        return anchor
+    bell = route.get("afternoon_bell") if is_afternoon else route.get("morning_bell")
+    if bell and _HHMM_RE.match(bell):
+        return bell
+    return _AFTERNOON_DEFAULT if is_afternoon else _MORNING_DEFAULT
 
 
 def _stop_label(st: dict) -> str:
@@ -84,9 +104,12 @@ def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
 
 
 _ROUTE_GEOMETRY_INPUTS_SQL = (
-    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, "
-    "s.name as school_name, s.lat as school_lat, s.lng as school_lng "
+    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, r.stops_computed, "
+    "r.gate_anchor, r.bus_id, r.trip_index, s.morning_bell, s.afternoon_bell, "
+    "s.name as school_name, s.lat as school_lat, s.lng as school_lng, "
+    "b.depot_lat, b.depot_lng "
     "from live_routes r left join live_schools s on s.id = r.school_id "
+    "left join live_buses b on b.id = r.bus_id "
     "where r.id = %s"
 )
 
@@ -106,8 +129,29 @@ def _geometry_fingerprint(route, location_keys: list[str], points: dict[str, dic
         str(route["school_id"]) if route["school_id"] is not None else None,
         route["school_lat"], route["school_lng"],
         bool(route["custom_stops"]), bool(route["manual_stop_order"]),
+        # trip_index + depot (U7): a depot move or trip-boundary change alters the
+        # prepended/appended leg, so phase 2 must discard a stale phase-1 compute.
+        route.get("trip_index"), route.get("depot_lat"), route.get("depot_lng"),
         groups,
     )
+
+
+def _depot_leg(conn, route) -> dict | None:
+    """The depot geometry point for a route, or None (U7/R12-R14). The depot is a
+    bus attribute that enters geometry ONLY as a boundary leg — an origin on the
+    bus's FIRST morning trip (min trip_index) and a destination on its LAST
+    afternoon trip (max trip_index) — never a stop row. Returns {'lat','lng'}."""
+    if not route.get("bus_id") or route.get("depot_lat") is None or route.get("depot_lng") is None:
+        return None
+    is_afternoon = route["type"] == "afternoon"
+    agg = "max" if is_afternoon else "min"
+    boundary = conn.execute(
+        f"select {agg}(trip_index) as ti from live_routes where bus_id = %s and type = %s",
+        (route["bus_id"], route["type"]),
+    ).fetchone()
+    if boundary and boundary["ti"] == route["trip_index"]:
+        return {"lat": route["depot_lat"], "lng": route["depot_lng"]}
+    return None
 
 
 def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
@@ -146,14 +190,11 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         )
         return result
 
-    # The departure anchor is derived from the student rows, never from the
-    # stop rows phase 2 is about to delete — else every recalc would reset a
-    # morning route to the 07:00 default.
-    if is_afternoon:
-        departure = geo_service.next_departure(None, default=_AFTERNOON_DEFAULT)
-    else:
-        earliest = next((st["pickup_time"] for st in students if st["pickup_time"]), None)
-        departure = geo_service.next_departure(earliest, default=_MORNING_DEFAULT)
+    # Bell-time anchor, one authority (U4): route override -> school bell ->
+    # system default. The schedule is solved AGAINST this gate time; it is never
+    # derived from student pickup times (the pre-U4 model, now retired). Student
+    # churn shifts the departure earlier/later — never the gate.
+    anchor_hhmm = resolve_gate_anchor(route)
 
     n_locations = len(location_keys)
     gate_point = {"lat": route["school_lat"], "lng": route["school_lng"]}
@@ -170,16 +211,25 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         return result
 
     ordered_keys = [p["key"] for p in ordering["ordered"]]
+    # Depot (U7): a boundary leg only — prepended origin on the first morning
+    # trip, appended destination on the last afternoon trip. Never a stop row.
+    depot = _depot_leg(conn, route)
     if is_afternoon:
-        # Existing afternoon semantics: the school gate leads and the
-        # computed order runs backwards (first pickup of the morning
-        # direction is dropped last).
+        # The school gate leads and the computed order runs backwards (first
+        # pickup of the morning direction is dropped last). The anchor IS the
+        # gate departure, so this is a single forward solve — no iteration.
         seq_keys = list(reversed(ordered_keys))
-        seq = [gate_point] + [points[k] for k in seq_keys]
+        seq = [gate_point] + [points[k] for k in seq_keys] + ([depot] if depot else [])
+        departure = geo_service.next_departure(anchor_hhmm, default=_AFTERNOON_DEFAULT)
+        geom = geo_service.route_geometry(seq, departure=departure)
+        converged = True
     else:
+        # Morning: the gate is the LAST point; backward-solve the departure so
+        # the gate-arrival ETA lands on the anchor (fixed-point iteration).
         seq_keys = ordered_keys
-        seq = [points[k] for k in seq_keys] + [gate_point]
-    geom = geo_service.route_geometry(seq, departure=departure)
+        seq = ([depot] if depot else []) + [points[k] for k in seq_keys] + [gate_point]
+        anchor_dt = geo_service.next_departure(anchor_hhmm, default=_MORNING_DEFAULT)
+        departure, geom, converged = geo_service.solve_morning_departure(seq, anchor_dt)
     if geom["provider"] != "google-routes" or len(geom["legs"]) != len(seq) - 1:
         # Mixed signals (order ok, geometry degraded/misshapen): full
         # fallback — never a partial write.
@@ -192,16 +242,28 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         cumulative += leg.get("duration_s") or 0
         etas.append((departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M"))
     if is_afternoon:
+        # Append is zip-safe: seq_keys is shorter than etas[1:] (the trailing
+        # depot arrival), so zip() truncates the depot ETA off the tail.
         gate_time, group_times = etas[0], dict(zip(seq_keys, etas[1:]))
         orders = {key: 2 + i for i, key in enumerate(seq_keys)}
         gate_order = 1
     else:
-        gate_time, group_times = etas[-1], dict(zip(seq_keys, etas[:-1]))
+        # Morning prepend is NOT zip-symmetric: a leading depot-departure ETA
+        # shifts the stop mapping by one, so stops map to etas[1:-1] (skip the
+        # depot departure AND the trailing gate) instead of etas[:-1] (U7/F10).
+        stop_etas = etas[1:-1] if depot else etas[:-1]
+        gate_time, group_times = etas[-1], dict(zip(seq_keys, stop_etas))
         orders = {key: 1 + i for i, key in enumerate(seq_keys)}
         gate_order = n_locations + 1
     result["computed"] = {
         "seq_keys": seq_keys, "orders": orders, "group_times": group_times,
         "gate_time": gate_time, "gate_order": gate_order,
+        # Persisted on the auto route (U3): the turnaround feasibility gate (U6)
+        # needs the drive duration of auto routes, not just planner-saved ones.
+        "total_duration_s": geom.get("total_duration_s"),
+        # False when the morning backward solve exhausted its iteration budget
+        # (U4): the best-iterate times are still written, but flagged degraded.
+        "converged": converged,
     }
     return result
 
@@ -349,10 +411,21 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
                 _insert_stop(conn, route_id, gate_name, computed["gate_order"],
                              computed["gate_time"],
                              route["school_lat"], route["school_lng"], True, None)
+                # The best-iterate geometry is written either way; a non-convergent
+                # morning solve (U4) is still flagged degraded through the durable
+                # channel — never silent.
+                converged = computed.get("converged", True)
                 conn.execute(
-                    "update live_routes set last_recalc_degraded = false where id = %s",
-                    (route_id,),
+                    "update live_routes set last_recalc_degraded = %s, "
+                    "stops_computed = true, total_duration_s = %s where id = %s",
+                    (not converged, computed.get("total_duration_s"), route_id),
                 )
+                if not converged:
+                    logger.warning(
+                        "route %s bell-anchor backward solve did not converge; "
+                        "wrote the best-error iterate", route_id
+                    )
+                    return False
                 return True
             degraded_reason = pre["degraded_reason"]
         else:
@@ -367,7 +440,12 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     # only the geometry path writes one, and this fallback re-writes it as-is,
     # so the marker survives degraded rebuilds in between. Manual routes (U7)
     # preserve unconditionally — the admin's order is authoritative.
-    previously_computed = prev_gate_time is not None
+    # U3: read the explicit marker, not the gate-row-time inference. Once admins
+    # can type a gate time (U4), "the gate row carries a scheduled_time" no longer
+    # means "geometry was computed"; the column is backfilled at 009 to match the
+    # old inference exactly at the cutover. prev_gate_time is still used below to
+    # re-write the gate row's preserved time.
+    previously_computed = bool(route["stops_computed"])
     preserve = previously_computed or not is_auto
     resolved: dict[str, dict] = {}
     if preserve:
@@ -538,30 +616,89 @@ def recalculate_route_stops(conn, route_id: str) -> bool:
 
 
 def _check_route_bus_conflict(
-    conn, bus_id: str | None, route_type: str, exclude_route_id: str | None = None
+    conn, bus_id: str | None, route_type: str, trip_index: int = 1,
+    exclude_route_id: str | None = None,
 ) -> None:
-    """One route per (bus, type) (R1). This friendly pre-check names the
-    conflicting route and bus; the partial unique index
-    live_routes_bus_type_key (migration 007) is the race-proof backstop."""
+    """One route per (bus, type, trip_index) (U6/R19: multi-trip). This friendly
+    pre-check names the conflicting route and bus; the partial unique index
+    live_routes_bus_type_key (now 3-column, migration 009) is the race-proof
+    backstop. A bus may hold several trips per period as long as each carries a
+    distinct trip_index."""
     from app.core.errors import ConflictError
 
     if not bus_id:
         return
     exclude_sql = " and r.id <> %s" if exclude_route_id else ""
-    params: list = [bus_id, route_type]
+    params: list = [bus_id, route_type, trip_index]
     if exclude_route_id:
         params.append(exclude_route_id)
     existing = conn.execute(
         "select r.name as route_name, b.name as bus_name "
         "from live_routes r join live_buses b on b.id = r.bus_id "
-        f"where r.bus_id = %s and r.type = %s{exclude_sql} limit 1",
+        f"where r.bus_id = %s and r.type = %s and r.trip_index = %s{exclude_sql} limit 1",
         params,
     ).fetchone()
     if existing:
         raise ConflictError(
-            f"Bus {existing['bus_name']} already has a {route_type} route "
-            f"({existing['route_name']})"
+            f"Bus {existing['bus_name']} already has a {route_type} trip {trip_index} "
+            f"({existing['route_name']}) — give this trip a different trip number"
         )
+
+
+_TURNAROUND_BUFFER_MIN_DEFAULT = 15
+
+
+def _hhmm_to_min(hhmm: str) -> int:
+    h, m = (int(x) for x in hhmm.split(":")[:2])
+    return h * 60 + m
+
+
+def _check_turnaround_feasibility(conn, bus_id: str | None, route_type: str) -> None:
+    """Flag an infeasible multi-trip chain for one (bus, period) (U6/R20). Each
+    later trip's solved departure must be >= the prior trip's BUS-FREE time plus
+    the turnaround buffer. Bus-free is period-asymmetric: morning = the gate
+    ARRIVAL (the anchor); afternoon = last-dropoff ETA + the return-to-gate
+    deadhead — the buffer stands in for that unmodeled return leg. Infeasible
+    trips persist last_recalc_degraded=true + WARN through the durable channel;
+    never a hard block (an admin may knowingly stage a tight chain). Runs after
+    regeneration, which clears the flag on a converged solve, so this is the
+    authority on chain feasibility."""
+    if not bus_id:
+        return
+    from app.core.config import get_settings
+
+    buffer_min = getattr(get_settings(), "turnaround_buffer_min", _TURNAROUND_BUFFER_MIN_DEFAULT)
+    is_afternoon = route_type == "afternoon"
+    trips = conn.execute(
+        "select r.id, r.gate_anchor, r.type, r.total_duration_s, "
+        "s.morning_bell, s.afternoon_bell "
+        "from live_routes r left join live_schools s on s.id = r.school_id "
+        "where r.bus_id = %s and r.type = %s",
+        (bus_id, route_type),
+    ).fetchall()
+    if len(trips) < 2:
+        return  # a single trip is always feasible
+    trips = sorted(trips, key=lambda t: _hhmm_to_min(resolve_gate_anchor(t)))
+    for prev, cur in zip(trips, trips[1:]):
+        prev_anchor, cur_anchor = _hhmm_to_min(resolve_gate_anchor(prev)), _hhmm_to_min(resolve_gate_anchor(cur))
+        prev_drive = round((prev["total_duration_s"] or 0) / 60)
+        cur_drive = round((cur["total_duration_s"] or 0) / 60)
+        if is_afternoon:
+            # bus is free after driving the whole route out (return deadhead in
+            # the buffer); the next afternoon trip departs at its own anchor.
+            bus_free, cur_departure = prev_anchor + prev_drive, cur_anchor
+        else:
+            # bus is free at the gate arrival (the anchor); the next morning trip
+            # departs its solved drive before its anchor.
+            bus_free, cur_departure = prev_anchor, cur_anchor - cur_drive
+        if cur_departure < bus_free + buffer_min:
+            conn.execute(
+                "update live_routes set last_recalc_degraded = true where id = %s", (cur["id"],)
+            )
+            logger.warning(
+                "turnaround infeasible: bus %s %s trip %s departs before the prior "
+                "trip is free + %d min buffer", bus_id, route_type, cur["id"], buffer_min
+            )
 
 
 def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
@@ -583,6 +720,17 @@ def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
                 bool(stop.get("is_school")),
             ),
         )
+    # U3: a planner-saved route is "computed" — mark it so a later
+    # student-assignment handover (which flips custom_stops off and regenerates)
+    # takes the preservation path rather than a wholesale rebuild. Mirrors the
+    # marker's gate-time semantics (true iff the gate row carries a time).
+    conn.execute(
+        "update live_routes set stops_computed = exists ("
+        "select 1 from live_route_stops s where s.route_id = %s "
+        "and s.is_school_gate and s.scheduled_time is not null"
+        ") where id = %s",
+        (route_id, route_id),
+    )
 
 
 class FleetDao:
@@ -635,9 +783,11 @@ class FleetDao:
         with get_connection() as conn:
             row = conn.execute(
                 """
-                insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone, capacity, status)
+                insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone,
+                    capacity, status, depot_lat, depot_lng, depot_address, depot_provenance)
                 values (%(name)s, %(plate_number)s, %(driver_id)s, %(driver_name)s, %(driver_phone)s,
-                        coalesce(%(capacity)s, 45), coalesce(%(status)s, 'idle'))
+                        coalesce(%(capacity)s, 45), coalesce(%(status)s, 'idle'),
+                        %(depot_lat)s, %(depot_lng)s, %(depot_address)s, %(depot_provenance)s)
                 returning *
                 """,
                 data,
@@ -646,17 +796,44 @@ class FleetDao:
 
     def update_bus(self, bus_id: str, data: dict) -> dict[str, Any] | None:
         with get_connection() as conn:
+            before = conn.execute(
+                "select depot_lat, depot_lng from live_buses where id = %s", (bus_id,)
+            ).fetchone()
             row = conn.execute(
                 """
                 update live_buses set
                     name = %(name)s, plate_number = %(plate_number)s, driver_id = %(driver_id)s,
                     driver_name = %(driver_name)s, driver_phone = %(driver_phone)s,
-                    capacity = coalesce(%(capacity)s, 45), status = coalesce(%(status)s, 'idle')
+                    capacity = coalesce(%(capacity)s, 45), status = coalesce(%(status)s, 'idle'),
+                    depot_lat = %(depot_lat)s, depot_lng = %(depot_lng)s,
+                    depot_address = %(depot_address)s, depot_provenance = %(depot_provenance)s
                 where id = %(id)s returning *
                 """,
                 {**data, "id": bus_id},
             ).fetchone()
-        return dict(row) if row else None
+            if not row:
+                return None
+            # A depot move changes the boundary-trip geometry (U7): regenerate
+            # this bus's routes so the first-morning origin / last-afternoon
+            # destination leg is recomputed. order by id: the global lock order.
+            depot_changed = before is not None and (
+                before["depot_lat"] != row["depot_lat"] or before["depot_lng"] != row["depot_lng"]
+            )
+            route_ids = []
+            if depot_changed:
+                route_ids = [
+                    r["id"] for r in conn.execute(
+                        "select id from live_routes where bus_id = %s order by id", (bus_id,)
+                    ).fetchall()
+                ]
+        # One transaction per route (mirrors update_school): a depot edit fans
+        # out to each affected route's regeneration + provider calls.
+        for route_id in route_ids:
+            with get_connection() as conn:
+                regenerate_route_stops(conn, route_id)
+                _check_turnaround_feasibility(conn, bus_id, "morning")
+                _check_turnaround_feasibility(conn, bus_id, "afternoon")
+        return dict(row)
 
     def delete_bus(self, bus_id: str) -> None:
         with get_connection() as conn:
@@ -672,8 +849,9 @@ class FleetDao:
     def create_school(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
             row = conn.execute(
-                "insert into live_schools (name, address, phone, lat, lng) "
-                "values (%(name)s, %(address)s, %(phone)s, %(lat)s, %(lng)s) returning *",
+                "insert into live_schools (name, address, phone, lat, lng, morning_bell, afternoon_bell) "
+                "values (%(name)s, %(address)s, %(phone)s, %(lat)s, %(lng)s, "
+                "%(morning_bell)s, %(afternoon_bell)s) returning *",
                 data,
             ).fetchone()
         return dict(row)
@@ -682,7 +860,8 @@ class FleetDao:
         with get_connection() as conn:
             row = conn.execute(
                 "update live_schools set name=%(name)s, address=%(address)s, phone=%(phone)s, "
-                "lat=%(lat)s, lng=%(lng)s where id=%(id)s returning *",
+                "lat=%(lat)s, lng=%(lng)s, morning_bell=%(morning_bell)s, "
+                "afternoon_bell=%(afternoon_bell)s where id=%(id)s returning *",
                 {**data, "id": school_id},
             ).fetchone()
             if row:
@@ -755,16 +934,19 @@ class FleetDao:
 
     def create_route(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:
-            _check_route_bus_conflict(conn, data.get("bus_id"), data.get("type") or "morning")
+            _check_route_bus_conflict(
+                conn, data.get("bus_id"), data.get("type") or "morning", data.get("trip_index") or 1
+            )
             # A planner save carries its own stops: flag the route custom,
             # keep the polyline/totals, write the stops verbatim and skip
             # student-based regeneration (R17/R18).
             custom = bool(data.get("stops"))
             row = conn.execute(
-                "insert into live_routes (name, type, bus_id, school_id, "
+                "insert into live_routes (name, type, bus_id, school_id, gate_anchor, trip_index, "
                 "custom_stops, polyline, total_distance_m, total_duration_s) "
                 "values (%(name)s, coalesce(%(type)s,'morning'), %(bus_id)s, %(school_id)s, "
-                "%(custom_stops)s, %(polyline)s, %(total_distance_m)s, %(total_duration_s)s) returning *",
+                "%(gate_anchor)s, coalesce(%(trip_index)s, 1), %(custom_stops)s, %(polyline)s, "
+                "%(total_distance_m)s, %(total_duration_s)s) returning *",
                 {
                     **data,
                     "custom_stops": custom,
@@ -778,6 +960,9 @@ class FleetDao:
                 _write_custom_stops(conn, row["id"], data["stops"])
             else:
                 stops_recalculated = regenerate_route_stops(conn, row["id"])
+            # Turnaround feasibility across this bus's period chain (U6/R20) —
+            # after regeneration, which clears the flag on a converged solve.
+            _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
         # Observable degradation (U6/R10): false when the rebuild fell back —
         # same signal shape as update_route.
         return {**dict(row), "stops_recalculated": stops_recalculated}
@@ -793,7 +978,7 @@ class FleetDao:
                 return None
             _check_route_bus_conflict(
                 conn, data.get("bus_id"), data.get("type") or "morning",
-                exclude_route_id=route_id,
+                data.get("trip_index") or 1, exclude_route_id=route_id,
             )
             custom = bool(data.get("stops"))
             stops_recalculated = True
@@ -807,8 +992,9 @@ class FleetDao:
                 # never clear).
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                    "bus_id=%(bus_id)s, school_id=%(school_id)s, custom_stops=true, "
-                    "manual_stop_order=false, last_recalc_degraded=false, "
+                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
+                    "trip_index=coalesce(%(trip_index)s, 1), "
+                    "custom_stops=true, manual_stop_order=false, last_recalc_degraded=false, "
                     "polyline=%(polyline)s, total_distance_m=%(total_distance_m)s, "
                     "total_duration_s=%(total_duration_s)s where id=%(id)s returning *",
                     {**data, "id": route_id},
@@ -821,7 +1007,8 @@ class FleetDao:
                 # for it); normal routes rebuild from students as before.
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                    "bus_id=%(bus_id)s, school_id=%(school_id)s where id=%(id)s returning *",
+                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
+                    "trip_index=coalesce(%(trip_index)s, 1) where id=%(id)s returning *",
                     {**data, "id": route_id},
                 ).fetchone()
                 if row:
@@ -838,6 +1025,11 @@ class FleetDao:
                     ).fetchall()
                     for s in students:
                         _derive_student_bus(conn, s["student_id"])
+                # Re-evaluate turnaround feasibility for the route's (new) chain,
+                # and for the chain it may have left (bus/type change).
+                _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
+                if current["bus_id"] != row["bus_id"] or current["type"] != row["type"]:
+                    _check_turnaround_feasibility(conn, current["bus_id"], current["type"])
         if not row:
             return None
         # Observable degradation (U6/R10): false when the rebuild fell back.
@@ -868,9 +1060,11 @@ class FleetDao:
         on each affected route's ordering mode, decided under the same
         route-row lock every stop rewrite takes (U6):
 
-        - auto: regenerate — on google routes the new time re-anchors the
-          morning departure (pickup_time is otherwise input-only there);
-          never-computed routes re-sort by it as before.
+        - auto: regenerate. Under bell-anchoring (U4) a computed morning route
+          is solved backwards from its gate anchor, so a pickup_time edit no
+          longer moves its schedule — it only affects the canonical stop sort
+          (``_assigned_students``) and the degraded/never-computed fallback
+          order. It never re-anchors a computed morning departure any more.
         - manual (U7, R13): write the new time through to that student's own
           stop row only — the admin's order is authoritative, so no re-sort
           and no regeneration; every other stop and the gate row stay as-is.
