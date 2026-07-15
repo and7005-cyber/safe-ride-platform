@@ -34,6 +34,13 @@ class BusPayload(BaseModel):
     driver_phone: str | None = None
     capacity: int | None = 45
     status: str | None = "idle"
+    # Overnight depot (U7/R12-R14): the bus starts its FIRST morning trip here
+    # and ends its LAST afternoon trip here. Enters geometry as a boundary leg,
+    # never a stop row. Set via the same PlacePicker.
+    depot_lat: float | None = None
+    depot_lng: float | None = None
+    depot_address: str | None = None
+    depot_provenance: str | None = None
 
 
 class SchoolPayload(BaseModel):

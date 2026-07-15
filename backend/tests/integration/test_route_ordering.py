@@ -1771,3 +1771,116 @@ def test_ordering_endpoints_require_admin(client):
     assert response.status_code == 403, response.text
     response = client.post(f"/api/fleet/routes/{bogus}/recalculate", headers=parent_headers)
     assert response.status_code == 403, response.text
+
+
+# Depot as geometry legs (U7, R12-R14) -------------------------------------------
+
+def _make_bus_with_depot(client, admin_headers, marker, depot_lat=-1.35, depot_lng=36.70):
+    r = client.post(
+        "/api/fleet/buses",
+        json={"name": f"IT Depot Bus {marker}", "depot_lat": depot_lat, "depot_lng": depot_lng,
+              "depot_address": "IT Depot", "depot_provenance": "picked"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_morning_depot_prepend_offsets_etas_first_stop_is_not_depot(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7/F10-F11: a morning depot prepends an ORIGIN leg. The gate still lands
+    on the anchor and each student's stop time is pinned to the gate (unchanged
+    by the depot) — the first pickup is NOT the depot departure. The depot is
+    never a stop row; total_duration_s carries the extra leg."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"],
+                        bus_id=bus["id"], gate_anchor="07:30")
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (("A", "06:30", -1.28, 36.79), ("B", "06:40", -1.29, 36.80)):
+            kids.append(_make_student(
+                client, admin_headers, _student_payload(marker, letter, pickup, lat, lng), [route["id"]]
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        # 2 stops + gate = 3 pts; +depot origin = 4 pts / 3 legs. gate anchored at
+        # 07:30; stops pinned one/two legs before it -> 07:20, 07:25 (NOT 07:15,
+        # which is the unwritten depot departure). No depot stop row.
+        non_gate = [s for s in stops if not s["is_school_gate"]]
+        assert len(non_gate) == 2  # depot is NOT a stop row
+        assert [s["scheduled_time"] for s in non_gate] == ["07:20", "07:25"]
+        assert non_gate[0]["scheduled_time"] != "07:15"  # first pickup != depot departure
+        assert stops[-1]["is_school_gate"] and stops[-1]["scheduled_time"] == "07:30"
+        # The depot leg is in the drive total (3 legs x LEG_SECONDS).
+        row = db.execute("select total_duration_s from live_routes where id=%s", (route["id"],)).fetchone()
+        assert row["total_duration_s"] == LEG_SECONDS * 3
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,), buses=(bus,))
+
+
+def test_afternoon_depot_append_is_zip_safe(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7: an afternoon depot appends a DESTINATION leg. The gate stays the
+    departure, drop times are unaffected (the trailing depot ETA is truncated by
+    the zip), and the depot is never a stop row."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "afternoon", school["id"], bus_id=bus["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (("A", "06:40", -1.28, 36.79), ("B", "06:48", -1.29, 36.80)):
+            kids.append(_make_student(
+                client, admin_headers, _student_payload(marker, letter, pickup, lat, lng), [route["id"]]
+            ))
+        patch_google(monkeypatch, geo, order=[0, 1])
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+        stops = _stops(_get_route(client, admin_headers, route["id"]))
+        non_gate = [s for s in stops if not s["is_school_gate"]]
+        assert len(non_gate) == 2  # depot is NOT a stop row
+        assert stops[0]["is_school_gate"] and stops[0]["scheduled_time"] == "15:30"  # gate departs
+        assert [s["scheduled_time"] for s in stops] == ["15:30", "15:35", "15:40"]  # depot ETA truncated
+        row = db.execute("select total_duration_s from live_routes where id=%s", (route["id"],)).fetchone()
+        assert row["total_duration_s"] == LEG_SECONDS * 3  # gate->B->A->depot = 3 legs
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,), buses=(bus,))
+
+
+def test_only_the_boundary_trip_gets_the_depot_leg(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """U7: on a multi-trip bus the depot attaches only to the FIRST morning trip
+    (min trip_index); a later morning trip gets no depot leg."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus_with_depot(client, admin_headers, marker)
+    t1 = client.post("/api/fleet/routes", json={"name": f"IT Depot T1 {marker}", "type": "morning",
+                     "school_id": school["id"], "bus_id": bus["id"], "trip_index": 1,
+                     "gate_anchor": "07:30"}, headers=admin_headers).json()
+    t2 = client.post("/api/fleet/routes", json={"name": f"IT Depot T2 {marker}", "type": "morning",
+                     "school_id": school["id"], "bus_id": bus["id"], "trip_index": 2,
+                     "gate_anchor": "08:30"}, headers=admin_headers).json()
+    kids = []
+    try:
+        k1 = _make_student(client, admin_headers, _student_payload(marker, "A", "06:30", -1.28, 36.79), [t1["id"]])
+        k2 = _make_student(client, admin_headers, _student_payload(marker, "B", "07:30", -1.29, 36.80), [t2["id"]])
+        kids += [k1, k2]
+        patch_google(monkeypatch, geo, order=[0])
+        assert fleet_dao.regenerate_route_stops(db, t1["id"]) is True
+        assert fleet_dao.regenerate_route_stops(db, t2["id"]) is True
+        db.commit()
+        # trip1 (boundary): 1 stop + gate + depot = 2 legs.
+        r1 = db.execute("select total_duration_s from live_routes where id=%s", (t1["id"],)).fetchone()
+        assert r1["total_duration_s"] == LEG_SECONDS * 2
+        # trip2 (not boundary): 1 stop + gate = 1 leg, no depot.
+        r2 = db.execute("select total_duration_s from live_routes where id=%s", (t2["id"],)).fetchone()
+        assert r2["total_duration_s"] == LEG_SECONDS * 1
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(t1, t2), schools=(school,), buses=(bus,))

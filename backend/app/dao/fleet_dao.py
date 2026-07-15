@@ -95,9 +95,11 @@ def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
 
 _ROUTE_GEOMETRY_INPUTS_SQL = (
     "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, r.stops_computed, "
-    "r.gate_anchor, s.morning_bell, s.afternoon_bell, "
-    "s.name as school_name, s.lat as school_lat, s.lng as school_lng "
+    "r.gate_anchor, r.bus_id, r.trip_index, s.morning_bell, s.afternoon_bell, "
+    "s.name as school_name, s.lat as school_lat, s.lng as school_lng, "
+    "b.depot_lat, b.depot_lng "
     "from live_routes r left join live_schools s on s.id = r.school_id "
+    "left join live_buses b on b.id = r.bus_id "
     "where r.id = %s"
 )
 
@@ -117,8 +119,29 @@ def _geometry_fingerprint(route, location_keys: list[str], points: dict[str, dic
         str(route["school_id"]) if route["school_id"] is not None else None,
         route["school_lat"], route["school_lng"],
         bool(route["custom_stops"]), bool(route["manual_stop_order"]),
+        # trip_index + depot (U7): a depot move or trip-boundary change alters the
+        # prepended/appended leg, so phase 2 must discard a stale phase-1 compute.
+        route.get("trip_index"), route.get("depot_lat"), route.get("depot_lng"),
         groups,
     )
+
+
+def _depot_leg(conn, route) -> dict | None:
+    """The depot geometry point for a route, or None (U7/R12-R14). The depot is a
+    bus attribute that enters geometry ONLY as a boundary leg — an origin on the
+    bus's FIRST morning trip (min trip_index) and a destination on its LAST
+    afternoon trip (max trip_index) — never a stop row. Returns {'lat','lng'}."""
+    if not route.get("bus_id") or route.get("depot_lat") is None or route.get("depot_lng") is None:
+        return None
+    is_afternoon = route["type"] == "afternoon"
+    agg = "max" if is_afternoon else "min"
+    boundary = conn.execute(
+        f"select {agg}(trip_index) as ti from live_routes where bus_id = %s and type = %s",
+        (route["bus_id"], route["type"]),
+    ).fetchone()
+    if boundary and boundary["ti"] == route["trip_index"]:
+        return {"lat": route["depot_lat"], "lng": route["depot_lng"]}
+    return None
 
 
 def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
@@ -178,12 +201,15 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         return result
 
     ordered_keys = [p["key"] for p in ordering["ordered"]]
+    # Depot (U7): a boundary leg only — prepended origin on the first morning
+    # trip, appended destination on the last afternoon trip. Never a stop row.
+    depot = _depot_leg(conn, route)
     if is_afternoon:
         # The school gate leads and the computed order runs backwards (first
         # pickup of the morning direction is dropped last). The anchor IS the
         # gate departure, so this is a single forward solve — no iteration.
         seq_keys = list(reversed(ordered_keys))
-        seq = [gate_point] + [points[k] for k in seq_keys]
+        seq = [gate_point] + [points[k] for k in seq_keys] + ([depot] if depot else [])
         departure = geo_service.next_departure(anchor_hhmm, default=_AFTERNOON_DEFAULT)
         geom = geo_service.route_geometry(seq, departure=departure)
         converged = True
@@ -191,7 +217,7 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         # Morning: the gate is the LAST point; backward-solve the departure so
         # the gate-arrival ETA lands on the anchor (fixed-point iteration).
         seq_keys = ordered_keys
-        seq = [points[k] for k in seq_keys] + [gate_point]
+        seq = ([depot] if depot else []) + [points[k] for k in seq_keys] + [gate_point]
         anchor_dt = geo_service.next_departure(anchor_hhmm, default=_MORNING_DEFAULT)
         departure, geom, converged = geo_service.solve_morning_departure(seq, anchor_dt)
     if geom["provider"] != "google-routes" or len(geom["legs"]) != len(seq) - 1:
@@ -206,11 +232,17 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         cumulative += leg.get("duration_s") or 0
         etas.append((departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M"))
     if is_afternoon:
+        # Append is zip-safe: seq_keys is shorter than etas[1:] (the trailing
+        # depot arrival), so zip() truncates the depot ETA off the tail.
         gate_time, group_times = etas[0], dict(zip(seq_keys, etas[1:]))
         orders = {key: 2 + i for i, key in enumerate(seq_keys)}
         gate_order = 1
     else:
-        gate_time, group_times = etas[-1], dict(zip(seq_keys, etas[:-1]))
+        # Morning prepend is NOT zip-symmetric: a leading depot-departure ETA
+        # shifts the stop mapping by one, so stops map to etas[1:-1] (skip the
+        # depot departure AND the trailing gate) instead of etas[:-1] (U7/F10).
+        stop_etas = etas[1:-1] if depot else etas[:-1]
+        gate_time, group_times = etas[-1], dict(zip(seq_keys, stop_etas))
         orders = {key: 1 + i for i, key in enumerate(seq_keys)}
         gate_order = n_locations + 1
     result["computed"] = {
@@ -741,9 +773,11 @@ class FleetDao:
         with get_connection() as conn:
             row = conn.execute(
                 """
-                insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone, capacity, status)
+                insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone,
+                    capacity, status, depot_lat, depot_lng, depot_address, depot_provenance)
                 values (%(name)s, %(plate_number)s, %(driver_id)s, %(driver_name)s, %(driver_phone)s,
-                        coalesce(%(capacity)s, 45), coalesce(%(status)s, 'idle'))
+                        coalesce(%(capacity)s, 45), coalesce(%(status)s, 'idle'),
+                        %(depot_lat)s, %(depot_lng)s, %(depot_address)s, %(depot_provenance)s)
                 returning *
                 """,
                 data,
@@ -752,17 +786,44 @@ class FleetDao:
 
     def update_bus(self, bus_id: str, data: dict) -> dict[str, Any] | None:
         with get_connection() as conn:
+            before = conn.execute(
+                "select depot_lat, depot_lng from live_buses where id = %s", (bus_id,)
+            ).fetchone()
             row = conn.execute(
                 """
                 update live_buses set
                     name = %(name)s, plate_number = %(plate_number)s, driver_id = %(driver_id)s,
                     driver_name = %(driver_name)s, driver_phone = %(driver_phone)s,
-                    capacity = coalesce(%(capacity)s, 45), status = coalesce(%(status)s, 'idle')
+                    capacity = coalesce(%(capacity)s, 45), status = coalesce(%(status)s, 'idle'),
+                    depot_lat = %(depot_lat)s, depot_lng = %(depot_lng)s,
+                    depot_address = %(depot_address)s, depot_provenance = %(depot_provenance)s
                 where id = %(id)s returning *
                 """,
                 {**data, "id": bus_id},
             ).fetchone()
-        return dict(row) if row else None
+            if not row:
+                return None
+            # A depot move changes the boundary-trip geometry (U7): regenerate
+            # this bus's routes so the first-morning origin / last-afternoon
+            # destination leg is recomputed. order by id: the global lock order.
+            depot_changed = before is not None and (
+                before["depot_lat"] != row["depot_lat"] or before["depot_lng"] != row["depot_lng"]
+            )
+            route_ids = []
+            if depot_changed:
+                route_ids = [
+                    r["id"] for r in conn.execute(
+                        "select id from live_routes where bus_id = %s order by id", (bus_id,)
+                    ).fetchall()
+                ]
+        # One transaction per route (mirrors update_school): a depot edit fans
+        # out to each affected route's regeneration + provider calls.
+        for route_id in route_ids:
+            with get_connection() as conn:
+                regenerate_route_stops(conn, route_id)
+                _check_turnaround_feasibility(conn, bus_id, "morning")
+                _check_turnaround_feasibility(conn, bus_id, "afternoon")
+        return dict(row)
 
     def delete_bus(self, bus_id: str) -> None:
         with get_connection() as conn:
