@@ -3,8 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { AdvancedMarker, InfoWindow, Map } from "@vis.gl/react-google-maps";
 import {
-  ArrowDown, ArrowUp, GripVertical, Plus, RotateCcw,
-  Route as RouteIcon, Save, Trash2, Upload, Wand2,
+  ArrowDown, ArrowUp, GripVertical, Pencil, Plus, RotateCcw,
+  Route as RouteIcon, Save, Trash2, Upload, Wand2, Warehouse,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,7 +28,7 @@ import {
 import { ToastAction } from "@/components/ui/toast";
 import { useToast } from "@/components/ui/use-toast";
 import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
-import { PlacePicker, type Provenance } from "@/features/admin/components/PlacePicker";
+import { PlacePicker, type Provenance, type ResolvedPlace } from "@/features/admin/components/PlacePicker";
 import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
@@ -136,6 +136,60 @@ export function FleetMapPage() {
   const [saveError, setSaveError] = useState("");
   const [saving, setSaving] = useState(false);
   const [csvOpen, setCsvOpen] = useState(false);
+
+  // Overnight depot editor (R12/U13). The bus editor proper lives on the Buses
+  // page, but this unit is scoped to FleetMapPage + RoutesPage, so the depot —
+  // a per-bus map location — is set here, on the fleet's own map surface, with
+  // the shared PlacePicker. `depotBus` is a snapshot of the row being edited.
+  const [depotBus, setDepotBus] = useState<any | null>(null);
+  const [depotValue, setDepotValue] = useState<ResolvedPlace>({
+    address: "", lat: null, lng: null, provenance: "typed",
+  });
+  const [savingDepot, setSavingDepot] = useState(false);
+
+  const openDepot = (bus: any) => {
+    setDepotBus(bus);
+    setDepotValue({
+      address: bus.depot_address ?? "",
+      lat: bus.depot_lat ?? null,
+      lng: bus.depot_lng ?? null,
+      provenance: (bus.depot_provenance as Provenance) ?? "typed",
+    });
+  };
+
+  // BusPayload requires `name` and the server overwrites every column from the
+  // payload, so a depot-only PUT would 422 and null the rest — resend the bus's
+  // existing fields alongside the new depot. Setting/moving the depot
+  // regenerates the bus's boundary trips server-side; clearing it (empty place)
+  // persists no depot (a bus may have none).
+  const persistDepot = async (place: ResolvedPlace) => {
+    if (!depotBus) return;
+    setSavingDepot(true);
+    try {
+      await api.put(`/api/fleet/buses/${depotBus.id}`, {
+        name: depotBus.name,
+        plate_number: depotBus.plate_number ?? null,
+        driver_id: depotBus.driver_id ?? null,
+        driver_name: depotBus.driver_name ?? null,
+        driver_phone: depotBus.driver_phone ?? null,
+        capacity: depotBus.capacity ?? 45,
+        status: depotBus.status ?? "idle",
+        depot_lat: place.lat,
+        depot_lng: place.lng,
+        depot_address: place.address || null,
+        depot_provenance: place.provenance,
+      });
+      await queryClient.invalidateQueries({ queryKey: ["buses"] });
+      setDepotBus(null);
+      toast({ title: place.lat != null || place.address ? "Depot saved" : "Depot removed" });
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setSavingDepot(false);
+    }
+  };
+  const saveDepot = () => persistDepot(depotValue);
+  const removeDepot = () => persistDepot({ address: "", lat: null, lng: null, provenance: "typed" });
 
   // Request generation (R20): reset and every plan()/reorder() call bump the
   // counter; a response only applies if its generation is still current, so
@@ -405,6 +459,51 @@ export function FleetMapPage() {
             </CardContent>
           </Card>
 
+          {/* Bus depots (R12/U13): every bus's optional overnight base. Unlike
+              the Buses card above (active runs only), this lists the whole fleet
+              so any bus's depot can be set, whether or not it is on a run now. */}
+          <Card>
+            <CardHeader className="flex-row items-center gap-2 space-y-0">
+              <Warehouse className="h-5 w-5 text-primary" />
+              <p className="font-heading text-lg font-semibold">Bus depots</p>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <p className="text-sm text-muted-foreground">
+                Overnight base each bus starts its first morning trip and ends its
+                last afternoon trip at. Optional.
+              </p>
+              {(buses as any[]).length === 0 ? (
+                <p className="text-sm text-muted-foreground">No buses in the fleet yet.</p>
+              ) : (
+                (buses as any[]).map((bus) => (
+                  <div
+                    key={bus.id}
+                    className="flex items-center gap-2 text-sm"
+                    data-testid={`depot-row-${bus.id}`}
+                  >
+                    <span className="font-medium">{bus.name}</span>
+                    <span
+                      className="ml-auto max-w-[55%] truncate text-xs text-muted-foreground"
+                      title={bus.depot_address ?? undefined}
+                    >
+                      {bus.depot_address ?? "No depot set"}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 shrink-0"
+                      aria-label={`Set depot for ${bus.name}`}
+                      data-testid={`edit-depot-${bus.id}`}
+                      onClick={() => openDepot(bus)}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))
+              )}
+            </CardContent>
+          </Card>
+
           <Card>
             <CardHeader className="flex-row items-center gap-2 space-y-0">
               <RouteIcon className="h-5 w-5 text-primary" />
@@ -661,6 +760,52 @@ export function FleetMapPage() {
             <Button variant="outline" onClick={() => setSaveOpen(false)} disabled={saving}>Cancel</Button>
             <Button onClick={saveRoute} disabled={saving} data-testid="confirm-save-route">
               {saving ? "Saving…" : "Save route"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Depot editor (R12): one PlacePicker per bus, prefilled when the bus
+          already has a depot. Empty saves as no depot. */}
+      <Dialog
+        open={!!depotBus}
+        onOpenChange={(o) => {
+          if (!o && !savingDepot) setDepotBus(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Overnight depot — {depotBus?.name}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label>Depot location</Label>
+            <PlacePicker
+              placeholder="Depot address"
+              testId="depot-address"
+              value={depotValue}
+              onChange={setDepotValue}
+            />
+            <p className="text-xs text-muted-foreground">
+              The bus begins its first morning trip and ends its last afternoon
+              trip here. It never appears as a passenger stop. Leave empty for none.
+            </p>
+          </div>
+          <DialogFooter>
+            {depotBus && (depotBus.depot_lat != null || depotBus.depot_address) && (
+              <Button
+                variant="outline"
+                onClick={removeDepot}
+                disabled={savingDepot}
+                data-testid="remove-depot"
+              >
+                Remove depot
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setDepotBus(null)} disabled={savingDepot}>
+              Cancel
+            </Button>
+            <Button onClick={saveDepot} disabled={savingDepot} data-testid="save-depot">
+              {savingDepot ? "Saving…" : "Save depot"}
             </Button>
           </DialogFooter>
         </DialogContent>
