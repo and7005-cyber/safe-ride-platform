@@ -88,6 +88,9 @@ class BulkRow(BaseModel):
     home_lng: float | None = None
     pickup_time: str | None = None
     route_name: str | None = None
+    # Set when a row's home was repaired via the PlacePicker (U8); a raw CSV
+    # row leaves this null and the DAO stamps 'imported'.
+    provenance: str | None = None
 
 
 class BulkPayload(BaseModel):
@@ -125,12 +128,53 @@ def delete_student(student_id: str, user: dict = Depends(admin_only)):
     return safe_call(lambda: (dao.delete_student(student_id), {"ok": True})[1])
 
 
+def _triage_row(row: BulkRow) -> dict:
+    """Geocode one bulk row and classify it (U8/R15): resolved (a confident
+    provider result or coords already supplied), ambiguous (only the low-
+    confidence fallback resolved it — the operator should confirm), or failed
+    (no coordinates). Also reports whether route_name resolves to a route."""
+    lat, lng, provider, status = row.home_lat, row.home_lng, None, "resolved"
+    if lat is None or lng is None:
+        hit = geo_service.geocode(row.home_address, allow_fallback=True) if row.home_address else None
+        if hit:
+            lat, lng, provider = hit["lat"], hit["lng"], hit["provider"]
+            status = "resolved" if provider in ("google", "mapbox") else "ambiguous"
+        else:
+            status = "failed"
+    return {
+        "index": None, "name": row.name, "address": row.home_address,
+        "lat": lat, "lng": lng, "provider": provider, "status": status,
+        "route_name": row.route_name,
+        "route_found": bool(row.route_name and dao.resolve_route_id_by_name(row.route_name)),
+    }
+
+
+@router.post("/bulk/validate")
+def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
+    """Import-time geocode triage (U8/R15-R16): geocode every row and return its
+    tier (resolved / ambiguous / failed) + provider + route resolution, WITHOUT
+    inserting anything. The client shows a persistent repair table for the
+    unresolved rows (ambiguous rows require explicit confirmation) and only then
+    POSTs /bulk to commit."""
+    def run() -> dict:
+        rows = []
+        for index, row in enumerate(payload.students):
+            rows.append({**_triage_row(row), "index": index})
+        return {"rows": rows}
+
+    return safe_call(run)
+
+
 @router.post("/bulk")
 def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
     def run() -> dict:
         inserted = 0
-        assignments = 0
+        parent_assignments = 0
+        route_assignments = 0
         errors: list[str] = []
+        # (student_id, route_id) collected across ALL rows, then regenerated once
+        # per affected route (Lambda burst guard, U8) — never per row.
+        links: list[tuple[str, str]] = []
         for index, row in enumerate(payload.students):
             label = row.name or f"row {index + 1}"
             if not row.name or not row.grade or not row.parent_name:
@@ -143,11 +187,26 @@ def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
                 errors.append(f"{label}: at least one parent email is required")
                 continue
             try:
-                assignments += dao.insert_bulk_student(_clean_student(row.model_dump(), geocode_fallback=False))
+                result = dao.insert_bulk_student(_clean_student(row.model_dump(), geocode_fallback=True))
                 inserted += 1
+                parent_assignments += result["parent_links"]
+                if row.route_name:
+                    route_id = dao.resolve_route_id_by_name(row.route_name)
+                    if route_id:
+                        links.append((result["id"], route_id))
+                        route_assignments += 1
+                    else:
+                        errors.append(f"{label}: route '{row.route_name}' not found — student added unassigned")
             except Exception as exc:  # noqa: BLE001 - surfaced per-row to the client
                 errors.append(f"{label}: {exc}")
-        return {"inserted": inserted, "parentAssignments": assignments, "errors": errors}
+        # One regeneration per affected route, after every insert.
+        dao.bulk_link_and_regenerate(links)
+        return {
+            "inserted": inserted,
+            "parentAssignments": parent_assignments,
+            "routeAssignments": route_assignments,
+            "errors": errors,
+        }
 
     return safe_call(run)
 

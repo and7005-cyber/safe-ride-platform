@@ -218,6 +218,24 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
     return stops_recalculated
 
 
+def _bulk_link_and_regenerate(conn, assignments: list[tuple[str, str]]) -> None:
+    """Insert the bulk (student, route) links, then regenerate each affected
+    route ONCE and re-derive each linked student's bus (U8). Takes an explicit
+    connection so the burst-guard batching is unit-testable."""
+    affected: set[str] = set()
+    for student_id, route_id in assignments:
+        conn.execute(
+            "insert into live_student_routes (student_id, route_id) values (%s, %s) "
+            "on conflict (student_id, route_id) do nothing",
+            (student_id, route_id),
+        )
+        affected.add(str(route_id))
+    for route_id in sorted(affected):
+        regenerate_route_stops(conn, route_id)
+    for student_id in {a[0] for a in assignments}:
+        _derive_student_bus(conn, student_id)
+
+
 class StudentLiveDao:
     def list_students(self) -> list[dict[str, Any]]:
         """All students, each with ``route_ids`` and a derived
@@ -331,20 +349,24 @@ class StudentLiveDao:
             for route_id in affected:
                 regenerate_route_stops(conn, route_id)
 
-    def insert_bulk_student(self, data: dict) -> int:
-        """Insert one bulk-upload row; returns the number of parent-account
-        links auto-created from its email slots."""
+    def insert_bulk_student(self, data: dict) -> dict[str, Any]:
+        """Insert one bulk-upload row; returns ``{id, parent_links}`` (the new
+        student id and the count of parent-account links auto-created from its
+        email slots). A CSV row's home defaults to provenance 'imported' (U8/U4);
+        a row repaired via the PlacePicker carries its own provenance."""
+        data = {**data, "provenance": data.get("provenance") or "imported"}
         with get_connection() as conn:
             row = conn.execute(
                 """
                 insert into live_students
                     (name, grade, parent_name, parent_phone, parent_phone2, parent_email,
                      parent2_name, parent2_email,
-                     home_address, home_lat, home_lng, pickup_time, status)
+                     home_address, home_lat, home_lng, pickup_time, status, provenance)
                 values
                     (%(name)s, %(grade)s, %(parent_name)s, %(parent_phone)s, %(parent_phone2)s,
                      %(parent_email)s, %(parent2_name)s, %(parent2_email)s,
-                     %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s, 'at-school')
+                     %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s, 'at-school',
+                     %(provenance)s)
                 returning id
                 """,
                 data,
@@ -352,4 +374,27 @@ class StudentLiveDao:
             assignments = sync_parent_links(
                 conn, row["id"], (data.get("parent_email"), data.get("parent2_email"))
             )
-        return assignments
+        return {"id": row["id"], "parent_links": assignments}
+
+    def resolve_route_id_by_name(self, name: str | None) -> str | None:
+        """Resolve a CSV ``route_name`` to a route id (U8) — the term-start
+        onboarding column. Case-insensitive exact match; None when unknown or
+        ambiguous (>1 route shares the name)."""
+        if not name or not name.strip():
+            return None
+        with get_connection() as conn:
+            rows = conn.execute(
+                "select id from live_routes where lower(name) = lower(%s) limit 2",
+                (name.strip(),),
+            ).fetchall()
+        return rows[0]["id"] if len(rows) == 1 else None
+
+    def bulk_link_and_regenerate(self, assignments: list[tuple[str, str]]) -> None:
+        """Link bulk-imported students to their routes and regenerate each
+        affected route EXACTLY ONCE (U8): per-row regeneration on a large import
+        is O(rows) Google round-trips in one Lambda invocation (verified burst
+        risk). route_type is set by the U2 trigger; buses are re-derived after."""
+        if not assignments:
+            return
+        with get_connection() as conn:
+            _bulk_link_and_regenerate(conn, assignments)

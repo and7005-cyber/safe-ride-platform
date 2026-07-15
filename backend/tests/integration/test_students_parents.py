@@ -889,3 +889,97 @@ def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_he
         for r in (m_a, m_b):
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+# CSV geocode triage + route_name wiring (U8, R15-R18) ---------------------------
+
+def test_bulk_validate_triages_rows_and_resolves_route_name(client, admin_headers):
+    """U8/R15-R16: /bulk/validate geocodes every row and tags it resolved (coords
+    supplied) / failed (no coords, key-less container can't geocode), and reports
+    whether route_name resolves — WITHOUT inserting anything."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    route = make_route("Express", "morning")
+    try:
+        payload = {"students": [
+            {"name": f"Coords {marker}", "grade": "G4", "parent_name": "P",
+             "parent_phone": "+254711000010", "parent_email": f"c-{marker}@t.local",
+             "home_lat": -1.3, "home_lng": 36.8, "route_name": f"IT U5 Express {marker}"},
+            {"name": f"NoCoords {marker}", "grade": "G4", "parent_name": "P",
+             "parent_phone": "+254711000011", "parent_email": f"n-{marker}@t.local",
+             "home_address": "Somewhere Unresolvable", "route_name": "no-such-route"},
+        ]}
+        r = client.post("/api/students/bulk/validate", json=payload, headers=admin_headers)
+        assert r.status_code == 200, r.text
+        rows = r.json()["rows"]
+        assert rows[0]["status"] == "resolved" and rows[0]["route_found"] is True
+        assert rows[1]["status"] == "failed" and rows[1]["route_found"] is False
+        # Nothing was inserted by validation.
+        names = {s["name"] for s in client.get("/api/students", headers=admin_headers).json()}
+        assert f"Coords {marker}" not in names
+    finally:
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_bulk_route_name_assigns_students_to_the_route(client, admin_headers):
+    """U8/R18: a bulk row's route_name assigns the student to that route through
+    the same _sync_routes choke point (the R21 constraint applies)."""
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    route = make_route("Express", "morning")
+    route_name = f"IT U5 Express {marker}"
+    created_names = [f"Bulk A {marker}", f"Bulk B {marker}"]
+    try:
+        payload = {"students": [
+            {"name": n, "grade": "G4", "parent_name": "P", "parent_phone": "+254711000012",
+             "parent_email": f"{n.replace(' ', '')}@t.local", "home_lat": -1.3, "home_lng": 36.8,
+             "route_name": route_name}
+            for n in created_names
+        ]}
+        r = client.post("/api/students/bulk", json=payload, headers=admin_headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["inserted"] == 2 and body["routeAssignments"] == 2
+        rostered = {s["name"] for s in client.get("/api/students", headers=admin_headers).json()
+                    if str(route["id"]) in [str(x) for x in (s.get("route_ids") or [])]}
+        assert set(created_names) <= rostered
+    finally:
+        for s in client.get("/api/students", headers=admin_headers).json():
+            if s["name"] in created_names:
+                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_bulk_link_regenerates_each_route_exactly_once(client, admin_headers, monkeypatch):
+    """U8: the burst guard — regeneration is batched per route, so N students
+    onto one route trigger ONE regenerate, not N (a per-row O(rows) Google burst
+    in one Lambda invocation is the verified risk)."""
+    from app.dao import student_live_dao
+
+    marker = uuid.uuid4().hex[:6]
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    route = make_route("Express", "morning")
+    ids = []
+    try:
+        for i in range(4):
+            s = client.post("/api/students", json=student_payload(f"{marker}{i}"), headers=admin_headers)
+            ids.append(s.json()["id"])
+        calls = []
+        monkeypatch.setattr(student_live_dao, "regenerate_route_stops",
+                            lambda conn, rid: calls.append(str(rid)) or True)
+        monkeypatch.setattr(student_live_dao, "_derive_student_bus", lambda conn, sid: None)
+        # Pass an explicit localhost connection (the host can't resolve the
+        # container's 'db' hostname); roll back so the test links don't persist.
+        with psycopg.connect(DB_URL) as conn:
+            student_live_dao._bulk_link_and_regenerate(conn, [(sid, route["id"]) for sid in ids])
+            conn.rollback()
+        # 4 students onto one route -> exactly ONE regeneration, independent of count.
+        assert calls.count(str(route["id"])) == 1
+        assert len(calls) == 1
+    finally:
+        for sid in ids:
+            client.delete(f"/api/students/{sid}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
