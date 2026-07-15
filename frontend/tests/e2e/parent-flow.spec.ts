@@ -41,14 +41,15 @@ test("parent profile shows account, children, and push state", async ({ page }) 
   // My Children rows carry the same derived status badge as Home (R36).
   await expect(page.getByTestId("child-status-badge").first()).toHaveText(STATUS_BADGE_LABEL);
 
-  // The push toggle reflects the server's FCM/VAPID config: "Push not configured
-  // on this server" (disabled) when the stack has no Firebase creds, else an
-  // Enable/Disable button. The local stack's state depends on whether
-  // backend/.env carries Firebase (this machine has push provisioned), so assert
-  // the control renders in whichever state the server reports — key-agnostic.
+  // The push toggle renders one of five state labels depending on browser push
+  // support, server FCM/VAPID config, notification permission, and subscription
+  // — all of which vary by machine and by what earlier specs did to the shared
+  // browser's push state. Assert the control renders in ANY of its valid states
+  // (the test's intent: the profile surfaces push state), not one hard-coded
+  // state — the old "not configured" assumption broke once push was provisioned.
   await expect(
     page.getByRole("button", {
-      name: /Push not configured on this server|Enable Push Notifications|Disable Push Notifications/,
+      name: /Push not supported on this device|Push not configured on this server|Notifications blocked in browser|Enable Push Notifications|Disable Push Notifications/,
     }),
   ).toBeVisible();
 });
