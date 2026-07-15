@@ -31,11 +31,10 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import { AddressAutocomplete } from "@/features/admin/components/AddressAutocomplete";
 import { BulkUploadDialog } from "@/features/admin/components/BulkUploadDialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
-import { MapPicker } from "@/features/admin/components/MapPicker";
 import { PageHeader } from "@/features/admin/components/PageHeader";
+import { PlacePicker, type Provenance } from "@/features/admin/components/PlacePicker";
 import { api } from "@/lib/apiClient";
 import { emailError, parentContactErrors, phoneError } from "@/lib/validation";
 import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
@@ -132,6 +131,9 @@ const EMPTY = {
   home_address: "",
   home_lat: null as number | null,
   home_lng: null as number | null,
+  // How the home coordinates were resolved. A fresh Add starts "typed" (nothing
+  // picked yet); editing an existing row seeds "legacy" (rows predate tracking).
+  provenance: "typed" as Provenance,
   pickup_time: "",
   school_id: "none",
   morning_route: "none",
@@ -217,7 +219,8 @@ export function StudentsPage() {
       parent_phone: s.parent_phone ?? "", parent_email: s.parent_email ?? "",
       parent2_name: s.parent2_name ?? "", parent_phone2: s.parent_phone2 ?? "",
       parent2_email: s.parent2_email ?? "", home_address: s.home_address ?? "",
-      home_lat: s.home_lat, home_lng: s.home_lng, pickup_time: s.pickup_time ?? "",
+      home_lat: s.home_lat, home_lng: s.home_lng, provenance: "legacy",
+      pickup_time: s.pickup_time ?? "",
       school_id: s.school_id ?? "none",
       morning_route: morningRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
       afternoon_route: afternoonRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
@@ -235,17 +238,6 @@ export function StudentsPage() {
   const contactErrs = parentContactErrors(form);
   const contactInvalid = !!(contactErrs.parentName || contactErrs.phone || contactErrs.email);
 
-  // A pin dropped/dragged on the map resolves to an editable address (R8).
-  // Best-effort: when the lookup finds nothing the field is left as-is.
-  const reverseGeocode = async (lat: number, lng: number) => {
-    try {
-      const res = await api.post("/api/fleet/reverse-geocode", { lat, lng });
-      if (res.found && res.label) setForm((f) => ({ ...f, home_address: res.label }));
-    } catch {
-      /* reverse geocoding is a convenience — never block the pin */
-    }
-  };
-
   const save = async () => {
     if (contactInvalid) {
       setShowContactErrors(true);
@@ -261,7 +253,8 @@ export function StudentsPage() {
         parent_phone: form.parent_phone || null, parent_email: form.parent_email || null,
         parent2_name: form.parent2_name || null, parent_phone2: form.parent_phone2 || null,
         parent2_email: form.parent2_email || null, home_address: form.home_address || null,
-        home_lat: form.home_lat, home_lng: form.home_lng, pickup_time: form.pickup_time || null,
+        home_lat: form.home_lat, home_lng: form.home_lng, provenance: form.provenance,
+        pickup_time: form.pickup_time || null,
         school_id: form.school_id === "none" ? null : form.school_id, route_ids,
       };
       if (editId) await api.put(`/api/students/${editId}`, payload);
@@ -497,30 +490,34 @@ export function StudentsPage() {
             <p className="text-xs text-muted-foreground">
               At least one phone and one email are needed across the two parents; emails link parent accounts.
             </p>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>Home address</Label>
-                <AddressAutocomplete
-                  value={form.home_address}
-                  placeholder="Type to search addresses…"
-                  testId="student-address"
-                  onChange={(address) => setForm((f) => ({ ...f, home_address: address }))}
-                  onResolve={(address, lat, lng) =>
-                    setForm((f) => ({ ...f, home_address: address, home_lat: lat, home_lng: lng }))
-                  }
-                />
-              </div>
-              <div className="space-y-2"><Label>Pickup time</Label><Input placeholder="06:45" value={form.pickup_time} onChange={(e) => setForm({ ...form, pickup_time: e.target.value })} /></div>
-            </div>
             <div className="space-y-2">
-              <Label>Home location {form.home_lat != null && <span className="text-xs text-muted-foreground">({form.home_lat}, {form.home_lng})</span>}</Label>
-              <MapPicker
-                lat={form.home_lat}
-                lng={form.home_lng}
-                onPick={(lat, lng) => setForm((f) => ({ ...f, home_lat: lat, home_lng: lng }))}
-                onMapPick={reverseGeocode}
+              <Label>Home {form.home_lat != null && <span className="text-xs text-muted-foreground">({form.home_lat}, {form.home_lng})</span>}</Label>
+              {/* One resolved-place control: address autocomplete + map-pin
+                  (with its own reverse-geocode) folded into a single field.
+                  home_lat/home_lng still flow to the payload unchanged (R10). */}
+              <PlacePicker
+                value={{
+                  address: form.home_address,
+                  lat: form.home_lat,
+                  lng: form.home_lng,
+                  provenance: form.provenance,
+                }}
+                placeholder="Type to search addresses…"
+                testId="student-address"
+                onChange={(next) =>
+                  setForm((f) => ({
+                    ...f,
+                    home_address: next.address,
+                    home_lat: next.lat,
+                    home_lng: next.lng,
+                    provenance: next.provenance,
+                  }))
+                }
               />
               <p className="text-xs text-muted-foreground">Pick an address suggestion to place the pin, or click the map — the address fills in and stays editable.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2"><Label>Pickup time</Label><Input placeholder="06:45" value={form.pickup_time} onChange={(e) => setForm({ ...form, pickup_time: e.target.value })} /></div>
             </div>
             <div className="space-y-2">
               <Label>School</Label>
