@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { AdvancedMarker, InfoWindow, Map } from "@vis.gl/react-google-maps";
 import {
-  ArrowDown, ArrowUp, GripVertical, Pencil, Plus, RotateCcw,
+  ArrowDown, ArrowUp, GripVertical, MapPinOff, Pencil, Plus, RotateCcw,
   Route as RouteIcon, Save, Trash2, Upload, Wand2, Warehouse,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -244,7 +244,8 @@ export function FleetMapPage() {
       if ((res.unresolved ?? []).length) {
         toast({
           title: "Some addresses couldn't be located",
-          description: (res.unresolved as string[]).join(", "),
+          description:
+            "Fix them in the repair panel below — set each stop on the map, then recalculate.",
           variant: "destructive",
         });
       }
@@ -260,6 +261,33 @@ export function FleetMapPage() {
   };
 
   const activeOption = options?.[selected];
+
+  // CSV/address repair surface (U12 / spec 4, R16-R17). The planner flow reports
+  // geocode failures as a flat `unresolved` list of stop labels. The planner
+  // sends no explicit label, so each entry is exactly the row's `address`
+  // (backend fleet.py route-options: `label = st.label or st.address`). Map those
+  // failures back to the planner rows that still lack coordinates, so each gets
+  // an inline PlacePicker to pin it on the map. A row drops out of the table the
+  // moment it gains lat/lng — picking a suggestion or dropping a pin resolves it,
+  // giving live feedback before the operator re-calculates (which then clears
+  // `unresolved` for good and re-enables Save).
+  //
+  // The route-options flow is deliberately binary (resolved / unresolved): it
+  // exposes no low-confidence "ambiguous" tier, so there is no accept-as-is path
+  // here — a failed stop has no coordinates and cannot be routed until one is
+  // set. (The ambiguous/accept tier belongs to the student-CSV flow, U8.)
+  const repairRows = useMemo(() => {
+    if (unresolved.length === 0) return [];
+    const failed = new Set(unresolved);
+    return rows
+      .map((row, index) => ({ row, index }))
+      .filter(
+        ({ row }) =>
+          row.address.trim() !== "" &&
+          failed.has(row.address) &&
+          (row.lat == null || row.lng == null),
+      );
+  }, [rows, unresolved]);
 
   // Drag-to-reorder: recompute road geometry + ETAs for the new fixed order.
   const reorder = async (from: number, to: number) => {
@@ -611,11 +639,73 @@ export function FleetMapPage() {
                 </Button>
               </div>
 
+              {/* Persistent repair table (U12 / spec 4, R16-R17): unresolved
+                  addresses surface here as a durable panel (not a fleeting
+                  toast), each with an inline PlacePicker so the operator can fix
+                  it by searching or dropping a pin. A row leaves the list the
+                  instant it gains coordinates; a re-calculate then clears the
+                  gate on Save. */}
+              {repairRows.length > 0 && (
+                <div
+                  className="space-y-3 rounded-md border border-destructive/40 bg-destructive/5 p-3"
+                  data-testid="csv-repair-table"
+                >
+                  <div className="flex items-center gap-2">
+                    <MapPinOff className="h-4 w-4 shrink-0 text-destructive" />
+                    <p className="text-sm font-semibold text-destructive">
+                      {repairRows.length} address{repairRows.length === 1 ? "" : "es"} need a location
+                    </p>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    These stops couldn't be found on the map. Set each one below —
+                    search an address or drop a pin — then recalculate. Fixed stops
+                    leave this list automatically.
+                  </p>
+                  {repairRows.map(({ row, index }) => (
+                    <div
+                      key={index}
+                      data-testid={`csv-repair-row-${index}`}
+                      className="space-y-2 rounded-md border bg-background p-2"
+                    >
+                      <div className="flex items-baseline gap-2">
+                        <span className="shrink-0 text-xs font-medium text-muted-foreground">
+                          Stop {index + 1}
+                        </span>
+                        <span className="flex-1 truncate text-sm font-medium" title={row.address}>
+                          {row.address}
+                        </span>
+                      </div>
+                      <p className="text-xs text-destructive">
+                        Address not found — set the location on the map.
+                      </p>
+                      <PlacePicker
+                        placeholder="Search an address or drop a pin"
+                        testId={`csv-repair-input-${index}`}
+                        value={{
+                          address: row.address,
+                          lat: row.lat ?? null,
+                          lng: row.lng ?? null,
+                          provenance: row.provenance ?? "imported",
+                        }}
+                        onChange={(next) =>
+                          setRow(index, {
+                            address: next.address,
+                            lat: next.lat,
+                            lng: next.lng,
+                            provenance: next.provenance,
+                          })
+                        }
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {options && (
                 <div className="space-y-3 pt-2" data-testid="route-result">
-                  {unresolved.length > 0 && (
-                    <p className="text-xs text-destructive">Could not locate: {unresolved.join(", ")}</p>
-                  )}
+                  {/* Unresolved addresses are handled by the persistent repair
+                      table above (data-testid="csv-repair-table"), not a weak
+                      inline note here. */}
                   <div className="flex flex-wrap gap-2">
                     {options.map((o, i) => (
                       <Button
@@ -713,7 +803,8 @@ export function FleetMapPage() {
                       </Button>
                       {unresolved.length > 0 && (
                         <p className="text-xs text-muted-foreground">
-                          Fix the unlocated addresses above before saving.
+                          Some addresses still need a location — fix them in the
+                          repair panel above, then recalculate before saving.
                         </p>
                       )}
                     </>
