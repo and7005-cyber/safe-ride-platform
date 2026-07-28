@@ -173,7 +173,9 @@ export function FleetMapPage() {
         driver_name: depotBus.driver_name ?? null,
         driver_phone: depotBus.driver_phone ?? null,
         capacity: depotBus.capacity ?? 45,
-        status: depotBus.status ?? "idle",
+        // No `status` (U9: derived server-side, no path writes it) and no
+        // `availability` — omitting it leaves the stored value alone, so saving
+        // a depot cannot return an out-of-service bus to service.
         depot_lat: place.lat,
         depot_lng: place.lng,
         depot_address: place.address || null,

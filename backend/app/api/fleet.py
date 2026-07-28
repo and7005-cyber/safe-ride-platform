@@ -47,7 +47,14 @@ class BusPayload(BaseModel):
     driver_name: str | None = None
     driver_phone: str | None = None
     capacity: int | None = 45
-    status: str | None = "idle"
+    # status is accepted and ignored (U9): bus status is derived at read time
+    # from the bus's current run and no path writes the column. The field stays
+    # on the payload so a client still sending it does not 422 mid-rollout.
+    status: str | None = None
+    # Office-set availability — 'in-service' | 'out-of-service'. Not derivable:
+    # whether a bus is in the workshop is not a function of its runs. null means
+    # "leave as-is", which is what a depot-only save from the fleet map sends.
+    availability: str | None = None
     # Overnight depot (U7/R12-R14): the bus starts its FIRST morning trip here
     # and ends its LAST afternoon trip here. Enters geometry as a boundary leg,
     # never a stop row. Set via the same PlacePicker.

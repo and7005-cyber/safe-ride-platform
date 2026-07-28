@@ -15,7 +15,14 @@ const BUS_STATUS_VARIANT: Record<string, "success" | "warning" | "secondary" | "
   active: "success",
   delayed: "warning",
   idle: "secondary",
-  offline: "destructive",
+  "out-of-service": "destructive",
+};
+
+const BUS_STATUS_LABEL: Record<string, string> = {
+  active: "Active",
+  delayed: "Delayed",
+  idle: "Idle",
+  "out-of-service": "Out of service",
 };
 
 export function DashboardPage() {
@@ -29,8 +36,11 @@ export function DashboardPage() {
 
   const today = new Date().toISOString().split("T")[0];
   const todayRuns = runs.filter((r: any) => r.date === today);
-  const activeBuses = buses.filter((b: any) => b.status === "active").length;
-  const delayed = buses.filter((b: any) => b.status === "delayed").length;
+  // Count the derived value (U9), not the stored column — nothing writes it any
+  // more, so counting it would freeze these tiles at whatever the office last
+  // typed.
+  const activeBuses = buses.filter((b: any) => b.derived_status === "active").length;
+  const delayed = buses.filter((b: any) => b.derived_status === "delayed").length;
   const studentsOnBus = students.filter((s: any) => s.status === "on-bus").length;
   const incidentsToday = todayIncidents?.count ?? 0;
 
@@ -95,7 +105,9 @@ export function DashboardPage() {
                     {bus.plate_number ?? "—"}{bus.driver_name ? ` · ${bus.driver_name}` : ""}
                   </p>
                 </div>
-                <Badge variant={BUS_STATUS_VARIANT[bus.status] ?? "secondary"}>{bus.status}</Badge>
+                <Badge variant={BUS_STATUS_VARIANT[bus.derived_status] ?? "secondary"}>
+                  {BUS_STATUS_LABEL[bus.derived_status] ?? bus.derived_status}
+                </Badge>
               </div>
             ))}
           </CardContent>

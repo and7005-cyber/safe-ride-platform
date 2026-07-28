@@ -36,19 +36,24 @@ import { api } from "@/lib/apiClient";
 import { phoneError } from "@/lib/validation";
 import { useBuses, useDrivers } from "@/lib/queries";
 
+// Bus status is derived server-side from the bus's current run (U9) and arrives
+// as `derived_status`; the stored column is no longer written by any path. The
+// one value the office still sets is availability, which overrides the
+// derivation because whether a bus is in the workshop is not a function of its
+// runs. 'offline' moved here as 'out-of-service'.
 const STATUS_FILTERS = [
   { value: "all", label: "All statuses" },
   { value: "active", label: "Active" },
   { value: "idle", label: "Idle" },
   { value: "delayed", label: "Delayed" },
-  { value: "offline", label: "Offline" },
+  { value: "out-of-service", label: "Out of service" },
 ];
 
 const STATUS_VARIANT: Record<string, "success" | "warning" | "secondary" | "destructive"> = {
   active: "success",
   delayed: "warning",
   idle: "secondary",
-  offline: "destructive",
+  "out-of-service": "destructive",
 };
 
 const EMPTY = {
@@ -58,7 +63,7 @@ const EMPTY = {
   driver_name: "",
   driver_phone: "",
   capacity: 45,
-  status: "idle",
+  availability: "in-service",
 };
 
 export function BusesPage() {
@@ -77,7 +82,8 @@ export function BusesPage() {
   const filtered = useMemo(
     () =>
       (buses as any[]).filter((b) => {
-        const matchesStatus = statusFilter === "all" || b.status === statusFilter;
+        // Filter on the derived value, never the stored column (U9).
+        const matchesStatus = statusFilter === "all" || b.derived_status === statusFilter;
         const q = search.toLowerCase();
         const matchesSearch =
           !q ||
@@ -104,7 +110,7 @@ export function BusesPage() {
       driver_name: bus.driver_name ?? "",
       driver_phone: bus.driver_phone ?? "",
       capacity: bus.capacity ?? 45,
-      status: bus.status ?? "idle",
+      availability: bus.availability ?? "in-service",
     });
     setOpen(true);
   };
@@ -209,7 +215,11 @@ export function BusesPage() {
                   <TableCell>{bus.driver_name ?? "—"}</TableCell>
                   <TableCell className="text-muted-foreground">{bus.driver_phone ?? "—"}</TableCell>
                   <TableCell>{bus.capacity} seats</TableCell>
-                  <TableCell><Badge variant={STATUS_VARIANT[bus.status] ?? "secondary"}>{bus.status}</Badge></TableCell>
+                  <TableCell>
+                    <Badge variant={STATUS_VARIANT[bus.derived_status] ?? "secondary"}>
+                      {STATUS_FILTERS.find((s) => s.value === bus.derived_status)?.label ?? bus.derived_status}
+                    </Badge>
+                  </TableCell>
                   <TableCell className="text-right">
                     <Button variant="ghost" size="icon" onClick={() => startEdit(bus)}><Pencil className="h-4 w-4" /></Button>
                     <Button variant="ghost" size="icon" onClick={() => remove(bus.id)}><Trash2 className="h-4 w-4" /></Button>
@@ -263,16 +273,17 @@ export function BusesPage() {
                 <Input type="number" min={1} max={100} value={form.capacity} onChange={(e) => setForm({ ...form, capacity: Number(e.target.value) })} />
               </div>
               <div className="space-y-2">
-                <Label>Status</Label>
-                <Select value={form.status} onValueChange={(v) => setForm({ ...form, status: v })}>
+                <Label>Availability</Label>
+                <Select value={form.availability} onValueChange={(v) => setForm({ ...form, availability: v })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="idle">Idle</SelectItem>
-                    <SelectItem value="active">Active</SelectItem>
-                    <SelectItem value="delayed">Delayed</SelectItem>
-                    <SelectItem value="offline">Offline</SelectItem>
+                    <SelectItem value="in-service">In service</SelectItem>
+                    <SelectItem value="out-of-service">Out of service</SelectItem>
                   </SelectContent>
                 </Select>
+                <p className="text-xs text-muted-foreground">
+                  Whether the bus can run at all. Active, Idle and Delayed are worked out from its runs.
+                </p>
               </div>
             </div>
           </div>
