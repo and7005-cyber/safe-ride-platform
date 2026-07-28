@@ -117,3 +117,41 @@ def bus_status_case(bus: str) -> str:
     bus's run today.
     """
     return _BUS_STATUS_CASE.format(bus=bus)
+
+
+# --- run progress (U10) ------------------------------------------------------
+# A run that has stopped recording arrivals. Derived, and distinct from the
+# office-set 'delayed' status: delay is a human judgement about schedule, this
+# is the absence of taps.
+#
+# Anchored at the run's creation as well as at each arrival, so a driver whose
+# phone dies before the first stop is caught — that case is the trigger the
+# office force-close exists for, and measuring only between consecutive
+# arrivals would never fire on it.
+#
+# Suppressed once every stop carries a timestamp. The closure gate deliberately
+# lengthens the window after the final arrival, while the driver resolves
+# blocking children before the run can close; a flag that fires on that normal
+# path is a flag the office learns to ignore.
+
+NO_PROGRESS_MINUTES = 15
+
+_NO_PROGRESS_CASE = """case
+                         when {run}.status = 'completed' then false
+                         when not exists (
+                             select 1 from run_stops rs
+                             where rs.run_id = {run}.id and rs.arrived_at is null
+                         ) then false
+                         else coalesce(
+                             (select max(rs.arrived_at) from run_stops rs where rs.run_id = {run}.id),
+                             {run}.created_at
+                         ) < now() - interval '%d minutes'
+                     end""" % NO_PROGRESS_MINUTES
+
+
+def no_progress_case(run: str) -> str:
+    """The derived no-progress boolean (bare — the consumer adds its own ``as``
+    alias), parameterized by the consuming query's ``live_runs`` table alias.
+    The subquery alias (rs) is fragment-local.
+    """
+    return _NO_PROGRESS_CASE.format(run=run)

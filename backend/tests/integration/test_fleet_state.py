@@ -72,7 +72,8 @@ def fleet(client, admin_headers):
         "/api/accounts/drivers",
         json={"full_name": f"IT Fleet Driver {marker}",
               "email": f"it-fleet-driver-{marker}@test.local",
-              "password": "test1234.", "phone": "+254711000900", "pin": pin},
+              "password": "test1234.", "phone": f"+2547{random.randint(10000000, 99999999)}",
+              "pin": pin},
         headers=admin_headers,
     )
     assert response.status_code in (200, 201), response.text
@@ -131,6 +132,27 @@ def fleet(client, admin_headers):
         client.delete(f"/api/accounts/drivers/{created['driver']['id']}", headers=admin_headers)
 
 
+_BUS_FIELDS = ("name", "plate_number", "driver_id", "driver_name", "driver_phone",
+               "capacity", "depot_lat", "depot_lng", "depot_address", "depot_provenance")
+
+
+def _put_bus(client, admin_headers, fleet, **overrides) -> None:
+    """PUT a bus the way the admin form does — its current field set, then the edit.
+
+    update_bus overwrites every column from the payload, so any field left out
+    is nulled. Re-reading the row first means a test that only means to change
+    availability cannot silently drop the bus's driver or depot as a side
+    effect. Closing that overwrite hazard in the API is out of this unit's
+    scope (it is U7's); this just stops the tests tripping over it.
+    """
+    current = _bus(client, admin_headers, fleet["bus"]["id"])
+    body = {field: current.get(field) for field in _BUS_FIELDS}
+    body.update(overrides)
+    response = client.put(f"/api/fleet/buses/{fleet['bus']['id']}", json=body,
+                          headers=admin_headers)
+    assert response.status_code == 200, response.text
+
+
 def test_new_bus_is_idle_and_in_service(client, admin_headers, fleet):
     """R22: a bus with no run derives idle, with nobody having set anything."""
     bus = _bus(client, admin_headers, fleet["bus"]["id"])
@@ -183,18 +205,11 @@ def test_availability_overrides_the_derivation(client, admin_headers, fleet):
     """R23: an out-of-service bus reads out of service regardless of its runs,
     and is distinguishable from one that simply has no run today."""
     bus = fleet["bus"]
-    response = client.put(
-        f"/api/fleet/buses/{bus['id']}",
-        json={"name": bus["name"], "capacity": 20, "availability": "out-of-service"},
-        headers=admin_headers,
-    )
-    assert response.status_code == 200, response.text
+    _put_bus(client, admin_headers, fleet, availability="out-of-service")
     try:
         assert _bus(client, admin_headers, bus["id"])["derived_status"] == "out-of-service"
     finally:
-        client.put(f"/api/fleet/buses/{bus['id']}",
-                   json={"name": bus["name"], "capacity": 20, "availability": "in-service"},
-                   headers=admin_headers)
+        _put_bus(client, admin_headers, fleet, availability="in-service")
     assert _bus(client, admin_headers, bus["id"])["derived_status"] == "idle"
 
 
@@ -205,24 +220,149 @@ def test_depot_only_save_does_not_reset_availability(client, admin_headers, flee
     silently return an out-of-service bus to service on every depot move.
     """
     bus = fleet["bus"]
-    client.put(f"/api/fleet/buses/{bus['id']}",
-               json={"name": bus["name"], "capacity": 20, "availability": "out-of-service"},
-               headers=admin_headers)
+    _put_bus(client, admin_headers, fleet, availability="out-of-service")
     try:
         # Exactly the payload FleetMapPage sends: no availability key.
-        response = client.put(
-            f"/api/fleet/buses/{bus['id']}",
-            json={"name": bus["name"], "plate_number": None, "driver_id": fleet["driver"]["id"],
-                  "capacity": 20, "depot_lat": -1.31, "depot_lng": 36.80,
-                  "depot_address": "Depot", "depot_provenance": "typed"},
-            headers=admin_headers,
-        )
-        assert response.status_code == 200, response.text
+        _put_bus(client, admin_headers, fleet, depot_lat=-1.31, depot_lng=36.80,
+                 depot_address="Depot", depot_provenance="typed")
         assert _bus(client, admin_headers, bus["id"])["availability"] == "out-of-service"
     finally:
-        client.put(f"/api/fleet/buses/{bus['id']}",
-                   json={"name": bus["name"], "capacity": 20, "availability": "in-service"},
-                   headers=admin_headers)
+        _put_bus(client, admin_headers, fleet, availability="in-service")
+
+
+def _run(client, admin_headers, run_id: str) -> dict:
+    runs = client.get("/api/runs", headers=admin_headers).json()
+    return next(r for r in runs if r["id"] == run_id)
+
+
+def test_arrival_records_when_not_just_how_many(client, admin_headers, fleet):
+    """R25: each arrival stamps its stop, and earlier stops keep their stamps.
+
+    The counter alone cannot answer "how long since the bus last moved", and the
+    force-close needs evidence the gate was actually reached.
+    """
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    started = client.post("/api/runs/driver/start",
+                          json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    try:
+        context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+        total = len(context["run_stops"])
+        assert total >= 2, "fixture route needs at least two stops"
+        assert all(s["arrived_at"] is None for s in context["run_stops"])
+
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+        stops = client.get("/api/runs/driver/context", headers=driver_headers).json()["run_stops"]
+        stamped = [s for s in stops if s["arrived_at"] is not None]
+        assert len(stamped) == 1 and stamped[0]["stop_order"] == 1
+
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+        stops = client.get("/api/runs/driver/context", headers=driver_headers).json()["run_stops"]
+        stamped = sorted(s["stop_order"] for s in stops if s["arrived_at"] is not None)
+        assert stamped == [1, 2], "an earlier arrival lost its timestamp"
+    finally:
+        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+
+
+def test_fresh_run_is_not_flagged_and_completed_runs_never_are(client, admin_headers, fleet):
+    """R25: the flag measures a stall, so a run that just started is clean, and
+    a completed run is never flagged however long ago it ended."""
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    started = client.post("/api/runs/driver/start",
+                          json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    try:
+        assert _run(client, admin_headers, run_id)["no_progress"] is False
+        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        assert _run(client, admin_headers, run_id)["no_progress"] is False
+    finally:
+        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+
+
+def test_flag_is_suppressed_once_every_stop_is_recorded(client, admin_headers, fleet):
+    """R25: the closure gate lengthens the window after the last arrival while
+    the driver resolves blocking children. A flag that fires on that normal path
+    is one the office learns to ignore, so it is suppressed there."""
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    started = client.post("/api/runs/driver/start",
+                          json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    try:
+        total = len(client.get("/api/runs/driver/context", headers=driver_headers).json()["run_stops"])
+        for _ in range(total):
+            client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+
+        stops = client.get("/api/runs/driver/context", headers=driver_headers).json()["run_stops"]
+        assert all(s["arrived_at"] is not None for s in stops), "not every stop was recorded"
+
+        # Backdate every arrival well past the threshold: with stops remaining
+        # this would flag, but none remain.
+        import psycopg
+        import os as _os
+        dsn = _os.environ.get("DATABASE_URL", "postgresql://saferide:saferide@localhost:5432/saferide")
+        with psycopg.connect(dsn, autocommit=True) as pg:
+            pg.execute("update run_stops set arrived_at = now() - interval '90 minutes' "
+                       "where run_id = %s", (run_id,))
+        assert _run(client, admin_headers, run_id)["no_progress"] is False
+    finally:
+        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+
+
+def test_stall_before_the_first_stop_is_flagged(client, admin_headers, fleet):
+    """R25: anchored at run start, not only between consecutive arrivals.
+
+    A driver whose phone dies before stop one is the case the office force-close
+    exists for; measuring only between arrivals would never fire on it.
+    """
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    started = client.post("/api/runs/driver/start",
+                          json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    try:
+        import psycopg
+        import os as _os
+        dsn = _os.environ.get("DATABASE_URL", "postgresql://saferide:saferide@localhost:5432/saferide")
+        with psycopg.connect(dsn, autocommit=True) as pg:
+            pg.execute("update live_runs set created_at = now() - interval '90 minutes' "
+                       "where id = %s", (run_id,))
+        assert _run(client, admin_headers, run_id)["no_progress"] is True
+
+        # The next arrival clears it on its own.
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+        assert _run(client, admin_headers, run_id)["no_progress"] is False
+    finally:
+        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+
+
+def test_repeat_arrive_taps_still_advance_progress(client, admin_headers, fleet):
+    """R25 guardrail: arrival tapping is deliberately NOT made idempotent.
+
+    arrive_next_stop takes no stop identifier, so repeat tapping is the only way
+    a driver catches progress up to a child's stop — and reaching it gates
+    confirming their drop-off. Suppressing repeats for the flag's benefit would
+    strand a driver who missed a tap.
+    """
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    started = client.post("/api/runs/driver/start",
+                          json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    try:
+        before = _run(client, admin_headers, run_id)["stops_completed"]
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+        after = _run(client, admin_headers, run_id)["stops_completed"]
+        assert after == before + 2, "repeat taps stopped advancing progress"
+    finally:
+        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
 
 
 def test_admin_writes_never_touch_the_retired_status_column(client, admin_headers, fleet):
@@ -233,12 +373,7 @@ def test_admin_writes_never_touch_the_retired_status_column(client, admin_header
     """
     bus = fleet["bus"]
     before = _bus(client, admin_headers, bus["id"])["status"]
-    response = client.put(
-        f"/api/fleet/buses/{bus['id']}",
-        json={"name": bus["name"], "capacity": 20, "status": "delayed"},
-        headers=admin_headers,
-    )
-    assert response.status_code == 200, response.text
+    _put_bus(client, admin_headers, fleet, status="delayed")
     after = _bus(client, admin_headers, bus["id"])
     assert after["status"] == before, "the retired column was written"
     assert after["derived_status"] == "idle", "a stale column value leaked into the derived status"
