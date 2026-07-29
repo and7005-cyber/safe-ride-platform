@@ -498,12 +498,14 @@ def test_display_status_matches_raw_at_school(
 
     faith = get_child(client, parent_headers, PARENT_CHILD)
     assert faith["status"] == "at-school"
-    assert faith["display_status"] == "at-school"
+    # U3: at-school now requires a boarding on a completed morning run. A
+    # seeded child with no run today reads at-home; the raw column is untouched.
+    assert faith["display_status"] == "at-home"
 
     # Grace is bus-less and route-less: nothing can ever flip her seeded status.
     grace = get_child(client, parent_headers, PARENT_BUSLESS_CHILD)
     assert grace["status"] == "at-school"
-    assert grace["display_status"] == "at-school"
+    assert grace["display_status"] == "at-home"
 
 
 def test_today_absence_flips_display_status_and_clearing_restores(
@@ -555,7 +557,9 @@ def test_dropped_off_child_with_no_afternoon_run_today_shows_at_home(
         kid = get_child(client, parent_headers, PARENT_CHILD)
         assert kid["status"] == "dropped-off"
         # A completed afternoon run today contains her: dropped-off is trusted.
-        assert kid["display_status"] == "dropped-off"
+        # U3: dropped-off is derived from a confirmed drop-off recorded on a run
+        # today. This child's state was staged on the column, so she reads at-home.
+        assert kid["display_status"] == "at-home"
 
         # Admin deletes the run: now dropped-off with no afternoon run today.
         deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)

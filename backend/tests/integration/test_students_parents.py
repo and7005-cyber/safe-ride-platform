@@ -505,7 +505,9 @@ def test_route_less_student_shows_unassigned_on_admin_list_only(
         listed = admin_row(client, admin_headers, student["id"])
         assert listed["display_status"] == "unassigned"
         assert listed["status"] == "at-school"  # raw status stays in the payload
-        assert parent_row(client, parent_headers, student["id"])["display_status"] == "at-school"
+        # U3: the parent surface reads at-home for a child with no participation
+        # today. The admin-only unassigned wrap above is what this test is for.
+        assert parent_row(client, parent_headers, student["id"])["display_status"] == "at-home"
 
         morning = driver_route(client, driver_headers, "morning")
         updated = client.put(
@@ -518,7 +520,8 @@ def test_route_less_student_shows_unassigned_on_admin_list_only(
         assert updated.status_code == 200, updated.text
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="at-school", raw="at-school",
+            # U3: at-school requires a boarding on a completed morning run.
+            expected="at-home", raw="at-school",
         )
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
@@ -545,7 +548,9 @@ def test_on_bus_on_active_run_today_shows_on_bus(
 
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="on-bus", raw="on-bus",
+            # U3/R7: the afternoon auto-board is a declared presumption, so it
+            # reads as expected-on-bus until the driver confirms or corrects.
+            expected="expected-on-bus", raw="on-bus",
         )
     finally:
         if run_id:
@@ -683,7 +688,8 @@ def test_stale_dropped_off_decays_to_at_home(
         # dropped-off is trusted (the else branch passes the raw through).
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="dropped-off", raw="dropped-off",
+            # U3: dropped-off is derived from a confirmed drop-off on a run today.
+            expected="at-home", raw="dropped-off",
         )
 
         deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)

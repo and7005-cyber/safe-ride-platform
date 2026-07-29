@@ -873,7 +873,9 @@ def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
         assert result is not None and result["scope"] == "afternoon"
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="at-school", raw="at-school",
+            # U3: a partial scope still never writes status; the baseline for a
+            # child with no participation today is at-home.
+            expected="at-home", raw="at-school",
         )
         assert driver_flag() is False  # pre-run branch pins to 'day'-only
 
@@ -889,7 +891,9 @@ def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
         assert removed == {"deleted": True, "scope": None}
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="at-school", raw="at-school",
+            # U3: withdrawing the absence returns the child to their baseline,
+            # which is at-home with no participation today.
+            expected="at-home", raw="at-school",
         )
     finally:
         _clear_absences_for(client, admin_headers, student["id"])

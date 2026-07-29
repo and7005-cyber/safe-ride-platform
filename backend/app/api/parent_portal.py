@@ -173,7 +173,11 @@ def cancel_ride(
                 f"The {scope} run has already been completed today — "
                 "that ride can no longer be cancelled."
             )
-        if context["student"]["status"] == "on-bus" and any(
+        # Confirmed aboard, not presumed (U3/R6). The afternoon auto-board
+        # presumes the whole roster aboard at run start, so keying on that would
+        # block a parent who collected their child from school from cancelling —
+        # the app enforcing an assertion it says it is not making.
+        if context["student"]["display_status"] == "on-bus" and any(
             t in active for t in _covered_types(scope)
         ):
             raise ConflictError(

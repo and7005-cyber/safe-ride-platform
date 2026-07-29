@@ -374,7 +374,7 @@ class PushService:
             bus = self._bus_label(run.get("bus_id"))
             students = [
                 s for s in self.dao.students_at_stop(str(run["id"]), next_order)
-                if s["student_status"] != "absent"
+                if s["student_status"] not in ("absent", "unaccounted")
             ]
             for link in self.dao.parents_of_students([s["student_id"] for s in students]):
                 self._notify(
@@ -399,7 +399,7 @@ class PushService:
             stops = self.dao.remaining_student_stops(str(run["id"]), run["stops_completed"])
             near = [
                 s for s in stops
-                if s["student_status"] != "absent"
+                if s["student_status"] not in ("absent", "unaccounted")
                 and haversine_m(lat, lng, float(s["lat"]), float(s["lng"])) <= radius
             ]
             for link in self.dao.parents_of_students([s["student_id"] for s in near]):
@@ -419,15 +419,20 @@ class PushService:
     # Internals ----------------------------------------------------------------
 
     def _boarded_links(self, run: dict) -> list[dict]:
-        """Parent links for students who actually boarded this run.
+        """Parent links for children the driver actually observed boarding.
 
-        end_run snapshots the pre-sweep on-bus roster into
-        run["boarded_student_ids"]; gate arrivals read live statuses.
+        end_run supplies run["boarded_student_ids"] from participation —
+        confirmed boardings only. A presumed afternoon board is not evidence a
+        child rode, and asserting arrival for one would be a false safety claim.
+
+        The fallback covers callers with no snapshot (a gate arrival mid-run)
+        and reads the derived status, not the raw column: after U2 the column
+        no longer tracks who boarded this run.
         """
         boarded_ids = run.get("boarded_student_ids")
         if boarded_ids is None:
             students = self.dao.students_on_run(str(run["id"]))
-            boarded_ids = [s["id"] for s in students if s.get("status") == "on-bus"]
+            boarded_ids = [s["id"] for s in students if s.get("display_status") == "on-bus"]
         return self.dao.parents_of_students(list(boarded_ids))
 
     def _bus_label(self, bus_id: str | None) -> str:

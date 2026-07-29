@@ -357,7 +357,10 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
 
         child = child_row(client, p1, s1["id"])
         assert child["cancellation"] == {"scope": "afternoon", "withdrawable": True}
-        assert child["display_status"] == "at-school"  # partial never writes status
+        # A partial cancellation still never writes status. The baseline for a
+        # child with no participation today is at-home since U3 — the stored
+        # column no longer decides what a surface shows.
+        assert child["display_status"] == "at-home"
 
         afternoon_run_id = _start_run(client, driver_headers, fleet["afternoon"]["id"])["id"]
         context = _driver_context(client, driver_headers)
@@ -738,7 +741,9 @@ def test_merge_to_day_and_household_half_withdrawal(client, admin_headers, fleet
         first = cancel(client, p1, s1["id"], "morning")
         assert first.status_code == 200, first.text
         assert first.json()["scope"] == "morning"
-        assert child_row(client, p1, s1["id"])["display_status"] == "at-school"
+        # U3: a child with no participation today reads at-home. The subject of
+        # this test is the cancellation merge, not the baseline status.
+        assert child_row(client, p1, s1["id"])["display_status"] == "at-home"
 
         merged = cancel(client, p1, s1["id"], "afternoon")
         assert merged.status_code == 200, merged.text
@@ -764,7 +769,7 @@ def test_merge_to_day_and_household_half_withdrawal(client, admin_headers, fleet
         assert downgraded.json() == {"ok": True, "deleted": False, "scope": "afternoon"}
         child = child_row(client, p2, s1["id"])
         assert child["cancellation"] == {"scope": "afternoon", "withdrawable": True}
-        assert child["display_status"] == "at-school"
+        assert child["display_status"] == "at-home"
         assert absence_row(client, admin_headers, s1["id"])["scope"] == "afternoon"
 
         removed = withdraw(client, p2, s1["id"], "afternoon")

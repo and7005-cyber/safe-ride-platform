@@ -3,7 +3,7 @@ from typing import Any
 from app.core.db import get_connection
 from app.dao.absence_dao import absent_student_ids
 from app.dao import participation_dao
-from app.dao.status_sql import no_progress_case, scope_covers
+from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
 
 
 class RunDao:
@@ -244,8 +244,12 @@ class RunDao:
             # run to match, so only whole-day rows flag (the %s arm is NULL
             # then, and `a.scope = null` matches nothing).
             active_dict = dict(active) if active else None
+            # display_status travels with the roster (U3) so the driver phone
+            # reads the same derived value as the admin list and the parent app.
+            # It used to project the raw status column and show a stale on-bus
+            # child differently from every other surface.
             absent_flag_sql = f"""
-                select s.*, exists (
+                select s.*, {display_status_case("s")} as display_status, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date

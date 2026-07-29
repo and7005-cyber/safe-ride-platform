@@ -119,8 +119,13 @@ class ParentLiveDao:
             ids = [str(cid) for cid in self._child_ids(conn, parent_id)]
             if str(student_id) not in ids:
                 return None  # ownership: not this parent's child
+            # display_status, not the raw column (U3): the Cancel-a-Ride guard
+            # keys on whether the child is confirmed aboard, and an afternoon
+            # roster is presumed aboard from run start.
             student = conn.execute(
-                "select id, name, status, bus_id from live_students where id = %s",
+                f"select s.id, s.name, s.status, s.bus_id, "
+                f"{display_status_case('s')} as display_status "
+                f"from live_students s where s.id = %s",
                 (student_id,),
             ).fetchone()
             if not student:
