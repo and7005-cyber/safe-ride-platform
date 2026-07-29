@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, Search, UserX } from "lucide-react";
+import { Check, LogOut, Search, Undo2, UserX } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -21,8 +22,19 @@ import {
 } from "@/lib/statusVocabulary";
 
 // Morning runs board students; afternoon runs (auto-boarded at start, R32)
-// confirm drop-offs. Both actions are final after an explicit confirmation
-// naming the student (R29) — there is no un-board/undo control.
+// confirm drop-offs. Both are confirmed explicitly, naming the student (R29).
+//
+// Since U13 every child on the roster can be released from this screen without
+// calling the office: marked absent whatever the stop progress, handed over
+// off-route with a note, or — for something this login recorded on a run still
+// open — undone. That is what the closure gate needs to be workable: it refuses
+// to end a run while anyone is unaccounted for, so the driver has to be able to
+// account for every case from the phone.
+//
+// Un-boarding is still not one of them. The boarding toggle's rejection of
+// on_bus=false is a stale-client concurrency guard with its own justification;
+// the undo below is a separate path that retracts a recorded outcome and tells
+// the family, rather than a relaxation of that guard.
 
 export function DriverBoardingPage() {
   const qc = useQueryClient();
@@ -33,10 +45,28 @@ export function DriverBoardingPage() {
   const runStops = data?.run_stops ?? [];
   const students = data?.students ?? [];
   const [search, setSearch] = useState("");
+  // Arrived here from a tapped name on the end-run blocking list (U13/R11).
+  const [params] = useSearchParams();
+  const focusId = params.get("student");
+  const focusRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    focusRef.current?.scrollIntoView({ block: "center" });
+  }, [focusId, students.length]);
 
   const afternoon = activeRun?.type === "afternoon";
-  const isAbsent = (s: any) => s.absent === true || s.status === "absent";
-  const isDone = (s: any) => (afternoon ? s.status === "dropped-off" : s.status === "on-bus");
+  // The derived status, never the raw column (U12/U13). The column is vestigial
+  // since U3 and drifts — U7 stopped resetting it on run deletion — so reading
+  // it showed the driver a different state from the office and the parent app
+  // for the same child, and could never show the two derived-only values.
+  const stateOf = (s: any): string => s.display_status ?? s.status ?? "";
+  const isAbsent = (s: any) => s.absent === true || stateOf(s) === "absent";
+  const isDone = (s: any) =>
+    afternoon ? stateOf(s) === "dropped-off" : stateOf(s) === "on-bus";
+  // Aboard covers the afternoon presumption too: the auto-board put them on the
+  // bus, which is what makes a drop-off or a hand-over the right release.
+  const isAboard = (s: any) =>
+    stateOf(s) === "on-bus" || stateOf(s) === "expected-on-bus";
 
   const done = (students as any[]).filter(isDone).length;
   const remaining = (students as any[]).filter((s) => !isDone(s) && !isAbsent(s)).length;
@@ -102,6 +132,50 @@ export function DriverBoardingPage() {
     }
   };
 
+  const handover = async (s: any) => {
+    // The note is the whole point: "left the bus" without where or why is not
+    // an account of anything, so the dialog blocks confirmation until it exists.
+    const note = await confirm({
+      title: `${s.name} left the bus off-route?`,
+      description:
+        "Use this when a child leaves the bus away from their own stop — a breakdown, "
+        + "a closed road, a guardian collecting them at the roadside. Their family is "
+        + "told they left the bus, with your note.",
+      confirmLabel: "Record hand-over",
+      cancelLabel: "Cancel",
+      destructive: false,
+      note: {
+        label: "Where and to whom?",
+        placeholder: "Collected by grandmother at the junction",
+        maxLength: 200,
+      },
+    });
+    if (note == null) return;
+    try {
+      await api.post("/api/runs/driver/handover", { student_id: s.id, note });
+      await refresh();
+    } catch (err) {
+      toast({ title: "Cannot record", description: (err as Error).message, variant: "destructive" });
+    }
+  };
+
+  const undo = async (s: any) => {
+    if (!(await confirm({
+      title: `Undo your entry for ${s.name}?`,
+      description:
+        "Their family is told about the correction, so only undo something you "
+        + "recorded by mistake.",
+      confirmLabel: "Undo",
+      cancelLabel: "Keep",
+    }))) return;
+    try {
+      await api.post("/api/runs/driver/reverse", { student_id: s.id });
+      await refresh();
+    } catch (err) {
+      toast({ title: "Cannot undo", description: (err as Error).message, variant: "destructive" });
+    }
+  };
+
   return (
     <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title={afternoon ? "Student Drop-off" : "Student Boarding"}>
       <div className="space-y-4">
@@ -135,63 +209,88 @@ export function DriverBoardingPage() {
               const order = orderForStudent(s.id);
               const reached = activeRun != null && order != null && order <= activeRun.stops_completed;
               const absent = isAbsent(s);
-              const onBus = s.status === "on-bus";
-              const droppedOff = s.status === "dropped-off";
-              // Absent is offered where a no-show is observable (R24):
-              // morning at a reached stop before boarding; afternoon while the
-              // student is still on the (auto-boarded) roster.
-              const canMarkAbsent = afternoon ? onBus : reached && !onBus;
+              const done = isDone(s);
+              const aboard = isAboard(s);
+              // Absent is offered for any child with no recorded outcome,
+              // whatever the stop progress (U13/R8). It used to require the
+              // stop to have been reached, which left the driver of a child who
+              // was never at the stop with nothing to tap — and the closure gate
+              // then refused to end the run over exactly that child.
+              const canMarkAbsent = !absent && !done;
+              // A hand-over releases a child who really was aboard, so it is
+              // offered only then. It deliberately does not require the stop to
+              // have been reached: by definition it did not happen there.
+              const canHandover = aboard && !done;
+              const focused = focusId === s.id;
               return (
-                <Card key={s.id}>
-                  <CardContent className="flex items-center justify-between gap-3 p-3">
-                    <div>
-                      <p className="font-medium">{s.name}</p>
-                      <p className="text-xs text-muted-foreground">{s.grade ?? ""}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {absent ? (
-                        <Badge variant="destructive">Absent</Badge>
-                      ) : afternoon ? (
-                        droppedOff ? (
-                          <Badge variant="success">Dropped off</Badge>
-                        ) : onBus ? (
-                          <>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                              onClick={() => markAbsent(s)}
-                            >
-                              <UserX className="h-4 w-4" /> Absent
-                            </Button>
-                            <Button size="sm" disabled={!reached} onClick={() => dropoff(s)}>
-                              <Check className="h-4 w-4" /> Drop-off
-                            </Button>
-                          </>
-                        ) : (
-                          <Badge variant={variantFor(STUDENT_STATUS_VARIANT, s.status)}>{labelFor(STUDENT_STATUS_LABEL, s.status)}</Badge>
-                        )
-                      ) : onBus ? (
-                        <Badge variant="success">On bus</Badge>
-                      ) : (
-                        <>
-                          <Badge variant={variantFor(STUDENT_STATUS_VARIANT, s.status)}>{labelFor(STUDENT_STATUS_LABEL, s.status)}</Badge>
-                          {canMarkAbsent && (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                              onClick={() => markAbsent(s)}
-                            >
-                              <UserX className="h-4 w-4" /> Absent
-                            </Button>
-                          )}
-                          <Button size="sm" disabled={!reached} onClick={() => board(s)}>
-                            <Check className="h-4 w-4" /> Board
+                <Card
+                  key={s.id}
+                  ref={focused ? focusRef : undefined}
+                  className={focused ? "ring-2 ring-primary" : undefined}
+                  data-testid={`student-row-${s.id}`}
+                >
+                  <CardContent className="space-y-2 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="font-medium">{s.name}</p>
+                        <p className="text-xs text-muted-foreground">{s.grade ?? ""}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Badge variant={variantFor(STUDENT_STATUS_VARIANT, stateOf(s))}>
+                          {labelFor(STUDENT_STATUS_LABEL, stateOf(s))}
+                        </Badge>
+                        {/* Shown only where the server would allow it (U13/R10):
+                            every terminal badge looking reversible invites
+                            accidental taps, and none of them looking reversible
+                            makes the path undiscoverable. */}
+                        {s.can_undo && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            data-testid={`undo-${s.id}`}
+                            onClick={() => undo(s)}
+                          >
+                            <Undo2 className="h-4 w-4" /> Undo
                           </Button>
-                        </>
-                      )}
+                        )}
+                      </div>
                     </div>
+
+                    {(canMarkAbsent || canHandover || (!done && !absent)) && (
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {canMarkAbsent && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                            data-testid={`absent-${s.id}`}
+                            onClick={() => markAbsent(s)}
+                          >
+                            <UserX className="h-4 w-4" /> Absent
+                          </Button>
+                        )}
+                        {canHandover && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid={`handover-${s.id}`}
+                            onClick={() => handover(s)}
+                          >
+                            <LogOut className="h-4 w-4" /> Off-route
+                          </Button>
+                        )}
+                        {!absent && !done && (afternoon ? aboard : true) && (
+                          <Button
+                            size="sm"
+                            disabled={!reached}
+                            data-testid={`${afternoon ? "dropoff" : "board"}-${s.id}`}
+                            onClick={() => (afternoon ? dropoff(s) : board(s))}
+                          >
+                            <Check className="h-4 w-4" /> {afternoon ? "Drop-off" : "Board"}
+                          </Button>
+                        )}
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               );

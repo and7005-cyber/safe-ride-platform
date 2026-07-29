@@ -39,6 +39,9 @@ export function DriverRunPage() {
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
   const completedToday: string[] = data?.completed_route_ids_today ?? [];
+  // Server-computed, and polled with the rest of the context, so a name leaves
+  // the list as soon as that child is resolved on the board screen.
+  const blocking: { id: string; name: string }[] = data?.blocking ?? [];
 
   // Bus position is derived from stop arrivals on the backend (no device GPS):
   // the admin's/driver's device location must never become the bus position.
@@ -74,21 +77,20 @@ export function DriverRunPage() {
 
   const end = async () => {
     if (!activeRun) return;
-    // Ending is final (R29): on afternoon runs, name anyone whose drop-off
-    // was never confirmed — their parents will NOT get a "dropped off" push.
-    const unconfirmed =
-      activeRun.type === "afternoon"
-        ? (data?.students ?? [])
-            .filter((s: any) => s.status === "on-bus")
-            .map((s: any) => s.name)
-        : [];
-    const description =
-      unconfirmed.length > 0
-        ? `Not yet confirmed dropped off: ${unconfirmed.join(", ")}`
-        : "This marks the run as completed.";
+    // The client-side warning list is gone (U13/R11): it read the raw status
+    // column, only ran on afternoon runs, and warned before ending the run
+    // anyway — a second, weaker copy of a rule that now actually refuses.
+    //
+    // So the attempt always reaches the server, even with names still listed.
+    // The gate decides whether this run may close, and its refusal is written
+    // for the driver and names the children; inventing a message here would
+    // recreate exactly the duplicate that was just removed.
     if (!(await confirm({
       title: "End this run?",
-      description,
+      description:
+        blocking.length > 0
+          ? `${blocking.length} ${blocking.length === 1 ? "child is" : "children are"} still unaccounted for. Ending will be refused until each one is resolved.`
+          : "This marks the run as completed.",
       confirmLabel: "End Run",
       cancelLabel: "Cancel",
     }))) return;
@@ -99,7 +101,10 @@ export function DriverRunPage() {
       toast({ title: "Run completed" });
       navigate("/driver");
     } catch (err) {
-      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+      // The gate's refusal names the children; it is written for the driver, so
+      // it surfaces verbatim rather than being reworded here.
+      toast({ title: "Cannot end run", description: (err as Error).message, variant: "destructive" });
+      await refresh();
     } finally {
       setBusy(false);
     }
@@ -173,10 +178,45 @@ export function DriverRunPage() {
             </CardContent>
           </Card>
 
+          {blocking.length > 0 && (
+            <Card className="border-destructive/40 bg-destructive/5">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">
+                  Still to account for ({blocking.length})
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  The run cannot end until each of these children has a recorded
+                  outcome. Tap a name to go to them.
+                </p>
+                <ul className="space-y-1" data-testid="blocking-list">
+                  {/* Tappable (U13/R11): with several blockers a driver would
+                      otherwise make a manual multi-screen round trip per child,
+                      on a phone, at the end of every route. */}
+                  {blocking.map((b) => (
+                    <li key={b.id}>
+                      <button
+                        type="button"
+                        className="w-full rounded-md border border-destructive/30 bg-background px-3 py-2 text-left text-sm font-medium"
+                        onClick={() => navigate(`/driver/boarding?student=${b.id}`)}
+                      >
+                        {b.name}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
+          )}
+
           <div className="grid grid-cols-2 gap-3">
             <Button onClick={arrive} disabled={busy || activeRun.stops_completed >= activeRun.total_stops}>
               <MapPin className="h-4 w-4" /> Arrive Next Stop
             </Button>
+            {/* Deliberately not disabled while blocked: the same control
+                re-attempts closure, and the server's refusal is what tells the
+                driver why. A dead button explains nothing. */}
             <Button variant="destructive" onClick={end} disabled={busy}>
               <Flag className="h-4 w-4" /> End Run
             </Button>

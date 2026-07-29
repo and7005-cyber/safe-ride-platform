@@ -348,32 +348,80 @@ class RunDao:
             # reads the same derived value as the admin list and the parent app.
             # It used to project the raw status column and show a stale on-bus
             # child differently from every other surface.
-            absent_flag_sql = f"""
+            def roster_sql(scope_param: str, undo: str) -> str:
+                return f"""
                 select s.*, {display_status_case("s")} as display_status, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                      and {scope_covers("a.scope", "%s")}
-                ) as absent
+                      and {scope_covers("a.scope", scope_param)}
+                ) as absent{undo}
                 from live_students s
-            """
+                """
+
             if active_dict:
+                # can_undo drives the row's undo affordance (U13/R10) and mirrors
+                # reverse_own_action's conditions exactly: this run, this login's
+                # own action, still reversible. Deriving it on the phone would
+                # mean the button appears on rows the server then refuses — or,
+                # worse, hides on rows it would have allowed. Every terminal
+                # badge looking reversible invites accidental taps; none of them
+                # looking reversible makes the path undiscoverable.
+                #
+                # The absence arm matches reverse_driver_absence's own guard
+                # (source 'driver', marked by this login), so a driver mark that
+                # U8's precedence left attributed to the office or a parent
+                # correctly offers no undo here.
+                undo_sql = """, (
+                        exists (
+                            select 1 from run_participation p
+                            where p.run_id = %(run_id)s and p.student_id = s.id
+                              and (p.dropped_off_at is not null or p.handover_at is not null)
+                              and p.acting_driver_id = %(driver_id)s
+                        )
+                        or exists (
+                            select 1 from live_student_absences a2
+                            where a2.student_id = s.id
+                              and a2.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                              and a2.source = 'driver'
+                              and a2.marked_by = %(driver_id)s
+                        )
+                    ) as can_undo"""
                 students = conn.execute(
-                    absent_flag_sql
+                    roster_sql("%(run_type)s", undo_sql)
                     + """
                     where s.id in (
                         select rs.student_id from run_stops rs
-                        where rs.run_id = %s and rs.student_id is not null
+                        where rs.run_id = %(run_id)s and rs.student_id is not null
                     )
                     order by s.name asc
                     """,
-                    (active_dict["type"], active_dict["id"]),
+                    {
+                        "run_type": active_dict["type"],
+                        "run_id": active_dict["id"],
+                        "driver_id": driver_id,
+                    },
                 ).fetchall()
             else:
+                # No run, so nothing of this driver's to undo on one.
                 students = conn.execute(
-                    absent_flag_sql + " where s.bus_id = %s order by s.name asc",
+                    roster_sql("%s", ", false as can_undo")
+                    + " where s.bus_id = %s order by s.name asc",
                     (None, bus["id"]),
                 ).fetchall()
+            # The closure gate's blocking set, as data rather than only as the
+            # text of a 409 (U13/R11). The driver's end-run screen lists these
+            # names live, so they disappear one by one as each child is
+            # resolved; recomputing the rule on the phone instead would be a
+            # second implementation of the gate, free to drift from the one that
+            # actually refuses.
+            blocking = (
+                participation_dao.unaccounted_on_run(
+                    conn, str(active_dict["id"]), active_dict["type"]
+                )
+                if active_dict
+                else []
+            )
             run_stops = []
             if active_dict:
                 run_stops = [
@@ -390,6 +438,7 @@ class RunDao:
             "active_run": active_dict,
             "run_stops": run_stops,
             "students": [dict(s) for s in students],
+            "blocking": [{"id": str(b["id"]), "name": b["name"]} for b in blocking],
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
         }
 
