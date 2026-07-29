@@ -777,16 +777,12 @@ The updated driver guide and a short briefing reach the pilot school's drivers, 
 - **The closure gate changes driver behaviour during a pilot.** Drivers who previously ended runs with unconfirmed children now cannot. The likely failure is drivers marking children absent to escape the gate, so the briefing in U15 is a release gate rather than a documentation task, and the rate of driver-created absences is the signal to watch afterwards. No surface reports that rate today — finding it means a manual query.
 - **Participation and status coexist during the transition.** Until the follow-up drops the column, two representations of the same fact exist. U3 moves the display, driver-context, notification-recipient and cancellation-guard read paths; anything else still reading the column after that is a defect.
 - **Eight new integration modules land in a suite with no shared fixtures.** Every existing module re-declares its own skip guard, HTTP client, throwaway-fleet fixture and run-teardown block. Either budget for that duplication or extract a shared fixture module first.
-- **Depends on** the school confirming the driver-assistant question: the actor model has one driver account per bus, so an assistant either shares that login — making reversal ownership vacuous — or cannot act at all.
+- **The record identifies an account, not a person.** The driver assistant shares the driver's login, so participation attribution and the reversal ownership check both resolve to the bus's driver account. "Their own action" therefore means "this login's action on this open run", and neither the office nor the record can tell which of the two humans acted. That is acceptable for correcting a mis-tap, which is what reversal is for; it is not an audit trail, and should not be relied on as one.
 - **Depends on** the school confirming its drivers have been briefed before the closure gate is enabled.
 
 ---
 
 ## Open Questions
-
-### Resolve before implementation
-
-- Does a driver assistant get their own account, or share the driver's? Reversal ownership and participation attribution both key on the acting account.
 
 ### Deferred to implementation
 
