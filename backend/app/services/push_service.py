@@ -285,6 +285,11 @@ class PushService:
                 return
             if incident.get("type") == "arrival" or not incident.get("bus_id"):
                 return
+            # Run-lifecycle rows are the office's operational feed (U16). Same
+            # defense-in-depth as the student_id guard: callers keep these
+            # DAO-direct, and this holds the line if one ever slips through.
+            if incident.get("lifecycle"):
+                return
             title = INCIDENT_TITLES.get(incident.get("type", ""), "Notice from the bus")
             body = incident.get("description") or f"Reported on {incident.get('bus_name') or 'the bus'}."
             # One notification per parent, however many children they have on

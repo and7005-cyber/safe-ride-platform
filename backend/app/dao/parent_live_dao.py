@@ -275,14 +275,26 @@ class ParentLiveDao:
                 window_sql += " and created_at <= now() - (%s || ' hours')::interval"
                 params.append(int(min_age_hours))
             params.append(limit)
+            # Two exclusions, for different reasons.
+            #
             # student_id-stamped incidents are child-specific (absence reports
             # for the school): only the admin Alerts page may see them — no
             # other parent on the bus learns a named child's absence here.
+            #
+            # lifecycle rows are the office's operational feed (U16): run
+            # started, run completed, and later the closure events. Parents
+            # already receive their own messages for anything that concerns
+            # them, so these would arrive as duplicate, vaguer news — and the
+            # refused-closure and force-close rows name blocking children to an
+            # audience that must not see them. Note this predicate also finally
+            # excludes the pre-existing 'arrival' rows, which have reached the
+            # parent feed all along because the only filter was student_id.
             rows = conn.execute(
                 f"""
                 select id, driver_name, bus_id, bus_name, type, run_type, description, created_at
                 from live_incidents
-                where bus_id = any(%s) and student_id is null{window_sql}
+                where bus_id = any(%s) and student_id is null
+                  and lifecycle = false and type <> 'arrival'{window_sql}
                 order by created_at desc
                 limit %s
                 """,

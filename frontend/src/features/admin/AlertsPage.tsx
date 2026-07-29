@@ -9,10 +9,11 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/apiClient";
 import { useIncidents } from "@/lib/queries";
 
-// Admin-side labels (note: traffic differs from the parent-side "Traffic Delay";
-// arrival has no mapping here — the live admin feed shows the raw "arrival").
+// Admin-side labels (note: traffic differs from the parent-side "Traffic Delay").
 // 'cancellation' is the parent Cancel-a-Ride alert (R17/U14): student-stamped,
 // bus context from the covered route, the acting parent named in the description.
+// 'arrival' and the run-lifecycle types (U16) are office-only and were the last
+// entries rendering as raw slugs.
 const TYPE_LABEL: Record<string, string> = {
   breakdown: "Vehicle Breakdown",
   accident: "Road Accident",
@@ -20,6 +21,9 @@ const TYPE_LABEL: Record<string, string> = {
   traffic: "Heavy Traffic / Delay",
   other: "Notice",
   cancellation: "Ride Cancellation",
+  arrival: "Arrived at School",
+  "run-started": "Route Started",
+  "run-completed": "Route Ended",
 };
 
 const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "success"> = {
@@ -30,6 +34,9 @@ const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "su
   arrival: "success",
   other: "secondary",
   cancellation: "warning",
+  // Lifecycle events are informational, not exceptional — muted on purpose.
+  "run-started": "secondary",
+  "run-completed": "secondary",
 };
 
 export function AlertsPage() {
