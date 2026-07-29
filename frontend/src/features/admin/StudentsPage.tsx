@@ -41,58 +41,26 @@ import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
 
 // --- Pure status pieces (unit-tested in tests/unit/studentStatus.test.ts) ---
 
-// The derived, day-scoped status computed by the backend (U3/U4). The raw
-// `status` column still travels in the payload but never renders here (R1–R4).
-export type StudentDisplayStatus =
-  | "at-school"
-  | "on-bus"
-  | "dropped-off"
-  | "absent"
-  | "at-home"
-  | "unassigned";
+// Status vocabulary lives in one shared module (U17) so admin, driver and
+// parent surfaces cannot drift apart again. Imported for use below and
+// re-exported because the unit tests import these names from this page.
+import {
+  STUDENT_STATUS_LABEL,
+  STUDENT_STATUS_VARIANT,
+  STUDENT_STATUS_FILTERS,
+  studentMatchesFilter,
+  absenceBadgeLabel,
+  type StudentDisplayStatus,
+} from "@/lib/statusVocabulary";
 
-export const STUDENT_STATUS_LABEL: Record<StudentDisplayStatus, string> = {
-  "at-school": "At school",
-  "on-bus": "On bus",
-  "dropped-off": "Dropped off",
-  absent: "Absent today",
-  "at-home": "At home",
-  unassigned: "Unassigned",
+export {
+  STUDENT_STATUS_LABEL,
+  STUDENT_STATUS_VARIANT,
+  STUDENT_STATUS_FILTERS,
+  studentMatchesFilter,
+  absenceBadgeLabel,
 };
-
-export const STUDENT_STATUS_VARIANT: Record<
-  StudentDisplayStatus,
-  "secondary" | "success" | "warning" | "destructive" | "outline"
-> = {
-  "at-school": "secondary",
-  "on-bus": "success",
-  "dropped-off": "warning",
-  absent: "destructive",
-  "at-home": "secondary",
-  unassigned: "outline",
-};
-
-// Filter options are the derived value set (R4) — one option per label entry.
-export const STUDENT_STATUS_FILTERS = [
-  { value: "all", label: "All statuses" },
-  ...Object.entries(STUDENT_STATUS_LABEL).map(([value, label]) => ({ value, label })),
-];
-
-// The status filter matches the derived display_status, never the raw status (R4).
-export function studentMatchesFilter(
-  student: { display_status?: string | null },
-  filter: string,
-): boolean {
-  return filter === "all" || student.display_status === filter;
-}
-
-// Absence badge text: whole-day keeps the historical wording; partial-scope
-// parent cancellations (U4) name their half of the day.
-export function absenceBadgeLabel(scope?: string | null): string {
-  if (scope === "morning") return "Absent (AM)";
-  if (scope === "afternoon") return "Absent (PM)";
-  return "Absent today";
-}
+export type { StudentDisplayStatus };
 
 // Copy for the scope-aware toggle's dialog: a parent cancellation is named
 // with its scope before the office escalates or removes it (U10).

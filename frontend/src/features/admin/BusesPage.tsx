@@ -35,27 +35,19 @@ import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
 import { phoneError } from "@/lib/validation";
 import { useBuses, useDrivers } from "@/lib/queries";
+import {
+  BUS_STATUS_FILTERS,
+  BUS_STATUS_LABEL,
+  BUS_STATUS_VARIANT,
+  BUS_AVAILABILITY_OPTIONS,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
 // Bus status is derived server-side from the bus's current run (U9) and arrives
 // as `derived_status`; the stored column is no longer written by any path. The
 // one value the office still sets is availability, which overrides the
-// derivation because whether a bus is in the workshop is not a function of its
-// runs. 'offline' moved here as 'out-of-service'.
-const STATUS_FILTERS = [
-  { value: "all", label: "All statuses" },
-  { value: "active", label: "Active" },
-  { value: "idle", label: "Idle" },
-  { value: "delayed", label: "Delayed" },
-  { value: "out-of-service", label: "Out of service" },
-];
-
-const STATUS_VARIANT: Record<string, "success" | "warning" | "secondary" | "destructive"> = {
-  active: "success",
-  delayed: "warning",
-  idle: "secondary",
-  "out-of-service": "destructive",
-};
-
+// derivation. Labels come from the shared vocabulary (U17).
 const EMPTY = {
   name: "",
   plate_number: "",
@@ -175,7 +167,7 @@ export function BusesPage() {
         search={search}
         onSearch={setSearch}
         placeholder="Search buses, plates, drivers…"
-        filters={[{ value: statusFilter, onChange: setStatusFilter, options: STATUS_FILTERS }]}
+        filters={[{ value: statusFilter, onChange: setStatusFilter, options: BUS_STATUS_FILTERS }]}
         actions={
           <Button onClick={startCreate}>
             <Plus className="h-4 w-4" /> Add Bus
@@ -216,8 +208,8 @@ export function BusesPage() {
                   <TableCell className="text-muted-foreground">{bus.driver_phone ?? "—"}</TableCell>
                   <TableCell>{bus.capacity} seats</TableCell>
                   <TableCell>
-                    <Badge variant={STATUS_VARIANT[bus.derived_status] ?? "secondary"}>
-                      {STATUS_FILTERS.find((s) => s.value === bus.derived_status)?.label ?? bus.derived_status}
+                    <Badge variant={variantFor(BUS_STATUS_VARIANT, bus.derived_status)}>
+                      {labelFor(BUS_STATUS_LABEL, bus.derived_status)}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">
@@ -277,8 +269,9 @@ export function BusesPage() {
                 <Select value={form.availability} onValueChange={(v) => setForm({ ...form, availability: v })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="in-service">In service</SelectItem>
-                    <SelectItem value="out-of-service">Out of service</SelectItem>
+                    {BUS_AVAILABILITY_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">

@@ -34,24 +34,21 @@ import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
 import { useBuses, useRoutes, useRuns } from "@/lib/queries";
+import {
+  RUN_STATUS_FILTERS,
+  RUN_STATUS_LABEL,
+  RUN_STATUS_VARIANT,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
-const RUN_STATUS_FILTERS = [
-  { value: "all", label: "All statuses" },
-  { value: "in-progress", label: "In progress" },
-  { value: "delayed", label: "Delayed" },
-  { value: "completed", label: "Completed" },
-];
+// Status labels come from the shared vocabulary (U17). Period is not a status
+// domain, so it stays local to this page.
 const RUN_TYPE_FILTERS = [
   { value: "all", label: "All types" },
   { value: "morning", label: "Morning" },
   { value: "afternoon", label: "Afternoon" },
 ];
-
-const STATUS_VARIANT: Record<string, "success" | "warning" | "secondary"> = {
-  "in-progress": "success",
-  delayed: "warning",
-  completed: "secondary",
-};
 
 const EMPTY = { bus_id: "none", route_id: "none", type: "morning", date: "", status: "in-progress" };
 
@@ -177,7 +174,7 @@ export function RunsPage() {
                   <TableCell>{r.route_name ?? r.type}</TableCell>
                   <TableCell>{r.date}</TableCell>
                   <TableCell>{r.stops_completed}/{r.total_stops} stops · {r.students_boarded}/{r.total_students} boarded</TableCell>
-                  <TableCell><Badge variant={STATUS_VARIANT[r.status] ?? "secondary"}>{r.status}</Badge></TableCell>
+                  <TableCell><Badge variant={variantFor(RUN_STATUS_VARIANT, r.status)}>{labelFor(RUN_STATUS_LABEL, r.status)}</Badge></TableCell>
                   <TableCell className="text-right">
                     <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); startEdit(r); }}><Pencil className="h-4 w-4" /></Button>
                     <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); remove(r.id); }}><Trash2 className="h-4 w-4" /></Button>
@@ -255,7 +252,7 @@ export function RunsPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-medium">{report.route_name ?? "—"}</span>
                 <Badge variant="outline">{report.type}</Badge>
-                <Badge variant={STATUS_VARIANT[report.status] ?? "secondary"}>{report.status}</Badge>
+                <Badge variant={variantFor(RUN_STATUS_VARIANT, report.status)}>{labelFor(RUN_STATUS_LABEL, report.status)}</Badge>
               </div>
               <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm sm:grid-cols-3">
                 <ReportField

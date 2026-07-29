@@ -11,6 +11,14 @@ import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { DRIVER_NAV } from "@/features/driver/DriverHomePage";
 import { useDriverContext } from "@/features/driver/driverHooks";
 import { api } from "@/lib/apiClient";
+// The driver board had no label map at all and rendered raw slugs like
+// "at-school" (U17). It now reads the same vocabulary as admin and parent.
+import {
+  STUDENT_STATUS_LABEL,
+  STUDENT_STATUS_VARIANT,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
 // Morning runs board students; afternoon runs (auto-boarded at start, R32)
 // confirm drop-offs. Both actions are final after an explicit confirmation
@@ -156,13 +164,13 @@ export function DriverBoardingPage() {
                             </Button>
                           </>
                         ) : (
-                          <Badge variant="secondary">{s.status}</Badge>
+                          <Badge variant={variantFor(STUDENT_STATUS_VARIANT, s.status)}>{labelFor(STUDENT_STATUS_LABEL, s.status)}</Badge>
                         )
                       ) : onBus ? (
                         <Badge variant="success">On bus</Badge>
                       ) : (
                         <>
-                          <Badge variant="secondary">{s.status}</Badge>
+                          <Badge variant={variantFor(STUDENT_STATUS_VARIANT, s.status)}>{labelFor(STUDENT_STATUS_LABEL, s.status)}</Badge>
                           {canMarkAbsent && (
                             <Button
                               size="sm"

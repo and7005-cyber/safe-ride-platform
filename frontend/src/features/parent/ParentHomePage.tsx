@@ -23,23 +23,16 @@ import {
   type CancelScope,
   type ChildCancellation,
 } from "@/features/parent/parentHooks";
+import {
+  STUDENT_STATUS_LABEL,
+  STUDENT_STATUS_VARIANT,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
-const STATUS_VARIANT: Record<string, "secondary" | "success" | "warning" | "destructive"> = {
-  "at-home": "secondary",
-  "at-school": "secondary",
-  "on-bus": "success",
-  "dropped-off": "warning",
-  absent: "destructive",
-};
-
-const STATUS_LABEL: Record<string, string> = {
-  "at-home": "At home",
-  "at-school": "At School",
-  "on-bus": "On the bus",
-  "dropped-off": "Dropped off",
-  absent: "Absent",
-};
-
+// Status labels come from the shared vocabulary (U17). The parent app used to
+// define its own map and drifted: "At School" against admin's "At school", "On
+// the bus" against "On bus", "Absent" against "Absent today".
 // Cancel-a-Ride pure pieces (U13: R14, R18; AE4) ------------------------------
 
 /** Pending-state chip copy per cancellation scope (R18's visible state). */
@@ -111,10 +104,10 @@ export function ChildStatusBadge({
   return (
     <Badge
       data-testid="child-status-badge"
-      variant={STATUS_VARIANT[status] ?? "secondary"}
+      variant={variantFor(STUDENT_STATUS_VARIANT, status)}
       className={cn("px-3 py-1 text-sm", className)}
     >
-      {STATUS_LABEL[status] ?? status}
+      {labelFor(STUDENT_STATUS_LABEL, status)}
     </Badge>
   );
 }

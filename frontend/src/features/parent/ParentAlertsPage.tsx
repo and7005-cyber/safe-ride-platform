@@ -21,66 +21,28 @@ import {
   useParentAlerts,
   useParentNotifications,
 } from "@/features/parent/parentHooks";
+import {
+  NOTIFICATION_LABEL,
+  NOTIFICATION_VARIANT,
+  PARENT_INCIDENT_LABEL,
+  PARENT_INCIDENT_VARIANT,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
-// Parent-side labels (traffic = "Traffic Delay", distinct from the admin label).
-export const TYPE_LABEL: Record<string, string> = {
-  breakdown: "Vehicle Breakdown",
-  accident: "Road Accident",
-  student: "Student Issue",
-  traffic: "Traffic Delay",
-  arrival: "Bus Arrived at School",
-  other: "Notice",
-};
+// Labels come from the shared vocabulary (U17). This page previously defined
+// Title Case notification labels against ParentHomePage's sentence case — the
+// same word rendered two ways on adjacent screens.
+export const TYPE_LABEL = PARENT_INCIDENT_LABEL;
+const TYPE_VARIANT = PARENT_INCIDENT_VARIANT;
+export { NOTIFICATION_LABEL, NOTIFICATION_VARIANT };
 
-const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "success"> = {
-  breakdown: "destructive",
-  accident: "destructive",
-  student: "warning",
-  traffic: "warning",
-  arrival: "success",
-  other: "secondary",
-};
-
-// Typed parent notifications (the push feed mirror). 'admin-notice' is the
-// office route broadcast and 'ride-cancelled' the Cancel-a-Ride confirmation
-// (R22, R17) — both first-class, with their own label and styling.
-export const NOTIFICATION_LABEL: Record<string, string> = {
-  "run-started": "Bus On The Way",
-  "student-boarded": "Boarded the Bus",
-  "bus-approaching": "Bus Approaching",
-  "reached-school": "Arrived at School",
-  "on-way-home": "On the Way Home",
-  "dropped-off": "Dropped Off",
-  "student-absent": "Marked Absent",
-  incident: "Bus Incident",
-  "admin-notice": "School Notice",
-  "ride-cancelled": "Ride Cancelled",
-  custom: "Notice",
-};
-
-export const NOTIFICATION_VARIANT: Record<
-  string,
-  "destructive" | "warning" | "secondary" | "success"
-> = {
-  "run-started": "secondary",
-  "student-boarded": "success",
-  "bus-approaching": "warning",
-  "reached-school": "success",
-  "on-way-home": "secondary",
-  "dropped-off": "success",
-  "student-absent": "destructive",
-  incident: "destructive",
-  "admin-notice": "warning",
-  "ride-cancelled": "secondary",
-  custom: "secondary",
-};
-
-// Type filter over the merged taxonomy (R33): notification types plus incident
-// types; the never-produced `custom` type is excluded. Values stay raw type
-// strings — the two namespaces don't collide.
+// Type filter over the merged taxonomy: notification types plus the incident
+// types a parent can actually receive; the never-produced `custom` type is
+// excluded. Values stay raw type strings — the two namespaces don't collide.
 export const TYPE_FILTER_OPTIONS: { value: string; label: string }[] = [
   ...Object.entries(NOTIFICATION_LABEL).filter(([type]) => type !== "custom"),
-  ...Object.entries(TYPE_LABEL),
+  ...Object.entries(PARENT_INCIDENT_LABEL),
 ].map(([value, label]) => ({ value, label }));
 
 const PERIODS = [
@@ -144,8 +106,8 @@ export function ParentAlertsPage() {
       kind: "incident" as const,
       type: a.type,
       runType: a.run_type ?? null,
-      label: TYPE_LABEL[a.type] ?? a.type,
-      variant: TYPE_VARIANT[a.type] ?? "secondary",
+      label: labelFor(TYPE_LABEL, a.type, a.type),
+      variant: variantFor(TYPE_VARIANT, a.type),
       heading: a.bus_name ?? "",
       body: a.description ?? "",
       createdAt: a.created_at ?? null,
@@ -159,8 +121,8 @@ export function ParentAlertsPage() {
         kind: "notification" as const,
         type: n.type,
         runType: n.run_type ?? null,
-        label: NOTIFICATION_LABEL[n.type] ?? n.type,
-        variant: NOTIFICATION_VARIANT[n.type] ?? "secondary",
+        label: labelFor(NOTIFICATION_LABEL, n.type, n.type),
+        variant: variantFor(NOTIFICATION_VARIANT, n.type),
         heading: n.title ?? "",
         body: n.body ?? "",
         createdAt: n.created_at ?? null,

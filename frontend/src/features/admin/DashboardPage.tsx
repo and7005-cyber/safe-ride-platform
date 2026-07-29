@@ -4,27 +4,16 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatCard } from "@/features/admin/components/StatCard";
 import { useActiveRuns, useBuses, useRuns, useStudents, useTodayIncidentCount } from "@/lib/queries";
+import {
+  BUS_STATUS_LABEL,
+  BUS_STATUS_VARIANT,
+  RUN_STATUS_LABEL,
+  RUN_STATUS_VARIANT,
+  labelFor,
+  variantFor,
+} from "@/lib/statusVocabulary";
 
-const RUN_STATUS_VARIANT: Record<string, "default" | "success" | "warning"> = {
-  "in-progress": "success",
-  delayed: "warning",
-  completed: "default",
-};
-
-const BUS_STATUS_VARIANT: Record<string, "success" | "warning" | "secondary" | "destructive"> = {
-  active: "success",
-  delayed: "warning",
-  idle: "secondary",
-  "out-of-service": "destructive",
-};
-
-const BUS_STATUS_LABEL: Record<string, string> = {
-  active: "Active",
-  delayed: "Delayed",
-  idle: "Idle",
-  "out-of-service": "Out of service",
-};
-
+// Status labels come from the shared vocabulary (U17) — no page defines its own.
 export function DashboardPage() {
   const { data: buses = [] } = useBuses();
   const { data: runs = [] } = useRuns();
@@ -41,7 +30,10 @@ export function DashboardPage() {
   // typed.
   const activeBuses = buses.filter((b: any) => b.derived_status === "active").length;
   const delayed = buses.filter((b: any) => b.derived_status === "delayed").length;
-  const studentsOnBus = students.filter((s: any) => s.status === "on-bus").length;
+  // Same rule for children (R26): the Students page beside this tile shows the
+  // derived value, so counting the raw column made the two disagree for stale
+  // and unassigned children.
+  const studentsOnBus = students.filter((s: any) => s.display_status === "on-bus").length;
   const incidentsToday = todayIncidents?.count ?? 0;
 
   return (
@@ -82,7 +74,7 @@ export function DashboardPage() {
                         {run.stops_completed}/{run.total_stops} stops · {run.students_boarded}/{run.total_students} boarded
                       </p>
                     </div>
-                    <Badge variant={RUN_STATUS_VARIANT[run.status] ?? "default"}>{run.status}</Badge>
+                    <Badge variant={variantFor(RUN_STATUS_VARIANT, run.status)}>{labelFor(RUN_STATUS_LABEL, run.status)}</Badge>
                   </div>
                 ))}
               </div>
@@ -105,8 +97,8 @@ export function DashboardPage() {
                     {bus.plate_number ?? "—"}{bus.driver_name ? ` · ${bus.driver_name}` : ""}
                   </p>
                 </div>
-                <Badge variant={BUS_STATUS_VARIANT[bus.derived_status] ?? "secondary"}>
-                  {BUS_STATUS_LABEL[bus.derived_status] ?? bus.derived_status}
+                <Badge variant={variantFor(BUS_STATUS_VARIANT, bus.derived_status)}>
+                  {labelFor(BUS_STATUS_LABEL, bus.derived_status)}
                 </Badge>
               </div>
             ))}
