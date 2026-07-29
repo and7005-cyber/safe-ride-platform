@@ -1,7 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
-from app.dao.absence_dao import absent_student_ids
+from app.dao.absence_dao import AbsenceDao, absent_student_ids
 from app.dao import participation_dao
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
 
@@ -822,6 +822,87 @@ class RunDao:
                 (dropped_count, run["id"]),
             ).fetchone()
         return dict(row), dict(run)
+
+    def reverse_own_action(
+        self, driver_id: str, student_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        """Undo this driver's own drop-off, hand-over or absence mark while the
+        run is still open (U5/R10). Returns (student, run, what_was_reversed).
+
+        The closure gate makes a mis-tap consequential. A drop-off confirmed on
+        the wrong child sends that family a false assurance and cannot be taken
+        back; an absence marked in error both misrecords the child and blocks
+        their real drop-off from ever being confirmed, because the drop-off path
+        requires them to be aboard.
+
+        This is a dedicated path, never a relaxation of the boarding toggle.
+        That endpoint's rejection of un-boarding is a stale-client concurrency
+        guard with a justification independent of the finality argument, and
+        relaxing it would regress that protection while appearing to change only
+        UX.
+
+        Scope is deliberately narrow: this driver's account, this run, still
+        open. The driver assistant shares the login, so "their own action" means
+        this login's action — enough to correct a mis-tap, not an audit trail.
+        """
+        from app.core.errors import ConflictError, ForbiddenError
+
+        with get_connection() as conn:
+            bus_id = self._bus_id_for_driver(conn, driver_id)
+            run = self.find_active_run_today(conn, bus_id) if bus_id else None
+            if not run or str(run["driver_id"]) != str(driver_id):
+                raise ForbiddenError("No active run for this driver")
+            stop = conn.execute(
+                "select 1 from run_stops where run_id = %s and student_id = %s limit 1",
+                (run["id"], student_id),
+            ).fetchone()
+            if not stop:
+                raise ForbiddenError("Student is not on this run")
+
+            record = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            reversed_what: str | None = None
+
+            if record and (record["dropped_off_at"] or record["handover_at"]):
+                if str(record["acting_driver_id"] or "") != str(driver_id):
+                    raise ForbiddenError("That was recorded by a different driver")
+                reversed_what = (
+                    "handover" if record["handover_at"] and not record["dropped_off_at"]
+                    else "dropoff"
+                )
+                participation_dao.reverse_outcome(conn, str(run["id"]), student_id)
+                conn.execute(
+                    "update live_students set status = 'on-bus' where id = %s", (student_id,)
+                )
+            elif AbsenceDao().reverse_driver_absence(conn, student_id, str(driver_id)):
+                reversed_what = "absence"
+                # Back onto the run as boarded: the child was aboard, which is
+                # why the driver could mark them absent from this run at all.
+                name = conn.execute(
+                    "select name from live_students where id = %s", (student_id,)
+                ).fetchone()
+                participation_dao.record_boarding(
+                    conn, str(run["id"]), student_id, name["name"], str(driver_id),
+                    presumed=(run["type"] == "afternoon"),
+                )
+
+            if not reversed_what:
+                raise ConflictError(
+                    "Nothing of yours to undo for this child on this run."
+                )
+
+            counted = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
+            run = conn.execute(
+                "update live_runs set students_boarded = %s where id = %s returning *",
+                (counted, run["id"]),
+            ).fetchone()
+            student = conn.execute(
+                "select * from live_students where id = %s", (student_id,)
+            ).fetchone()
+        return dict(student), dict(run), reversed_what
 
     def mark_student_absent(
         self, driver_id: str, student_id: str

@@ -236,6 +236,30 @@ class PushDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def retract_notifications(self, run_id: str, student_id: str, types: list[str]) -> int:
+        """Remove notifications superseded by a driver correction (U5).
+
+        The dedup index is unique on (user, run, student, type), which is what
+        makes a retried tap harmless. It also means a re-confirmation after a
+        reversal would be silently suppressed as a duplicate — the family would
+        keep the false message and never receive the true one.
+
+        Deleting the superseded rows fixes both halves: the parent feed stops
+        showing a claim the driver retracted, and the corrected outcome can be
+        delivered when it happens. The correction notification itself tells the
+        family what changed, so nothing disappears unexplained.
+        """
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                delete from live_notifications
+                where run_id = %s and student_id = %s and type = any(%s)
+                returning id
+                """,
+                (run_id, student_id, types),
+            ).fetchall()
+        return len(rows)
+
     def insert_notification(
         self,
         user_id: str,

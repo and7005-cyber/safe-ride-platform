@@ -363,6 +363,41 @@ class AbsenceDao:
                     )
             conn.execute("delete from live_student_absences where id = %s", (absence_id,))
 
+    def reverse_driver_absence(self, conn, student_id: str, driver_id: str) -> bool:
+        """Undo today's absence, but only the one this driver marked (U5).
+
+        The general clear path refuses while a covered run is active — a guard
+        with its own justification, since clearing mid-run puts a child back on
+        a roster the run has already snapshotted. This is deliberately narrower:
+        same day, source 'driver', marked by this account, and the caller has
+        already checked the run is still open and belongs to them.
+
+        Guarded inside the statement rather than read-then-write, matching the
+        provenance ratchet: a concurrent staff escalation flips source away from
+        'driver' and this returns False rather than clobbering it.
+
+        Takes the caller's connection — the reversal, the participation change
+        and the status reset are one transaction or none of them.
+        """
+        deleted = conn.execute(
+            """
+            delete from live_student_absences
+            where student_id = %s
+              and absence_date = (now() at time zone 'Africa/Nairobi')::date
+              and source = 'driver'
+              and marked_by = %s
+            returning id
+            """,
+            (student_id, driver_id),
+        ).fetchone()
+        if not deleted:
+            return False
+        conn.execute(
+            "update live_students set status = 'at-school' where id = %s and status = 'absent'",
+            (student_id,),
+        )
+        return True
+
     def clear_for_student_date(self, student_id: str, date: str) -> None:
         with get_connection() as conn:
             conn.execute(

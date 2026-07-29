@@ -91,6 +91,23 @@ def record_handover(
     )
 
 
+def reverse_outcome(conn, run_id: str, student_id: str) -> None:
+    """Undo a confirmed drop-off or hand-over, leaving the boarding intact (U5).
+
+    The child is back in the blocking set: they were on the bus and their real
+    outcome has not been recorded yet, which is exactly what the closure gate
+    should refuse to close over.
+    """
+    conn.execute(
+        """
+        update run_participation
+        set dropped_off_at = null, handover_at = null, handover_note = null
+        where run_id = %s and student_id = %s
+        """,
+        (run_id, student_id),
+    )
+
+
 def clear_for_student(conn, run_id: str, student_id: str) -> None:
     """Drop a child's participation on this run — used when an absence removes
     them from the roster's expectations."""

@@ -191,6 +191,26 @@ def record_handover(
     return student
 
 
+@router.post("/driver/reverse")
+def reverse_own_action(
+    payload: StudentIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    """Undo this driver's own drop-off, hand-over or absence mark (U5/R10).
+
+    Deliberately a separate endpoint from /driver/boarding: that one's rejection
+    of un-boarding is a stale-client concurrency guard, and relaxing it would
+    regress that protection while appearing to change only UX.
+
+    The affected parents always get an explicit correction. Retracting a
+    statement silently would be worse than the mis-tap.
+    """
+    student, run, reversed_what = safe_call(
+        lambda: dao.reverse_own_action(user["id"], payload.student_id)
+    )
+    background_tasks.add_task(push_service.notify_correction, student, run, reversed_what)
+    return student
+
+
 def _record_lifecycle_alert(run_id: str, incident_type: str) -> None:
     """Office-only run-lifecycle alert (U16/R29-R30).
 

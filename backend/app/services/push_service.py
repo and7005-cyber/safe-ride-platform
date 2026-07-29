@@ -192,6 +192,50 @@ class PushService:
         except Exception:
             logger.exception("notify_student_handover failed")
 
+    def notify_correction(self, student: dict, run: dict, reversed_what: str) -> None:
+        """The driver corrected their own mis-tap (U5/R10).
+
+        Its own notification type, because the dedup index keys on
+        (user, run, student, type): reusing 'dropped-off' or 'student-absent'
+        would be suppressed as a duplicate of the very message being corrected,
+        and the family would keep the false one.
+        """
+        try:
+            student_id = str(student["id"])
+            # Retract the message being corrected first. The dedup index is
+            # unique on (user, run, student, type), so leaving it would suppress
+            # the driver's genuine second confirmation as a duplicate — the
+            # family would keep the false message and never get the true one.
+            superseded = (
+                ["student-absent"] if reversed_what == "absence" else ["dropped-off"]
+            )
+            self.dao.retract_notifications(str(run["id"]), student_id, superseded)
+
+            if reversed_what == "absence":
+                type_ = "absence-corrected"
+                title = "Correction: not absent"
+                tail = "was marked absent by mistake. They are on the bus."
+            else:
+                type_ = "dropoff-corrected"
+                title = "Correction: not dropped off"
+                tail = (
+                    "was marked as dropped off by mistake. They are still on the bus — "
+                    "the driver will confirm when they get off."
+                )
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type=type_,
+                    title=title,
+                    body=f"{link['student_name']} {tail}",
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_correction failed")
+
     def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
         """Driver marked the child absent at pickup — tell that child's linked
         parents and nobody else. Run-scoped (run_id + student_id set) so a
