@@ -40,11 +40,21 @@ class IncidentDao:
         return row["n"]
 
     def today_count(self) -> int:
+        """Incidents raised today, in Africa/Nairobi terms.
+
+        Both sides are converted to a Nairobi date. Comparing the timestamptz
+        directly against `(now() at time zone 'Africa/Nairobi')::date` looked
+        equivalent but was not: Postgres resolves the bare date at the server's
+        UTC midnight, so anything raised between 00:00 and 03:00 Nairobi — which
+        is 21:00-00:00 UTC the day before — fell outside "today" and the office's
+        tile silently undercounted for three hours every night.
+        """
         with get_connection() as conn:
             row = conn.execute(
                 f"""
                 select count(*) as n from live_incidents
-                where created_at >= (now() at time zone 'Africa/Nairobi')::date
+                where (created_at at time zone 'Africa/Nairobi')::date
+                      = (now() at time zone 'Africa/Nairobi')::date
                   and {self._NOT_LIFECYCLE}
                 """
             ).fetchone()

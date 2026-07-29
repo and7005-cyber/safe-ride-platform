@@ -8,7 +8,7 @@ import {
   apiToken,
   authHeaders,
   cardContaining,
-  emailLogin,
+  signInAs,
   endActiveRun,
 } from "./helpers";
 
@@ -105,7 +105,7 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
   expect(ended.ok()).toBeTruthy();
 
   // The parent sees every stage in the alerts feed.
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
   await expect(page.getByText("Boarded the Bus").first()).toBeVisible();
@@ -160,7 +160,7 @@ test("opening the alerts page marks notifications as read", async ({ page, reque
     )
     .toBeGreaterThan(0);
 
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
 
@@ -187,7 +187,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
     data: { type: "breakdown", description: marker },
   });
 
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText(marker).first()).toBeVisible();
   await expect(page.getByText("Vehicle Breakdown").first()).toBeVisible();
@@ -210,7 +210,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
 test("an admin route broadcast reaches route parents under every period chip", async ({ page }) => {
   const marker = `E2E school notice ${Date.now()}`;
 
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
   await page.goto("/routes");
   const card = cardContaining(page, SEED.driverMorningRoute);
   await card.getByTestId("message-parents").click();
@@ -225,7 +225,7 @@ test("an admin route broadcast reaches route parents under every period chip", a
 
   // Switch to the seeded parent (auth.spec's storage sign-out idiom).
   await page.evaluate(() => localStorage.removeItem("saferide-token"));
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
 
   // Exactly one School Notice row, and it survives every period chip —

@@ -5,14 +5,16 @@ import {
   DRIVER,
   SEED,
   apiCancelRide,
+  apiDriverToken,
   apiToken,
   authHeaders,
   cardContaining,
   clearCancellationState,
   confirmDelete,
-  emailLogin,
+  signInAs,
   fieldInput,
   pickSelectOption,
+  purgeRun,
   uniqueName,
 } from "./helpers";
 
@@ -43,7 +45,7 @@ test.beforeAll(async ({ request }) => {
 });
 
 async function adminLogin(page: Page) {
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
 }
 
 function dialog(page: Page) {
@@ -539,4 +541,76 @@ test("admin reorders route stops with the arrows and the manual order persists",
   // (also the cleanup — later suites expect the seeded route in auto mode).
   await card.getByTestId("recalculate-order").click();
   await expect(card.getByTestId("route-mode-chip")).toHaveText("Auto", { timeout: 20_000 });
+});
+
+// Office resolution of a stuck run (U14: R12, R14, R26). The gate can refuse to
+// close a run, so the office needs a way out that records what is true — the
+// children nobody accounted for — and then tracks the phone calls it owes,
+// because no automated message goes to those families.
+
+test("the office force-closes a stuck run and discharges the contact obligation", async ({
+  page,
+  request,
+}) => {
+  const driverToken = await apiDriverToken(request);
+  const driverHeaders = authHeaders(driverToken);
+  const context = await (
+    await request.get(`${API_URL}/api/runs/driver/context`, { headers: driverHeaders })
+  ).json();
+  const afternoon = context.routes.find((r: any) => r.type === "afternoon");
+  const started = await request.post(`${API_URL}/api/runs/driver/start`, {
+    headers: driverHeaders,
+    data: { route_id: afternoon.id },
+  });
+  expect(started.ok()).toBeTruthy();
+  const runId = (await started.json()).id;
+
+  try {
+    await adminLogin(page);
+    await page.goto("/runs");
+    const row = page.getByRole("row", { name: new RegExp(SEED.driverAfternoonRoute) }).first();
+
+    // The copy has to say both things it is easy to conflate: unaccounted is not
+    // a location, and nobody is messaged automatically.
+    await row.getByTestId(`force-close-${runId}`).click();
+    const confirmBox = page.getByRole("dialog");
+    await expect(confirmBox.getByText("Force-close this run?")).toBeVisible();
+    await expect(confirmBox.getByText(/not the same as saying where they are/)).toBeVisible();
+    await expect(confirmBox.getByText(/No parent is notified automatically/)).toBeVisible();
+    await confirmBox.getByRole("button", { name: "Force-close" }).click();
+
+    // The call list lands in front of whoever did it, naming each child.
+    const report = page.getByRole("dialog");
+    await expect(report.getByText("Unaccounted children — phone their families")).toBeVisible();
+    const firstCall = report.getByRole("button", { name: "Mark called" }).first();
+    await expect(firstCall).toBeVisible();
+    const outstanding = await report.getByRole("button", { name: "Mark called" }).count();
+    await firstCall.click();
+    await expect(report.getByText("Family called").first()).toBeVisible();
+    await expect(report.getByRole("button", { name: "Mark called" })).toHaveCount(outstanding - 1);
+
+    // Dismissed and reloaded, the obligation is still findable on the list — a
+    // one-shot dialog would lose it the moment the office user was pulled away.
+    await page.keyboard.press("Escape");
+    await expect(report).toHaveCount(0);
+    await page.reload();
+    const reloaded = page.getByRole("row", { name: new RegExp(SEED.driverAfternoonRoute) }).first();
+    await expect(reloaded.getByTestId("contact-pending")).toContainText(
+      `${outstanding - 1} to call`,
+    );
+  } finally {
+    purgeRun(runId);
+  }
+});
+
+test("the buses page offers availability and no status control", async ({ page }) => {
+  // R23: the stored bus status is retired — derived from the bus's run now — so
+  // the form must not offer a control that writes a column nothing reads.
+  await adminLogin(page);
+  await page.goto("/buses");
+  await page.getByRole("button", { name: "Add Bus" }).click();
+  const form = dialog(page);
+  await expect(form.locator('div:has(> label:text-is("Availability"))')).toBeVisible();
+  await expect(form.locator('div:has(> label:text-is("Status"))')).toHaveCount(0);
+  await form.getByRole("button", { name: "Cancel" }).click();
 });

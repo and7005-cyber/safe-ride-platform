@@ -7,7 +7,7 @@ import {
   SEED,
   apiDriverToken,
   authHeaders,
-  emailLogin,
+  signInAs,
   endActiveRun,
 } from "./helpers";
 
@@ -16,7 +16,7 @@ import {
 // assert against the live-parity copy and information architecture.
 
 test("admin sees the dashboard and can navigate the shell", async ({ page }) => {
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
   await expect(page).toHaveURL("/");
   await expect(page.getByText("Active Buses")).toBeVisible();
   await expect(page.getByText("Incidents Today")).toBeVisible();
@@ -32,7 +32,7 @@ test("admin sees the dashboard and can navigate the shell", async ({ page }) => 
 });
 
 test("admin is the only role allowed on admin routes", async ({ page }) => {
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/buses");
   // Parent gets redirected away from the admin surface.
   await expect(page).toHaveURL("/parent");
@@ -85,7 +85,7 @@ test("parent sees their children and bus-less child has no driver actions", asyn
     data: { type: "breakdown", description: "E2E smoke breakdown" },
   });
 
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await expect(page).toHaveURL("/parent");
   await expect(page.getByText(/Good (morning|afternoon|evening)/)).toBeVisible();
   await expect(page.getByText(SEED.parentChild)).toBeVisible();

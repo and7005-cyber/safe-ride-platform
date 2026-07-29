@@ -38,7 +38,19 @@ class RunDao:
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
                        {no_progress_case("r")} as no_progress,
                        (r.status <> 'completed'
-                        and r.date < (now() at time zone 'Africa/Nairobi')::date) as stale
+                        and r.date < (now() at time zone 'Africa/Nairobi')::date) as stale,
+                       -- Children this run left unaccounted whose parents have
+                       -- not been phoned yet (U14/R14). On the list, not only in
+                       -- the force-close dialog: an office user pulled away
+                       -- mid-task would otherwise have no way to rediscover
+                       -- which runs still owe a family a call, which is the
+                       -- entire reason the obligation is recorded.
+                       (
+                           select count(*) from run_participation p
+                           where p.run_id = r.id
+                             and p.unaccounted_at is not null
+                             and p.contacted_at is null
+                       ) as contact_pending
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -290,8 +302,13 @@ class RunDao:
                         (run["route_id"], run["date"], run["type"]),
                     ).fetchall()
                     approximate = True
+            # The contact obligation is re-readable per run (U14/R14), so the
+            # office can reopen a force-closed run days later and still see who
+            # was never accounted for and whether anyone rang their family.
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
         report = dict(run)
         report["absent_students"] = [dict(a) for a in absent]
+        report["unaccounted"] = outstanding
         report["approximate"] = approximate
         return report
 

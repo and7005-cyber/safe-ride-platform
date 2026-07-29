@@ -11,7 +11,7 @@ import {
   cardContaining,
   clearCancellationState,
   endActiveRun,
-  pinLogin,
+  signInAsDriver,
   purgeRun,
 } from "./helpers";
 
@@ -112,7 +112,7 @@ async function accountForEveryone(
 }
 
 test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await expect(page.getByText(/Hello,/)).toBeVisible();
   await expect(page.getByText(SEED.driverBus)).toBeVisible();
   await expect(page.getByText("Stops")).toBeVisible();
@@ -121,7 +121,7 @@ test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
 });
 
 test("morning run: explicit start, confirmed boarding, completed-today lock", async ({ page, request }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
 
   // The home tile never starts a run — it routes to the Run page (R27).
   await page.getByRole("button", { name: "Start Run" }).click();
@@ -197,7 +197,7 @@ test("morning run: explicit start, confirmed boarding, completed-today lock", as
 });
 
 test("afternoon run: drop-off language and a confirmed, final drop-off", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
 
   await page.goto("/driver/run");
   await page.getByRole("combobox").click();
@@ -260,7 +260,7 @@ test("afternoon run: drop-off language and a confirmed, final drop-off", async (
 test("the blocking list names each child and navigates to them", async ({ page }) => {
   // R11: with several blockers a driver would otherwise make a manual
   // multi-screen round trip per child, on a phone, at the end of every route.
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await startAfternoonRun(page);
 
   await page.goto("/driver/run");
@@ -277,7 +277,7 @@ test("absent is offered before the child's stop has been reached", async ({ page
   // R8: it used to require the stop to have been reached, which left the driver
   // of a child who was never at the stop with nothing to tap — and the gate then
   // refused to close the run over exactly that child.
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await startAfternoonRun(page);
 
   await page.goto("/driver/boarding");
@@ -291,7 +291,7 @@ test("a hand-over cannot be confirmed without a note", async ({ page }) => {
   // R9: "left the bus" without where or why is not an account of anything, and
   // the driver's only other release would be marking the child absent — which
   // tells the family they were never on the bus home.
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await startAfternoonRun(page);
 
   await page.goto("/driver/boarding");
@@ -321,7 +321,7 @@ test("a hand-over cannot be confirmed without a note", async ({ page }) => {
 test("no driver status badge renders a raw slug", async ({ page }) => {
   // R3: the board reads the derived status, which carries values the raw
   // column never held ('expected on bus'), and every one of them is labelled.
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await startAfternoonRun(page);
 
   await page.goto("/driver/boarding");
@@ -334,7 +334,7 @@ test("no driver status badge renders a raw slug", async ({ page }) => {
 });
 
 test("driver can report an incident", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await page.goto("/driver/incident");
   await expect(page.getByText("New Incident Report")).toBeVisible();
 
@@ -347,7 +347,7 @@ test("driver can report an incident", async ({ page }) => {
 });
 
 test("search filters the boarding list", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await page.goto("/driver/boarding");
   await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
 
@@ -365,7 +365,7 @@ test("an afternoon cancellation excludes the student from the driver's run", asy
 }) => {
   await apiCancelRide(request, SEED.parentChild, "afternoon");
   try {
-    await pinLogin(page, DRIVER.pin);
+    await signInAsDriver(page);
     await page.goto("/driver/run");
     await page.getByRole("combobox").click();
     await page.getByRole("option", { name: SEED.driverAfternoonRoute }).click();

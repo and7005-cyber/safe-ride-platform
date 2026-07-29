@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { PARENT, SEED, cardContaining, clearCancellationState, emailLogin } from "./helpers";
+import { PARENT, SEED, cardContaining, clearCancellationState, signInAs } from "./helpers";
 
 // Parent journey: home, tracking, profile, push state, Cancel-a-Ride.
 
@@ -7,7 +7,7 @@ import { PARENT, SEED, cardContaining, clearCancellationState, emailLogin } from
 const STATUS_BADGE_LABEL = /^(At home|At School|On the bus|Dropped off|Absent)$/;
 
 test("parent home lists children with status and ETA", async ({ page }) => {
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await expect(page.getByText(/Good (morning|afternoon|evening)/)).toBeVisible();
   await expect(page.getByText(SEED.parentChild)).toBeVisible();
   // Each child card highlights the server-derived display_status (R36).
@@ -19,7 +19,7 @@ test("parent home lists children with status and ETA", async ({ page }) => {
 });
 
 test("parent track page shows the route map with own stop highlighted", async ({ page }) => {
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/track");
 
   await expect(page.getByTestId("track-map")).toBeVisible();
@@ -31,7 +31,7 @@ test("parent track page shows the route map with own stop highlighted", async ({
 });
 
 test("parent profile shows account, children, and push state", async ({ page }) => {
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/profile");
 
   await expect(page.getByText(SEED.parentName)).toBeVisible();
@@ -61,7 +61,7 @@ test("parent cancels the afternoon ride, sees chip and confirmation, then withdr
   request,
 }) => {
   try {
-    await emailLogin(page, PARENT.email, PARENT.password);
+    await signInAs(page, PARENT);
 
     // Cancel Faith's afternoon ride from her card.
     await cardContaining(page, SEED.parentChild).getByTestId("cancel-ride-button").click();

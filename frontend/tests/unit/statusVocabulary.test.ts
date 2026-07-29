@@ -140,10 +140,15 @@ describe("filter options derive from the labels", () => {
     ["bus", BUS_STATUS_FILTERS, BUS_STATUS_LABEL],
     ["run", RUN_STATUS_FILTERS, RUN_STATUS_LABEL],
   ])("%s filters carry one option per label plus All", (_name, filters, labels) => {
+    // The three label maps have different key unions, so the loop below indexes
+    // them as a plain string map. Widened here rather than at the export, where
+    // the narrow key type is what makes the exhaustiveness assertions mean
+    // something.
+    const byValue = labels as Record<string, string>;
     expect(filters[0]).toEqual({ value: "all", label: "All statuses" });
-    expect(filters.length).toBe(Object.keys(labels).length + 1);
+    expect(filters.length).toBe(Object.keys(byValue).length + 1);
     for (const option of filters.slice(1)) {
-      expect(labels[option.value]).toBe(option.label);
+      expect(byValue[option.value]).toBe(option.label);
     }
   });
 

@@ -20,6 +20,7 @@ import random
 import uuid
 
 import httpx
+import psycopg
 import pytest
 
 from conftest import purge_run
@@ -35,6 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
 ADMIN = {"email": "admin@test.com", "password": "test1234."}
+DSN = os.environ.get("DATABASE_URL", "postgresql://saferide:saferide@localhost:5432/saferide")
 
 
 @pytest.fixture(scope="module")
@@ -134,6 +136,12 @@ def _alerts_for_bus(client, admin_headers, bus_id: str) -> list[dict]:
     return [a for a in rows if a.get("bus_id") == bus_id]
 
 
+def _real_alerts(client, admin_headers, bus_id: str) -> list[dict]:
+    """Incidents that should move the office's counters — everything the backend
+    does not mark as run lifecycle."""
+    return [a for a in _alerts_for_bus(client, admin_headers, bus_id) if not a["lifecycle"]]
+
+
 def _wait_for(predicate, timeout: float = 10.0):
     """Background tasks run inside the request lifecycle but the feed row lands
     asynchronously enough to race a fast assertion."""
@@ -206,8 +214,11 @@ def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_header
     driver_headers = _driver_headers(client, fleet)
     before_today = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]
     before_unread = client.get("/api/incidents/unread-count", headers=admin_headers).json()["count"]
-    before_real = len([a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
-                       if a["type"] not in ("run-started", "run-completed")])
+    # Filtered on the row's own lifecycle marker, not a list of type names: U11
+    # added four more lifecycle types, and a hardcoded list silently counted
+    # them as real incidents here while the backend correctly excluded them —
+    # so this assertion started failing about the very thing it was protecting.
+    before_real = len(_real_alerts(client, admin_headers, fleet["bus"]["id"]))
 
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
@@ -223,8 +234,8 @@ def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_header
         # Deltas, not absolutes: the fixture is module-scoped, so earlier tests
         # in this file have already raised lifecycle alerts on the same bus.
         rows = _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
-        lifecycle = [a for a in rows if a["type"] in ("run-started", "run-completed")]
-        real = [a for a in rows if a["type"] not in ("run-started", "run-completed")]
+        lifecycle = [a for a in rows if a["lifecycle"]]
+        real = [a for a in rows if not a["lifecycle"]]
         assert len(lifecycle) >= 2, "the lifecycle alerts were not raised"
 
         # Driving the run to the school gate raises a genuine 'arrival' incident,
@@ -457,3 +468,42 @@ def test_the_closure_alerts_stay_out_of_parent_feeds_and_counters(
     after_unread = client.get("/api/incidents/unread-count", headers=admin_headers).json()["count"]
     assert after_today == before_today, "closure alerts moved the incidents-today tile"
     assert after_unread == before_unread, "closure alerts landed in the acknowledgement queue"
+
+
+def test_the_today_counter_uses_the_nairobi_day(client, admin_headers, fleet):
+    """The office tile counts today in Africa/Nairobi, not in UTC.
+
+    This only ever manifested between 00:00 and 03:00 Nairobi, so it hid for
+    twenty-one hours a day: the predicate compared a timestamptz against
+    `(now() at time zone 'Africa/Nairobi')::date`, which Postgres resolves at the
+    server's UTC midnight. An incident raised at 00:30 Nairobi is 21:30 UTC the
+    day before, so it fell outside "today" and the tile silently undercounted
+    every incident from the start of the service day until dawn.
+
+    Staged by SQL because it is a clock-dependent bug and the test must not be
+    one: the row is placed inside the window rather than waiting for it.
+    """
+    before = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        pg.execute(
+            """
+            insert into live_incidents (bus_id, bus_name, type, description, created_at)
+            values (
+                %s, %s, 'other', 'IT nairobi-boundary probe',
+                -- 00:30 on today's Nairobi date, expressed as the instant it is.
+                ((now() at time zone 'Africa/Nairobi')::date + time '00:30')
+                    at time zone 'Africa/Nairobi'
+            )
+            """,
+            (fleet["bus"]["id"], fleet["bus"]["name"]),
+        )
+    try:
+        after = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]
+        assert after == before + 1, (
+            "an incident from the small hours of the service day was not counted as today"
+        )
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as pg:
+            pg.execute(
+                "delete from live_incidents where description = 'IT nairobi-boundary probe'"
+            )

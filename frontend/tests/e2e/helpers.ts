@@ -39,6 +39,58 @@ export const SEED = {
 
 export const API_URL = process.env.PLAYWRIGHT_API_URL ?? "http://localhost:9001";
 
+/**
+ * One token per account per worker.
+ *
+ * Every credential endpoint is rate limited on purpose — login is 10 attempts
+ * per account per five minutes — and the suite was spending that budget on
+ * setup: a full run drove the sign-in form dozens of times as admin, so the
+ * last specs to run were refused and failed on a login timeout that had nothing
+ * to do with what they were testing. Signing in once and reusing the token
+ * keeps the limiter protecting the product rather than throttling the tests.
+ */
+const tokenCache = new Map<string, string>();
+
+async function cachedToken(
+  request: APIRequestContext,
+  email: string,
+  password: string,
+): Promise<string> {
+  const hit = tokenCache.get(email);
+  if (hit) return hit;
+  const token = await apiToken(request, email, password);
+  tokenCache.set(email, token);
+  return token;
+}
+
+/**
+ * Put an authenticated session in the browser without driving the form.
+ *
+ * For every spec whose subject is not the login screen itself. The form's own
+ * behaviour — success, wrong password, PIN entry — stays covered by
+ * auth.spec.ts, which calls emailLogin/pinLogin below and must keep doing so.
+ */
+export async function signInAs(
+  page: Page,
+  account: { email: string; password: string },
+): Promise<void> {
+  const token = await cachedToken(page.request, account.email, account.password);
+  // Any app-origin document, so localStorage is writable before the app boots.
+  await page.goto("/auth");
+  await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  await page.goto("/");
+  await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
+}
+
+/** The driver equivalent: PIN login is limited to 10 per IP per minute. */
+export async function signInAsDriver(page: Page): Promise<void> {
+  const token = await cachedDriverToken(page.request);
+  await page.goto("/auth");
+  await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  await page.goto("/driver");
+  await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
+}
+
 export async function emailLogin(page: Page, email: string, password: string) {
   await page.goto("/auth");
   await page.locator("#email").fill(email);
@@ -72,11 +124,21 @@ export async function apiToken(
 }
 
 export async function apiDriverToken(request: APIRequestContext): Promise<string> {
+  return cachedDriverToken(request);
+}
+
+const DRIVER_TOKEN_KEY = "__driver_pin__";
+
+async function cachedDriverToken(request: APIRequestContext): Promise<string> {
+  const hit = tokenCache.get(DRIVER_TOKEN_KEY);
+  if (hit) return hit;
   const response = await request.post(`${API_URL}/api/auth/pin-login`, {
     data: { pin: DRIVER.pin },
   });
   expect(response.ok()).toBeTruthy();
-  return (await response.json()).token;
+  const token = (await response.json()).token;
+  tokenCache.set(DRIVER_TOKEN_KEY, token);
+  return token;
 }
 
 export function authHeaders(token: string) {

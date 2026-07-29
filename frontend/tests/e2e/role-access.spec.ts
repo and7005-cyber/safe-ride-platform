@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { ADMIN, DRIVER, PARENT, emailLogin, pinLogin } from "./helpers";
+import { ADMIN, DRIVER, PARENT, signInAs, signInAsDriver } from "./helpers";
 
 // Role-based access control: every role is fenced into its own surface.
 
@@ -15,7 +15,7 @@ test("unauthenticated visitors are redirected to /auth from every protected rout
 });
 
 test("parent cannot reach admin or driver surfaces", async ({ page }) => {
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   for (const route of ["/buses", "/students", "/drivers", "/alerts", "/parent-assignments", "/driver", "/driver/run"]) {
     await page.goto(route);
     await expect(page, `route ${route} should bounce to /parent`).toHaveURL("/parent");
@@ -23,7 +23,7 @@ test("parent cannot reach admin or driver surfaces", async ({ page }) => {
 });
 
 test("driver cannot reach admin or parent surfaces", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   for (const route of ["/buses", "/students", "/parents", "/parent-assignments", "/parent", "/parent/alerts"]) {
     await page.goto(route);
     await expect(page, `route ${route} should bounce to /driver`).toHaveURL("/driver");
@@ -36,13 +36,13 @@ test("/parent-assignments redirects to the students page (page removed)", async 
   await expect(page).toHaveURL(/\/auth/);
 
   // Admins land on /students, where assignment now happens in the form (R12).
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
   await page.goto("/parent-assignments");
   await expect(page).toHaveURL("/students");
 });
 
 test("admin cannot reach driver or parent surfaces", async ({ page }) => {
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
   for (const route of ["/driver", "/parent", "/parent/profile"]) {
     await page.goto(route);
     await expect(page, `route ${route} should bounce to /`).toHaveURL("/");
