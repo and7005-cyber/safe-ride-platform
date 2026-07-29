@@ -225,26 +225,36 @@ export function RunsPage() {
             </div>
             <div className="space-y-2">
               <Label>Status</Label>
-              {/* Finishing a run is a claim that every child is accounted for,
-                  so it belongs to the driver's end or the office force-close,
-                  never to this form — and a finished run cannot be reopened
-                  here either (U7). Offering either would only produce a 409. */}
+              {/* Finishing a *live* run is a claim that every child is
+                  accounted for, so editing one to 'completed' belongs to the
+                  driver's end or the office force-close, never to this form —
+                  and a finished run cannot be reopened here either (U7).
+                  Offering either on an edit would only produce a 409.
+
+                  Creating one is a different act: a run added here after the
+                  fact is a bookkeeping record of something that already
+                  happened, with no roster and no participation behind it. The
+                  server still accepts that, and U7's delete rule carves those
+                  rows out precisely because they assert nothing about a child. */}
               <Select
                 value={form.status}
-                disabled={form.status === "completed"}
+                disabled={editId != null && form.status === "completed"}
                 onValueChange={(v) => setForm({ ...form, status: v })}
               >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {form.status === "completed"
-                    ? <SelectItem value="completed">Completed</SelectItem>
-                    : <>
-                        <SelectItem value="in-progress">In progress</SelectItem>
-                        <SelectItem value="delayed">Delayed</SelectItem>
-                      </>}
+                  {editId != null && form.status === "completed" ? (
+                    <SelectItem value="completed">Completed</SelectItem>
+                  ) : (
+                    <>
+                      <SelectItem value="in-progress">In progress</SelectItem>
+                      <SelectItem value="delayed">Delayed</SelectItem>
+                      {editId == null && <SelectItem value="completed">Completed</SelectItem>}
+                    </>
+                  )}
                 </SelectContent>
               </Select>
-              {form.status === "completed" && (
+              {editId != null && form.status === "completed" && (
                 <p className="text-xs text-muted-foreground">
                   This run is finished. Start a new run if the bus is going out again.
                 </p>

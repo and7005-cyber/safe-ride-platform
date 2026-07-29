@@ -1,4 +1,10 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const COMPOSE_FILE = "docker-compose.local.yml";
 
 // Seeded local credentials and fixtures (backend/db/seeds/003_local_snapshot.sql).
 // On seed drift, update these constants instead of individual specs.
@@ -78,6 +84,31 @@ export function authHeaders(token: string) {
 }
 
 /** End the demo driver's active run if one exists (idempotent cleanup). */
+/**
+ * Delete a run out-of-band. **Teardown only** — never inside an assertion.
+ *
+ * Since U7 the product refuses to delete a completed run dated today whose
+ * children have recorded participation: those rows are the only evidence anyone
+ * boarded, so cascading them would flip a whole roster from at school to at
+ * home mid-day. That refusal is a real guarantee and the tests must not have a
+ * product-level backdoor around it, so the suite's own cleanup goes to the
+ * database directly — the same choice the integration suite's conftest makes.
+ *
+ * Uses the compose db container rather than a Node pg client, so the e2e suite
+ * gains no new dependency.
+ */
+export function purgeRun(runId: string): void {
+  execFileSync(
+    "docker",
+    [
+      "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
+      "psql", "-U", "saferide", "-d", "saferide", "-q",
+      "-c", `delete from live_runs where id = '${runId}'`,
+    ],
+    { stdio: "ignore", cwd: REPO_ROOT },
+  );
+}
+
 export async function endActiveRun(request: APIRequestContext): Promise<void> {
   const token = await apiDriverToken(request);
   const context = await request.get(`${API_URL}/api/runs/driver/context`, {
@@ -104,9 +135,7 @@ export async function endActiveRun(request: APIRequestContext): Promise<void> {
   const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10); // Nairobi UTC+3
   for (const run of await runs.json()) {
     if (run.bus_id === busId && String(run.date).slice(0, 10) === today) {
-      await request.delete(`${API_URL}/api/runs/${run.id}`, {
-        headers: authHeaders(adminToken),
-      });
+      purgeRun(run.id);
     }
   }
 }
