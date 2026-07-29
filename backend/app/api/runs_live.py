@@ -57,6 +57,11 @@ class StudentIdPayload(BaseModel):
     student_id: str
 
 
+class HandoverPayload(BaseModel):
+    student_id: str
+    note: str
+
+
 # Admin run CRUD -------------------------------------------------------------
 
 @router.get("")
@@ -160,6 +165,29 @@ def dropoff_student(
     dedup index suppresses retries."""
     student, run = safe_call(lambda: dao.dropoff_student(user["id"], payload.student_id))
     background_tasks.add_task(push_service.notify_student_dropped_off, student, run)
+    return student
+
+
+@router.post("/driver/handover")
+def record_handover(
+    payload: HandoverPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+):
+    """Record a hand-over away from the child's stop (U4/R12).
+
+    A breakdown, a closed road, a guardian collecting at the roadside. Without
+    this the driver's only release for a child who left the bus off-route is
+    marking them absent, which tells the family the child was never on the bus
+    home — false, and the class of claim this work removes.
+
+    The parent is told their child left the bus, with the driver's note, so the
+    message matches what happened rather than the route's expectation.
+    """
+    student, run = safe_call(
+        lambda: dao.record_handover(user["id"], payload.student_id, payload.note)
+    )
+    background_tasks.add_task(
+        push_service.notify_student_handover, student, run, payload.note
+    )
     return student
 
 

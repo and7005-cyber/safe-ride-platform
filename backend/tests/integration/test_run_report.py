@@ -27,6 +27,9 @@ import httpx
 import psycopg
 import pytest
 
+# Since U4 a run cannot close with unaccounted children.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -238,7 +241,14 @@ def test_students_boarded_recount_is_idempotent(client, admin_headers, driver_he
         assert rejected.status_code == 409, rejected.text
         assert boarded_count() == expected
 
-        # end_run persists the final pre-sweep on-bus count for morning runs.
+        # Since U4 the run cannot close while anyone is unaccounted for. Board
+        # the remainder so the closure is legitimate, then assert the persisted
+        # count matches the boardings actually recorded — the subject of this
+        # test is that the recount never drifts, not what the total happens to be.
+        for student_id in student_ids[expected:]:
+            board(student_id)
+        expected = len(student_ids)
+
         ended = client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
         assert ended.status_code == 200, ended.text
         assert ended.json()["students_boarded"] == expected

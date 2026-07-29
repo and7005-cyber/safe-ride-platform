@@ -39,6 +39,10 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -309,7 +313,7 @@ def test_custom_stops_route_cannot_start(client, admin_headers, fleet):
 
 # Afternoon lifecycle (R32, AE12) -------------------------------------------------
 
-def test_afternoon_auto_board_dropoff_and_silent_sweep(client, admin_headers, fleet):
+def test_afternoon_auto_board_dropoff_and_closure_gate(client, admin_headers, fleet):
     """Afternoon start auto-boards the run's roster with no per-student
     boarding taps; drop-offs are confirmed per stop once reached; the end-run
     sweep normalizes unconfirmed students without inventing confirmations.
@@ -368,14 +372,32 @@ def test_afternoon_auto_board_dropoff_and_silent_sweep(client, admin_headers, fl
         assert retry.status_code == 409, retry.text
         assert _report(client, admin_headers, run_id)["students_boarded"] == 1
 
-        # End with s1 unconfirmed: status is swept to dropped-off, but the
-        # persisted count stays at the confirmed drop-offs (AE12 data side —
-        # the sweep must never inflate confirmations).
+        # Ending with s1 unconfirmed is now refused (U4/R7). This is the defect
+        # the gate replaced: the old sweep wrote 'dropped-off' to s1 anyway, so
+        # the office and the parent saw a confirmed drop-off the driver never
+        # made. The refusal names who is blocking.
+        refused = client.post(
+            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
+        )
+        assert refused.status_code == 409, refused.text
+        assert fleet["s1"]["name"] in refused.json()["detail"]
+        assert _student_status(client, admin_headers, fleet["s1"]["id"]) != "dropped-off", (
+            "a refused closure wrote a terminal status anyway"
+        )
+
+        # Confirming s1 releases the gate, and the count reflects real
+        # confirmations rather than a sweep.
+        _arrive(client, driver_headers, run_id)
+        confirmed = client.post(
+            "/api/runs/driver/dropoff", json={"student_id": fleet["s1"]["id"]},
+            headers=driver_headers,
+        )
+        assert confirmed.status_code == 200, confirmed.text
         ended = client.post(
             "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
         )
         assert ended.status_code == 200, ended.text
-        assert ended.json()["students_boarded"] == 1
+        assert ended.json()["students_boarded"] == 2
         assert _student_status(client, admin_headers, fleet["s1"]["id"]) == "dropped-off"
     finally:
         _end_and_delete(client, admin_headers, driver_headers, run_id)
@@ -496,12 +518,12 @@ def test_driver_absent_flow(client, admin_headers, fleet):
         assert blocked.status_code == 409, blocked.text
         assert "End the run first" in blocked.json()["detail"]
 
-        # After the run ends the clear succeeds and resets the status.
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        # After the run ends the clear succeeds and resets the status. Since U4
+        # the run cannot close until everyone is accounted for — the absent child
+        # already is, so complete_run boards the rest.
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
-        assert _student_status(client, admin_headers, s2["id"]) == "absent"  # sweep skips absent
+        assert _student_status(client, admin_headers, s2["id"]) == "absent"
         cleared = client.delete(
             f"/api/students/absences/{absence['id']}", headers=admin_headers
         )

@@ -165,6 +165,33 @@ class PushService:
         except Exception:
             logger.exception("notify_student_dropped_off failed")
 
+    def notify_student_handover(self, student: dict, run: dict, note: str) -> None:
+        """Driver handed the child over away from their stop (U4/R12).
+
+        Reuses the 'dropped-off' type on purpose: from the family's side this is
+        the same event — the child left the bus — and the type carries the
+        dedup key and the parent-feed label already. What changes is the body,
+        which says where, because the route's own stop would be the wrong answer.
+        """
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type="dropped-off",
+                    title="Left the bus",
+                    body=(
+                        f"{link['student_name']} left the bus away from their usual stop. "
+                        f"Driver's note: {note}"
+                    ),
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_student_handover failed")
+
     def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
         """Driver marked the child absent at pickup — tell that child's linked
         parents and nobody else. Run-scoped (run_id + student_id set) so a

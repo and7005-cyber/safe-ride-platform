@@ -37,6 +37,10 @@ import httpx
 import psycopg
 import pytest
 
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -341,9 +345,8 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
     morning_run_id = afternoon_run_id = None
     try:
         morning_run_id = _start_run(client, driver_headers, fleet["morning"]["id"])["id"]
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": morning_run_id}, headers=driver_headers
-        )
+        # Since U4 a run cannot close with unaccounted children.
+        ended = complete_run(client, driver_headers, morning_run_id)
         assert ended.status_code == 200, ended.text
 
         response = cancel(client, p1, s1["id"], "afternoon")
@@ -357,10 +360,10 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
 
         child = child_row(client, p1, s1["id"])
         assert child["cancellation"] == {"scope": "afternoon", "withdrawable": True}
-        # A partial cancellation still never writes status. The baseline for a
-        # child with no participation today is at-home since U3 — the stored
-        # column no longer decides what a surface shows.
-        assert child["display_status"] == "at-home"
+        # A partial cancellation still never writes status. The child boarded
+        # and the morning run completed, so at-school is now earned by a
+        # recorded boarding rather than asserted by the old sweep.
+        assert child["display_status"] == "at-school"
 
         afternoon_run_id = _start_run(client, driver_headers, fleet["afternoon"]["id"])["id"]
         context = _driver_context(client, driver_headers)
@@ -657,9 +660,7 @@ def test_mid_run_not_boarded_cancel_appends_run_absences(client, admin_headers, 
         assert held.status_code == 409, held.text
         assert "already started" in held.json()["detail"]
 
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
         report = client.get(f"/api/runs/{run_id}/report", headers=admin_headers).json()
         listed = {a["student_id"]: a["reason"] for a in report["absent_students"]}
@@ -714,9 +715,7 @@ def test_withdraw_scope_dao_guard_blocks_after_covered_run_starts(
         # Once the run completes the DAO guard steps aside (status <>
         # 'completed') — post-completion policy is the API pre-read's
         # stricter run-row EXISTENCE check, not the DAO's.
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
         removed = absence_dao.withdraw_scope(s1["id"], "morning", p1["id"])
         assert removed == {"deleted": True, "scope": None}

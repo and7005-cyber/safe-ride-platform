@@ -570,14 +570,41 @@ class RunDao:
         return {"run": dict(updated), "arrival_incident": arrival_incident}
 
     def end_run(self, driver_id: str, run_id: str) -> dict[str, Any]:
+        """Complete a run — refused while any roster child is unaccounted (U4).
+
+        The end-of-run sweep is gone. It used to write a terminal status to
+        every non-absent roster child, which meant a child who never boarded was
+        recorded as safely at school and a child the driver never confirmed off
+        the bus was recorded as dropped off. With the gate in place no sweep is
+        needed: every child already has an individually recorded outcome, or the
+        run does not close.
+
+        The run row is locked for the duration so a concurrent driver-end and
+        office force-close cannot both pass their completed check and each write
+        a different outcome for the same children.
+        """
         from app.core.errors import ConflictError, ForbiddenError
 
         with get_connection() as conn:
-            run = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+            run = conn.execute(
+                "select * from live_runs where id = %s for update", (run_id,)
+            ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
+
+            blocking = participation_dao.unaccounted_on_run(conn, str(run_id), run["type"])
+            if blocking:
+                names = ", ".join(b["name"] for b in blocking)
+                action = (
+                    "Confirm their drop-off, record an off-route hand-over, or mark them absent"
+                    if run["type"] == "afternoon"
+                    else "Board them or mark them absent"
+                )
+                raise ConflictError(
+                    f"Not everyone is accounted for: {names}. {action} before ending the run."
+                )
             # Who the driver actually observed boarding (U2). Read from
             # participation, not from the status column: a presumed afternoon
             # board is not evidence a child rode, and the arrival notification
@@ -597,15 +624,24 @@ class RunDao:
                 "end_time=to_char(now() at time zone 'Africa/Nairobi','HH24:MI') where id=%s",
                 (final_count, run_id),
             )
-            # Sweep the run's roster (run_stops student_ids), skipping absent.
-            sweep_status = "dropped-off" if run["type"] == "afternoon" else "at-school"
+            # No sweep. Every roster child reached this point with a recorded
+            # outcome — that is what the gate above guarantees — so writing one
+            # here could only manufacture a claim nobody made.
+            #
+            # live_students.status is still updated for children who boarded, so
+            # the vestigial column does not drift while it survives; nothing
+            # derives from it since U3.
+            column_status = "dropped-off" if run["type"] == "afternoon" else "at-school"
             conn.execute(
                 """
                 update live_students set status = %s
-                where id in (select distinct student_id from run_stops where run_id = %s and student_id is not null)
-                    and status <> 'absent'
+                where id in (
+                    select p.student_id from run_participation p
+                    where p.run_id = %s and p.student_id is not null
+                      and p.boarded_at is not null
+                )
                 """,
-                (sweep_status, run_id),
+                (column_status, run_id),
             )
             # Clear the bus live position.
             conn.execute(
@@ -729,6 +765,57 @@ class RunDao:
                 (student_id,),
             ).fetchone()
             participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
+            dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
+            run = conn.execute(
+                "update live_runs set students_boarded = %s where id = %s returning *",
+                (dropped_count, run["id"]),
+            ).fetchone()
+        return dict(row), dict(run)
+
+    def record_handover(
+        self, driver_id: str, student_id: str, note: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Record a hand-over away from the child's own stop (U4/R12).
+
+        A breakdown, a closed road, a guardian collecting at the roadside — the
+        child left the bus, just not where the route said. Without this the
+        driver's only release is marking them absent, which tells the family the
+        child was never on the bus home: false, and the exact class of claim
+        this work removes. Records an accounted outcome with the driver's note
+        and no absence row.
+
+        Unlike a drop-off this does not require the child's stop to have been
+        reached, because by definition it did not happen there.
+        """
+        from app.core.errors import BadRequestError, ConflictError, ForbiddenError
+
+        note = (note or "").strip()
+        if not note:
+            raise BadRequestError("A note is required — say where the child was handed over.")
+
+        with get_connection() as conn:
+            bus_id = self._bus_id_for_driver(conn, driver_id)
+            run = self.find_active_run_today(conn, bus_id) if bus_id else None
+            if not run or str(run["driver_id"]) != str(driver_id):
+                raise ForbiddenError("No active run for this driver")
+            stop = conn.execute(
+                "select 1 from run_stops where run_id = %s and student_id = %s limit 1",
+                (run["id"], student_id),
+            ).fetchone()
+            if not stop:
+                raise ForbiddenError("Student is not on this run")
+            aboard = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            if not aboard or aboard["boarded_at"] is None:
+                raise ConflictError("Student is not on the bus")
+            if aboard["dropped_off_at"] is not None or aboard["handover_at"] is not None:
+                raise ConflictError("This child is already accounted for")
+            participation_dao.record_handover(
+                conn, str(run["id"]), student_id, str(driver_id), note
+            )
+            row = conn.execute(
+                "update live_students set status = 'dropped-off' where id = %s returning *",
+                (student_id,),
+            ).fetchone()
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",

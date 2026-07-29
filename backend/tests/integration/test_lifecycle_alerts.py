@@ -24,7 +24,7 @@ import pytest
 
 # Cross-module helper reuse, as the other integration suites do — parent
 # accounts are created through signup, not by naming an email on a student.
-from test_students_parents import signup_parent
+from test_students_parents import complete_run, signup_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -161,7 +161,7 @@ def test_run_start_and_completion_each_raise_one_office_alert(client, admin_head
         assert fleet["bus"]["name"] in (alerts[0]["description"] or "")
         assert "morning" in (alerts[0]["description"] or "")
 
-        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        complete_run(client, driver_headers, run_id)
         ended = _wait_for(lambda: [a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
                                    if a["type"] == "run-completed"])
         assert len(ended) == 1, f"expected one run-completed alert, got {len(ended)}"
@@ -181,7 +181,7 @@ def test_lifecycle_alerts_never_reach_the_parent(client, admin_headers, fleet):
     try:
         _wait_for(lambda: [a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
                            if a["type"] == "run-started"])
-        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        complete_run(client, driver_headers, run_id)
         _wait_for(lambda: [a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
                            if a["type"] == "run-completed"])
 
@@ -204,6 +204,8 @@ def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_header
     driver_headers = _driver_headers(client, fleet)
     before_today = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]
     before_unread = client.get("/api/incidents/unread-count", headers=admin_headers).json()["count"]
+    before_real = len([a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
+                       if a["type"] not in ("run-started", "run-completed")])
 
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
@@ -212,11 +214,27 @@ def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_header
     try:
         _wait_for(lambda: [a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
                            if a["type"] == "run-started"])
-        client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+        complete_run(client, driver_headers, run_id)
         _wait_for(lambda: [a for a in _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
                            if a["type"] == "run-completed"])
 
-        assert client.get("/api/incidents/today-count", headers=admin_headers).json()["count"] == before_today
-        assert client.get("/api/incidents/unread-count", headers=admin_headers).json()["count"] == before_unread
+        # Deltas, not absolutes: the fixture is module-scoped, so earlier tests
+        # in this file have already raised lifecycle alerts on the same bus.
+        rows = _alerts_for_bus(client, admin_headers, fleet["bus"]["id"])
+        lifecycle = [a for a in rows if a["type"] in ("run-started", "run-completed")]
+        real = [a for a in rows if a["type"] not in ("run-started", "run-completed")]
+        assert len(lifecycle) >= 2, "the lifecycle alerts were not raised"
+
+        # Driving the run to the school gate raises a genuine 'arrival' incident,
+        # which the office has always counted and still should. The point is that
+        # the two lifecycle rows contribute nothing on top of it.
+        after_today = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]
+        after_unread = client.get("/api/incidents/unread-count", headers=admin_headers).json()["count"]
+        assert after_today - before_today == len(real) - before_real, (
+            "lifecycle alerts moved the incidents-today tile"
+        )
+        assert after_unread - before_unread == len(real) - before_real, (
+            "lifecycle alerts landed in the acknowledgement queue"
+        )
     finally:
         client.delete(f"/api/runs/{run_id}", headers=admin_headers)

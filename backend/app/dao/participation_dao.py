@@ -141,6 +141,70 @@ def confirmed_boarded_ids(conn, run_id: str) -> list[str]:
     return [str(r["student_id"]) for r in rows]
 
 
+def unaccounted_on_run(conn, run_id: str, run_type: str) -> list[dict[str, Any]]:
+    """Roster children with no recorded outcome on this run (U4).
+
+    Accounted for means one of five things, and the fifth is easy to miss:
+
+    - boarded, on a morning run;
+    - drop-off confirmed, on an afternoon run;
+    - an off-route hand-over recorded;
+    - covered by an absence today whose scope covers this run's period;
+    - **confirmed aboard a different run of the same period today.** Without
+      that condition a cross-bus rider — a child whose afternoon route rides
+      another bus — has no truthful release on their first bus: they were not
+      boarded here, were not dropped off here, and marking them absent would be
+      a lie. The run could never close, and the office force-close would then
+      record them unaccounted while another run holds a confirmed boarding.
+
+    The roster is the run's own snapshot (run_stops), never the derived bus
+    roster, which drifts for exactly those cross-bus riders.
+
+    Returns the blocking children with their names, so the driver and the office
+    alert can both name them rather than showing a generic failure.
+    """
+    outcome = (
+        "(p.dropped_off_at is not null or p.handover_at is not null)"
+        if run_type == "afternoon"
+        else "p.boarded_at is not null"
+    )
+    rows = conn.execute(
+        f"""
+        select distinct s.id, s.name
+        from run_stops rs
+        join live_students s on s.id = rs.student_id
+        left join run_participation p
+            on p.run_id = rs.run_id and p.student_id = rs.student_id
+        where rs.run_id = %(run_id)s
+          and rs.student_id is not null
+          and not ({outcome})
+          and not exists (
+              select 1 from live_student_absences a
+              where a.student_id = s.id
+                and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                and (a.scope = 'day' or a.scope = %(run_type)s)
+          )
+          and not exists (
+              select 1
+              from run_participation op
+              join live_runs orun on orun.id = op.run_id
+              where op.student_id = s.id
+                and op.run_id <> rs.run_id
+                and orun.date = (now() at time zone 'Africa/Nairobi')::date
+                and orun.type = %(run_type)s
+                and (
+                    (op.boarded_at is not null and op.boarded_presumed = false)
+                    or op.dropped_off_at is not null
+                    or op.handover_at is not null
+                )
+          )
+        order by s.name asc
+        """,
+        {"run_id": run_id, "run_type": run_type},
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_for_student(conn, run_id: str, student_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         "select * from run_participation where run_id = %s and student_id = %s",

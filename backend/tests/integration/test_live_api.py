@@ -19,6 +19,10 @@ import uuid
 import httpx
 import pytest
 
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -534,7 +538,9 @@ def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, n
         context = client.get("/api/runs/driver/context", headers=driver_headers).json()
         active = context.get("active_run")
         if active:
-            client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
+            # Since U4 the run will not close with unaccounted children, and a
+            # silent 409 here would leave it open and the absence uncleared.
+            complete_run(client, driver_headers, active["id"])
         absences = client.get(
             "/api/students/absences", headers=admin_headers
         ).json()
@@ -576,7 +582,8 @@ def test_run_lifecycle_notifies_parents(client, admin_headers, parent_headers, d
     assert boarded.json()["status"] == "on-bus"
 
     # End the run (sweeps students to at-school and emits reached-school).
-    ended = client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+    # Since U4 a run cannot close with unaccounted children.
+    ended = complete_run(client, driver_headers, run_id)
     assert ended.status_code == 200
     assert ended.json()["status"] == "completed"
 

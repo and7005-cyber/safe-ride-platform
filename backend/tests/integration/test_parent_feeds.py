@@ -36,6 +36,9 @@ import httpx
 import psycopg
 import pytest
 
+# Since U4 a run cannot close with unaccounted children.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -111,11 +114,9 @@ def no_runs_today(client, admin_headers, driver_headers):
 
     def sweep():
         context = client.get("/api/runs/driver/context", headers=driver_headers).json()
-        active = context.get("active_run")
-        if active:
-            client.post(
-                "/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]}
-            )
+        # No end-run here since U4: the gate refuses to close a run with
+        # unaccounted children, and this sweep only needs the run gone. Deleting
+        # it below is the admin recovery path and does the job.
         bus = context.get("bus") or {}
         today = nairobi_today()
         for run in client.get("/api/runs", headers=admin_headers).json():
@@ -133,19 +134,14 @@ def get_child(client, parent_headers, name: str) -> dict:
 
 
 def run_morning_and_end(client, driver_headers) -> None:
-    """Start and immediately end a morning run: the end-run sweep normalizes
-    the roster back to at-school, restoring the seeded state."""
-    context = client.get("/api/runs/driver/context", headers=driver_headers).json()
-    morning = next(r for r in context["routes"] if r["type"] == "morning")
-    started = client.post(
-        "/api/runs/driver/start", json={"route_id": morning["id"]}, headers=driver_headers
-    )
-    if started.status_code == 200:
-        client.post(
-            "/api/runs/driver/end",
-            json={"run_id": started.json()["id"]},
-            headers=driver_headers,
-        )
+    """No-op since U3/U4.
+
+    This used to start and immediately end a morning run so the end-of-run
+    sweep would normalise the seeded roster back to at-school. Nothing derives
+    from that column any more, and the sweep itself is gone — the closure gate
+    replaced it. Kept as a no-op so the fixtures that call it read unchanged.
+    """
+    return None
 
 
 # Feed windows (R35, AE10) -----------------------------------------------------
@@ -548,20 +544,18 @@ def test_dropped_off_child_with_no_afternoon_run_today_shows_at_home(
     run_id = started.json()["id"]
 
     try:
-        # End-run sweeps the run's roster to dropped-off (afternoon semantics).
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        # Since U4 there is no sweep: the run closes only once every child has a
+        # recorded outcome, so complete_run confirms each drop-off.
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
 
         kid = get_child(client, parent_headers, PARENT_CHILD)
-        assert kid["status"] == "dropped-off"
-        # A completed afternoon run today contains her: dropped-off is trusted.
-        # U3: dropped-off is derived from a confirmed drop-off recorded on a run
-        # today. This child's state was staged on the column, so she reads at-home.
-        assert kid["display_status"] == "at-home"
+        # A confirmed drop-off on a completed afternoon run today.
+        assert kid["display_status"] == "dropped-off"
 
-        # Admin deletes the run: now dropped-off with no afternoon run today.
+        # Admin deletes the run. The participation record goes with it, so the
+        # evidence of the drop-off is gone and she reads at-home again — the
+        # raw column is untouched and no longer decides anything.
         deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
         assert deleted.status_code == 200, deleted.text
 

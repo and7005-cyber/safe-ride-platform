@@ -387,18 +387,15 @@ def driver_headers(client):
 
 
 def run_morning_and_end(client, driver_headers) -> None:
-    """Start and immediately end a morning run: the end-run sweep normalizes
-    the seeded roster back to at-school after afternoon staging left students
-    on-bus or dropped-off (same helper as test_parent_feeds)."""
-    context = client.get("/api/runs/driver/context", headers=driver_headers).json()
-    morning = next(r for r in context["routes"] if r["type"] == "morning")
-    started = client.post(
-        "/api/runs/driver/start", json={"route_id": morning["id"]}, headers=driver_headers
-    )
-    if started.status_code == 200:
-        client.post(
-            "/api/runs/driver/end", json={"run_id": started.json()["id"]}, headers=driver_headers
-        )
+    """No-op since U3/U4.
+
+    This used to start and immediately end a morning run so the end-of-run
+    sweep would normalise seeded roster statuses back to at-school after
+    afternoon staging. Nothing derives from that column any more, and the sweep
+    itself is gone — the closure gate replaced it. Kept as a no-op so the
+    fixtures that call it read unchanged.
+    """
+    return None
 
 
 @pytest.fixture()
@@ -412,11 +409,9 @@ def clean_run_slate(client, admin_headers, driver_headers):
 
     def sweep():
         context = client.get("/api/runs/driver/context", headers=driver_headers).json()
-        active = context.get("active_run")
-        if active:
-            client.post(
-                "/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]}
-            )
+        # No end-run here since U4: the gate refuses to close a run with
+        # unaccounted children, and this sweep only needs the run gone. Deleting
+        # it below is the admin recovery path and does the job.
         bus = context.get("bus") or {}
         today = nairobi_today()
         for run in client.get("/api/runs", headers=admin_headers).json():
@@ -475,6 +470,37 @@ def assert_display_parity(
     admin = admin_row(client, admin_headers, student_id)
     assert (parent["display_status"], admin["display_status"]) == (expected, expected)
     assert (parent["status"], admin["status"]) == (raw, raw)
+
+
+def complete_run(client, driver_headers, run_id: str):
+    """End a run the way a driver must since U4: account for everyone first.
+
+    The closure gate refuses to complete a run while any roster child has no
+    recorded outcome — that is what replaced the end-of-run sweep, which used to
+    assert 'at school' for children nobody boarded. Tests that want a completed
+    run now walk the same path a driver walks: arrive at the stops, board or
+    confirm each child, then end.
+
+    Children already covered by an absence are skipped — they are accounted for.
+    Returns the end-run response so callers can assert on it.
+    """
+    context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+    run = context.get("active_run") or {}
+    for _ in range(len(context.get("run_stops", []))):
+        client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
+
+    context = client.get("/api/runs/driver/context", headers=driver_headers).json()
+    for student in context.get("students", []):
+        if student.get("absent"):
+            continue
+        if run.get("type") == "afternoon":
+            client.post("/api/runs/driver/dropoff",
+                        json={"student_id": student["id"]}, headers=driver_headers)
+        else:
+            client.post("/api/runs/driver/boarding",
+                        json={"student_id": student["id"], "on_bus": True},
+                        headers=driver_headers)
+    return client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
 
 
 def force_student_status(student_id: str, status: str) -> None:
@@ -679,17 +705,16 @@ def test_stale_dropped_off_decays_to_at_home(
         )
         assert started.status_code == 200, started.text
         run_id = started.json()["id"]
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        # Since U4 the run cannot close with unaccounted children. This test
+        # stages its state on the status column, which nothing derives from
+        # since U3, so the child is confirmed here to let the run close.
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
 
-        # A completed afternoon run today still contains the student:
-        # dropped-off is trusted (the else branch passes the raw through).
+        # A confirmed drop-off on a completed afternoon run today.
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            # U3: dropped-off is derived from a confirmed drop-off on a run today.
-            expected="at-home", raw="dropped-off",
+            expected="dropped-off", raw="dropped-off",
         )
 
         deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
