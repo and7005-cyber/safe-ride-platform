@@ -2,6 +2,18 @@ from typing import Any
 
 from app.core.db import get_connection
 
+# One sentence shape for every run-lifecycle row: "<where>: <what>. <detail>".
+# The office reads this feed by scanning it, and four new event types arriving
+# in four different shapes is how a feed stops being scannable.
+_LIFECYCLE_HEADLINE = {
+    "run-started": "run started.",
+    "run-completed": "run completed.",
+    "closure-refused": "the driver could not close the run.",
+    "force-closed": "the office force-closed the run.",
+    "handover-recorded": "a child left the bus away from their stop.",
+    "action-reversed": "the driver corrected their own entry.",
+}
+
 
 class IncidentDao:
     def list_incidents(self) -> list[dict[str, Any]]:
@@ -38,7 +50,14 @@ class IncidentDao:
             ).fetchone()
         return row["n"]
 
-    def create_lifecycle_incident(self, run_id: str, incident_type: str) -> dict[str, Any] | None:
+    def create_lifecycle_incident(
+        self,
+        run_id: str,
+        incident_type: str,
+        detail: str | None = None,
+        *,
+        dedup: bool = False,
+    ) -> dict[str, Any] | None:
         """Record a run-lifecycle event on the office feed.
 
         Dispatched DAO-direct from a local wrapper in the router, never through
@@ -55,6 +74,18 @@ class IncidentDao:
         these out of the counters; the acknowledgement keeps the Alerts page
         from offering an "Acknowledge" button on an event that asks nothing of
         anyone.
+
+        ``detail`` carries what the event itself is about — the blocking
+        children, the driver's note, the outcome retracted (U11). Without it a
+        completed run could mean every drop-off confirmed or a driver
+        self-attesting a hand-over, and the office cannot tell which.
+
+        ``dedup`` suppresses a repeat carrying the identical description. Used
+        by the refusal alert, where the description encodes the blocking set:
+        the driver tapping End four times against the same unresolved children
+        is one situation, while a run still stuck after partial progress is a
+        new one the office has not been told about. Keying on the run alone
+        would report it once and then go quiet exactly as it got worse.
         """
         with get_connection() as conn:
             run = conn.execute(
@@ -71,11 +102,22 @@ class IncidentDao:
             if not run:
                 return None
             period = "morning" if run["type"] == "morning" else "afternoon"
-            verb = "started" if incident_type == "run-started" else "ended"
-            description = (
-                f"{run['route_name'] or 'Route'} ({period}) {verb} — "
-                f"{run['bus_name'] or 'bus'}."
-            )
+            where = f"{run['route_name'] or 'Route'} ({period}) — {run['bus_name'] or 'bus'}"
+            headline = _LIFECYCLE_HEADLINE.get(incident_type, incident_type)
+            description = f"{where}: {headline}"
+            if detail:
+                description = f"{description} {detail}"
+            if dedup:
+                existing = conn.execute(
+                    """
+                    select 1 from live_incidents
+                    where run_id = %s and type = %s and description = %s
+                    limit 1
+                    """,
+                    (run["id"], incident_type, description),
+                ).fetchone()
+                if existing:
+                    return None
             row = conn.execute(
                 """
                 insert into live_incidents

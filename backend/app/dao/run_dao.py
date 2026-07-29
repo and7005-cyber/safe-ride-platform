@@ -715,7 +715,7 @@ class RunDao:
         office force-close cannot both pass their completed check and each write
         a different outcome for the same children.
         """
-        from app.core.errors import ConflictError, ForbiddenError
+        from app.core.errors import ClosureRefusedError, ConflictError, ForbiddenError
 
         with get_connection() as conn:
             run = conn.execute(
@@ -735,8 +735,12 @@ class RunDao:
                     if run["type"] == "afternoon"
                     else "Board them or mark them absent"
                 )
-                raise ConflictError(
-                    f"Not everyone is accounted for: {names}. {action} before ending the run."
+                # Typed so the router can alert the office naming the same
+                # children the driver was just told about (U11).
+                raise ClosureRefusedError(
+                    f"Not everyone is accounted for: {names}. {action} before ending the run.",
+                    run_id=str(run_id),
+                    blocking=[dict(b) for b in blocking],
                 )
             # Who the driver actually observed boarding (U2). Read from
             # participation, not from the status column: a presumed afternoon

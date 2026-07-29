@@ -3,7 +3,8 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
-from app.api._helpers import safe_call
+from app.api._helpers import map_error, safe_call
+from app.core.errors import ClosureRefusedError
 from app.core.auth import get_current_user, require_role
 from app.dao.incident_dao import IncidentDao
 from app.dao.run_dao import RunDao
@@ -112,7 +113,15 @@ def force_close_run(
     """
     result = safe_call(lambda: dao.force_close_run(user["id"], run_id))
     background_tasks.add_task(push_service.notify_run_ended, result)
-    background_tasks.add_task(_record_lifecycle_alert, str(result["id"]), "force-closed")
+    outstanding = [c["student_name"] for c in result.get("unaccounted") or []]
+    background_tasks.add_task(
+        _record_lifecycle_alert, str(result["id"]), "force-closed",
+        (
+            "Unaccounted, and owed a phone call: " + ", ".join(outstanding) + "."
+            if outstanding
+            else "Every child was already accounted for."
+        ),
+    )
     return result
 
 
@@ -169,7 +178,17 @@ def arrive(
 def end_run(
     payload: RunIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
 ):
-    run = safe_call(lambda: dao.end_run(user["id"], payload.run_id))
+    try:
+        run = dao.end_run(user["id"], payload.run_id)
+    except ClosureRefusedError as refusal:
+        # Recorded before the 409 leaves, not as a background task: FastAPI
+        # returns the error response through its own handler, which carries no
+        # background tasks — the alert would be silently dropped on exactly the
+        # path the office most needs to hear about.
+        _record_closure_refusal(refusal)
+        raise map_error(refusal) from refusal
+    except Exception as error:
+        raise map_error(error) from error
     background_tasks.add_task(push_service.notify_run_ended, run)
     background_tasks.add_task(_record_lifecycle_alert, str(run["id"]), "run-completed")
     return run
@@ -231,6 +250,10 @@ def record_handover(
     background_tasks.add_task(
         push_service.notify_student_handover, student, run, payload.note
     )
+    background_tasks.add_task(
+        _record_lifecycle_alert, str(run["id"]), "handover-recorded",
+        f"{student['name']} — driver's note: {payload.note}",
+    )
     return student
 
 
@@ -251,10 +274,17 @@ def reverse_own_action(
         lambda: dao.reverse_own_action(user["id"], payload.student_id)
     )
     background_tasks.add_task(push_service.notify_correction, student, run, reversed_what)
+    retracted = "absence mark" if reversed_what == "absence" else "drop-off confirmation"
+    background_tasks.add_task(
+        _record_lifecycle_alert, str(run["id"]), "action-reversed",
+        f"{student['name']} — the {retracted} was retracted.",
+    )
     return student
 
 
-def _record_lifecycle_alert(run_id: str, incident_type: str) -> None:
+def _record_lifecycle_alert(
+    run_id: str, incident_type: str, detail: str | None = None
+) -> None:
     """Office-only run-lifecycle alert (U16/R29-R30).
 
     Dispatched DAO-direct, never through push_service.notify_incident — that
@@ -266,9 +296,27 @@ def _record_lifecycle_alert(run_id: str, incident_type: str) -> None:
     breaks the driver's request.
     """
     try:
-        incident_dao.create_lifecycle_incident(run_id, incident_type)
+        incident_dao.create_lifecycle_incident(run_id, incident_type, detail)
     except Exception:
         logger.exception("recording %s lifecycle alert failed", incident_type)
+
+
+def _record_closure_refusal(refusal: ClosureRefusedError) -> None:
+    """Office alert for a refused closure (U11/R29).
+
+    Deduped on the blocking set rather than the run: a driver tapping End four
+    times against the same unresolved children is one situation and should read
+    as one alert, while a run still stuck after partial progress is a different
+    situation the office has not been told about yet. Keying on the run alone
+    would report the first refusal and then stay quiet as it got worse.
+    """
+    names = ", ".join(sorted(b["name"] for b in refusal.blocking))
+    try:
+        incident_dao.create_lifecycle_incident(
+            refusal.run_id, "closure-refused", f"Waiting on: {names}.", dedup=True
+        )
+    except Exception:
+        logger.exception("recording closure-refused alert failed")
 
 
 def _record_absent_incident(driver_id: str, student: dict, run: dict) -> None:

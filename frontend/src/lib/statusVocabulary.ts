@@ -170,7 +170,11 @@ export type IncidentType =
   | "other"
   | "cancellation"
   | "run-started"
-  | "run-completed";
+  | "run-completed"
+  | "closure-refused"
+  | "force-closed"
+  | "handover-recorded"
+  | "action-reversed";
 
 export const ADMIN_INCIDENT_LABEL: Record<IncidentType, string> = {
   breakdown: "Vehicle breakdown",
@@ -182,6 +186,11 @@ export const ADMIN_INCIDENT_LABEL: Record<IncidentType, string> = {
   cancellation: "Ride cancellation",
   "run-started": "Route started",
   "run-completed": "Route ended",
+  // Named for what the office has to do about them, not for the internal event.
+  "closure-refused": "Route cannot close",
+  "force-closed": "Route force-closed",
+  "handover-recorded": "Left the bus off-route",
+  "action-reversed": "Driver correction",
 };
 
 export const ADMIN_INCIDENT_VARIANT: Record<IncidentType, BadgeVariant> = {
@@ -195,6 +204,12 @@ export const ADMIN_INCIDENT_VARIANT: Record<IncidentType, BadgeVariant> = {
   // Lifecycle events are informational, not exceptional.
   "run-started": "secondary",
   "run-completed": "secondary",
+  // These four are lifecycle rows too, but they are not routine: each one means
+  // a child's outcome is unresolved, was resolved off-route, or was retracted.
+  "closure-refused": "warning",
+  "force-closed": "warning",
+  "handover-recorded": "warning",
+  "action-reversed": "secondary",
 };
 
 /** What a parent can actually receive — lifecycle and arrival rows are excluded

@@ -41,6 +41,9 @@ const NOTIFICATION_VALUES = [
 const ADMIN_INCIDENT_VALUES = [
   "breakdown", "accident", "student", "traffic", "arrival", "other",
   "cancellation", "run-started", "run-completed",
+  // The closure events (U11): every one of them changes what a completed run
+  // means, so each needs office wording rather than a raw slug.
+  "closure-refused", "force-closed", "handover-recorded", "action-reversed",
 ] as const;
 const PARENT_INCIDENT_VALUES = [
   "breakdown", "accident", "student", "traffic", "other",
@@ -150,7 +153,12 @@ describe("cross-role agreement", () => {
   });
 
   it("hides office-only incident types from the parent vocabulary", () => {
-    for (const officeOnly of ["arrival", "run-started", "run-completed", "cancellation"]) {
+    // The closure events matter most here: they name other people's children,
+    // so a leak into parent wording would be a disclosure, not a duplicate.
+    for (const officeOnly of [
+      "arrival", "run-started", "run-completed", "cancellation",
+      "closure-refused", "force-closed", "handover-recorded", "action-reversed",
+    ]) {
       expect(Object.keys(PARENT_INCIDENT_LABEL)).not.toContain(officeOnly);
     }
   });
