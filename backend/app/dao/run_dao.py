@@ -2,6 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.absence_dao import absent_student_ids
+from app.dao import participation_dao
 from app.dao.status_sql import no_progress_case, scope_covers
 
 
@@ -430,12 +431,34 @@ class RunDao:
                     """,
                     (run["id"], route["type"]),
                 )
+            if route["type"] == "afternoon":
+                # Record the auto-board as participation, flagged presumed (U2):
+                # the app assumed these children are aboard, nobody observed it.
+                # The distinction is what stops the arrival notification and the
+                # parent card asserting a boarding no actor recorded.
+                for row in conn.execute(
+                    """
+                    select rs.student_id, s.name
+                    from run_stops rs
+                    join live_students s on s.id = rs.student_id
+                    where rs.run_id = %s and rs.student_id is not null
+                      and s.status = 'on-bus'
+                    """,
+                    (run["id"],),
+                ).fetchall():
+                    participation_dao.record_boarding(
+                        conn, str(run["id"]), str(row["student_id"]), row["name"],
+                        str(driver_id), presumed=True,
+                    )
             # Recount students_boarded (never increment): morning counts who is
-            # on the bus, afternoon counts confirmed drop-offs — both 0 at
-            # start in the normal case, but recomputing keeps the counter
-            # honest even for roster students carried over in an odd state.
-            count_status = "dropped-off" if route["type"] == "afternoon" else "on-bus"
-            boarded_count = self._count_run_students_with_status(conn, run["id"], count_status)
+            # aboard, afternoon counts confirmed drop-offs — both 0 at start in
+            # the normal case, but recomputing keeps the counter honest even for
+            # roster students carried over in an odd state.
+            boarded_count = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if route["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -551,22 +574,19 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
-            # Capture who was actually on the bus before the sweep wipes it;
-            # notifications must only assert arrival for boarded students.
-            boarded = conn.execute(
-                """
-                select distinct s.id from live_students s
-                where s.id in (select student_id from run_stops where run_id = %s and student_id is not null)
-                  and s.status = 'on-bus'
-                """,
-                (run_id,),
-            ).fetchall()
-            # Persist students_boarded as the final pre-sweep count over the
-            # run's own roster (run_stops), per run type: morning counts who
-            # is on the bus; afternoon counts who was dropped off at their
-            # stop (tap-time drop-offs) before the sweep rewrites statuses.
-            final_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
-            final_count = self._count_run_students_with_status(conn, run_id, final_status)
+            # Who the driver actually observed boarding (U2). Read from
+            # participation, not from the status column: a presumed afternoon
+            # board is not evidence a child rode, and the arrival notification
+            # must never assert arrival for one. This also no longer needs to
+            # run "before the sweep wipes it" — the record outlives the run.
+            boarded_ids = participation_dao.confirmed_boarded_ids(conn, str(run_id))
+            # Persist students_boarded per run type: morning counts who is
+            # aboard; afternoon counts confirmed drop-offs and hand-overs.
+            final_count = (
+                participation_dao.count_dropped_off(conn, str(run_id))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run_id))
+            )
             conn.execute(
                 "update live_runs set status='completed', stops_completed=total_stops, "
                 "students_boarded=%s, "
@@ -590,7 +610,7 @@ class RunDao:
             )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
         result = dict(updated)
-        result["boarded_student_ids"] = [str(b["id"]) for b in boarded]
+        result["boarded_student_ids"] = boarded_ids
         return result
 
     def write_position(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
@@ -643,10 +663,17 @@ class RunDao:
                 "update live_students set status = 'on-bus' where id = %s returning *",
                 (student_id,),
             ).fetchone()
-            # Recount students_boarded from the run's own roster in the SAME
-            # transaction — never increment/decrement, so repeated taps and
-            # board/unboard cycles can't drift the counter (R15).
-            boarded_count = self._count_run_students_with_status(conn, run["id"], "on-bus")
+            # The observed fact, recorded against this run with its actor (U2).
+            # The status write above stays for now: participation and the column
+            # coexist until the follow-up drops it.
+            participation_dao.record_boarding(
+                conn, str(run["id"]), student_id, row["name"], str(driver_id), presumed=False
+            )
+            # Recount students_boarded from participation in the SAME
+            # transaction — never increment/decrement, so repeated taps can't
+            # drift the counter (R15), and it no longer reads a status column
+            # that has stopped tracking boarding.
+            boarded_count = participation_dao.count_boarded(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -682,16 +709,23 @@ class RunDao:
                 raise ForbiddenError("Student is not on this run")
             if stop["stop_order"] > run["stops_completed"]:
                 raise ConflictError("Stop has not been reached yet")
-            student = conn.execute(
-                "select * from live_students where id = %s", (student_id,)
-            ).fetchone()
-            if not student or student["status"] != "on-bus":
+            # Precondition re-keyed onto participation (U2), not the status
+            # column. The afternoon board is presumed, so a child may legitimately
+            # be mid-transition; what matters is that this run records them
+            # aboard. Keying on status would refuse every afternoon confirmation
+            # the moment boarding stops writing it, and no afternoon run could
+            # then pass the closure gate.
+            aboard = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            if not aboard or aboard["boarded_at"] is None:
                 raise ConflictError("Student is not on the bus")
+            if aboard["dropped_off_at"] is not None or aboard["handover_at"] is not None:
+                raise ConflictError("This drop-off is already confirmed")
             row = conn.execute(
                 "update live_students set status = 'dropped-off' where id = %s returning *",
                 (student_id,),
             ).fetchone()
-            dropped_count = self._count_run_students_with_status(conn, run["id"], "dropped-off")
+            participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
+            dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (dropped_count, run["id"]),
@@ -754,8 +788,15 @@ class RunDao:
                 """,
                 (run["id"], student_id, student["name"], reason),
             ).fetchone()
-            count_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
-            boarded_count = self._count_run_students_with_status(conn, run["id"], count_status)
+            # A child marked absent was not aboard, so their participation goes
+            # (U2). On an afternoon run this retracts the presumed board the
+            # auto-board wrote — the correction that presumption exists to allow.
+            participation_dao.clear_for_student(conn, str(run["id"]), student_id)
+            boarded_count = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -778,19 +819,9 @@ class RunDao:
         run["newly_recorded"] = inserted is not None
         return dict(student), run
 
-    def _count_run_students_with_status(self, conn, run_id: str, status: str) -> int:
-        """Distinct students on the run's own roster (run_stops) currently in
-        ``status``. The run-scoped roster, never the derived bus roster."""
-        row = conn.execute(
-            """
-            select count(distinct s.id) as n from live_students s
-            where s.id in (
-                select student_id from run_stops where run_id = %s and student_id is not null
-            ) and s.status = %s
-            """,
-            (run_id, status),
-        ).fetchone()
-        return row["n"]
+    # _count_run_students_with_status is gone (U2): every counter now reads
+    # participation. Counting a status column that no longer tracks boarding
+    # would have frozen students_boarded at whatever the last sweep left.
 
     def _bus_id_for_driver(self, conn, driver_id: str) -> str | None:
         row = conn.execute(
