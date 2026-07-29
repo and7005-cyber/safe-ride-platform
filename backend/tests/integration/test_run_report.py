@@ -27,6 +27,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 # Since U4 a run cannot close with unaccounted children.
 from test_students_parents import complete_run
 
@@ -88,7 +90,7 @@ def no_active_run(client, driver_headers, admin_headers):
         today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == bus_id and str(run.get("date")) == today:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
 
     reset_today_runs()
     yield
@@ -172,7 +174,7 @@ def test_report_snapshots_absent_student_and_survives_deletion(
     finally:
         if run_id:
             client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         if not student_deleted:
             _clear_absences_for(client, admin_headers, student["id"])
             client.delete(f"/api/students/{student['id']}", headers=admin_headers)
@@ -255,7 +257,7 @@ def test_students_boarded_recount_is_idempotent(client, admin_headers, driver_he
         assert boarded_count() == expected
     finally:
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 # Report shapes ------------------------------------------------------------------
@@ -283,7 +285,7 @@ def test_report_for_routeless_run_is_empty_and_exact(client, admin_headers, driv
         fenced = client.get(f"/api/runs/{run['id']}/report", headers=driver_headers)
         assert fenced.status_code == 403, fenced.text
     finally:
-        client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+        purge_run(run['id'])
 
 
 def test_report_missing_run_is_404(client, admin_headers):
@@ -338,7 +340,7 @@ def test_legacy_run_falls_back_to_live_absences_flagged_approximate(client, admi
         assert entry["reason"] == f"IT travel {marker}"
     finally:
         if run_id:
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         _clear_absences_for(client, admin_headers, student["id"])
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
@@ -409,7 +411,7 @@ def test_legacy_fallback_excludes_non_covering_scopes(client, admin_headers):
         assert morning_kid["id"] not in listed  # morning cancellation ≠ afternoon absence
     finally:
         if run_id:
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         for student in (morning_kid, afternoon_kid, day_kid):
             _clear_absences_for(client, admin_headers, student["id"])
             client.delete(f"/api/students/{student['id']}", headers=admin_headers)

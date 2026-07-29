@@ -22,6 +22,8 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_run
+
 # Cross-module helper reuse, as the other integration suites do — parent
 # accounts are created through signup, not by naming an email on a student.
 from test_students_parents import complete_run, signup_parent
@@ -113,7 +115,7 @@ def fleet(client, admin_headers):
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == created["bus"]["id"]:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
         client.delete(f"/api/students/{created['student']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{created['route']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{created['bus']['id']}", headers=admin_headers)
@@ -167,7 +169,7 @@ def test_run_start_and_completion_each_raise_one_office_alert(client, admin_head
         assert len(ended) == 1, f"expected one run-completed alert, got {len(ended)}"
         assert ended[0]["type"] != alerts[0]["type"], "start and end are indistinguishable"
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_lifecycle_alerts_never_reach_the_parent(client, admin_headers, fleet):
@@ -194,7 +196,7 @@ def test_lifecycle_alerts_never_reach_the_parent(client, admin_headers, fleet):
         # because the only feed filter was on child-stamped rows.
         assert "arrival" not in types
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_headers, fleet):
@@ -237,4 +239,4 @@ def test_lifecycle_alerts_do_not_move_the_incident_counters(client, admin_header
             "lifecycle alerts landed in the acknowledgement queue"
         )
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)

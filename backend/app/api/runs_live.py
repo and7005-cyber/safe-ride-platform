@@ -27,7 +27,11 @@ class RunPayload(BaseModel):
     date: str | None = None
     start_time: str | None = None
     end_time: str | None = None
-    status: str | None = "in-progress"
+    # No default: create coalesces a missing status to 'in-progress', while
+    # update must be able to tell "omitted" from "explicitly set". Defaulting
+    # here meant every edit that left the status out arrived as an explicit
+    # 'in-progress' and silently reopened a finished run (U7/R16).
+    status: str | None = None
     total_stops: int | None = 0
     stops_completed: int | None = 0
     total_students: int | None = 0

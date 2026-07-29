@@ -97,18 +97,47 @@ class RunDao:
         return dict(row)
 
     def update_run(self, run_id: str, data: dict) -> dict[str, Any] | None:
+        """Edit a run's plan. Cannot complete one (R16).
+
+        Completion is a claim about children, not a field: it means every child
+        on the roster has a recorded outcome. Only the gated driver end and the
+        office force-close can make it, because only those two evaluate the
+        roster — one refusing until the driver accounts for everyone, the other
+        recording the unresolved children as unaccounted. Setting the column
+        here would produce a completed run with neither guarantee behind it.
+        """
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
             current = conn.execute(
-                "select date from live_runs where id = %s", (run_id,)
+                "select date, status from live_runs where id = %s", (run_id,)
             ).fetchone()
             if not current:
                 return None
+            if data.get("status") == "completed" and current["status"] != "completed":
+                raise ConflictError(
+                    "A run cannot be marked finished here. The driver ends it once "
+                    "every child is accounted for, or you can force-close it if they "
+                    "cannot."
+                )
+            # Reopening is blocked as well, and not only for symmetry: a finished
+            # run reopened here is no longer 'completed', which is what the
+            # delete refusal keys on — so reopen-then-delete would cascade the
+            # participation this unit exists to protect.
+            if (
+                current["status"] == "completed"
+                and data.get("status") not in (None, "completed")
+            ):
+                raise ConflictError(
+                    "This run is finished and cannot be reopened. Start a new run "
+                    "if the bus is going out again."
+                )
             # Re-run the create_run conflict check when the resulting state is
             # non-completed with a bus, excluding this run, so admins get the
             # friendly 409 instead of the raw unique-violation message (R3).
-            # The resulting date falls back to the run's current date,
-            # matching coalesce(%(date)s, date) in the update below.
-            if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
+            # The resulting date and status fall back to the run's current ones,
+            # matching the coalesce(..., <column>) pairs in the update below.
+            if data.get("bus_id") and (data.get("status") or current["status"]) != "completed":
                 self._assert_no_active_run_conflict(
                     conn, data["bus_id"], data.get("date") or current["date"],
                     exclude_run_id=run_id,
@@ -118,7 +147,11 @@ class RunDao:
                 update live_runs set
                     bus_id=%(bus_id)s, route_id=%(route_id)s, type=coalesce(%(type)s,'morning'),
                     date=coalesce(%(date)s, date), start_time=%(start_time)s, end_time=%(end_time)s,
-                    status=coalesce(%(status)s,'in-progress'), total_stops=coalesce(%(total_stops)s,0),
+                    -- Preserve, don't default: 'in-progress' here meant any edit
+                    -- that omitted the status silently reopened a completed run,
+                    -- which then blocked its own bus through the (bus, date)
+                    -- uniqueness index.
+                    status=coalesce(%(status)s, status), total_stops=coalesce(%(total_stops)s,0),
                     stops_completed=coalesce(%(stops_completed)s,0),
                     total_students=coalesce(%(total_students)s,0),
                     students_boarded=coalesce(%(students_boarded)s,0), incidents=coalesce(%(incidents)s,0)
@@ -129,26 +162,74 @@ class RunDao:
         return dict(row) if row else None
 
     def delete_run(self, run_id: str) -> None:
-        """Delete a run. Deleting a NON-completed run also resets its roster's
-        'on-bus' students back to 'at-school' in the same transaction — R28's
-        recovery path (admin deletes a mistakenly started run) must not strand
-        an auto-boarded afternoon roster on a phantom bus."""
+        """Delete a run — the admin's recovery path for a run started in error
+        (R16).
+
+        Deleting a non-completed run no longer writes any child a status. It
+        used to bulk-set the roster's 'on-bus' children to 'at-school', which
+        was a guess dressed as a fact: an afternoon roster is auto-boarded on
+        presumption, so that sweep asserted a whole busload arrived somewhere
+        nobody observed. Participation cascades with the run instead, leaving
+        each child with nothing recorded today — which derives to their true
+        pre-run state rather than an invented one.
+
+        The absence rows this run's driver created go with it, for the same
+        reason: they were marked in the course of a run that is being undone,
+        and leaving them would keep children absent for a trip that no longer
+        exists. Office- and parent-created rows are untouched — those are
+        statements from outside the run and the admin did not ask to revoke them.
+
+        Deleting a *completed* run dated today whose children have recorded
+        participation is refused. Those rows are now the only evidence anyone
+        boarded, so cascading them would flip a whole roster from at school to
+        at home in the middle of the day.
+
+        The refusal keys on the evidence rather than on the status, because the
+        two are not the same thing: an admin-created bookkeeping row carries no
+        roster and no participation, and blocking its deletion would cost the
+        office a legitimate correction to protect nothing. Older completed runs
+        keep their participation as history and delete normally — their day is
+        over, so nothing on a live surface moves.
+        """
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
             run = conn.execute(
-                "select status from live_runs where id = %s", (run_id,)
+                """
+                select r.status, r.driver_id, r.date,
+                       r.date = (now() at time zone 'Africa/Nairobi')::date as is_today,
+                       exists (
+                           select 1 from run_participation p
+                           where p.run_id = r.id and p.student_id is not null
+                       ) as has_evidence
+                from live_runs r where r.id = %s
+                """,
+                (run_id,),
             ).fetchone()
-            if run and run["status"] != "completed":
+            if run and run["status"] == "completed" and run["is_today"] and run["has_evidence"]:
+                raise ConflictError(
+                    "This run is finished, and its record is the only evidence of "
+                    "who was on the bus today. Deleting it would show those children "
+                    "as never having travelled. Edit the run instead."
+                )
+            if run and run["status"] != "completed" and run["driver_id"]:
+                # Scoped to this run's own roster: a driver runs a morning and an
+                # afternoon route on the same date, and undoing one must not
+                # revoke the absences they marked on the other.
                 conn.execute(
                     """
-                    update live_students set status = 'at-school'
-                    where status = 'on-bus'
-                      and id in (
+                    delete from live_student_absences
+                    where absence_date = %(date)s
+                      and source = 'driver'
+                      and marked_by = %(driver_id)s
+                      and student_id in (
                           select student_id from run_stops
-                          where run_id = %s and student_id is not null
+                          where run_id = %(run_id)s and student_id is not null
                       )
                     """,
-                    (run_id,),
+                    {"date": run["date"], "driver_id": run["driver_id"], "run_id": run_id},
                 )
+            # run_participation and run_stops cascade on the run's own delete.
             conn.execute("delete from live_runs where id = %s", (run_id,))
 
     def run_report(self, run_id: str) -> dict[str, Any]:

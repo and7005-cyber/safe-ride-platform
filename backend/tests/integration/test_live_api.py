@@ -19,6 +19,8 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_run
+
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
 from test_students_parents import complete_run
@@ -88,7 +90,7 @@ def no_active_run(client, driver_headers, admin_headers):
         today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == bus_id and str(run.get("date")) == today:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
 
     reset_today_runs()
     yield
@@ -510,7 +512,7 @@ def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
         headers=admin_headers,
     )
     assert run2.status_code == 409
-    client.delete(f"/api/runs/{run1.json()['id']}", headers=admin_headers)
+    purge_run(run1.json()['id'])
     client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
 
 

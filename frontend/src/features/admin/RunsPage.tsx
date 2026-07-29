@@ -225,14 +225,30 @@ export function RunsPage() {
             </div>
             <div className="space-y-2">
               <Label>Status</Label>
-              <Select value={form.status} onValueChange={(v) => setForm({ ...form, status: v })}>
+              {/* Finishing a run is a claim that every child is accounted for,
+                  so it belongs to the driver's end or the office force-close,
+                  never to this form — and a finished run cannot be reopened
+                  here either (U7). Offering either would only produce a 409. */}
+              <Select
+                value={form.status}
+                disabled={form.status === "completed"}
+                onValueChange={(v) => setForm({ ...form, status: v })}
+              >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="in-progress">In progress</SelectItem>
-                  <SelectItem value="delayed">Delayed</SelectItem>
-                  <SelectItem value="completed">Completed</SelectItem>
+                  {form.status === "completed"
+                    ? <SelectItem value="completed">Completed</SelectItem>
+                    : <>
+                        <SelectItem value="in-progress">In progress</SelectItem>
+                        <SelectItem value="delayed">Delayed</SelectItem>
+                      </>}
                 </SelectContent>
               </Select>
+              {form.status === "completed" && (
+                <p className="text-xs text-muted-foreground">
+                  This run is finished. Start a new run if the bus is going out again.
+                </p>
+              )}
             </div>
           </div>
           <DialogFooter>

@@ -20,6 +20,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -138,7 +140,7 @@ def fleet(client, admin_headers):
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == created["bus"]["id"]:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
         client.delete(f"/api/students/{created['student']['id']}", headers=admin_headers)
         for period in ("morning", "afternoon"):
             client.delete(f"/api/fleet/routes/{created[period]['id']}", headers=admin_headers)
@@ -195,7 +197,7 @@ def test_a_confirmed_boarding_reads_on_bus_everywhere(
         assert driver_status(client, driver_headers, sid) == "on-bus"
     finally:
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_completed_morning_run_leaves_boarded_children_at_school(
@@ -214,7 +216,7 @@ def test_a_completed_morning_run_leaves_boarded_children_at_school(
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
         assert admin_status(client, admin_headers, fleet["student"]["id"]) == "at-school"
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_presumed_afternoon_board_is_not_rendered_as_confirmed(
@@ -234,7 +236,7 @@ def test_a_presumed_afternoon_board_is_not_rendered_as_confirmed(
         assert parent_status(client, fleet["parent_headers"], sid) == "expected-on-bus"
     finally:
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_an_unaccounted_child_never_decays_to_at_home(
@@ -259,7 +261,7 @@ def test_an_unaccounted_child_never_decays_to_at_home(
         )
         assert parent_status(client, fleet["parent_headers"], sid) == "unaccounted"
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_the_driver_reads_the_same_value_as_admin_and_parent(
@@ -279,7 +281,7 @@ def test_the_driver_reads_the_same_value_as_admin_and_parent(
         )
     finally:
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_presumed_child_can_still_have_their_ride_cancelled(
@@ -306,4 +308,4 @@ def test_a_presumed_child_can_still_have_their_ride_cancelled(
                        json={"student_id": fleet["student"]["id"], "scope": "afternoon"},
                        headers=fleet["parent_headers"])
         client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)

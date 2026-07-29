@@ -34,6 +34,8 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -1164,7 +1166,7 @@ def test_started_run_keeps_its_snapshot_through_a_recalc(
     finally:
         if run_id and driver_headers:
             client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         _cleanup(
             client, admin_headers,
             students=kids, routes=(route,), schools=(school,), buses=(bus,), drivers=(driver,),
@@ -1753,7 +1755,7 @@ def test_started_run_keeps_its_snapshot_through_a_manual_reorder(client, admin_h
     finally:
         if run_id and driver_headers:
             client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         _cleanup(
             client, admin_headers,
             students=kids, routes=(route,), schools=(school,), buses=(bus,), drivers=(driver,),

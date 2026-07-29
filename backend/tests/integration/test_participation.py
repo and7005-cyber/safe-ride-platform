@@ -23,6 +23,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -117,7 +119,7 @@ def fleet(client, admin_headers):
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == created["bus"]["id"]:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
         for s in created["students"]:
             client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         for period in ("morning", "afternoon"):
@@ -141,7 +143,7 @@ def morning_run(client, admin_headers, fleet, driver_headers):
     run_id = started.json()["id"]
     yield run_id
     client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 @pytest.fixture
@@ -152,7 +154,7 @@ def afternoon_run(client, admin_headers, fleet, driver_headers):
     run_id = started.json()["id"]
     yield run_id
     client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def test_boarding_records_who_when_and_that_it_was_observed(

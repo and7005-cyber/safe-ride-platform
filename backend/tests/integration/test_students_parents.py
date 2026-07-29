@@ -23,6 +23,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -416,7 +418,7 @@ def clean_run_slate(client, admin_headers, driver_headers):
         today = nairobi_today()
         for run in client.get("/api/runs", headers=admin_headers).json():
             if str(run.get("bus_id")) == str(bus.get("id")) and str(run.get("date")) == today:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
 
     sweep()
     yield
@@ -501,6 +503,22 @@ def complete_run(client, driver_headers, run_id: str):
                         json={"student_id": student["id"], "on_bus": True},
                         headers=driver_headers)
     return client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+
+
+def force_run_completed(run_id: str) -> None:
+    """Stage a completed run that recorded no outcomes — no API can produce one.
+
+    Since U7 the only two completion paths both say something about the
+    children: the driver's end refuses until every one is accounted for, and
+    the office force-close records the rest as unaccounted. The admin PUT that
+    used to complete a run while sweeping nothing is gone, which is the point —
+    so the stale state it left behind is now reachable only by SQL.
+    """
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        updated = conn.execute(
+            "update live_runs set status = 'completed' where id = %s", (run_id,)
+        )
+        assert updated.rowcount == 1, f"run {run_id} not staged"
 
 
 def force_student_status(student_id: str, status: str) -> None:
@@ -641,8 +659,9 @@ def test_today_absence_overrides_stored_on_bus_to_absent(
 
 def test_stale_on_bus_decays_to_at_home(client, admin_headers, driver_headers, clean_run_slate):
     """R2: raw 'on-bus' is only trusted while a non-completed run today
-    carries the student. Completing the run via admin PUT (which, unlike the
-    driver's end-run, sweeps nothing) leaves the stale on-bus behind."""
+    carries the student. The run is completed by SQL here — since U7 no API
+    path completes a run without recording an outcome per child — which leaves
+    exactly the stale on-bus column this derivation must not trust."""
     marker = uuid.uuid4().hex[:6]
     afternoon = driver_route(client, driver_headers, "afternoon")
     student, parent_id, _, parent_headers = create_linked_student(
@@ -655,26 +674,7 @@ def test_stale_on_bus_decays_to_at_home(client, admin_headers, driver_headers, c
         assert started.status_code == 200, started.text
         run = started.json()
 
-        completed = client.put(
-            f"/api/runs/{run['id']}",
-            json={
-                "bus_id": run["bus_id"],
-                "route_id": run["route_id"],
-                "type": run["type"],
-                "date": str(run["date"]),
-                "start_time": run["start_time"],
-                "end_time": run["end_time"],
-                "status": "completed",
-                "total_stops": run["total_stops"],
-                "stops_completed": run["stops_completed"],
-                "total_students": run["total_students"],
-                "students_boarded": run["students_boarded"],
-                "incidents": run["incidents"],
-            },
-            headers=admin_headers,
-        )
-        assert completed.status_code == 200, completed.text
-        assert completed.json()["status"] == "completed"
+        force_run_completed(run["id"])
 
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
@@ -691,8 +691,8 @@ def test_stale_dropped_off_decays_to_at_home(
     client, admin_headers, driver_headers, clean_run_slate
 ):
     """R2: 'dropped-off' is only trusted while an afternoon run today contains
-    the student; once the completed run is deleted the badge decays to
-    at-home while the raw status is never rewritten by the read."""
+    the student; once no such run holds them the badge decays to at-home, and
+    the raw status is never rewritten by the read."""
     marker = uuid.uuid4().hex[:6]
     afternoon = driver_route(client, driver_headers, "afternoon")
     student, parent_id, _, parent_headers = create_linked_student(
@@ -717,14 +717,19 @@ def test_stale_dropped_off_decays_to_at_home(
             expected="dropped-off", raw="dropped-off",
         )
 
-        deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
-        assert deleted.status_code == 200, deleted.text
+        # Deleting a completed run dated today is refused since U7 — this flip
+        # is exactly the harm that refusal prevents. Removed out-of-band here to
+        # reach the state under test.
+        refused = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        assert refused.status_code == 409, refused.text
+        purge_run(run_id)
 
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
             expected="at-home", raw="dropped-off",
         )
     finally:
+        purge_run(run_id)
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
 

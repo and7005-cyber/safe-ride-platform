@@ -36,6 +36,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 # Since U4 a run cannot close with unaccounted children.
 from test_students_parents import complete_run
 
@@ -121,7 +123,7 @@ def no_runs_today(client, admin_headers, driver_headers):
         today = nairobi_today()
         for run in client.get("/api/runs", headers=admin_headers).json():
             if str(run.get("bus_id")) == str(bus.get("id")) and str(run.get("date")) == today:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
 
     sweep()
     yield
@@ -553,11 +555,13 @@ def test_dropped_off_child_with_no_afternoon_run_today_shows_at_home(
         # A confirmed drop-off on a completed afternoon run today.
         assert kid["display_status"] == "dropped-off"
 
-        # Admin deletes the run. The participation record goes with it, so the
-        # evidence of the drop-off is gone and she reads at-home again — the
-        # raw column is untouched and no longer decides anything.
-        deleted = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
-        assert deleted.status_code == 200, deleted.text
+        # The product refuses to delete a completed run dated today — that
+        # refusal exists precisely because of the flip this test measures, and
+        # it has its own coverage below. Here the run is removed out-of-band to
+        # reach the state under test: no afternoon run today holding her.
+        refused = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        assert refused.status_code == 409, refused.text
+        purge_run(run_id)
 
         kid = get_child(client, parent_headers, PARENT_CHILD)
         assert kid["status"] == "dropped-off"  # raw status untouched

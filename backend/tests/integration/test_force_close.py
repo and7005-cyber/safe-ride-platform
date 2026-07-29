@@ -26,6 +26,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 # Parent accounts come from signup; naming an email on a student only links a
 # row, and without a linked account no notification is ever produced.
 from test_students_parents import signup_parent
@@ -150,7 +152,7 @@ def fleet(client, admin_headers):
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == created["bus"]["id"]:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
         for s in created["students"]:
             client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         for period in ("morning", "afternoon"):
@@ -185,7 +187,7 @@ def start_and_arrive(client, driver_headers, fleet, period: str, stops: int | No
 def afternoon_run(client, admin_headers, fleet, driver_headers):
     run_id = start_and_arrive(client, driver_headers, fleet, "afternoon")
     yield run_id
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def test_force_close_keeps_confirmed_dropoffs_and_records_the_rest_unaccounted(
@@ -288,7 +290,7 @@ def test_a_morning_force_close_after_a_recorded_gate_arrival_notifies_boarded_ch
             "a child who never boarded was told they reached school"
         )
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_morning_force_close_with_no_gate_arrival_notifies_nobody(
@@ -311,7 +313,7 @@ def test_a_morning_force_close_with_no_gate_arrival_notifies_nobody(
             "arrival was asserted with no record of the bus reaching the gate"
         )
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_the_bus_can_start_its_next_route_immediately(
@@ -337,8 +339,8 @@ def test_the_bus_can_start_its_next_route_immediately(
         afternoon = freed.json()["id"]
     finally:
         if afternoon:
-            client.delete(f"/api/runs/{afternoon}", headers=admin_headers)
-        client.delete(f"/api/runs/{morning}", headers=admin_headers)
+            purge_run(afternoon)
+        purge_run(morning)
 
 
 def test_a_run_from_a_past_service_day_rejects_driver_actions(
@@ -364,7 +366,7 @@ def test_a_run_from_a_past_service_day_rejects_driver_actions(
         closed = client.post(f"/api/runs/{run_id}/force-close", headers=admin_headers)
         assert closed.status_code == 200, closed.text
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_stale_run_surfaces_to_the_office_as_active(
@@ -383,7 +385,7 @@ def test_a_stale_run_surfaces_to_the_office_as_active(
         assert mine, "the stale run is invisible to the office"
         assert mine[0]["stale"] is True, "the stale run is not flagged as such"
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_force_close_is_refused_on_a_completed_run(
@@ -404,7 +406,7 @@ def test_force_close_is_refused_on_a_completed_run(
         again = client.post(f"/api/runs/{run_id}/force-close", headers=admin_headers)
         assert again.status_code == 409, again.text
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_a_driver_cannot_force_close(client, fleet, driver_headers, afternoon_run):

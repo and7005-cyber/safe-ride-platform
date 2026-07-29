@@ -37,6 +37,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
 from test_students_parents import complete_run
@@ -300,7 +302,7 @@ def _end_and_delete(client, admin_headers, driver_headers, run_id: str | None) -
     if not run_id:
         return
     client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def _driver_context(client, driver_headers) -> dict:
@@ -385,7 +387,7 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
         assert listed == {s1["id"]: CANCELLED_BY_PARENT}
     finally:
         _end_and_delete(client, admin_headers, driver_headers, afternoon_run_id)
-        client.delete(f"/api/runs/{morning_run_id}", headers=admin_headers)
+        purge_run(morning_run_id)
         _clear_absences_for(client, admin_headers, s1["id"])
         _purge_cancellation_incidents(client, admin_headers, s1["id"])
 
@@ -593,7 +595,7 @@ def test_day_cancel_after_completed_morning_records_afternoon_and_withdraw_guard
     finally:
         for run_id in (morning_run, afternoon_run):
             if run_id:
-                client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+                purge_run(run_id)
         _clear_absences_for(client, admin_headers, s1["id"])
         _purge_cancellation_incidents(client, admin_headers, s1["id"])
 

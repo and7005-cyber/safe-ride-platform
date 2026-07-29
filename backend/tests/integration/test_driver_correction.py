@@ -20,6 +20,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
 # Parent accounts come from signup; naming an email on a student only links a
 # row, and without a linked account no notification is ever produced.
 from test_students_parents import signup_parent
@@ -130,7 +132,7 @@ def fleet(client, admin_headers):
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == created["bus"]["id"]:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
         for s in created["students"]:
             client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         for period in ("morning", "afternoon"):
@@ -159,7 +161,7 @@ def afternoon_run(client, admin_headers, fleet, driver_headers):
     for _ in range(len(context["run_stops"])):
         client.post("/api/runs/driver/arrive", json={"run_id": run_id}, headers=driver_headers)
     yield run_id
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def test_reversing_a_dropoff_puts_the_child_back_in_the_blocking_set(
@@ -278,7 +280,7 @@ def test_reversal_is_refused_once_the_run_is_closed(
                                headers=driver_headers)
         assert too_late.status_code == 403, too_late.text
     finally:
-        client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        purge_run(run_id)
 
 
 def test_there_is_nothing_to_undo_for_an_untouched_child(
