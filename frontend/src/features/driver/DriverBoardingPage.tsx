@@ -118,9 +118,16 @@ export function DriverBoardingPage() {
       // Says which run it covers (U8/R17). The mark is scoped to this trip:
       // a child missing this morning may still be riding home, and claiming
       // the whole day would strike them off that route too.
+      //
+      // No longer "contact the office to undo": since U5 the driver can undo
+      // their own mark while the run is open, and telling them to ring the
+      // office for something they can do themselves is how a correction path
+      // goes unused.
       description: afternoon
-        ? "This covers the trip home only. The parent and the school office will be notified. Contact the office to undo."
-        : "This covers the morning trip only. The parent and the school office will be notified. Contact the office to undo.",
+        ? "This covers the trip home only, not the morning. The parent and the school "
+          + "office are notified. You can undo it here while this run is open."
+        : "This covers the morning trip only, not the ride home. The parent and the "
+          + "school office are notified. You can undo it here while this run is open.",
       confirmLabel: "Mark absent",
       cancelLabel: "Cancel",
     }))) return;
