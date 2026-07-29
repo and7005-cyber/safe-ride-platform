@@ -56,12 +56,19 @@ test("driver can log in by PIN and start a run", async ({ page, request }) => {
     await expect(page.getByText("Run in progress")).toBeVisible();
     await expect(page.getByText("Arrive Next Stop")).toBeVisible();
 
-    // Ending the run requires confirmation (R29).
+    // Ending the run is guarded by a confirmation (R29). Whether confirming it
+    // actually closes the run depends on the roster's state, which this test
+    // does not control — the seeded children may already carry absences from
+    // earlier specs in the serial suite, and since U4 an empty blocking set
+    // closes while a non-empty one is refused. Both outcomes are covered
+    // deterministically in driver-flow.spec.ts, which owns the roster it
+    // asserts on. Here the dialog is the subject, so it is dismissed.
     await page.getByRole("button", { name: "End Run" }).click();
     const endDialog = page.getByRole("dialog");
     await expect(endDialog.getByText("End this run?")).toBeVisible();
-    await endDialog.getByRole("button", { name: "End Run" }).click();
-    await expect(page).toHaveURL("/driver");
+    await endDialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(endDialog).toHaveCount(0);
+    await expect(page.getByText("Run in progress")).toBeVisible();
   } finally {
     // End + delete today's runs so completed-today gating (R28) cannot block
     // later lifecycle suites.

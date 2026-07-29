@@ -60,9 +60,16 @@ test("admin can create, edit, search, and delete a bus", async ({ page }) => {
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Plate number").fill("KZZ 999E");
   await fieldInput(dialog(page), "Capacity").fill("18");
-  await pickSelectOption(dialog(page), "Status", "Active");
+  // Availability, not status (U9): a bus's status is derived from its run now,
+  // and the form's Status control is gone. Availability is the one thing no
+  // derivation can produce — whether the bus is in the workshop is not a
+  // function of its runs — so it stays office-set and overrides everything.
+  await pickSelectOption(dialog(page), "Availability", "In service");
   await dialog(page).getByRole("button", { name: "Save" }).click();
-  await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
+  const created = page.getByRole("row", { name: new RegExp(name) });
+  await expect(created).toBeVisible();
+  // A bus with no run today derives to idle.
+  await expect(created.getByText("Idle")).toBeVisible();
 
   // Search narrows the table to the new bus.
   await page.getByPlaceholder("Search buses, plates, drivers…").fill("KZZ 999E");
@@ -459,12 +466,18 @@ test("a parent cancellation shows a scoped badge and an office alert without cha
     await page.goto("/students");
 
     const row = page.getByRole("row", { name: new RegExp(SEED.parentChild) });
-    // Display honesty (R19): the STATUS cell still reads "At school" — a
-    // partial cancellation gates rosters, never the displayed day status.
-    // The selector pins the status cell (index 7): a day-absent student would
-    // read "Absent today" in both the name badge and the status cell, and
-    // this assertion must fail for that shape.
-    await expect(row.getByRole("cell").nth(7).getByText("At school")).toBeVisible();
+    // Display honesty (R19): a partial cancellation gates that run's roster and
+    // never rewrites the displayed day status. The selector pins the status
+    // cell (index 7) — a day-absent student would read "Absent today" in both
+    // the name badge and the status cell, and this assertion must fail for that
+    // shape.
+    //
+    // The undisturbed value is "At home", not "At school": since U3 the status
+    // is derived from participation, and a child with none today is simply not
+    // in the system's care. "At school" was the raw column's leftover from
+    // whenever it was last written, which is the staleness the derivation
+    // removed.
+    await expect(row.getByRole("cell").nth(7).getByText("At home")).toBeVisible();
     // The name cell carries the scope-labelled absence badge (U10).
     await expect(row.getByText("Absent (PM)")).toBeVisible();
     await expect(row.getByText("Absent today")).toHaveCount(0);

@@ -30,6 +30,43 @@ async function startMorningRun(request: APIRequestContext): Promise<string> {
   return (await started.json()).id;
 }
 
+/**
+ * Give every remaining roster child an outcome so the run can close.
+ *
+ * Since U4 the closure gate refuses to end a run while anyone is unaccounted
+ * for, so a test that boards one child and ends the run never reaches the
+ * arrival notifications it is actually asserting. Driven from the context's own
+ * `blocking` set — the same set the gate refuses on — rather than a second
+ * guess at the rule.
+ */
+async function accountForRestOfRoster(
+  request: APIRequestContext,
+  runId: string,
+  driverHeaders: Record<string, string>,
+) {
+  for (let i = 0; i < 12; i++) {
+    const ctx = await (
+      await request.get(`${API_URL}/api/runs/driver/context`, { headers: driverHeaders })
+    ).json();
+    const run = ctx.active_run;
+    if (!run || run.stops_completed >= run.total_stops) break;
+    // Boarding is refused until the child's stop has been reached.
+    await request.post(`${API_URL}/api/runs/driver/arrive`, {
+      headers: driverHeaders,
+      data: { run_id: runId },
+    });
+  }
+  const ctx = await (
+    await request.get(`${API_URL}/api/runs/driver/context`, { headers: driverHeaders })
+  ).json();
+  for (const child of ctx.blocking ?? []) {
+    await request.post(`${API_URL}/api/runs/driver/boarding`, {
+      headers: driverHeaders,
+      data: { student_id: child.id, on_bus: true },
+    });
+  }
+}
+
 test.afterEach(async ({ request }) => {
   await endActiveRun(request);
 });
@@ -58,11 +95,14 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
     headers: driverHeaders,
     data: { student_id: child.id, on_bus: true },
   });
-  // Complete the run at the school gate.
-  await request.post(`${API_URL}/api/runs/driver/end`, {
+  // Complete the run at the school gate — which the gate only permits once
+  // every child has an outcome (U4).
+  await accountForRestOfRoster(request, runId, driverHeaders);
+  const ended = await request.post(`${API_URL}/api/runs/driver/end`, {
     headers: driverHeaders,
     data: { run_id: runId },
   });
+  expect(ended.ok()).toBeTruthy();
 
   // The parent sees every stage in the alerts feed.
   await emailLogin(page, PARENT.email, PARENT.password);
@@ -196,7 +236,9 @@ test("an admin route broadcast reaches route parents under every period chip", a
     const notice = feedCards.filter({ hasText: marker });
     await expect(notice.first()).toBeVisible({ timeout: 10_000 });
     await expect(notice).toHaveCount(1);
-    await expect(notice.getByText("School Notice", { exact: true })).toBeVisible();
+    // Sentence case since U17 — the parent alerts page used to render Title
+    // Case against the parent home page's sentence case on the same screen.
+    await expect(notice.getByText("School notice", { exact: true })).toBeVisible();
     await expect(notice.getByText(`School notice — ${SEED.driverMorningRoute}`)).toBeVisible();
   }
 });
