@@ -27,16 +27,25 @@ export type BadgeVariant = "secondary" | "success" | "warning" | "destructive" |
 export type StudentDisplayStatus =
   | "at-school"
   | "on-bus"
+  | "expected-on-bus"
   | "dropped-off"
   | "absent"
+  | "unaccounted"
   | "at-home"
   | "unassigned";
 
 export const STUDENT_STATUS_LABEL: Record<StudentDisplayStatus, string> = {
   "at-school": "At school",
   "on-bus": "On bus",
+  // The afternoon auto-board presumes a boarding nobody observed (U3). Rendering
+  // it as "On bus" would state as fact the one thing the driver has not yet
+  // confirmed, which is the class of claim this work removes.
+  "expected-on-bus": "Expected on bus",
   "dropped-off": "Dropped off",
   absent: "Absent today",
+  // Recorded by the office force-close (U6): the app saying plainly that nobody
+  // knows, instead of decaying to "At home" as it used to.
+  unaccounted: "Unaccounted",
   "at-home": "At home",
   unassigned: "Unassigned",
 };
@@ -44,10 +53,36 @@ export const STUDENT_STATUS_LABEL: Record<StudentDisplayStatus, string> = {
 export const STUDENT_STATUS_VARIANT: Record<StudentDisplayStatus, BadgeVariant> = {
   "at-school": "secondary",
   "on-bus": "success",
+  // Not 'success': the presumption is not yet evidence.
+  "expected-on-bus": "warning",
   "dropped-off": "warning",
   absent: "destructive",
+  unaccounted: "destructive",
   "at-home": "secondary",
   unassigned: "outline",
+};
+
+/**
+ * Parent-facing wording for the same derived values (U12/R27).
+ *
+ * Identical wording is right almost everywhere — U17 exists because the three
+ * surfaces had drifted apart — so this map matches the operational one except
+ * where the operational term would land badly on a family.
+ *
+ * 'unaccounted' is that case. It means the office does not yet know where the
+ * child is and is about to phone the parents; the force-close raises that
+ * obligation precisely so a person makes that call. Showing the bare term would
+ * have the app break the news first, in a word chosen for a dispatcher.
+ */
+export const PARENT_STUDENT_STATUS_LABEL: Record<StudentDisplayStatus, string> = {
+  ...STUDENT_STATUS_LABEL,
+  unaccounted: "Being confirmed",
+};
+
+/** A line under the badge, where the label alone would leave a parent guessing. */
+export const PARENT_STUDENT_STATUS_NOTE: Partial<Record<StudentDisplayStatus, string>> = {
+  unaccounted: "The school is confirming where your child is and will call you.",
+  "expected-on-bus": "The driver has not confirmed this yet.",
 };
 
 /** Filter options are the derived value set — one option per label entry. */
@@ -243,6 +278,15 @@ export function labelFor(
 ): string {
   if (!value) return fallback;
   return map[value] ?? fallback;
+}
+
+/** The supplementary line for a value, or null when it needs none. */
+export function noteFor(
+  map: Partial<Record<string, string>>,
+  value: string | null | undefined,
+): string | null {
+  if (!value) return null;
+  return map[value] ?? null;
 }
 
 export function variantFor(

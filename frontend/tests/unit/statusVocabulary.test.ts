@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   ADMIN_INCIDENT_LABEL,
+  PARENT_STUDENT_STATUS_LABEL,
+  PARENT_STUDENT_STATUS_NOTE,
+  noteFor,
   ADMIN_INCIDENT_VARIANT,
   BUS_AVAILABILITY_OPTIONS,
   BUS_STATUS_FILTERS,
@@ -30,6 +33,9 @@ import {
 
 const STUDENT_VALUES = [
   "at-school", "on-bus", "dropped-off", "absent", "at-home", "unassigned",
+  // The two values the rebuilt derivation introduced (U3, U6). Before U12 both
+  // rendered as raw slugs on every surface that could receive them.
+  "expected-on-bus", "unaccounted",
 ] as const;
 const BUS_VALUES = ["active", "idle", "delayed", "out-of-service"] as const;
 const RUN_VALUES = ["in-progress", "completed", "delayed"] as const;
@@ -52,6 +58,7 @@ const PARENT_INCIDENT_VALUES = [
 describe("exhaustiveness", () => {
   const domains: [string, readonly string[], Record<string, string>, Record<string, string>][] = [
     ["student", STUDENT_VALUES, STUDENT_STATUS_LABEL, STUDENT_STATUS_VARIANT],
+    ["parent student", STUDENT_VALUES, PARENT_STUDENT_STATUS_LABEL, STUDENT_STATUS_VARIANT],
     ["bus", BUS_VALUES, BUS_STATUS_LABEL, BUS_STATUS_VARIANT],
     ["run", RUN_VALUES, RUN_STATUS_LABEL, RUN_STATUS_VARIANT],
     ["notification", NOTIFICATION_VALUES, NOTIFICATION_LABEL, NOTIFICATION_VARIANT],
@@ -75,6 +82,7 @@ describe("casing convention", () => {
   // word, two ways, on adjacent screens.
   const everyLabel = [
     ...Object.values(STUDENT_STATUS_LABEL),
+    ...Object.values(PARENT_STUDENT_STATUS_LABEL),
     ...Object.values(BUS_STATUS_LABEL),
     ...Object.values(RUN_STATUS_LABEL),
     ...Object.values(NOTIFICATION_LABEL),
@@ -101,6 +109,7 @@ describe("no raw slugs reach a user", () => {
   it("never renders a hyphenated identifier as a label", () => {
     const everyLabel = [
       ...Object.values(STUDENT_STATUS_LABEL),
+      ...Object.values(PARENT_STUDENT_STATUS_LABEL),
       ...Object.values(BUS_STATUS_LABEL),
       ...Object.values(RUN_STATUS_LABEL),
       ...Object.values(NOTIFICATION_LABEL),
@@ -160,6 +169,55 @@ describe("cross-role agreement", () => {
       "closure-refused", "force-closed", "handover-recorded", "action-reversed",
     ]) {
       expect(Object.keys(PARENT_INCIDENT_LABEL)).not.toContain(officeOnly);
+    }
+  });
+});
+
+
+describe("parent wording for the derived values (U12/R27)", () => {
+  it("never shows a parent the bare operational term for unaccounted", () => {
+    // The force-close raises a phone-call obligation precisely so a person
+    // delivers this news. The app must not get there first, in a word chosen
+    // for a dispatcher.
+    expect(PARENT_STUDENT_STATUS_LABEL.unaccounted).not.toBe(
+      STUDENT_STATUS_LABEL.unaccounted,
+    );
+    expect(PARENT_STUDENT_STATUS_LABEL.unaccounted.toLowerCase()).not.toContain("unaccounted");
+  });
+
+  it("tells the parent what happens next", () => {
+    const note = noteFor(PARENT_STUDENT_STATUS_NOTE, "unaccounted");
+    expect(note).toBeTruthy();
+    expect(note!.toLowerCase()).toContain("call");
+  });
+
+  it("keeps admin and driver on the operational term", () => {
+    expect(STUDENT_STATUS_LABEL.unaccounted).toBe("Unaccounted");
+  });
+
+  it("distinguishes a presumed rider from a confirmed one on every surface", () => {
+    for (const map of [STUDENT_STATUS_LABEL, PARENT_STUDENT_STATUS_LABEL]) {
+      expect(map["expected-on-bus"]).not.toBe(map["on-bus"]);
+    }
+    // Not styled as a confirmed success: the presumption is not yet evidence.
+    expect(STUDENT_STATUS_VARIANT["expected-on-bus"]).not.toBe(
+      STUDENT_STATUS_VARIANT["on-bus"],
+    );
+  });
+
+  it("shares every other value with the operational vocabulary", () => {
+    for (const [value, label] of Object.entries(STUDENT_STATUS_LABEL)) {
+      if (value === "unaccounted") continue;
+      expect(PARENT_STUDENT_STATUS_LABEL[value as keyof typeof STUDENT_STATUS_LABEL]).toBe(label);
+    }
+  });
+
+  it("renders no raw slug for either new value on any surface", () => {
+    for (const map of [STUDENT_STATUS_LABEL, PARENT_STUDENT_STATUS_LABEL]) {
+      for (const value of ["expected-on-bus", "unaccounted"] as const) {
+        expect(labelFor(map, value)).not.toBe("Unknown");
+        expect(labelFor(map, value)).not.toMatch(/^[a-z]+(-[a-z]+)+$/);
+      }
     }
   });
 });
