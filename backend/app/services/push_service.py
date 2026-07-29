@@ -241,11 +241,31 @@ class PushService:
         parents and nobody else. Run-scoped (run_id + student_id set) so a
         repeat mark within the same run is dedup-suppressed. The school-side
         channel is a student-stamped incident inserted by the caller, never a
-        parent fan-out."""
+        parent fan-out.
+
+        The body states the period covered and claims nothing beyond it
+        (U8/R21). It used to say "will not board the bus today" off a single
+        run — so a parent whose child missed the morning pickup was told they
+        were not coming home either, which the driver had no way of knowing and
+        which was often simply wrong.
+        """
         try:
             student_id = str(student["id"])
+            period = run.get("absence_period") or run.get("type") or "day"
+            name_slot = "{name}"
+            if period == "morning":
+                template = (
+                    f"{name_slot} was not at the stop for the morning pickup, so they are "
+                    "not riding to school. The trip home is unaffected."
+                )
+            elif period == "afternoon":
+                template = (
+                    f"{name_slot} did not board the bus home this afternoon."
+                )
+            else:
+                template = f"{name_slot} is marked absent for the whole day and will not travel."
             for link in self.dao.parents_of_students([student_id]):
-                body = f"{link['student_name']} was marked absent at pickup and will not board the bus today."
+                body = template.format(name=link["student_name"])
                 if reason:
                     body = f"{body} Reason: {reason}"
                 self._notify(

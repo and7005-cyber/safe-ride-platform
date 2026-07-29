@@ -85,7 +85,12 @@ export function DriverBoardingPage() {
   const markAbsent = async (s: any) => {
     if (!(await confirm({
       title: `Mark ${s.name} absent?`,
-      description: "The parent and the school office will be notified. Contact the office to undo.",
+      // Says which run it covers (U8/R17). The mark is scoped to this trip:
+      // a child missing this morning may still be riding home, and claiming
+      // the whole day would strike them off that route too.
+      description: afternoon
+        ? "This covers the trip home only. The parent and the school office will be notified. Contact the office to undo."
+        : "This covers the morning trip only. The parent and the school office will be notified. Contact the office to undo.",
       confirmLabel: "Mark absent",
       cancelLabel: "Cancel",
     }))) return;

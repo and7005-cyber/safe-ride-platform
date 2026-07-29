@@ -234,6 +234,21 @@ def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent
                 f"{name}'s absence today was recorded by the school — "
                 "please contact the office to change it."
             )
+        # A driver marked a period at the stop (U8/R19). Withdrawal may not cut
+        # below that: the driver was there and the child was not, and a parent
+        # changing their own plans does not make the observation untrue. The
+        # generic post-hoc refusal below would blame a race instead of saying so.
+        marked = absence.get("marked_period")
+        if marked is not None and (marked == "day" or marked in _covered_types(payload.scope)):
+            witnessed = (
+                "as not travelling today"
+                if marked == "day"
+                else f"as not travelling on the {marked} run"
+            )
+            raise ConflictError(
+                f"The driver recorded {name} {witnessed} — "
+                "please contact the office to change it."
+            )
         row_scope = absence["scope"]
         # Withdrawing a half of a merged 'day' row is the downgrade path;
         # any other mismatch (row is a partial, request names the other

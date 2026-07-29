@@ -102,7 +102,8 @@ class ParentLiveDao:
         child's live on-bus state. Otherwise returns:
 
           student      {id, name, status, bus_id}
-          absence      today's absence row {scope, source, reason} or None
+          absence      today's absence row {scope, source, reason,
+                       marked_period} or None
           runs         today's run rows involving the child, each
                        {type, status} — involvement is run_stops membership
                        OR the run's route being one of the child's routes
@@ -132,7 +133,7 @@ class ParentLiveDao:
                 return None  # link row outlived the student: same 404
             absence = conn.execute(
                 """
-                select scope, source, reason from live_student_absences
+                select scope, source, reason, marked_period from live_student_absences
                 where student_id = %s
                   and absence_date = (now() at time zone 'Africa/Nairobi')::date
                 """,

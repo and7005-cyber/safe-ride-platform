@@ -13,9 +13,16 @@ observed it.
 
 Branches, in order:
 
-- a whole-day today-absence, or a driver-sourced period-scoped one → 'absent'.
-  Driver marks write status despite their partial scope; a parent's own partial
-  cancellation gates rosters per run type but never the displayed status;
+- a whole-day today-absence, or one where someone individually marked a period
+  (``marked_period``) → 'absent'. A period marking is a driver saying they were
+  at the stop and the child was not; that is evidence about the child, so it
+  shows even though its coverage is partial. A parent's own partial cancellation
+  is a statement of intent — it gates that run's roster and nothing else.
+
+  Keyed on ``marked_period`` rather than ``source = 'driver'`` because since U8
+  the driver no longer takes over the row: widening a parent's morning
+  cancellation with an afternoon mark leaves the source 'parent' (R20), and a
+  source test would have silently stopped showing those children as absent;
 - an unaccounted participation row on any of today's runs → 'unaccounted'.
   Recorded by the office force-close: the app saying plainly that it does not
   know where the child is, rather than guessing. This branch sits above the
@@ -50,7 +57,7 @@ _DISPLAY_STATUS_CASE = """case
                                select 1 from live_student_absences a
                                where a.student_id = {student}.id
                                  and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                                 and (a.scope = 'day' or a.source = 'driver')
+                                 and (a.scope = 'day' or a.marked_period is not null)
                            ) then 'absent'
                            when exists (
                                select 1 from run_participation p

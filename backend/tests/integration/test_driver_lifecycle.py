@@ -9,11 +9,12 @@ custom-stops start rejections, the afternoon auto-board -> tap-time drop-off ->
 silent sweep lifecycle, one-way morning boarding, the driver absent flow
 (absence row + run_absences snapshot + status + admin incident, no parent
 fan-out), today-scoped admin absence side-effects with the active-run clear
-guard, the stale-'absent' self-heal, and delete_run's status reset.
+guard, the stale-'absent' self-heal, and delete_run recording no outcome (U7).
 
 Also covers scoped absences through the roster machinery (ops-refinement U4:
 R2, R15, R16, R19; AE4 groundwork): partial-scope run filtering per run type,
-the staff-over-parent provenance ratchet (escalation and the atomic refusal),
+the office-over-parent precedence rule (escalation and the atomic refusal;
+the office end of the ordering U8 extended down to driver marks),
 parent merge/downgrade/withdraw transitions with their status resets, the
 scope-pinned driver flags and clear guard, and the scope-aware stale-'absent'
 heal. Parent transitions run DAO-direct (set_scope/withdraw_scope have no

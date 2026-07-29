@@ -256,9 +256,35 @@ def test_student_absent_notifies_only_that_students_parents(
     assert {n["user_id"] for n in dao.notifications} == {"p1", "p9"}
     for note in dao.notifications:
         assert "Leila" in note["body"]
-        assert "absent at pickup" in note["body"]
         assert note["run_id"] == "run-1"
         assert note["student_id"] == "s1"
+
+
+def test_student_absent_body_claims_only_the_period_marked() -> None:
+    """U8/R21: the driver saw one run. The body used to say the child "will not
+    board the bus today" off a single morning mark, telling a parent their child
+    was not coming home either — which the driver had no way of knowing."""
+    cases = [
+        ({**RUN, "absence_period": "morning"}, "morning", "home is unaffected"),
+        ({**AFTERNOON_RUN, "absence_period": "afternoon"}, "afternoon", None),
+        ({**RUN, "absence_period": "day"}, "whole day", None),
+    ]
+    for run, must_say, also in cases:
+        dao = FakePushDao()
+        dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+        PushService(dao).notify_student_absent({"id": "s1", "name": "Leila"}, run)
+
+        body = dao.notifications[0]["body"]
+        assert must_say in body.lower(), body
+        if also:
+            assert also in body.lower(), body
+    # A morning mark must not speak for the afternoon.
+    dao = FakePushDao()
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+    PushService(dao).notify_student_absent(
+        {"id": "s1", "name": "Leila"}, {**RUN, "absence_period": "morning"}
+    )
+    assert "today" not in dao.notifications[0]["body"].lower()
 
 
 def test_student_absent_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:

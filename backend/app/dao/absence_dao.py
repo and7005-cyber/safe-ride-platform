@@ -9,15 +9,25 @@ roster (run_stops) carries the student; a clear resets an 'absent' status to
 covered type (the run already excluded the stop; un-absenting mid-run is
 incoherent). Past/future-dated marks and clears never touch the live status.
 
-Each row carries a ``scope`` ('day' = whole day; 'morning'/'afternoon' =
-that run only) and a ``source`` ('parent'/'driver'/'admin'). Partial scopes
-gate rosters for their run type but never write the displayed status — only
-'day' ever writes status='absent', and any exit from 'day' (downgrade or
-delete) resets an 'absent' status to 'at-school'. Provenance is a one-way
-ratchet: staff writers escalate any row to a whole-day staff mark; parent
-writers (set_scope / withdraw_scope) only ever touch source='parent' rows,
-enforced inside the single upsert/delete statement so a concurrent staff
-mark always wins.
+Each row carries three separate facts, and keeping them apart is what makes the
+record true about the period it claims (U8):
+
+- ``scope`` ('day' | 'morning' | 'afternoon') is **coverage** — which runs the
+  absence gates. It only ever widens; two different scopes union to 'day'.
+- ``source`` ('admin' | 'parent' | 'driver') is **precedence**, in that order. A
+  lower-precedence mark never re-attributes a higher one, though it still
+  widens coverage. Enforced inside the single upsert/delete statement, so a
+  concurrent office mark always wins.
+- ``marked_period`` is the **witness** — which period someone individually
+  marked. It survives the collapse to 'day' that widening causes, and it is what
+  the derivation keys on.
+
+A partial parent cancellation gates its run's roster but never writes the
+displayed status: it is a statement of intent. A recorded marking does write it,
+partial or not, because it is a driver saying they were at the stop and the
+child was not. So 'day' coverage and a marking are the two things that set
+status='absent', and either one exiting resets it — which is why clear and
+withdraw check the marking rather than using whole-day scope as its proxy.
 """
 from typing import Any
 
@@ -61,7 +71,7 @@ class AbsenceDao:
             rows = conn.execute(
                 """
                 select a.id, a.student_id, a.absence_date, a.reason, a.created_at,
-                       a.scope, a.source,
+                       a.scope, a.source, a.marked_period,
                        s.name as student_name, s.grade
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
@@ -110,8 +120,8 @@ class AbsenceDao:
                 )
                 conn.execute(
                     """
-                    insert into run_absences (run_id, student_id, student_name, reason)
-                    select r.id, s.id, s.name, %s
+                    insert into run_absences (run_id, student_id, student_name, reason, period)
+                    select r.id, s.id, s.name, %s, 'day'
                     from live_runs r
                     join live_students s on s.id = %s
                     where r.status <> 'completed'
@@ -139,15 +149,21 @@ class AbsenceDao:
         the row and on any run_absences snapshot taken here, so the admin
         absence list and run reports say why the child is off the roster.
 
-        The provenance ratchet lives in the statement's WHERE clause — the
-        conflict branch only fires on source='parent' rows, so a staff mark
-        committed at any point (even between this statement's snapshot and
-        its conflict resolution — ON CONFLICT re-checks the WHERE on the
-        locked current row) makes the parent lose. Returns None on that
-        refusal (the caller maps it to a friendly 409). Otherwise returns the
-        stored row plus ``changed``: whether the stored scope actually moved
-        (the ``prior`` CTE shares the statement's snapshot, so no separate
-        read-then-write window exists).
+        Precedence lives in the statement's WHERE clause — office, then parent,
+        then driver (U8/R20). The conflict branch fires on parent- and
+        driver-sourced rows, so an office mark committed at any point (even
+        between this statement's snapshot and its conflict resolution — ON
+        CONFLICT re-checks the WHERE on the locked current row) makes the parent
+        lose. Returns None on that refusal (the caller maps it to a friendly
+        409). Otherwise returns the stored row plus ``changed``: whether the
+        stored scope actually moved (the ``prior`` CTE shares the statement's
+        snapshot, so no separate read-then-write window exists).
+
+        A driver row no longer blocks the parent: the ordering used to be
+        staff-over-parent, which meant a driver's mark at the stop outranked the
+        office's own record. Taking over the row keeps ``marked_period``
+        untouched, so the driver's observation survives the change of source and
+        the child still reads absent.
 
         Only a resulting 'day' scope writes status='absent' (partial scopes
         gate rosters, never the displayed status), and only on an actual
@@ -182,7 +198,7 @@ class AbsenceDao:
                         reason = excluded.reason,
                         marked_by = excluded.marked_by,
                         source = 'parent'
-                    where a.source = 'parent'
+                    where a.source in ('parent', 'driver')
                 returning a.*, (select scope from prior) as prior_scope
                 """,
                 {
@@ -205,8 +221,8 @@ class AbsenceDao:
                     )
                 conn.execute(
                     f"""
-                    insert into run_absences (run_id, student_id, student_name, reason)
-                    select r.id, s.id, s.name, %s
+                    insert into run_absences (run_id, student_id, student_name, reason, period)
+                    select r.id, s.id, s.name, %s, %s
                     from live_runs r
                     join live_students s on s.id = %s
                     where r.status <> 'completed'
@@ -218,7 +234,7 @@ class AbsenceDao:
                       )
                     on conflict (run_id, student_id) do nothing
                     """,
-                    (reason, student_id, result["scope"], result["scope"]),
+                    (reason, result["scope"], student_id, result["scope"], result["scope"]),
                 )
         return result
 
@@ -241,12 +257,20 @@ class AbsenceDao:
         withdrawing the not-yet-started half of a merged 'day' row stays
         allowed while the OTHER half's run is active.
 
-        Returns None when nothing was withdrawn (no row today, staff-sourced
-        row, non-matching scope, or a covered run just started — the caller
-        distinguishes for messaging), else {'deleted': bool, 'scope':
-        remaining scope or None}. Any exit from 'day' — downgrade or delete —
-        resets an 'absent' status to 'at-school' (clear_absence's reset), in
-        the same transaction.
+        Withdrawal also cannot cut below a recorded period marking (U8/R18-R19).
+        A driver's mark is an observation — they were at the stop and the child
+        was not — and a parent cancelling their side of the day does not make
+        that untrue. So a downgrade must leave the marked period still covered,
+        and a delete is refused outright while a marking exists. Coverage only
+        ever widens; this is the same rule seen from the other end.
+
+        Returns None when nothing was withdrawn (no row today, an office-sourced
+        row, non-matching scope, a covered run just started, or a marking that
+        withdrawal would cut below — the caller distinguishes for messaging),
+        else {'deleted': bool, 'scope': remaining scope or None}. An exit from
+        'day' resets an 'absent' status to 'at-school' (clear_absence's reset),
+        unless a marking survives the withdrawal and is still writing that
+        status — the parent withdrew their half, not the driver's.
         """
         _validate_scope(scope)
         run_guard = """not exists (
@@ -277,8 +301,16 @@ class AbsenceDao:
                       and a.source = 'parent'
                       and a.scope = 'day'
                       and %(scope)s in ('morning', 'afternoon')
+                      -- The half left behind must still cover any marked period.
+                      and (
+                        a.marked_period is null
+                        or a.marked_period = case
+                               when %(scope)s = 'morning' then 'afternoon'
+                               else 'morning'
+                           end
+                      )
                       and {run_guard.format(type_predicate="r.type = %(scope)s")}
-                    returning a.scope
+                    returning a.scope, a.marked_period
                 ),
                 deleted as (
                     delete from live_student_absences a
@@ -286,21 +318,26 @@ class AbsenceDao:
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
                       and a.source = 'parent'
                       and a.scope = %(scope)s
+                      and a.marked_period is null
                       and not exists (select 1 from downgraded)
                       and {run_guard.format(type_predicate=scope_covers("%(scope)s", "r.type"))}
                     returning a.scope
                 )
                 select (select scope from downgraded) as downgraded_to,
+                       (select marked_period from downgraded) as surviving_marking,
                        (select scope from deleted) as deleted_scope
                 """,
                 {"student_id": student_id, "scope": scope, "actor": actor_user_id},
             ).fetchone()
             downgraded_to, deleted_scope = row["downgraded_to"], row["deleted_scope"]
             if downgraded_to is None and deleted_scope is None:
-                return None  # no matching parent-sourced row to withdraw
+                return None  # nothing this parent may withdraw
             # A downgrade only ever fires FROM 'day'; a delete exits 'day'
-            # when the deleted row's scope says so.
-            if downgraded_to is not None or deleted_scope == "day":
+            # when the deleted row's scope says so. A marking that survived the
+            # downgrade is still writing 'absent', so the reset would contradict
+            # the row that is left.
+            exits_day = downgraded_to is not None or deleted_scope == "day"
+            if exits_day and row["surviving_marking"] is None:
                 conn.execute(
                     "update live_students set status = 'at-school' "
                     "where id = %s and status = 'absent'",
@@ -314,15 +351,22 @@ class AbsenceDao:
         first' — the run either contains their stop or excluded it at
         snapshot time; a partial absence never blocks on the other run type);
         otherwise it resets the live status to 'at-school', but only when the
-        current status is 'absent' and the row was whole-day — partial scopes
-        never wrote the status, so deleting one never touches it. Clearing
-        past/future-dated absences never touches the status."""
+        current status is 'absent' and the row actually wrote it. Clearing
+        past/future-dated absences never touches the status.
+
+        "Wrote the status" is whole-day coverage OR a recorded period marking
+        (U8/R18): since a driver's period mark displays the child as absent, it
+        has to clear like one. Whole-day scope alone was the proxy for this and
+        is no longer sufficient — a driver-marked afternoon absence would have
+        been deleted while the child stayed 'absent' on every surface, with no
+        row left to explain why.
+        """
         from app.core.errors import ConflictError
 
         with get_connection() as conn:
             row = conn.execute(
                 """
-                select a.student_id, a.scope,
+                select a.student_id, a.scope, a.marked_period,
                        (a.absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today,
                        s.status
                 from live_student_absences a
@@ -356,7 +400,9 @@ class AbsenceDao:
                 ).fetchone()
                 if active:
                     raise ConflictError("End the run first")
-                if row["status"] == "absent" and row["scope"] == "day":
+                if row["status"] == "absent" and (
+                    row["scope"] == "day" or row["marked_period"] is not None
+                ):
                     conn.execute(
                         "update live_students set status = 'at-school' where id = %s",
                         (row["student_id"],),

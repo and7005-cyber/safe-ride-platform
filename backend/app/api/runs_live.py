@@ -61,6 +61,14 @@ class StudentIdPayload(BaseModel):
     student_id: str
 
 
+class AbsentPayload(BaseModel):
+    student_id: str
+    # Default false: a driver sees one run. Claiming the whole day from a single
+    # stop was the old behaviour, and it struck the child off the other run's
+    # roster too — so the bus never stopped for them (U8/R17).
+    whole_day: bool = False
+
+
 class HandoverPayload(BaseModel):
     student_id: str
     note: str
@@ -284,13 +292,22 @@ def _record_absent_incident(driver_id: str, student: dict, run: dict) -> None:
 
 @router.post("/driver/absent")
 def mark_student_absent(
-    payload: StudentIdPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
+    payload: AbsentPayload, background_tasks: BackgroundTasks, user: dict = Depends(driver_only)
 ):
-    """Driver marks a roster student absent at the stop (R30). The DAO writes
-    the absence row, the run_absences snapshot, the 'absent' status and the
-    boarded recount in one transaction; the parent push and the admin-only
-    incident fire post-commit."""
-    student, run = safe_call(lambda: dao.mark_student_absent(user["id"], payload.student_id))
+    """Driver marks a roster student absent at the stop (U8/R17). The DAO writes
+    the absence row scoped to this run's period, the run_absences snapshot, the
+    'absent' status and the boarded recount in one transaction; the parent push
+    and the admin-only incident fire post-commit.
+
+    whole_day is the driver saying they know the child is out all day — which
+    they can only know from something a parent told them, so it is a separate
+    confirmation rather than the default.
+    """
+    student, run = safe_call(
+        lambda: dao.mark_student_absent(
+            user["id"], payload.student_id, whole_day=payload.whole_day
+        )
+    )
     background_tasks.add_task(push_service.notify_student_absent, student, run)
     # The parent push dedups on the notifications unique index; the incident
     # has no such index, so only a NEWLY recorded absence raises one.

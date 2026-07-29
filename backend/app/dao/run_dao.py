@@ -256,9 +256,12 @@ class RunDao:
             ).fetchone()
             if not run:
                 raise NotFoundError("Run was not found")
+            # period tells an afternoon non-boarding from a morning no-show
+            # (U8/R21) — the same child, two different failures, and the office
+            # cannot act on the report without knowing which.
             absent = conn.execute(
                 """
-                select student_id, student_name, reason from run_absences
+                select student_id, student_name, reason, period from run_absences
                 where run_id = %s order by student_name asc
                 """,
                 (run_id,),
@@ -274,7 +277,8 @@ class RunDao:
                     # afternoon run.
                     absent = conn.execute(
                         f"""
-                        select a.student_id, s.name as student_name, a.reason
+                        select a.student_id, s.name as student_name, a.reason,
+                               a.marked_period as period
                         from live_student_absences a
                         join live_students s on s.id = a.student_id
                         join live_student_routes sr
@@ -598,8 +602,12 @@ class RunDao:
             # snapshot would rot after student deletion.
             conn.execute(
                 f"""
-                insert into run_absences (run_id, student_id, student_name, reason)
-                select %s, s.id, s.name, a.reason
+                insert into run_absences (run_id, student_id, student_name, reason, period)
+                select %s, s.id, s.name, a.reason,
+                       -- What was individually marked, falling back to the
+                       -- row's coverage for absences nobody witnessed at a
+                       -- stop (an office mark, a parent cancellation).
+                       coalesce(a.marked_period, a.scope)
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
                 join live_student_routes sr
@@ -1113,22 +1121,41 @@ class RunDao:
         return dict(student), dict(run), reversed_what
 
     def mark_student_absent(
-        self, driver_id: str, student_id: str
+        self, driver_id: str, student_id: str, *, whole_day: bool = False
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Driver marks a roster student absent mid-run (R30); returns
+        """Driver marks a roster student absent mid-run (U8/R17-R20); returns
         (student, run snapshot enriched with route_name/bus_name for the
         caller's post-commit notification + incident tasks).
 
-        Single transaction: upsert today's live_student_absences row
-        (marked_by = the driver; a repeat mark is a reason edit, never a
-        500), append the run_absences snapshot (on conflict do nothing —
-        one row per run+student), set status 'absent', recount
-        students_boarded from the run's roster.
+        Scoped to the period the driver actually witnessed. It used to write a
+        whole-day absence from a single run, which said something the driver was
+        in no position to know: a child who is not at their morning stop may
+        well be riding home that afternoon, and the whole-day row struck them off
+        the afternoon roster too — so the bus never stopped for them, and the
+        record blamed the child for a stop nobody made. Whole-day coverage now
+        needs the driver to say so (`whole_day`), which is a claim they can only
+        make from something a parent told them.
 
-        Staff transition rule (U4): a driver mark is a whole-day absence, so
-        the conflict branch escalates any existing row — a parent's partial
-        cancellation included — to scope='day' and stamps source='driver'
-        (the provenance ratchet's one-way direction).
+        Three fields move independently on a repeat mark, and the distinction is
+        the point:
+
+        - **scope** is coverage, and only ever widens (R19). Morning marked, then
+          afternoon, means the child was absent all day; nothing here may narrow
+          an existing row, because the earlier writer saw something this one did
+          not.
+        - **source** is precedence: office, then parent, then driver (R20). A
+          driver mark no longer re-attributes an office or parent row. The old
+          ratchet ran the other way and let the last actor at the stop overwrite
+          a cancellation the office had recorded deliberately.
+        - **marked_period** is the witness: which period someone individually
+          marked, surviving the collapse to 'day' that widening causes. Without
+          it the run report cannot tell an afternoon non-boarding from a morning
+          no-show, and the derivation cannot tell a driver's period observation
+          from a parent's partial cancellation — only the first of which is
+          evidence the child is not travelling at all.
+
+        marked_by follows source rather than the last write: it is the row's
+        actor, and reverse_driver_absence keys on the pair.
         """
         from app.core.errors import ForbiddenError
 
@@ -1144,16 +1171,46 @@ class RunDao:
             ).fetchone()
             if not stop:
                 raise ForbiddenError("Student is not on this run")
+            period = "day" if whole_day else run["type"]
             conn.execute(
                 """
-                insert into live_student_absences
-                    (student_id, absence_date, reason, marked_by, scope, source)
-                values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'day', 'driver')
-                on conflict (student_id, absence_date)
-                do update set reason = excluded.reason, marked_by = excluded.marked_by,
-                              scope = 'day', source = 'driver'
+                insert into live_student_absences as a
+                    (student_id, absence_date, reason, marked_by, scope, source, marked_period)
+                values (
+                    %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
+                    %(reason)s, %(driver)s, %(period)s, 'driver', %(period)s
+                )
+                on conflict (student_id, absence_date) do update set
+                    reason = excluded.reason,
+                    -- Coverage widens, never narrows: two different scopes union
+                    -- to the whole day (R19).
+                    scope = case
+                        when a.scope = excluded.scope then a.scope
+                        else 'day'
+                    end,
+                    -- Office and parent rows keep their attribution (R20).
+                    source = case
+                        when a.source in ('admin', 'parent') then a.source
+                        else excluded.source
+                    end,
+                    marked_by = case
+                        when a.source in ('admin', 'parent') then a.marked_by
+                        else excluded.marked_by
+                    end,
+                    -- Both periods individually witnessed means the whole day
+                    -- was, which is a stronger claim than either mark alone.
+                    marked_period = case
+                        when a.marked_period is null then excluded.marked_period
+                        when a.marked_period = excluded.marked_period then a.marked_period
+                        else 'day'
+                    end
                 """,
-                (student_id, reason, driver_id),
+                {
+                    "student_id": student_id,
+                    "reason": reason,
+                    "driver": driver_id,
+                    "period": period,
+                },
             )
             student = conn.execute(
                 "update live_students set status = 'absent' where id = %s returning *",
@@ -1161,12 +1218,12 @@ class RunDao:
             ).fetchone()
             inserted = conn.execute(
                 """
-                insert into run_absences (run_id, student_id, student_name, reason)
-                values (%s, %s, %s, %s)
+                insert into run_absences (run_id, student_id, student_name, reason, period)
+                values (%s, %s, %s, %s, %s)
                 on conflict (run_id, student_id) do nothing
                 returning id
                 """,
-                (run["id"], student_id, student["name"], reason),
+                (run["id"], student_id, student["name"], reason, period),
             ).fetchone()
             # A child marked absent was not aboard, so their participation goes
             # (U2). On an afternoon run this retracts the presumed board the
@@ -1197,6 +1254,9 @@ class RunDao:
         # newly_recorded lets the API layer keep the school-side incident
         # idempotent per run+student: repeat taps re-notify nothing.
         run["newly_recorded"] = inserted is not None
+        # What the parent message may claim (U8/R21). Not run["type"]: an
+        # explicit whole-day confirmation says more than this run does.
+        run["absence_period"] = period
         return dict(student), run
 
     # _count_run_students_with_status is gone (U2): every counter now reads
