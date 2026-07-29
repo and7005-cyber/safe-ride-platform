@@ -86,6 +86,37 @@ def delete_run(run_id: str, user: dict = Depends(admin_only)):
     return safe_call(lambda: (dao.delete_run(run_id), {"ok": True})[1])
 
 
+@router.post("/{run_id}/force-close")
+def force_close_run(
+    run_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+):
+    """Close a run no driver can resolve (U6/R12-R15).
+
+    The arrival notification is not decided here: force_close_run resolves it
+    inside the transaction that reads the gate arrival and the confirmed
+    boardings, and hands back `boarded_student_ids` — empty when there is no
+    evidence to notify on. notify_run_ended then sends to exactly that set,
+    so there is one decision point rather than two that can disagree.
+    """
+    result = safe_call(lambda: dao.force_close_run(user["id"], run_id))
+    background_tasks.add_task(push_service.notify_run_ended, result)
+    background_tasks.add_task(_record_lifecycle_alert, str(result["id"]), "force-closed")
+    return result
+
+
+@router.post("/{run_id}/contacted")
+def record_parent_contact(
+    run_id: str, payload: StudentIdPayload, user: dict = Depends(admin_only)
+):
+    """Record that the office phoned an unaccounted child's parents (R14).
+
+    No automated message goes to these families — nobody knows where the child
+    is, and a push saying so is worse than a call. This is the app tracking that
+    the call happened instead of pretending it did.
+    """
+    return safe_call(lambda: dao.record_parent_contact(user["id"], run_id, payload.student_id))
+
+
 @router.get("/{run_id}/report")
 def run_report(run_id: str, user: dict = Depends(admin_only)):
     """Post-run report (R14-R16): the run row + bus/route/driver names + the

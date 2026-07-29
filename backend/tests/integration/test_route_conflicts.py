@@ -239,9 +239,16 @@ def test_run_edit_conflict_is_friendly_409(client, admin_headers):
 
 # Active-runs filter -------------------------------------------------------------
 
-def test_active_filter_excludes_completed_and_prior_date_runs(client, admin_headers):
-    """GET /api/runs?active=true returns only today's (Africa/Nairobi)
-    non-completed runs, still carrying the joined bus/route names (R5)."""
+def test_active_filter_excludes_completed_and_flags_stale_runs(client, admin_headers):
+    """GET /api/runs?active=true returns non-completed runs up to and including
+    today (Africa/Nairobi), still carrying the joined bus/route names (R5).
+
+    Prior-date runs used to be excluded here. That hid the one run that most
+    needed attention: a run still open at midnight also falls out of the
+    date-scoped driver lookup and the per-date uniqueness index, so nobody could
+    close it and nobody was told it existed. It now surfaces flagged `stale`,
+    which is where the office force-closes it (U6/R15).
+    """
     marker = uuid.uuid4().hex[:6]
     bus = _create_bus(client, admin_headers, f"IT ActiveBus {marker}")
     yesterday = (dt.datetime.now(NAIROBI).date() - dt.timedelta(days=1)).isoformat()
@@ -266,11 +273,15 @@ def test_active_filter_excludes_completed_and_prior_date_runs(client, admin_head
         ids = {r["id"] for r in runs}
         assert active_today["id"] in ids
         assert completed_today["id"] not in ids
-        assert stale_in_progress["id"] not in ids
+        assert stale_in_progress["id"] in ids, "the stuck run is invisible to the office"
 
         entry = next(r for r in runs if r["id"] == active_today["id"])
         assert entry["bus_name"] == f"IT ActiveBus {marker}"
         assert "route_name" in entry and "plate_number" in entry
+        assert entry["stale"] is False
+
+        stuck = next(r for r in runs if r["id"] == stale_in_progress["id"])
+        assert stuck["stale"] is True, "a prior-day run is not flagged for closure"
 
         # The unfiltered listing still returns everything.
         all_ids = {r["id"] for r in client.get("/api/runs", headers=admin_headers).json()}

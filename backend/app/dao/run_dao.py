@@ -10,12 +10,25 @@ class RunDao:
     # --- admin runs --------------------------------------------------------
 
     def list_runs(self, active: bool = False) -> list[dict[str, Any]]:
-        """All runs, newest first. active=True narrows to today's (Africa/
-        Nairobi) non-completed runs — the dashboard's Active Runs card (R5),
-        same predicate shape as find_active_run_today."""
+        """All runs, newest first. active=True narrows to non-completed runs up
+        to and including today (Africa/Nairobi) — the dashboard's Active Runs
+        card (R5).
+
+        Deliberately *not* the same predicate as find_active_run_today, which
+        stays pinned to today so a stale run is invisible to every driver write
+        that resolves through it (R15; arrive and end take a run_id instead and
+        are guarded by _assert_service_day).
+
+        That pinning is what creates the problem this widening solves: a run
+        still open at midnight falls out of the driver lookup and out of the
+        per-date uniqueness index, and — before this — out of the office's view
+        too, so it sat in progress forever with nobody told. Prior-day runs
+        surface here flagged `stale`, which is where the office force-closes
+        them.
+        """
         where = (
             "where r.status <> 'completed' "
-            "and r.date = (now() at time zone 'Africa/Nairobi')::date"
+            "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
             if active
             else ""
         )
@@ -23,7 +36,9 @@ class RunDao:
             rows = conn.execute(
                 f"""
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
-                       {no_progress_case("r")} as no_progress
+                       {no_progress_case("r")} as no_progress,
+                       (r.status <> 'completed'
+                        and r.date < (now() at time zone 'Africa/Nairobi')::date) as stale
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -293,6 +308,33 @@ class RunDao:
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
         }
 
+    def _assert_service_day(self, conn, run: dict) -> None:
+        """No driver action operates on a run from a past service day (R15).
+
+        The student-level paths get this free: they resolve the run through
+        find_active_run_today, so a stale run is simply not found. The two paths
+        that take a run_id straight from the client — arrive and end — do not,
+        and without this a driver opening the app the next morning could arrive
+        stops and close yesterday's run with today's timestamps.
+
+        Ending is blocked too, not just extending. A day-late close writes
+        today's end_time and today's counts onto yesterday's run, and any child
+        still unaccounted would be swept past by a gate that only sees the
+        roster. The office force-close is the designed exit precisely because it
+        records those children as unaccounted rather than closing over them.
+        """
+        from app.core.errors import ConflictError
+
+        row = conn.execute(
+            "select %s::date < (now() at time zone 'Africa/Nairobi')::date as stale",
+            (run["date"],),
+        ).fetchone()
+        if row and row["stale"]:
+            raise ConflictError(
+                "This run is from a previous day and can no longer be changed. "
+                "Ask the office to close it."
+            )
+
     def find_active_run_today(self, conn, bus_id: str) -> dict[str, Any] | None:
         row = conn.execute(
             """
@@ -508,6 +550,7 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
+            self._assert_service_day(conn, run)
             new_completed = min(run["stops_completed"] + 1, run["total_stops"])
             conn.execute(
                 "update live_runs set stops_completed = %s where id = %s", (new_completed, run_id)
@@ -593,6 +636,7 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
+            self._assert_service_day(conn, run)
 
             blocking = participation_dao.unaccounted_on_run(conn, str(run_id), run["type"])
             if blocking:
@@ -652,6 +696,89 @@ class RunDao:
         result = dict(updated)
         result["boarded_student_ids"] = boarded_ids
         return result
+
+    def force_close_run(self, admin_id: str, run_id: str) -> dict[str, Any]:
+        """Close a run no driver can resolve (U6/R12-R14).
+
+        A driver whose phone dies, whose shift ends, or who simply forgets leaves
+        the run open — and the partial unique index on (bus, date) then blocks
+        that bus from starting its next route for the day. Past midnight it gets
+        worse: every driver action resolves the run through a date-scoped lookup,
+        so the driver loses even their own release. Without this the only exit
+        is deleting the run, which destroys its report.
+
+        This is not a sweep. Children without an outcome are recorded
+        **unaccounted** — the app saying plainly that nobody knows — rather than
+        given a terminal status nobody observed. That distinction is the whole
+        reason the sweep was removed.
+
+        Returns the run plus the children the office now owes a phone call.
+        """
+        from app.core.errors import ConflictError, NotFoundError
+
+        with get_connection() as conn:
+            run = conn.execute(
+                "select * from live_runs where id = %s for update", (run_id,)
+            ).fetchone()
+            if not run:
+                raise NotFoundError("Run not found")
+            if run["status"] == "completed":
+                raise ConflictError("Run is already completed")
+
+            blocking = participation_dao.unaccounted_on_run(conn, str(run_id), run["type"])
+            participation_dao.record_unaccounted(conn, str(run_id), blocking)
+
+            gate_reached = participation_dao.gate_arrival_recorded(conn, str(run_id))
+            boarded_ids = (
+                participation_dao.confirmed_boarded_ids(conn, str(run_id))
+                if gate_reached and run["type"] == "morning"
+                else []
+            )
+            final_count = (
+                participation_dao.count_dropped_off(conn, str(run_id))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run_id))
+            )
+            # No force_closed_by column: a force-closed run is identifiable by
+            # its unaccounted participation rows, and the office alert records
+            # who did it. Adding two columns for a fact already derivable would
+            # have meant a second migration on a promise of one.
+            conn.execute(
+                """
+                update live_runs
+                set status = 'completed', stops_completed = total_stops,
+                    students_boarded = %s,
+                    end_time = to_char(now() at time zone 'Africa/Nairobi', 'HH24:MI')
+                where id = %s
+                """,
+                (final_count, run_id),
+            )
+            conn.execute(
+                "update live_buses set current_lat = null, current_lng = null where id = %s",
+                (run["bus_id"],),
+            )
+            updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+
+        result = dict(updated)
+        # Only children the driver was recorded as observing aboard, and only
+        # when the gate arrival was itself recorded (R13). The office was not on
+        # the bus; a notification on its say-so would be the manufactured claim
+        # this work removes.
+        result["boarded_student_ids"] = boarded_ids
+        result["gate_arrival_recorded"] = gate_reached
+        result["unaccounted"] = outstanding
+        return result
+
+    def record_parent_contact(self, admin_id: str, run_id: str, student_id: str) -> dict[str, Any]:
+        """Record that the office phoned an unaccounted child's parents (R14)."""
+        from app.core.errors import NotFoundError
+
+        with get_connection() as conn:
+            if not participation_dao.record_contact(conn, str(run_id), student_id, admin_id):
+                raise NotFoundError("No unaccounted child on this run to record contact for")
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+        return {"run_id": str(run_id), "unaccounted": outstanding}
 
     def write_position(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
         """Record the bus position; returns the active run snapshot."""

@@ -222,6 +222,80 @@ def unaccounted_on_run(conn, run_id: str, run_type: str) -> list[dict[str, Any]]
     return [dict(r) for r in rows]
 
 
+def record_unaccounted(conn, run_id: str, blocking: list[dict[str, Any]]) -> None:
+    """Record that nobody knows what happened to these children (U6/R12).
+
+    The honest outcome, and the reason the force-close is not a sweep: a sweep
+    wrote a terminal status — safely at school, safely dropped off — for
+    children nobody had accounted for. This writes the absence of knowledge
+    instead, and the derivation renders it as its own state rather than decaying
+    it to 'at home' when the run completes.
+    """
+    for child in blocking:
+        conn.execute(
+            """
+            insert into run_participation
+                (run_id, student_id, student_name, unaccounted_at)
+            values (%s, %s, %s, now())
+            on conflict (run_id, student_id) do update set
+                unaccounted_at = coalesce(run_participation.unaccounted_at, excluded.unaccounted_at)
+            """,
+            (run_id, child["id"], child["name"]),
+        )
+
+
+def unaccounted_children(conn, run_id: str) -> list[dict[str, Any]]:
+    """Children on this run the office still owes a phone call about (U6/R14)."""
+    rows = conn.execute(
+        """
+        select student_id, student_name, contacted_at, contacted_by
+        from run_participation
+        where run_id = %s and unaccounted_at is not null
+        order by student_name asc
+        """,
+        (run_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_contact(conn, run_id: str, student_id: str, admin_id: str) -> bool:
+    """Record that the office contacted this child's parents (U6/R14).
+
+    The obligation exists because no automated message goes to them — the one
+    case where a person has to make the call, so the app tracks whether it
+    happened rather than pretending it did.
+    """
+    row = conn.execute(
+        """
+        update run_participation
+        set contacted_at = coalesce(contacted_at, now()),
+            contacted_by = coalesce(contacted_by, %s)
+        where run_id = %s and student_id = %s and unaccounted_at is not null
+        returning id
+        """,
+        (admin_id, run_id, student_id),
+    ).fetchone()
+    return row is not None
+
+
+def gate_arrival_recorded(conn, run_id: str) -> bool:
+    """Did this run's bus actually reach the school gate?
+
+    The force-close arrival notification depends on it (U6/R13): the office was
+    not on the bus, so the only honest basis for telling a family their child
+    arrived is that the arrival was itself recorded.
+    """
+    row = conn.execute(
+        """
+        select 1 from run_stops
+        where run_id = %s and is_school_gate = true and arrived_at is not null
+        limit 1
+        """,
+        (run_id,),
+    ).fetchone()
+    return row is not None
+
+
 def get_for_student(conn, run_id: str, student_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         "select * from run_participation where run_id = %s and student_id = %s",
