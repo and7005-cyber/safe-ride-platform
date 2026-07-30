@@ -60,7 +60,11 @@ for migration_path in "$MIGRATIONS_DIR"/*.sql; do
   fi
 
   echo "Applying $(basename "$migration_path")..."
-  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$migration_path"
+  # ON_ERROR_STOP matches the seed loop below: without it psql reports success
+  # after a failing statement, and the rehearsal would pass on a half-applied
+  # migration that live — which runs each file as one transaction — would reject.
+  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 < "$migration_path"
 done
 
 if [ "${APP_ENV:-}" != "local" ]; then
