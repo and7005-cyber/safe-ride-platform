@@ -29,13 +29,15 @@ describe("feed windows", () => {
 });
 
 describe("notification label/variant maps", () => {
-  it("renders admin broadcasts as a warning-styled School Notice", () => {
-    expect(NOTIFICATION_LABEL["admin-notice"]).toBe("School Notice");
+  // Sentence case throughout since U17 — this page previously rendered Title
+  // Case against ParentHomePage's sentence case on an adjacent screen.
+  it("renders admin broadcasts as a warning-styled school notice", () => {
+    expect(NOTIFICATION_LABEL["admin-notice"]).toBe("School notice");
     expect(NOTIFICATION_VARIANT["admin-notice"]).toBe("warning");
   });
 
-  it("renders cancellation confirmations as a secondary-styled Ride Cancelled", () => {
-    expect(NOTIFICATION_LABEL["ride-cancelled"]).toBe("Ride Cancelled");
+  it("renders cancellation confirmations as a secondary-styled ride cancelled", () => {
+    expect(NOTIFICATION_LABEL["ride-cancelled"]).toBe("Ride cancelled");
     expect(NOTIFICATION_VARIANT["ride-cancelled"]).toBe("secondary");
   });
 
@@ -48,10 +50,10 @@ describe("notification label/variant maps", () => {
 
 describe("TYPE_FILTER_OPTIONS", () => {
   it("picks up the new types automatically, labelled from the map", () => {
-    expect(TYPE_FILTER_OPTIONS).toContainEqual({ value: "admin-notice", label: "School Notice" });
+    expect(TYPE_FILTER_OPTIONS).toContainEqual({ value: "admin-notice", label: "School notice" });
     expect(TYPE_FILTER_OPTIONS).toContainEqual({
       value: "ride-cancelled",
-      label: "Ride Cancelled",
+      label: "Ride cancelled",
     });
   });
 

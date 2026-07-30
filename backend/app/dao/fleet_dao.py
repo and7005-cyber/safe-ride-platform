@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.dao.status_sql import bus_status_case
 from app.services import geo_service
 
 logger = logging.getLogger("saferide.fleet")
@@ -738,7 +739,13 @@ class FleetDao:
 
     def list_buses(self) -> list[dict[str, Any]]:
         with get_connection() as conn:
-            rows = conn.execute("select * from live_buses order by name asc").fetchall()
+            # derived_status (U9) replaces the hand-maintained status column as
+            # the value every admin surface reads. The raw column still travels
+            # in the payload (select *) but nothing should render it.
+            rows = conn.execute(
+                f"select b.*, {bus_status_case('b')} as derived_status "
+                "from live_buses b order by b.name asc"
+            ).fetchall()
             buses = [dict(r) for r in rows]
             # Derive a live position status from the bus's active run (no GPS):
             # at-school / at-stop / starting. Position itself lives in
@@ -784,9 +791,9 @@ class FleetDao:
             row = conn.execute(
                 """
                 insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone,
-                    capacity, status, depot_lat, depot_lng, depot_address, depot_provenance)
+                    capacity, availability, depot_lat, depot_lng, depot_address, depot_provenance)
                 values (%(name)s, %(plate_number)s, %(driver_id)s, %(driver_name)s, %(driver_phone)s,
-                        coalesce(%(capacity)s, 45), coalesce(%(status)s, 'idle'),
+                        coalesce(%(capacity)s, 45), coalesce(%(availability)s, 'in-service'),
                         %(depot_lat)s, %(depot_lng)s, %(depot_address)s, %(depot_provenance)s)
                 returning *
                 """,
@@ -795,6 +802,19 @@ class FleetDao:
         return dict(row)
 
     def update_bus(self, bus_id: str, data: dict) -> dict[str, Any] | None:
+        """Update a bus. Note two deliberate omissions (U9).
+
+        `status` is no longer written by any path — it is derived at read time
+        from the bus's current run. This mirrors the fix applied when the admin
+        student edit was found silently resetting a live child's status: an
+        operational field must not have a CRUD surface writing it.
+
+        `availability` coalesces to its own stored value rather than to a
+        default, so a caller that omits the key leaves it alone. FleetMapPage
+        saves a depot by re-sending the bus's whole field set, and a coalesce to
+        'in-service' would quietly return an out-of-service bus to service on
+        every depot move — the same silent-reset defect in a new place.
+        """
         with get_connection() as conn:
             before = conn.execute(
                 "select depot_lat, depot_lng from live_buses where id = %s", (bus_id,)
@@ -804,7 +824,8 @@ class FleetDao:
                 update live_buses set
                     name = %(name)s, plate_number = %(plate_number)s, driver_id = %(driver_id)s,
                     driver_name = %(driver_name)s, driver_phone = %(driver_phone)s,
-                    capacity = coalesce(%(capacity)s, 45), status = coalesce(%(status)s, 'idle'),
+                    capacity = coalesce(%(capacity)s, 45),
+                    availability = coalesce(%(availability)s, availability),
                     depot_lat = %(depot_lat)s, depot_lng = %(depot_lng)s,
                     depot_address = %(depot_address)s, depot_provenance = %(depot_provenance)s
                 where id = %(id)s returning *

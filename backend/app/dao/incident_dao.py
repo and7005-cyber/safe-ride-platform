@@ -11,22 +11,83 @@ class IncidentDao:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # Run-lifecycle rows share this table but are not incidents (U16): they are
+    # the office's normal operational feed, roughly four per bus per day. They
+    # are excluded from both counters — otherwise the Dashboard's "Incidents
+    # Today" tile turns red on an ordinary day and the acknowledgement badge
+    # fills with items nobody needs to acknowledge, which is how a counter stops
+    # meaning anything.
+    _NOT_LIFECYCLE = "lifecycle = false"
+
     def unacknowledged_count(self) -> int:
         with get_connection() as conn:
             row = conn.execute(
-                "select count(*) as n from live_incidents where acknowledged = false"
+                f"select count(*) as n from live_incidents "
+                f"where acknowledged = false and {self._NOT_LIFECYCLE}"
             ).fetchone()
         return row["n"]
 
     def today_count(self) -> int:
         with get_connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 select count(*) as n from live_incidents
                 where created_at >= (now() at time zone 'Africa/Nairobi')::date
+                  and {self._NOT_LIFECYCLE}
                 """
             ).fetchone()
         return row["n"]
+
+    def create_lifecycle_incident(self, run_id: str, incident_type: str) -> dict[str, Any] | None:
+        """Record a run-lifecycle event on the office feed.
+
+        Dispatched DAO-direct from a local wrapper in the router, never through
+        push_service.notify_incident — the same rule the driver-absent and
+        cancellation alerts already follow, because that path fans out bus-wide
+        to parents.
+
+        Resolves bus, driver and route names itself: live_runs carries only ids,
+        and every caller would otherwise repeat the joins. The description names
+        bus, route and period so the office can read the feed without opening
+        anything.
+
+        Written pre-acknowledged as well as lifecycle-marked. The marker keeps
+        these out of the counters; the acknowledgement keeps the Alerts page
+        from offering an "Acknowledge" button on an event that asks nothing of
+        anyone.
+        """
+        with get_connection() as conn:
+            run = conn.execute(
+                """
+                select r.id, r.driver_id, r.bus_id, r.type,
+                       b.name as bus_name, b.driver_name, rt.name as route_name
+                from live_runs r
+                left join live_buses b on b.id = r.bus_id
+                left join live_routes rt on rt.id = r.route_id
+                where r.id = %s
+                """,
+                (run_id,),
+            ).fetchone()
+            if not run:
+                return None
+            period = "morning" if run["type"] == "morning" else "afternoon"
+            verb = "started" if incident_type == "run-started" else "ended"
+            description = (
+                f"{run['route_name'] or 'Route'} ({period}) {verb} — "
+                f"{run['bus_name'] or 'bus'}."
+            )
+            row = conn.execute(
+                """
+                insert into live_incidents
+                    (run_id, driver_id, driver_name, bus_id, bus_name, type, description,
+                     run_type, lifecycle, acknowledged)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true)
+                returning *
+                """,
+                (run["id"], run["driver_id"], run["driver_name"], run["bus_id"],
+                 run["bus_name"], incident_type, description, run["type"]),
+            ).fetchone()
+        return dict(row) if row else None
 
     def create_incident(self, data: dict) -> dict[str, Any]:
         with get_connection() as conn:

@@ -2,7 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.dao.absence_dao import absent_student_ids
-from app.dao.status_sql import scope_covers
+from app.dao.status_sql import no_progress_case, scope_covers
 
 
 class RunDao:
@@ -21,7 +21,8 @@ class RunDao:
         with get_connection() as conn:
             rows = conn.execute(
                 f"""
-                select r.*, b.name as bus_name, b.plate_number, rt.name as route_name
+                select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
+                       {no_progress_case("r")} as no_progress
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -483,6 +484,23 @@ class RunDao:
             new_completed = min(run["stops_completed"] + 1, run["total_stops"])
             conn.execute(
                 "update live_runs set stops_completed = %s where id = %s", (new_completed, run_id)
+            )
+            # Record WHEN the stop was reached, not just how many have been (U10).
+            # The no-progress flag measures elapsed time between arrivals, and the
+            # office force-close needs evidence the bus actually reached the school
+            # gate before it asserts a child arrived safely. Every row at this
+            # stop_order is stamped: a shared stop carries one row per student.
+            #
+            # Deliberately NOT idempotent. arrive_next_stop takes no stop
+            # identifier — every tap means "arrive at next" — so repeat tapping is
+            # the only way a driver catches progress up to a child's stop_order,
+            # and reaching it is a precondition for confirming their drop-off.
+            # Suppressing repeats would leave a driver who missed a tap unable to
+            # confirm, pushing them toward marking the child absent instead.
+            conn.execute(
+                "update run_stops set arrived_at = now() "
+                "where run_id = %s and stop_order = %s",
+                (run_id, new_completed),
             )
             arrival_incident = None
             gate = conn.execute(

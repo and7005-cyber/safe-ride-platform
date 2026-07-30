@@ -8,29 +8,10 @@ import { PageHeader } from "@/features/admin/components/PageHeader";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/apiClient";
 import { useIncidents } from "@/lib/queries";
+import { ADMIN_INCIDENT_LABEL, labelFor } from "@/lib/statusVocabulary";
 
-// Admin-side labels (note: traffic differs from the parent-side "Traffic Delay";
-// arrival has no mapping here — the live admin feed shows the raw "arrival").
-// 'cancellation' is the parent Cancel-a-Ride alert (R17/U14): student-stamped,
-// bus context from the covered route, the acting parent named in the description.
-const TYPE_LABEL: Record<string, string> = {
-  breakdown: "Vehicle Breakdown",
-  accident: "Road Accident",
-  student: "Student Issue",
-  traffic: "Heavy Traffic / Delay",
-  other: "Notice",
-  cancellation: "Ride Cancellation",
-};
-
-const TYPE_VARIANT: Record<string, "destructive" | "warning" | "secondary" | "success"> = {
-  breakdown: "destructive",
-  accident: "destructive",
-  student: "warning",
-  traffic: "warning",
-  arrival: "success",
-  other: "secondary",
-  cancellation: "warning",
-};
+// Labels come from the shared vocabulary (U17). Admin wording is operational
+// and deliberately differs from the parent wording for the same incident types.
 
 export function AlertsPage() {
   const qc = useQueryClient();
@@ -69,7 +50,7 @@ export function AlertsPage() {
                 <div className="mt-0.5 text-muted-foreground"><TriangleAlert className="h-5 w-5" /></div>
                 <div className="flex-1 space-y-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-semibold">{TYPE_LABEL[incident.type] ?? incident.type}</span>
+                    <span className="text-sm font-semibold">{labelFor(ADMIN_INCIDENT_LABEL, incident.type, incident.type)}</span>
                     {!incident.acknowledged ? (
                       <Badge variant="warning" className="px-1.5 py-0 text-[10px]">New</Badge>
                     ) : (

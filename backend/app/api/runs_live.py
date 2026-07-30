@@ -101,6 +101,7 @@ def start_run(
 ):
     run = safe_call(lambda: dao.start_run(user["id"], payload.route_id))
     background_tasks.add_task(push_service.notify_run_started, run)
+    background_tasks.add_task(_record_lifecycle_alert, str(run["id"]), "run-started")
     return run
 
 
@@ -122,6 +123,7 @@ def end_run(
 ):
     run = safe_call(lambda: dao.end_run(user["id"], payload.run_id))
     background_tasks.add_task(push_service.notify_run_ended, run)
+    background_tasks.add_task(_record_lifecycle_alert, str(run["id"]), "run-completed")
     return run
 
 
@@ -159,6 +161,23 @@ def dropoff_student(
     student, run = safe_call(lambda: dao.dropoff_student(user["id"], payload.student_id))
     background_tasks.add_task(push_service.notify_student_dropped_off, student, run)
     return student
+
+
+def _record_lifecycle_alert(run_id: str, incident_type: str) -> None:
+    """Office-only run-lifecycle alert (U16/R29-R30).
+
+    Dispatched DAO-direct, never through push_service.notify_incident — that
+    path fans out bus-wide to parents, and the office has no run lifecycle in
+    its feed today at all: completion shows only on the Runs page, which nobody
+    watches during a route.
+
+    Wrapped like the other admin-only alert helpers so a failing alert never
+    breaks the driver's request.
+    """
+    try:
+        incident_dao.create_lifecycle_incident(run_id, incident_type)
+    except Exception:
+        logger.exception("recording %s lifecycle alert failed", incident_type)
 
 
 def _record_absent_incident(driver_id: str, student: dict, run: dict) -> None:
