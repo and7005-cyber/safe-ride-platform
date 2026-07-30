@@ -8,7 +8,7 @@ import {
   apiToken,
   authHeaders,
   cardContaining,
-  emailLogin,
+  signInAs,
   endActiveRun,
 } from "./helpers";
 
@@ -28,6 +28,43 @@ async function startMorningRun(request: APIRequestContext): Promise<string> {
   });
   expect(started.ok()).toBeTruthy();
   return (await started.json()).id;
+}
+
+/**
+ * Give every remaining roster child an outcome so the run can close.
+ *
+ * Since U4 the closure gate refuses to end a run while anyone is unaccounted
+ * for, so a test that boards one child and ends the run never reaches the
+ * arrival notifications it is actually asserting. Driven from the context's own
+ * `blocking` set — the same set the gate refuses on — rather than a second
+ * guess at the rule.
+ */
+async function accountForRestOfRoster(
+  request: APIRequestContext,
+  runId: string,
+  driverHeaders: Record<string, string>,
+) {
+  for (let i = 0; i < 12; i++) {
+    const ctx = await (
+      await request.get(`${API_URL}/api/runs/driver/context`, { headers: driverHeaders })
+    ).json();
+    const run = ctx.active_run;
+    if (!run || run.stops_completed >= run.total_stops) break;
+    // Boarding is refused until the child's stop has been reached.
+    await request.post(`${API_URL}/api/runs/driver/arrive`, {
+      headers: driverHeaders,
+      data: { run_id: runId },
+    });
+  }
+  const ctx = await (
+    await request.get(`${API_URL}/api/runs/driver/context`, { headers: driverHeaders })
+  ).json();
+  for (const child of ctx.blocking ?? []) {
+    await request.post(`${API_URL}/api/runs/driver/boarding`, {
+      headers: driverHeaders,
+      data: { student_id: child.id, on_bus: true },
+    });
+  }
 }
 
 test.afterEach(async ({ request }) => {
@@ -58,14 +95,17 @@ test("a driver run produces typed notifications in the parent alerts feed", asyn
     headers: driverHeaders,
     data: { student_id: child.id, on_bus: true },
   });
-  // Complete the run at the school gate.
-  await request.post(`${API_URL}/api/runs/driver/end`, {
+  // Complete the run at the school gate — which the gate only permits once
+  // every child has an outcome (U4).
+  await accountForRestOfRoster(request, runId, driverHeaders);
+  const ended = await request.post(`${API_URL}/api/runs/driver/end`, {
     headers: driverHeaders,
     data: { run_id: runId },
   });
+  expect(ended.ok()).toBeTruthy();
 
   // The parent sees every stage in the alerts feed.
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
   await expect(page.getByText("Boarded the Bus").first()).toBeVisible();
@@ -120,7 +160,7 @@ test("opening the alerts page marks notifications as read", async ({ page, reque
     )
     .toBeGreaterThan(0);
 
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText("Bus On The Way").first()).toBeVisible();
 
@@ -147,7 +187,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
     data: { type: "breakdown", description: marker },
   });
 
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
   await expect(page.getByText(marker).first()).toBeVisible();
   await expect(page.getByText("Vehicle Breakdown").first()).toBeVisible();
@@ -170,7 +210,7 @@ test("an incident report notifies parents on that bus", async ({ page, request }
 test("an admin route broadcast reaches route parents under every period chip", async ({ page }) => {
   const marker = `E2E school notice ${Date.now()}`;
 
-  await emailLogin(page, ADMIN.email, ADMIN.password);
+  await signInAs(page, ADMIN);
   await page.goto("/routes");
   const card = cardContaining(page, SEED.driverMorningRoute);
   await card.getByTestId("message-parents").click();
@@ -185,7 +225,7 @@ test("an admin route broadcast reaches route parents under every period chip", a
 
   // Switch to the seeded parent (auth.spec's storage sign-out idiom).
   await page.evaluate(() => localStorage.removeItem("saferide-token"));
-  await emailLogin(page, PARENT.email, PARENT.password);
+  await signInAs(page, PARENT);
   await page.goto("/parent/alerts");
 
   // Exactly one School Notice row, and it survives every period chip —
@@ -196,8 +236,8 @@ test("an admin route broadcast reaches route parents under every period chip", a
     const notice = feedCards.filter({ hasText: marker });
     await expect(notice.first()).toBeVisible({ timeout: 10_000 });
     await expect(notice).toHaveCount(1);
-    // Sentence case since U17 — the parent alerts page rendered Title Case
-    // against the parent home page's sentence case on the same screen.
+    // Sentence case since U17 — the parent alerts page used to render Title
+    // Case against the parent home page's sentence case on the same screen.
     await expect(notice.getByText("School notice", { exact: true })).toBeVisible();
     await expect(notice.getByText(`School notice — ${SEED.driverMorningRoute}`)).toBeVisible();
   }

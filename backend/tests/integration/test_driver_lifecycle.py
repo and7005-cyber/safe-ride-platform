@@ -9,11 +9,12 @@ custom-stops start rejections, the afternoon auto-board -> tap-time drop-off ->
 silent sweep lifecycle, one-way morning boarding, the driver absent flow
 (absence row + run_absences snapshot + status + admin incident, no parent
 fan-out), today-scoped admin absence side-effects with the active-run clear
-guard, the stale-'absent' self-heal, and delete_run's status reset.
+guard, the stale-'absent' self-heal, and delete_run recording no outcome (U7).
 
 Also covers scoped absences through the roster machinery (ops-refinement U4:
 R2, R15, R16, R19; AE4 groundwork): partial-scope run filtering per run type,
-the staff-over-parent provenance ratchet (escalation and the atomic refusal),
+the office-over-parent precedence rule (escalation and the atomic refusal;
+the office end of the ordering U8 extended down to driver marks),
 parent merge/downgrade/withdraw transitions with their status resets, the
 scope-pinned driver flags and clear guard, and the scope-aware stale-'absent'
 heal. Parent transitions run DAO-direct (set_scope/withdraw_scope have no
@@ -37,7 +38,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
+import psycopg
 import pytest
+
+from conftest import purge_run
+
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -187,9 +195,34 @@ def _clear_absences_for(client, admin_headers, student_id: str) -> None:
             client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
 
 
+def _boarded_on_run(run_id: str, student_id: str) -> bool:
+    """Did this run record the child aboard?
+
+    Since U2 that is what "not boarded" means. The raw status column is
+    vestigial and, since U7, no longer reset by deleting a run — so asserting
+    "at-school" here would only be testing what the previous test happened to
+    leave behind.
+    """
+    with psycopg.connect(DB_URL, autocommit=True) as conn:
+        row = conn.execute(
+            "select 1 from run_participation "
+            "where run_id = %s and student_id = %s and boarded_at is not null",
+            (run_id, student_id),
+        ).fetchone()
+    return row is not None
+
+
 def _student_status(client, admin_headers, student_id: str) -> str:
     students = client.get("/api/students", headers=admin_headers).json()
     return next(s["status"] for s in students if s["id"] == student_id)
+
+
+def _display_status(client, admin_headers, student_id: str) -> str:
+    """The derived status every surface actually shows. Since U3 the raw column
+    decides nothing, so assertions about what a child's state *means* belong
+    here rather than on `status`."""
+    students = client.get("/api/students", headers=admin_headers).json()
+    return next(s["display_status"] for s in students if s["id"] == student_id)
 
 
 def _end_and_delete(client, admin_headers, driver_headers, run_id: str | None) -> None:
@@ -198,7 +231,7 @@ def _end_and_delete(client, admin_headers, driver_headers, run_id: str | None) -
     if not run_id:
         return
     client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def _start_run(client, driver_headers, route_id: str) -> dict:
@@ -260,7 +293,7 @@ def test_completed_route_today_blocks_driver_start(client, admin_headers, fleet)
         # The afternoon route stays startable — the gate is per route.
         assert fleet["afternoon"]["id"] not in context["completed_route_ids_today"]
     finally:
-        client.delete(f"/api/runs/{completed_id}", headers=admin_headers)
+        purge_run(completed_id)
 
     # Deleting the mistaken run reopens the route (R28 recovery path).
     context = client.get("/api/runs/driver/context", headers=fleet["driver_headers"]).json()
@@ -309,7 +342,7 @@ def test_custom_stops_route_cannot_start(client, admin_headers, fleet):
 
 # Afternoon lifecycle (R32, AE12) -------------------------------------------------
 
-def test_afternoon_auto_board_dropoff_and_silent_sweep(client, admin_headers, fleet):
+def test_afternoon_auto_board_dropoff_and_closure_gate(client, admin_headers, fleet):
     """Afternoon start auto-boards the run's roster with no per-student
     boarding taps; drop-offs are confirmed per stop once reached; the end-run
     sweep normalizes unconfirmed students without inventing confirmations.
@@ -368,35 +401,183 @@ def test_afternoon_auto_board_dropoff_and_silent_sweep(client, admin_headers, fl
         assert retry.status_code == 409, retry.text
         assert _report(client, admin_headers, run_id)["students_boarded"] == 1
 
-        # End with s1 unconfirmed: status is swept to dropped-off, but the
-        # persisted count stays at the confirmed drop-offs (AE12 data side —
-        # the sweep must never inflate confirmations).
+        # Ending with s1 unconfirmed is now refused (U4/R7). This is the defect
+        # the gate replaced: the old sweep wrote 'dropped-off' to s1 anyway, so
+        # the office and the parent saw a confirmed drop-off the driver never
+        # made. The refusal names who is blocking.
+        refused = client.post(
+            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
+        )
+        assert refused.status_code == 409, refused.text
+        assert fleet["s1"]["name"] in refused.json()["detail"]
+        assert _student_status(client, admin_headers, fleet["s1"]["id"]) != "dropped-off", (
+            "a refused closure wrote a terminal status anyway"
+        )
+
+        # Confirming s1 releases the gate, and the count reflects real
+        # confirmations rather than a sweep.
+        _arrive(client, driver_headers, run_id)
+        confirmed = client.post(
+            "/api/runs/driver/dropoff", json={"student_id": fleet["s1"]["id"]},
+            headers=driver_headers,
+        )
+        assert confirmed.status_code == 200, confirmed.text
         ended = client.post(
             "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
         )
         assert ended.status_code == 200, ended.text
-        assert ended.json()["students_boarded"] == 1
+        assert ended.json()["students_boarded"] == 2
         assert _student_status(client, admin_headers, fleet["s1"]["id"]) == "dropped-off"
     finally:
         _end_and_delete(client, admin_headers, driver_headers, run_id)
 
 
-def test_delete_of_in_progress_run_resets_auto_boarded_students(client, admin_headers, fleet):
-    """Deleting a mistakenly started (non-completed) run restores its roster's
-    on-bus students to at-school — R28's recovery path must not strand an
-    auto-boarded roster."""
+def test_delete_of_in_progress_run_records_no_outcome(client, admin_headers, fleet):
+    """Deleting a mistakenly started run asserts nothing about any child (U7/R16).
+
+    This used to bulk-write the roster's on-bus children to 'at-school', which
+    was a guess dressed as a fact: an afternoon roster is auto-boarded on
+    presumption, so that sweep claimed a whole busload had arrived somewhere
+    nobody observed — and 'at-school' is a specific, reassuring claim to make
+    about a child whose bus was just deleted.
+
+    Now the participation rows cascade with the run and nothing is written in
+    their place, so each child derives back to their true pre-run state.
+    """
     run = _start_run(client, fleet["driver_headers"], fleet["afternoon"]["id"])
     deleted = False
     try:
-        assert _student_status(client, admin_headers, fleet["s1"]["id"]) == "on-bus"
+        assert _display_status(client, admin_headers, fleet["s1"]["id"]) == "expected-on-bus"
         response = client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
         assert response.status_code == 200, response.text
         deleted = True
-        assert _student_status(client, admin_headers, fleet["s1"]["id"]) == "at-school"
-        assert _student_status(client, admin_headers, fleet["s2"]["id"]) == "at-school"
+
+        for kid in (fleet["s1"], fleet["s2"]):
+            derived = _display_status(client, admin_headers, kid["id"])
+            assert derived == "at-home", derived
+            assert derived != "at-school", "the delete claimed the child reached school"
+            assert derived != "dropped-off", "the delete claimed the child was dropped off"
     finally:
         if not deleted:
             _end_and_delete(client, admin_headers, fleet["driver_headers"], run["id"])
+
+
+def test_delete_removes_the_absences_this_runs_driver_marked(client, admin_headers, fleet):
+    """U7/R16: an absence marked during a run being undone goes with it.
+
+    The mark was made in the course of a trip that no longer exists, and leaving
+    it would keep the child absent for a run nobody took. Scoped to this run's
+    driver and roster — office and parent marks are statements from outside the
+    run and the admin did not ask to revoke them.
+    """
+    run = _start_run(client, fleet["driver_headers"], fleet["afternoon"]["id"])
+    deleted = False
+    try:
+        marked = client.post("/api/runs/driver/absent",
+                             json={"student_id": fleet["s1"]["id"]},
+                             headers=fleet["driver_headers"])
+        assert marked.status_code == 200, marked.text
+        office = client.post("/api/students/absences",
+                             json={"student_id": fleet["s2"]["id"], "reason": "IT dentist"},
+                             headers=admin_headers)
+        assert office.status_code == 200, office.text
+
+        response = client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+        assert response.status_code == 200, response.text
+        deleted = True
+
+        assert _display_status(client, admin_headers, fleet["s1"]["id"]) != "absent", (
+            "the driver's absence outlived the run it was marked on"
+        )
+        assert _display_status(client, admin_headers, fleet["s2"]["id"]) == "absent", (
+            "the office's own absence was revoked by an unrelated run delete"
+        )
+    finally:
+        if not deleted:
+            _end_and_delete(client, admin_headers, fleet["driver_headers"], run["id"])
+        for kid in (fleet["s1"], fleet["s2"]):
+            _clear_absences_for(client, admin_headers, kid["id"])
+
+
+def test_a_completed_run_from_today_cannot_be_deleted(client, admin_headers, fleet):
+    """U7/R16: participation is now the only evidence those children boarded, so
+    cascading it mid-day would flip a whole roster from at school to at home —
+    a fresh instance of the manufactured claim this work removes."""
+    run_id = None
+    try:
+        run = _start_run(client, fleet["driver_headers"], fleet["afternoon"]["id"])
+        run_id = run["id"]
+        ended = complete_run(client, fleet["driver_headers"], run_id)
+        assert ended.status_code == 200, ended.text
+
+        refused = client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+        assert refused.status_code == 409, refused.text
+        assert "only evidence" in refused.json()["detail"]
+
+        still_there = client.get(f"/api/runs/{run_id}/report", headers=admin_headers)
+        assert still_there.status_code == 200, "the refusal did not preserve the run"
+    finally:
+        purge_run(run_id)
+
+
+def test_a_run_cannot_be_marked_completed_through_the_edit_endpoint(
+    client, admin_headers, fleet
+):
+    """U7/R16: completion is a claim about children, not a field. Only the gated
+    driver end and the office force-close evaluate the roster, so setting the
+    column here would produce a completed run with neither guarantee behind it."""
+    run_id = None
+    try:
+        run = _start_run(client, fleet["driver_headers"], fleet["afternoon"]["id"])
+        run_id = run["id"]
+        refused = client.put(
+            f"/api/runs/{run_id}",
+            json={"bus_id": run["bus_id"], "route_id": run["route_id"],
+                  "type": "afternoon", "status": "completed"},
+            headers=admin_headers,
+        )
+        assert refused.status_code == 409, refused.text
+
+        current = client.get("/api/runs", headers=admin_headers).json()
+        row = next(r for r in current if r["id"] == run_id)
+        assert row["status"] != "completed", "the run was completed outside the gate"
+    finally:
+        purge_run(run_id)
+
+
+def test_editing_a_completed_run_does_not_reopen_it(client, admin_headers, fleet):
+    """U7/R16: the status column defaulted to 'in-progress' on update, so an
+    edit that simply omitted it silently reopened a finished run — which then
+    blocked its own bus through the (bus, date) uniqueness index."""
+    run_id = None
+    try:
+        run = _start_run(client, fleet["driver_headers"], fleet["afternoon"]["id"])
+        run_id = run["id"]
+        ended = complete_run(client, fleet["driver_headers"], run_id)
+        assert ended.status_code == 200, ended.text
+
+        # Implicit: the payload omits the status entirely.
+        edited = client.put(
+            f"/api/runs/{run_id}",
+            json={"bus_id": run["bus_id"], "route_id": run["route_id"], "type": "afternoon"},
+            headers=admin_headers,
+        )
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["status"] == "completed", "an edit reopened a finished run"
+
+        # Explicit: reopening is refused outright. A reopened run is no longer
+        # 'completed', which is what the delete refusal keys on — so this would
+        # otherwise be a two-step route to cascading the participation.
+        reopened = client.put(
+            f"/api/runs/{run_id}",
+            json={"bus_id": run["bus_id"], "route_id": run["route_id"],
+                  "type": "afternoon", "status": "in-progress"},
+            headers=admin_headers,
+        )
+        assert reopened.status_code == 409, reopened.text
+        assert "cannot be reopened" in reopened.json()["detail"]
+    finally:
+        purge_run(run_id)
 
 
 # Morning boarding is one-way (R26) ------------------------------------------------
@@ -496,12 +677,12 @@ def test_driver_absent_flow(client, admin_headers, fleet):
         assert blocked.status_code == 409, blocked.text
         assert "End the run first" in blocked.json()["detail"]
 
-        # After the run ends the clear succeeds and resets the status.
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        # After the run ends the clear succeeds and resets the status. Since U4
+        # the run cannot close until everyone is accounted for — the absent child
+        # already is, so complete_run boards the rest.
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
-        assert _student_status(client, admin_headers, s2["id"]) == "absent"  # sweep skips absent
+        assert _student_status(client, admin_headers, s2["id"]) == "absent"
         cleared = client.delete(
             f"/api/students/absences/{absence['id']}", headers=admin_headers
         )
@@ -644,7 +825,7 @@ def test_afternoon_scoped_absence_rides_morning_and_skips_afternoon(
         run_id = run["id"]
         context = client.get("/api/runs/driver/context", headers=driver_headers).json()
         assert s2["id"] not in {s["student_id"] for s in context["run_stops"]}
-        assert _student_status(client, admin_headers, s2["id"]) == "at-school"  # not boarded
+        assert not _boarded_on_run(run_id, s2["id"]), "the auto-board did not skip them"
         report = _report(client, admin_headers, run_id)
         assert [a["student_id"] for a in report["absent_students"]] == [s2["id"]]
     finally:
@@ -873,7 +1054,9 @@ def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
         assert result is not None and result["scope"] == "afternoon"
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="at-school", raw="at-school",
+            # U3: a partial scope still never writes status; the baseline for a
+            # child with no participation today is at-home.
+            expected="at-home", raw="at-school",
         )
         assert driver_flag() is False  # pre-run branch pins to 'day'-only
 
@@ -889,7 +1072,9 @@ def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
         assert removed == {"deleted": True, "scope": None}
         assert_display_parity(
             client, parent_headers, admin_headers, student["id"],
-            expected="at-school", raw="at-school",
+            # U3: withdrawing the absence returns the child to their baseline,
+            # which is at-home with no participation today.
+            expected="at-home", raw="at-school",
         )
     finally:
         _clear_absences_for(client, admin_headers, student["id"])

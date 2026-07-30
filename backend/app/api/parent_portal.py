@@ -173,7 +173,11 @@ def cancel_ride(
                 f"The {scope} run has already been completed today — "
                 "that ride can no longer be cancelled."
             )
-        if context["student"]["status"] == "on-bus" and any(
+        # Confirmed aboard, not presumed (U3/R6). The afternoon auto-board
+        # presumes the whole roster aboard at run start, so keying on that would
+        # block a parent who collected their child from school from cancelling —
+        # the app enforcing an assertion it says it is not making.
+        if context["student"]["display_status"] == "on-bus" and any(
             t in active for t in _covered_types(scope)
         ):
             raise ConflictError(
@@ -228,6 +232,21 @@ def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent
         if absence["source"] != "parent":
             raise ConflictError(
                 f"{name}'s absence today was recorded by the school — "
+                "please contact the office to change it."
+            )
+        # A driver marked a period at the stop (U8/R19). Withdrawal may not cut
+        # below that: the driver was there and the child was not, and a parent
+        # changing their own plans does not make the observation untrue. The
+        # generic post-hoc refusal below would blame a race instead of saying so.
+        marked = absence.get("marked_period")
+        if marked is not None and (marked == "day" or marked in _covered_types(payload.scope)):
+            witnessed = (
+                "as not travelling today"
+                if marked == "day"
+                else f"as not travelling on the {marked} run"
+            )
+            raise ConflictError(
+                f"The driver recorded {name} {witnessed} — "
                 "please contact the office to change it."
             )
         row_scope = absence["scope"]

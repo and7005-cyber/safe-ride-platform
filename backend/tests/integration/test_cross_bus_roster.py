@@ -18,6 +18,8 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -170,7 +172,7 @@ def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers):
             if driver_b_headers:
                 client.post("/api/runs/driver/end", json={"run_id": run_id},
                             headers=driver_b_headers)
-            client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+            purge_run(run_id)
         for sid in created["students"]:
             client.delete(f"/api/students/{sid}", headers=admin_headers)
         for bid in created["buses"]:

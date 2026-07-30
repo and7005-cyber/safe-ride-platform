@@ -19,6 +19,12 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_run
+
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -84,7 +90,7 @@ def no_active_run(client, driver_headers, admin_headers):
         today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=3))).date().isoformat()
         for run in client.get("/api/runs", headers=admin_headers).json():
             if run.get("bus_id") == bus_id and str(run.get("date")) == today:
-                client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+                purge_run(run['id'])
 
     reset_today_runs()
     yield
@@ -506,7 +512,7 @@ def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
         headers=admin_headers,
     )
     assert run2.status_code == 409
-    client.delete(f"/api/runs/{run1.json()['id']}", headers=admin_headers)
+    purge_run(run1.json()['id'])
     client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
 
 
@@ -534,7 +540,9 @@ def test_absence_suppresses_driver_stop(client, admin_headers, driver_headers, n
         context = client.get("/api/runs/driver/context", headers=driver_headers).json()
         active = context.get("active_run")
         if active:
-            client.post("/api/runs/driver/end", headers=driver_headers, json={"run_id": active["id"]})
+            # Since U4 the run will not close with unaccounted children, and a
+            # silent 409 here would leave it open and the absence uncleared.
+            complete_run(client, driver_headers, active["id"])
         absences = client.get(
             "/api/students/absences", headers=admin_headers
         ).json()
@@ -576,7 +584,8 @@ def test_run_lifecycle_notifies_parents(client, admin_headers, parent_headers, d
     assert boarded.json()["status"] == "on-bus"
 
     # End the run (sweeps students to at-school and emits reached-school).
-    ended = client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
+    # Since U4 a run cannot close with unaccounted children.
+    ended = complete_run(client, driver_headers, run_id)
     assert ended.status_code == 200
     assert ended.json()["status"] == "completed"
 

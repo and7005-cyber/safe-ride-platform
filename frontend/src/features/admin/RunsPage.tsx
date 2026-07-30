@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Pencil, PhoneCall, Plus, SquareX, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -123,6 +123,49 @@ export function RunsPage() {
     }
   };
 
+  /**
+   * Close a run no driver can resolve (U14/R12).
+   *
+   * The copy states plainly what it will and will not record, because the two
+   * are easy to conflate: it does not decide where anyone is, and it does not
+   * tell any family anything. A force-close that silently messaged the parents
+   * of children nobody could account for would be the manufactured claim this
+   * whole change removes — so the app raises a phone-call obligation instead,
+   * and the office discharges it below.
+   */
+  const forceClose = async (run: any) => {
+    if (!(await confirm({
+      title: "Force-close this run?",
+      description:
+        "Use this when the driver cannot finish it — a dead phone, a shift that "
+        + "ended. Children with no recorded outcome are marked unaccounted for, "
+        + "which is not the same as saying where they are. No parent is notified "
+        + "automatically: you will get a list of families to phone.",
+      confirmLabel: "Force-close",
+      cancelLabel: "Cancel",
+    }))) return;
+    try {
+      await api.post(`/api/runs/${run.id}/force-close`, {});
+      await qc.invalidateQueries({ queryKey: ["runs"] });
+      // Open the run's report so the call list is in front of whoever did this.
+      setReportId(run.id);
+    } catch (err) {
+      toast({ title: "Cannot force-close", description: (err as Error).message, variant: "destructive" });
+    }
+  };
+
+  const recordContact = async (runId: string, studentId: string) => {
+    try {
+      await api.post(`/api/runs/${runId}/contacted`, { student_id: studentId });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["run-report", runId] }),
+        qc.invalidateQueries({ queryKey: ["runs"] }),
+      ]);
+    } catch (err) {
+      toast({ title: "Cannot record", description: (err as Error).message, variant: "destructive" });
+    }
+  };
+
   const remove = async (id: string) => {
     if (!(await confirm({
       title: "Delete this run?",
@@ -174,8 +217,45 @@ export function RunsPage() {
                   <TableCell>{r.route_name ?? r.type}</TableCell>
                   <TableCell>{r.date}</TableCell>
                   <TableCell>{r.stops_completed}/{r.total_stops} stops · {r.students_boarded}/{r.total_students} boarded</TableCell>
-                  <TableCell><Badge variant={variantFor(RUN_STATUS_VARIANT, r.status)}>{labelFor(RUN_STATUS_LABEL, r.status)}</Badge></TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Badge variant={variantFor(RUN_STATUS_VARIANT, r.status)}>{labelFor(RUN_STATUS_LABEL, r.status)}</Badge>
+                      {/* Distinct from the office-set 'delayed' status (U14/R26):
+                          delay is a human judgement about the schedule, this is
+                          the absence of arrival taps — often a dead phone, which
+                          is the case force-close exists for. */}
+                      {r.no_progress && (
+                        <Badge variant="destructive" data-testid="no-progress">
+                          <AlertTriangle className="h-3 w-3" /> No taps
+                        </Badge>
+                      )}
+                      {/* A run open past its service day. It has fallen out of
+                          every driver path, so only the office can end it. */}
+                      {r.stale && (
+                        <Badge variant="warning" data-testid="stale-run">Needs closing</Badge>
+                      )}
+                      {/* Survives the force-close dialog being dismissed — the
+                          obligation is the point, so it has to be rediscoverable. */}
+                      {Number(r.contact_pending ?? 0) > 0 && (
+                        <Badge variant="destructive" data-testid="contact-pending">
+                          <PhoneCall className="h-3 w-3" /> {r.contact_pending} to call
+                        </Badge>
+                      )}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-right">
+                    {r.status !== "completed" && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Force-close run"
+                        aria-label="Force-close run"
+                        data-testid={`force-close-${r.id}`}
+                        onClick={(e) => { e.stopPropagation(); forceClose(r); }}
+                      >
+                        <SquareX className="h-4 w-4" />
+                      </Button>
+                    )}
                     <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); startEdit(r); }}><Pencil className="h-4 w-4" /></Button>
                     <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); remove(r.id); }}><Trash2 className="h-4 w-4" /></Button>
                   </TableCell>
@@ -225,14 +305,40 @@ export function RunsPage() {
             </div>
             <div className="space-y-2">
               <Label>Status</Label>
-              <Select value={form.status} onValueChange={(v) => setForm({ ...form, status: v })}>
+              {/* Finishing a *live* run is a claim that every child is
+                  accounted for, so editing one to 'completed' belongs to the
+                  driver's end or the office force-close, never to this form —
+                  and a finished run cannot be reopened here either (U7).
+                  Offering either on an edit would only produce a 409.
+
+                  Creating one is a different act: a run added here after the
+                  fact is a bookkeeping record of something that already
+                  happened, with no roster and no participation behind it. The
+                  server still accepts that, and U7's delete rule carves those
+                  rows out precisely because they assert nothing about a child. */}
+              <Select
+                value={form.status}
+                disabled={editId != null && form.status === "completed"}
+                onValueChange={(v) => setForm({ ...form, status: v })}
+              >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="in-progress">In progress</SelectItem>
-                  <SelectItem value="delayed">Delayed</SelectItem>
-                  <SelectItem value="completed">Completed</SelectItem>
+                  {editId != null && form.status === "completed" ? (
+                    <SelectItem value="completed">Completed</SelectItem>
+                  ) : (
+                    <>
+                      <SelectItem value="in-progress">In progress</SelectItem>
+                      <SelectItem value="delayed">Delayed</SelectItem>
+                      {editId == null && <SelectItem value="completed">Completed</SelectItem>}
+                    </>
+                  )}
                 </SelectContent>
               </Select>
+              {editId != null && form.status === "completed" && (
+                <p className="text-xs text-muted-foreground">
+                  This run is finished. Start a new run if the bus is going out again.
+                </p>
+              )}
             </div>
           </div>
           <DialogFooter>
@@ -288,6 +394,42 @@ export function RunsPage() {
                   </ul>
                 )}
               </div>
+
+              {/* The contact obligation (U14/R14). Rendered from the report so
+                  it is here whenever the run is opened, not only in the moment
+                  after a force-close — an office user pulled away mid-task has
+                  to be able to find the families still owed a call. */}
+              {(report.unaccounted ?? []).length > 0 && (
+                <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+                  <p className="text-sm font-medium">Unaccounted children — phone their families</p>
+                  <p className="text-xs text-muted-foreground">
+                    Nobody recorded what happened to these children on this run, and
+                    no message was sent to their parents. Call each family, then mark
+                    it here.
+                  </p>
+                  <ul className="space-y-2">
+                    {report.unaccounted.map((c: any) => (
+                      <li key={c.student_id} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="font-medium">{c.student_name}</span>
+                        {c.contacted_at ? (
+                          <Badge variant="success" data-testid={`contacted-${c.student_id}`}>
+                            Family called
+                          </Badge>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid={`record-contact-${c.student_id}`}
+                            onClick={() => recordContact(report.id, c.student_id)}
+                          >
+                            <PhoneCall className="h-4 w-4" /> Mark called
+                          </Button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           )}
         </DialogContent>

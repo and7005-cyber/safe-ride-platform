@@ -21,6 +21,10 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src", "vite.config.ts"],
+  // tests/ is included so the specs are typechecked too. They were not, which
+  // is how a spec referencing an unimported helper passed `tsc --noEmit` and
+  // then failed at runtime with "is not defined" — the typecheck was reporting
+  // on a smaller surface than anyone reading it assumed.
+  "include": ["src", "tests", "vite.config.ts"],
   "references": []
 }

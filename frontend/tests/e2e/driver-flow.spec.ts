@@ -11,7 +11,8 @@ import {
   cardContaining,
   clearCancellationState,
   endActiveRun,
-  pinLogin,
+  signInAsDriver,
+  purgeRun,
 } from "./helpers";
 
 // Driver journey: PIN login, explicit run starts (R27/R28), confirmed final
@@ -34,7 +35,7 @@ async function deleteTodaysRuns(request: APIRequestContext) {
   const runs = await request.get(`${API_URL}/api/runs`, { headers: authHeaders(adminToken) });
   for (const run of await runs.json()) {
     if (run.bus_id === busId && String(run.date).startsWith(today)) {
-      await request.delete(`${API_URL}/api/runs/${run.id}`, { headers: authHeaders(adminToken) });
+      purgeRun(run.id);
     }
   }
 }
@@ -44,8 +45,74 @@ test.afterEach(async ({ request }) => {
   await deleteTodaysRuns(request); // completed runs block same-day restarts
 });
 
+/** Start the seeded afternoon route and land on a run in progress. */
+async function startAfternoonRun(page: import("@playwright/test").Page) {
+  await page.goto("/driver/run");
+  await page.getByRole("combobox").click();
+  await page.getByRole("option", { name: SEED.driverAfternoonRoute }).click();
+  await page.getByRole("button", { name: "Start Run" }).click();
+  await expect(page.getByText("Run in progress")).toBeVisible();
+}
+
+/**
+ * Open the board and wait for a roster that has actually loaded.
+ *
+ * The page renders "Students (0)" during the context query's first paint, so
+ * asserting on the count text alone passes against an empty list and every
+ * later action then races the real data.
+ */
+async function openRoster(page: import("@playwright/test").Page) {
+  await page.goto("/driver/boarding");
+  await expect(page.getByText(/Students \([1-9]\d*\)/)).toBeVisible();
+}
+
+/** Arrive every remaining stop, so each child's stop counts as reached. */
+async function arriveAllStops(page: import("@playwright/test").Page) {
+  await page.goto("/driver/run");
+  const arrive = page.getByRole("button", { name: "Arrive Next Stop" });
+  const progress = page.getByText(/\d+\/\d+ stops completed/);
+  for (let i = 0; i < 12; i++) {
+    await expect(progress).toBeVisible();
+    if (await arrive.isDisabled()) return;
+    const before = await progress.textContent();
+    await arrive.click();
+    // Waits for the count to actually move rather than predicting it: the test
+    // may already have arrived stops of its own before calling this.
+    await expect(progress).not.toHaveText(before ?? "");
+  }
+}
+
+/**
+ * Give every child on the roster a recorded outcome.
+ *
+ * Since U4 a run cannot close while anyone is unaccounted for, so a test that
+ * resolves one child and ends the run is asserting a contract the product no
+ * longer has.
+ */
+async function accountForEveryone(
+  page: import("@playwright/test").Page,
+  action: "Board" | "Drop-off",
+) {
+  const confirmLabel = action === "Board" ? "Board" : "Drop off";
+  for (let i = 0; i < 12; i++) {
+    await openRoster(page);
+    const next = page.getByRole("button", { name: action, exact: true }).first();
+    if ((await next.count()) === 0) return;
+    // Wait for enablement rather than filtering on it: the row paints from the
+    // context query's first response, and a button read in that window is
+    // disabled purely because stops_completed has not arrived yet. Filtering
+    // would silently match nothing and leave this child unresolved — which the
+    // gate then refuses the run over, several steps later.
+    await expect(next).toBeEnabled();
+    await next.click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: confirmLabel, exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+  }
+}
+
 test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await expect(page.getByText(/Hello,/)).toBeVisible();
   await expect(page.getByText(SEED.driverBus)).toBeVisible();
   await expect(page.getByText("Stops")).toBeVisible();
@@ -54,7 +121,7 @@ test("driver home shows the assigned bus and stat tiles", async ({ page }) => {
 });
 
 test("morning run: explicit start, confirmed boarding, completed-today lock", async ({ page, request }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
 
   // The home tile never starts a run — it routes to the Run page (R27).
   await page.getByRole("button", { name: "Start Run" }).click();
@@ -106,8 +173,14 @@ test("morning run: explicit start, confirmed boarding, completed-today lock", as
     page.getByText("Boarded", { exact: true }).locator("xpath=preceding-sibling::span[1]"),
   ).not.toHaveText("0");
 
+  // The gate refuses while anyone is still unaccounted for (U4), so the rest of
+  // the roster is boarded before the run can close.
+  await arriveAllStops(page);
+  await accountForEveryone(page, "Board");
+
   // Ending the run also requires confirmation (R29).
   await page.goto("/driver/run");
+  await expect(page.getByTestId("blocking-list")).toHaveCount(0);
   await page.getByRole("button", { name: "End Run" }).click();
   const endDialog = page.getByRole("dialog");
   await expect(endDialog.getByText("End this run?")).toBeVisible();
@@ -124,7 +197,7 @@ test("morning run: explicit start, confirmed boarding, completed-today lock", as
 });
 
 test("afternoon run: drop-off language and a confirmed, final drop-off", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
 
   await page.goto("/driver/run");
   await page.getByRole("combobox").click();
@@ -134,24 +207,15 @@ test("afternoon run: drop-off language and a confirmed, final drop-off", async (
 
   // Afternoon reword (R31): the primary action is Drop-off and the counter
   // says "Dropped off". The roster was auto-boarded at start (R32).
-  await page.goto("/driver/boarding");
-  await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
+  await openRoster(page);
   await expect(page.getByText("Dropped off", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Drop-off" }).first()).toBeVisible();
 
-  // Tap Arrive until some student's stop is reached (school gate stops carry
-  // no student, so the first arrival may not unlock anything).
+  // School gate stops carry no student, so arrive everything before expecting
+  // any drop-off to unlock.
+  await arriveAllStops(page);
+  await openRoster(page);
   const enabledDrop = page.getByRole("button", { name: "Drop-off", disabled: false });
-  for (let arrivals = 1; arrivals <= 10; arrivals++) {
-    await page.goto("/driver/run");
-    const arrive = page.getByRole("button", { name: "Arrive Next Stop" });
-    if (await arrive.isDisabled()) break;
-    await arrive.click();
-    await expect(page.getByText(new RegExp(`${arrivals}/\\d+ stops completed`))).toBeVisible();
-    await page.goto("/driver/boarding");
-    await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
-    if ((await enabledDrop.count()) > 0) break;
-  }
   await expect(enabledDrop.first()).toBeVisible();
 
   // Confirm one drop-off; the row flips to a static badge with no actions.
@@ -169,20 +233,108 @@ test("afternoon run: drop-off language and a confirmed, final drop-off", async (
   await expect(dropDialog).toHaveCount(0);
   const row = cardContaining(page, studentName);
   await expect(row.getByText("Dropped off")).toBeVisible();
-  await expect(row.getByRole("button")).toHaveCount(0);
+  // The only control left is Undo (U13/R10) — this driver recorded it, and the
+  // run is still open. Before U5 there was no way back from a mis-tap at all.
+  await expect(row.getByRole("button", { name: "Undo" })).toBeVisible();
 
-  // End Run confirmation lists students not yet confirmed dropped off (R29).
+  // The gate refuses while anyone is unaccounted for (U13/R11): the run stays
+  // in progress and the server's own message names the children.
   await page.goto("/driver/run");
+  await expect(page.getByText(/Still to account for \(\d+\)/)).toBeVisible();
   await page.getByRole("button", { name: "End Run" }).click();
   const endDialog = page.getByRole("dialog");
   await expect(endDialog.getByText("End this run?")).toBeVisible();
-  await expect(endDialog.getByText(/Not yet confirmed dropped off:/)).toBeVisible();
   await endDialog.getByRole("button", { name: "End Run" }).click();
+  await expect(page.getByText(/Not everyone is accounted for/)).toBeVisible();
+  await expect(page).toHaveURL(/\/driver\/run/);
+
+  // Resolving the rest empties the list and the same control now closes it.
+  await accountForEveryone(page, "Drop-off");
+  await page.goto("/driver/run");
+  await expect(page.getByTestId("blocking-list")).toHaveCount(0);
+  await page.getByRole("button", { name: "End Run" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "End Run" }).click();
   await page.waitForURL("/driver");
 });
 
+test("the blocking list names each child and navigates to them", async ({ page }) => {
+  // R11: with several blockers a driver would otherwise make a manual
+  // multi-screen round trip per child, on a phone, at the end of every route.
+  await signInAsDriver(page);
+  await startAfternoonRun(page);
+
+  await page.goto("/driver/run");
+  const blocking = page.getByTestId("blocking-list");
+  await expect(blocking).toBeVisible();
+  const firstName = (await blocking.getByRole("button").first().textContent()) ?? "";
+  await blocking.getByRole("button").first().click();
+
+  await page.waitForURL(/\/driver\/boarding\?student=/);
+  await expect(cardContaining(page, firstName.trim())).toBeVisible();
+});
+
+test("absent is offered before the child's stop has been reached", async ({ page }) => {
+  // R8: it used to require the stop to have been reached, which left the driver
+  // of a child who was never at the stop with nothing to tap — and the gate then
+  // refused to close the run over exactly that child.
+  await signInAsDriver(page);
+  await startAfternoonRun(page);
+
+  await page.goto("/driver/boarding");
+  await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
+  // No stop has been arrived at yet, so Drop-off is disabled everywhere.
+  await expect(page.getByRole("button", { name: "Drop-off" }).first()).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Absent" }).first()).toBeEnabled();
+});
+
+test("a hand-over cannot be confirmed without a note", async ({ page }) => {
+  // R9: "left the bus" without where or why is not an account of anything, and
+  // the driver's only other release would be marking the child absent — which
+  // tells the family they were never on the bus home.
+  await signInAsDriver(page);
+  await startAfternoonRun(page);
+
+  await page.goto("/driver/boarding");
+  await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
+  const target = page
+    .locator("div[class*='bg-card']")
+    .filter({ has: page.getByRole("button", { name: "Off-route" }) })
+    .first();
+  const studentName = ((await target.locator("p").first().textContent()) ?? "").trim();
+  await target.getByRole("button", { name: "Off-route" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(`${studentName} left the bus off-route?`)).toBeVisible();
+  const record = dialog.getByRole("button", { name: "Record hand-over" });
+  await expect(record).toBeDisabled();
+
+  await dialog.getByTestId("confirm-note").fill("Collected by an aunt at the junction");
+  await expect(record).toBeEnabled();
+  await record.click();
+  await expect(dialog).toHaveCount(0);
+
+  // Accounted for, and the row now offers the undo rather than another release.
+  const row = cardContaining(page, studentName);
+  await expect(row.getByRole("button", { name: "Undo" })).toBeVisible();
+});
+
+test("no driver status badge renders a raw slug", async ({ page }) => {
+  // R3: the board reads the derived status, which carries values the raw
+  // column never held ('expected on bus'), and every one of them is labelled.
+  await signInAsDriver(page);
+  await startAfternoonRun(page);
+
+  await page.goto("/driver/boarding");
+  await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
+  await expect(page.getByText("Expected on bus").first()).toBeVisible();
+  const body = (await page.locator("main").textContent()) ?? "";
+  for (const slug of ["expected-on-bus", "on-bus", "at-school", "dropped-off", "unaccounted"]) {
+    expect(body).not.toContain(slug);
+  }
+});
+
 test("driver can report an incident", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await page.goto("/driver/incident");
   await expect(page.getByText("New Incident Report")).toBeVisible();
 
@@ -195,7 +347,7 @@ test("driver can report an incident", async ({ page }) => {
 });
 
 test("search filters the boarding list", async ({ page }) => {
-  await pinLogin(page, DRIVER.pin);
+  await signInAsDriver(page);
   await page.goto("/driver/boarding");
   await expect(page.getByText(/Students \(\d+\)/)).toBeVisible();
 
@@ -213,7 +365,7 @@ test("an afternoon cancellation excludes the student from the driver's run", asy
 }) => {
   await apiCancelRide(request, SEED.parentChild, "afternoon");
   try {
-    await pinLogin(page, DRIVER.pin);
+    await signInAsDriver(page);
     await page.goto("/driver/run");
     await page.getByRole("combobox").click();
     await page.getByRole("option", { name: SEED.driverAfternoonRoute }).click();

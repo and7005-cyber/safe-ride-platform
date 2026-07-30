@@ -37,6 +37,12 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_run
+
+# Since U4 a run cannot close with unaccounted children; complete_run walks the
+# path a driver must now walk before ending one.
+from test_students_parents import complete_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -296,7 +302,7 @@ def _end_and_delete(client, admin_headers, driver_headers, run_id: str | None) -
     if not run_id:
         return
     client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
-    client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+    purge_run(run_id)
 
 
 def _driver_context(client, driver_headers) -> dict:
@@ -341,9 +347,8 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
     morning_run_id = afternoon_run_id = None
     try:
         morning_run_id = _start_run(client, driver_headers, fleet["morning"]["id"])["id"]
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": morning_run_id}, headers=driver_headers
-        )
+        # Since U4 a run cannot close with unaccounted children.
+        ended = complete_run(client, driver_headers, morning_run_id)
         assert ended.status_code == 200, ended.text
 
         response = cancel(client, p1, s1["id"], "afternoon")
@@ -357,7 +362,10 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
 
         child = child_row(client, p1, s1["id"])
         assert child["cancellation"] == {"scope": "afternoon", "withdrawable": True}
-        assert child["display_status"] == "at-school"  # partial never writes status
+        # A partial cancellation still never writes status. The child boarded
+        # and the morning run completed, so at-school is now earned by a
+        # recorded boarding rather than asserted by the old sweep.
+        assert child["display_status"] == "at-school"
 
         afternoon_run_id = _start_run(client, driver_headers, fleet["afternoon"]["id"])["id"]
         context = _driver_context(client, driver_headers)
@@ -379,7 +387,7 @@ def test_afternoon_cancel_after_completed_morning_excludes_from_auto_board(
         assert listed == {s1["id"]: CANCELLED_BY_PARENT}
     finally:
         _end_and_delete(client, admin_headers, driver_headers, afternoon_run_id)
-        client.delete(f"/api/runs/{morning_run_id}", headers=admin_headers)
+        purge_run(morning_run_id)
         _clear_absences_for(client, admin_headers, s1["id"])
         _purge_cancellation_incidents(client, admin_headers, s1["id"])
 
@@ -587,7 +595,7 @@ def test_day_cancel_after_completed_morning_records_afternoon_and_withdraw_guard
     finally:
         for run_id in (morning_run, afternoon_run):
             if run_id:
-                client.delete(f"/api/runs/{run_id}", headers=admin_headers)
+                purge_run(run_id)
         _clear_absences_for(client, admin_headers, s1["id"])
         _purge_cancellation_incidents(client, admin_headers, s1["id"])
 
@@ -654,9 +662,7 @@ def test_mid_run_not_boarded_cancel_appends_run_absences(client, admin_headers, 
         assert held.status_code == 409, held.text
         assert "already started" in held.json()["detail"]
 
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
         report = client.get(f"/api/runs/{run_id}/report", headers=admin_headers).json()
         listed = {a["student_id"]: a["reason"] for a in report["absent_students"]}
@@ -711,9 +717,7 @@ def test_withdraw_scope_dao_guard_blocks_after_covered_run_starts(
         # Once the run completes the DAO guard steps aside (status <>
         # 'completed') — post-completion policy is the API pre-read's
         # stricter run-row EXISTENCE check, not the DAO's.
-        ended = client.post(
-            "/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers
-        )
+        ended = complete_run(client, driver_headers, run_id)
         assert ended.status_code == 200, ended.text
         removed = absence_dao.withdraw_scope(s1["id"], "morning", p1["id"])
         assert removed == {"deleted": True, "scope": None}
@@ -738,7 +742,9 @@ def test_merge_to_day_and_household_half_withdrawal(client, admin_headers, fleet
         first = cancel(client, p1, s1["id"], "morning")
         assert first.status_code == 200, first.text
         assert first.json()["scope"] == "morning"
-        assert child_row(client, p1, s1["id"])["display_status"] == "at-school"
+        # U3: a child with no participation today reads at-home. The subject of
+        # this test is the cancellation merge, not the baseline status.
+        assert child_row(client, p1, s1["id"])["display_status"] == "at-home"
 
         merged = cancel(client, p1, s1["id"], "afternoon")
         assert merged.status_code == 200, merged.text
@@ -764,7 +770,7 @@ def test_merge_to_day_and_household_half_withdrawal(client, admin_headers, fleet
         assert downgraded.json() == {"ok": True, "deleted": False, "scope": "afternoon"}
         child = child_row(client, p2, s1["id"])
         assert child["cancellation"] == {"scope": "afternoon", "withdrawable": True}
-        assert child["display_status"] == "at-school"
+        assert child["display_status"] == "at-home"
         assert absence_row(client, admin_headers, s1["id"])["scope"] == "afternoon"
 
         removed = withdraw(client, p2, s1["id"], "afternoon")

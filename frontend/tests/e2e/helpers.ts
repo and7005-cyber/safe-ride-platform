@@ -1,4 +1,10 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const COMPOSE_FILE = "docker-compose.local.yml";
 
 // Seeded local credentials and fixtures (backend/db/seeds/003_local_snapshot.sql).
 // On seed drift, update these constants instead of individual specs.
@@ -33,6 +39,58 @@ export const SEED = {
 
 export const API_URL = process.env.PLAYWRIGHT_API_URL ?? "http://localhost:9001";
 
+/**
+ * One token per account per worker.
+ *
+ * Every credential endpoint is rate limited on purpose — login is 10 attempts
+ * per account per five minutes — and the suite was spending that budget on
+ * setup: a full run drove the sign-in form dozens of times as admin, so the
+ * last specs to run were refused and failed on a login timeout that had nothing
+ * to do with what they were testing. Signing in once and reusing the token
+ * keeps the limiter protecting the product rather than throttling the tests.
+ */
+const tokenCache = new Map<string, string>();
+
+async function cachedToken(
+  request: APIRequestContext,
+  email: string,
+  password: string,
+): Promise<string> {
+  const hit = tokenCache.get(email);
+  if (hit) return hit;
+  const token = await apiToken(request, email, password);
+  tokenCache.set(email, token);
+  return token;
+}
+
+/**
+ * Put an authenticated session in the browser without driving the form.
+ *
+ * For every spec whose subject is not the login screen itself. The form's own
+ * behaviour — success, wrong password, PIN entry — stays covered by
+ * auth.spec.ts, which calls emailLogin/pinLogin below and must keep doing so.
+ */
+export async function signInAs(
+  page: Page,
+  account: { email: string; password: string },
+): Promise<void> {
+  const token = await cachedToken(page.request, account.email, account.password);
+  // Any app-origin document, so localStorage is writable before the app boots.
+  await page.goto("/auth");
+  await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  await page.goto("/");
+  await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
+}
+
+/** The driver equivalent: PIN login is limited to 10 per IP per minute. */
+export async function signInAsDriver(page: Page): Promise<void> {
+  const token = await cachedDriverToken(page.request);
+  await page.goto("/auth");
+  await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  await page.goto("/driver");
+  await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
+}
+
 export async function emailLogin(page: Page, email: string, password: string) {
   await page.goto("/auth");
   await page.locator("#email").fill(email);
@@ -66,11 +124,21 @@ export async function apiToken(
 }
 
 export async function apiDriverToken(request: APIRequestContext): Promise<string> {
+  return cachedDriverToken(request);
+}
+
+const DRIVER_TOKEN_KEY = "__driver_pin__";
+
+async function cachedDriverToken(request: APIRequestContext): Promise<string> {
+  const hit = tokenCache.get(DRIVER_TOKEN_KEY);
+  if (hit) return hit;
   const response = await request.post(`${API_URL}/api/auth/pin-login`, {
     data: { pin: DRIVER.pin },
   });
   expect(response.ok()).toBeTruthy();
-  return (await response.json()).token;
+  const token = (await response.json()).token;
+  tokenCache.set(DRIVER_TOKEN_KEY, token);
+  return token;
 }
 
 export function authHeaders(token: string) {
@@ -78,6 +146,31 @@ export function authHeaders(token: string) {
 }
 
 /** End the demo driver's active run if one exists (idempotent cleanup). */
+/**
+ * Delete a run out-of-band. **Teardown only** — never inside an assertion.
+ *
+ * Since U7 the product refuses to delete a completed run dated today whose
+ * children have recorded participation: those rows are the only evidence anyone
+ * boarded, so cascading them would flip a whole roster from at school to at
+ * home mid-day. That refusal is a real guarantee and the tests must not have a
+ * product-level backdoor around it, so the suite's own cleanup goes to the
+ * database directly — the same choice the integration suite's conftest makes.
+ *
+ * Uses the compose db container rather than a Node pg client, so the e2e suite
+ * gains no new dependency.
+ */
+export function purgeRun(runId: string): void {
+  execFileSync(
+    "docker",
+    [
+      "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
+      "psql", "-U", "saferide", "-d", "saferide", "-q",
+      "-c", `delete from live_runs where id = '${runId}'`,
+    ],
+    { stdio: "ignore", cwd: REPO_ROOT },
+  );
+}
+
 export async function endActiveRun(request: APIRequestContext): Promise<void> {
   const token = await apiDriverToken(request);
   const context = await request.get(`${API_URL}/api/runs/driver/context`, {
@@ -104,9 +197,7 @@ export async function endActiveRun(request: APIRequestContext): Promise<void> {
   const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10); // Nairobi UTC+3
   for (const run of await runs.json()) {
     if (run.bus_id === busId && String(run.date).slice(0, 10) === today) {
-      await request.delete(`${API_URL}/api/runs/${run.id}`, {
-        headers: authHeaders(adminToken),
-      });
+      purgeRun(run.id);
     }
   }
 }

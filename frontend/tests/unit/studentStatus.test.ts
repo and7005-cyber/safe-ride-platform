@@ -16,8 +16,13 @@ import {
 const DERIVED_VALUES: StudentDisplayStatus[] = [
   "at-school",
   "on-bus",
+  // The rebuilt derivation's two additions (U3, U6). Listed here as well as in
+  // the vocabulary's own exhaustiveness test because this file also drives the
+  // admin filter, which has to offer every value the server can return.
+  "expected-on-bus",
   "dropped-off",
   "absent",
+  "unaccounted",
   "at-home",
   "unassigned",
 ];
@@ -32,8 +37,10 @@ describe("status label/variant maps", () => {
     expect(STUDENT_STATUS_LABEL).toEqual({
       "at-school": "At school",
       "on-bus": "On bus",
+      "expected-on-bus": "Expected on bus",
       "dropped-off": "Dropped off",
       absent: "Absent today",
+      unaccounted: "Unaccounted",
       "at-home": "At home",
       unassigned: "Unassigned",
     });
@@ -43,8 +50,11 @@ describe("status label/variant maps", () => {
     expect(STUDENT_STATUS_VARIANT).toEqual({
       "at-school": "secondary",
       "on-bus": "success",
+      // Deliberately not 'success': a presumed boarding is not evidence.
+      "expected-on-bus": "warning",
       "dropped-off": "warning",
       absent: "destructive",
+      unaccounted: "destructive",
       "at-home": "secondary",
       unassigned: "outline",
     });

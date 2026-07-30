@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+from conftest import purge_run
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -195,10 +197,15 @@ def test_route_bus_change_rederives_student_bus(client, admin_headers):
 # Run edit conflicts ------------------------------------------------------------
 
 def test_run_edit_conflict_is_friendly_409(client, admin_headers):
-    """Moving a completed run back to in-progress on a bus that already has an
-    active run 409s with the friendly message, not a raw unique-violation
-    'Record already exists' (R3). Editing the active run itself must not
-    self-conflict."""
+    """Moving an in-progress run onto a bus that already has an active run 409s
+    with the friendly message, not a raw unique-violation 'Record already
+    exists' (R3). Editing the active run itself must not self-conflict.
+
+    This used to stage the conflict by reopening a completed run. Since U7 that
+    is refused before the bus check ever runs — reopening was itself a bypass,
+    because a reopened run is no longer 'completed' and could then be deleted,
+    cascading the participation the delete refusal protects.
+    """
     marker = uuid.uuid4().hex[:6]
     bus = _create_bus(client, admin_headers, f"IT RunBus {marker}")
     active = client.post(
@@ -207,20 +214,22 @@ def test_run_edit_conflict_is_friendly_409(client, admin_headers):
     )
     assert active.status_code == 200, active.text
     active_run = active.json()
-    completed = client.post(
-        "/api/runs", json={"bus_id": bus["id"], "type": "morning", "status": "completed"},
+    # A second in-progress run on a *different* bus, then moved onto the busy one.
+    other_bus = _create_bus(client, admin_headers, f"IT RunBus2 {marker}")
+    second = client.post(
+        "/api/runs", json={"bus_id": other_bus["id"], "type": "morning", "status": "in-progress"},
         headers=admin_headers,
     )
-    assert completed.status_code == 200, completed.text
-    completed_run = completed.json()
+    assert second.status_code == 200, second.text
+    completed_run = second.json()
     try:
-        revived = client.put(
+        moved = client.put(
             f"/api/runs/{completed_run['id']}",
             json={"bus_id": bus["id"], "type": "morning", "status": "in-progress"},
             headers=admin_headers,
         )
-        assert revived.status_code == 409, revived.text
-        assert "already has an active run" in revived.json()["detail"]
+        assert moved.status_code == 409, moved.text
+        assert "already has an active run" in moved.json()["detail"]
 
         # Editing the active run itself is excluded from its own check.
         self_edit = client.put(
@@ -232,16 +241,24 @@ def test_run_edit_conflict_is_friendly_409(client, admin_headers):
         assert self_edit.status_code == 200, self_edit.text
         assert self_edit.json()["total_students"] == 5
     finally:
-        client.delete(f"/api/runs/{completed_run['id']}", headers=admin_headers)
-        client.delete(f"/api/runs/{active_run['id']}", headers=admin_headers)
+        purge_run(completed_run['id'])
+        purge_run(active_run['id'])
+        client.delete(f"/api/fleet/buses/{other_bus['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
 
 
 # Active-runs filter -------------------------------------------------------------
 
-def test_active_filter_excludes_completed_and_prior_date_runs(client, admin_headers):
-    """GET /api/runs?active=true returns only today's (Africa/Nairobi)
-    non-completed runs, still carrying the joined bus/route names (R5)."""
+def test_active_filter_excludes_completed_and_flags_stale_runs(client, admin_headers):
+    """GET /api/runs?active=true returns non-completed runs up to and including
+    today (Africa/Nairobi), still carrying the joined bus/route names (R5).
+
+    Prior-date runs used to be excluded here. That hid the one run that most
+    needed attention: a run still open at midnight also falls out of the
+    date-scoped driver lookup and the per-date uniqueness index, so nobody could
+    close it and nobody was told it existed. It now surfaces flagged `stale`,
+    which is where the office force-closes it (U6/R15).
+    """
     marker = uuid.uuid4().hex[:6]
     bus = _create_bus(client, admin_headers, f"IT ActiveBus {marker}")
     yesterday = (dt.datetime.now(NAIROBI).date() - dt.timedelta(days=1)).isoformat()
@@ -266,18 +283,22 @@ def test_active_filter_excludes_completed_and_prior_date_runs(client, admin_head
         ids = {r["id"] for r in runs}
         assert active_today["id"] in ids
         assert completed_today["id"] not in ids
-        assert stale_in_progress["id"] not in ids
+        assert stale_in_progress["id"] in ids, "the stuck run is invisible to the office"
 
         entry = next(r for r in runs if r["id"] == active_today["id"])
         assert entry["bus_name"] == f"IT ActiveBus {marker}"
         assert "route_name" in entry and "plate_number" in entry
+        assert entry["stale"] is False
+
+        stuck = next(r for r in runs if r["id"] == stale_in_progress["id"])
+        assert stuck["stale"] is True, "a prior-day run is not flagged for closure"
 
         # The unfiltered listing still returns everything.
         all_ids = {r["id"] for r in client.get("/api/runs", headers=admin_headers).json()}
         assert {active_today["id"], completed_today["id"], stale_in_progress["id"]} <= all_ids
     finally:
         for run in (active_today, completed_today, stale_in_progress):
-            client.delete(f"/api/runs/{run['id']}", headers=admin_headers)
+            purge_run(run['id'])
         client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
 
 

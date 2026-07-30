@@ -1,27 +1,41 @@
-"""Shared SQL fragments: the derived student ``display_status`` (R1–R4) and
-the scope-covers-run-type predicate (U4).
+"""Shared SQL fragments: the derived student and bus status, run progress, and
+the scope-covers-run-type predicate.
 
 Leaf module imported across ``app.dao``. It must import nothing from
 ``app.dao``: the student_live_dao↔fleet_dao pair already needs a lazy import
 to dodge a cycle, and this module must never grow another.
 
-The derivation is day-scoped to Africa/Nairobi, computed at read time and
-never stored (the raw ``status`` column stays untouched in every payload).
+The student derivation reads participation and absence (U3), day-scoped to
+Africa/Nairobi and computed at read time. It replaces four staleness branches
+that existed only to compensate for a status column with no provenance — a
+column that could not say which run a boarding belonged to, or whether anyone
+observed it.
+
 Branches, in order:
 
-- a whole-day today-absence exists (live_student_absences, scope='day') →
-  'absent', whatever the raw status says. Partial-scope rows ('morning'/
-  'afternoon' — parent Cancel-a-Ride) gate rosters per run type but never
-  the displayed status (U4);
-- raw 'absent' with no today-absence → 'at-home' (stale absent);
-- raw 'on-bus' with no active run today whose run_stops contain the student
-  → 'at-home' (stale on-bus). "Active" is the codebase's
-  status <> 'completed' convention, so 'delayed' keeps counting, and
-  membership goes through run_stops — never live_students.bus_id, which is
-  derived, morning-preferring, and drifts;
-- raw 'dropped-off' with no afternoon run today containing the student
-  (same run_stops membership) → 'at-home' (stale dropped-off);
-- anything else → the raw status.
+- a whole-day today-absence, or one where someone individually marked a period
+  (``marked_period``) → 'absent'. A period marking is a driver saying they were
+  at the stop and the child was not; that is evidence about the child, so it
+  shows even though its coverage is partial. A parent's own partial cancellation
+  is a statement of intent — it gates that run's roster and nothing else.
+
+  Keyed on ``marked_period`` rather than ``source = 'driver'`` because since U8
+  the driver no longer takes over the row: widening a parent's morning
+  cancellation with an afternoon mark leaves the source 'parent' (R20), and a
+  source test would have silently stopped showing those children as absent;
+- an unaccounted participation row on any of today's runs → 'unaccounted'.
+  Recorded by the office force-close: the app saying plainly that it does not
+  know where the child is, rather than guessing. This branch sits above the
+  rest because a completed run must not decay it to 'at-home';
+- a confirmed drop-off or hand-over today → 'dropped-off';
+- a boarding today on a run still open → 'on-bus' if the driver observed it,
+  'expected-on-bus' if the afternoon auto-board presumed it. The presumption is
+  never rendered as a confirmed fact;
+- a confirmed boarding on a completed morning run today → 'at-school';
+- everything else → 'at-home'. No participation and no absence today means the
+  child is not in the system's care, which also covers the child left at school
+  on an earlier day and the newly created student — the two cases the old
+  derivation got wrong because it fell through to the raw column.
 
 The admin students list wraps this expression with its own 'unassigned' rule
 (no live_student_routes rows → 'unassigned', overriding everything); that
@@ -43,26 +57,50 @@ _DISPLAY_STATUS_CASE = """case
                                select 1 from live_student_absences a
                                where a.student_id = {student}.id
                                  and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                                 and a.scope = 'day'
+                                 and (a.scope = 'day' or a.marked_period is not null)
                            ) then 'absent'
-                           when {student}.status = 'absent' then 'at-home'
-                           when {student}.status = 'on-bus' and not exists (
-                               select 1
-                               from live_runs r
-                               join run_stops rs on rs.run_id = r.id
-                               where rs.student_id = {student}.id
+                           when exists (
+                               select 1 from run_participation p
+                               join live_runs r on r.id = p.run_id
+                               where p.student_id = {student}.id
+                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
+                                 and p.unaccounted_at is not null
+                           ) then 'unaccounted'
+                           when exists (
+                               select 1 from run_participation p
+                               join live_runs r on r.id = p.run_id
+                               where p.student_id = {student}.id
+                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
+                                 and (p.dropped_off_at is not null or p.handover_at is not null)
+                           ) then 'dropped-off'
+                           when exists (
+                               select 1 from run_participation p
+                               join live_runs r on r.id = p.run_id
+                               where p.student_id = {student}.id
                                  and r.date = (now() at time zone 'Africa/Nairobi')::date
                                  and r.status <> 'completed'
-                           ) then 'at-home'
-                           when {student}.status = 'dropped-off' and not exists (
-                               select 1
-                               from live_runs r
-                               join run_stops rs on rs.run_id = r.id
-                               where rs.student_id = {student}.id
+                                 and p.boarded_at is not null
+                                 and p.boarded_presumed = false
+                           ) then 'on-bus'
+                           when exists (
+                               select 1 from run_participation p
+                               join live_runs r on r.id = p.run_id
+                               where p.student_id = {student}.id
                                  and r.date = (now() at time zone 'Africa/Nairobi')::date
-                                 and r.type = 'afternoon'
-                           ) then 'at-home'
-                           else {student}.status
+                                 and r.status <> 'completed'
+                                 and p.boarded_at is not null
+                                 and p.boarded_presumed = true
+                           ) then 'expected-on-bus'
+                           when exists (
+                               select 1 from run_participation p
+                               join live_runs r on r.id = p.run_id
+                               where p.student_id = {student}.id
+                                 and r.date = (now() at time zone 'Africa/Nairobi')::date
+                                 and r.type = 'morning'
+                                 and r.status = 'completed'
+                                 and p.boarded_at is not null
+                           ) then 'at-school'
+                           else 'at-home'
                        end"""
 
 

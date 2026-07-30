@@ -1,20 +1,34 @@
 from typing import Any
 
 from app.core.db import get_connection
-from app.dao.absence_dao import absent_student_ids
-from app.dao.status_sql import no_progress_case, scope_covers
+from app.dao.absence_dao import AbsenceDao, absent_student_ids
+from app.dao import participation_dao
+from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
 
 
 class RunDao:
     # --- admin runs --------------------------------------------------------
 
     def list_runs(self, active: bool = False) -> list[dict[str, Any]]:
-        """All runs, newest first. active=True narrows to today's (Africa/
-        Nairobi) non-completed runs — the dashboard's Active Runs card (R5),
-        same predicate shape as find_active_run_today."""
+        """All runs, newest first. active=True narrows to non-completed runs up
+        to and including today (Africa/Nairobi) — the dashboard's Active Runs
+        card (R5).
+
+        Deliberately *not* the same predicate as find_active_run_today, which
+        stays pinned to today so a stale run is invisible to every driver write
+        that resolves through it (R15; arrive and end take a run_id instead and
+        are guarded by _assert_service_day).
+
+        That pinning is what creates the problem this widening solves: a run
+        still open at midnight falls out of the driver lookup and out of the
+        per-date uniqueness index, and — before this — out of the office's view
+        too, so it sat in progress forever with nobody told. Prior-day runs
+        surface here flagged `stale`, which is where the office force-closes
+        them.
+        """
         where = (
             "where r.status <> 'completed' "
-            "and r.date = (now() at time zone 'Africa/Nairobi')::date"
+            "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
             if active
             else ""
         )
@@ -22,7 +36,21 @@ class RunDao:
             rows = conn.execute(
                 f"""
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
-                       {no_progress_case("r")} as no_progress
+                       {no_progress_case("r")} as no_progress,
+                       (r.status <> 'completed'
+                        and r.date < (now() at time zone 'Africa/Nairobi')::date) as stale,
+                       -- Children this run left unaccounted whose parents have
+                       -- not been phoned yet (U14/R14). On the list, not only in
+                       -- the force-close dialog: an office user pulled away
+                       -- mid-task would otherwise have no way to rediscover
+                       -- which runs still owe a family a call, which is the
+                       -- entire reason the obligation is recorded.
+                       (
+                           select count(*) from run_participation p
+                           where p.run_id = r.id
+                             and p.unaccounted_at is not null
+                             and p.contacted_at is null
+                       ) as contact_pending
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -81,18 +109,47 @@ class RunDao:
         return dict(row)
 
     def update_run(self, run_id: str, data: dict) -> dict[str, Any] | None:
+        """Edit a run's plan. Cannot complete one (R16).
+
+        Completion is a claim about children, not a field: it means every child
+        on the roster has a recorded outcome. Only the gated driver end and the
+        office force-close can make it, because only those two evaluate the
+        roster — one refusing until the driver accounts for everyone, the other
+        recording the unresolved children as unaccounted. Setting the column
+        here would produce a completed run with neither guarantee behind it.
+        """
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
             current = conn.execute(
-                "select date from live_runs where id = %s", (run_id,)
+                "select date, status from live_runs where id = %s", (run_id,)
             ).fetchone()
             if not current:
                 return None
+            if data.get("status") == "completed" and current["status"] != "completed":
+                raise ConflictError(
+                    "A run cannot be marked finished here. The driver ends it once "
+                    "every child is accounted for, or you can force-close it if they "
+                    "cannot."
+                )
+            # Reopening is blocked as well, and not only for symmetry: a finished
+            # run reopened here is no longer 'completed', which is what the
+            # delete refusal keys on — so reopen-then-delete would cascade the
+            # participation this unit exists to protect.
+            if (
+                current["status"] == "completed"
+                and data.get("status") not in (None, "completed")
+            ):
+                raise ConflictError(
+                    "This run is finished and cannot be reopened. Start a new run "
+                    "if the bus is going out again."
+                )
             # Re-run the create_run conflict check when the resulting state is
             # non-completed with a bus, excluding this run, so admins get the
             # friendly 409 instead of the raw unique-violation message (R3).
-            # The resulting date falls back to the run's current date,
-            # matching coalesce(%(date)s, date) in the update below.
-            if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
+            # The resulting date and status fall back to the run's current ones,
+            # matching the coalesce(..., <column>) pairs in the update below.
+            if data.get("bus_id") and (data.get("status") or current["status"]) != "completed":
                 self._assert_no_active_run_conflict(
                     conn, data["bus_id"], data.get("date") or current["date"],
                     exclude_run_id=run_id,
@@ -102,7 +159,11 @@ class RunDao:
                 update live_runs set
                     bus_id=%(bus_id)s, route_id=%(route_id)s, type=coalesce(%(type)s,'morning'),
                     date=coalesce(%(date)s, date), start_time=%(start_time)s, end_time=%(end_time)s,
-                    status=coalesce(%(status)s,'in-progress'), total_stops=coalesce(%(total_stops)s,0),
+                    -- Preserve, don't default: 'in-progress' here meant any edit
+                    -- that omitted the status silently reopened a completed run,
+                    -- which then blocked its own bus through the (bus, date)
+                    -- uniqueness index.
+                    status=coalesce(%(status)s, status), total_stops=coalesce(%(total_stops)s,0),
                     stops_completed=coalesce(%(stops_completed)s,0),
                     total_students=coalesce(%(total_students)s,0),
                     students_boarded=coalesce(%(students_boarded)s,0), incidents=coalesce(%(incidents)s,0)
@@ -113,26 +174,74 @@ class RunDao:
         return dict(row) if row else None
 
     def delete_run(self, run_id: str) -> None:
-        """Delete a run. Deleting a NON-completed run also resets its roster's
-        'on-bus' students back to 'at-school' in the same transaction — R28's
-        recovery path (admin deletes a mistakenly started run) must not strand
-        an auto-boarded afternoon roster on a phantom bus."""
+        """Delete a run — the admin's recovery path for a run started in error
+        (R16).
+
+        Deleting a non-completed run no longer writes any child a status. It
+        used to bulk-set the roster's 'on-bus' children to 'at-school', which
+        was a guess dressed as a fact: an afternoon roster is auto-boarded on
+        presumption, so that sweep asserted a whole busload arrived somewhere
+        nobody observed. Participation cascades with the run instead, leaving
+        each child with nothing recorded today — which derives to their true
+        pre-run state rather than an invented one.
+
+        The absence rows this run's driver created go with it, for the same
+        reason: they were marked in the course of a run that is being undone,
+        and leaving them would keep children absent for a trip that no longer
+        exists. Office- and parent-created rows are untouched — those are
+        statements from outside the run and the admin did not ask to revoke them.
+
+        Deleting a *completed* run dated today whose children have recorded
+        participation is refused. Those rows are now the only evidence anyone
+        boarded, so cascading them would flip a whole roster from at school to
+        at home in the middle of the day.
+
+        The refusal keys on the evidence rather than on the status, because the
+        two are not the same thing: an admin-created bookkeeping row carries no
+        roster and no participation, and blocking its deletion would cost the
+        office a legitimate correction to protect nothing. Older completed runs
+        keep their participation as history and delete normally — their day is
+        over, so nothing on a live surface moves.
+        """
+        from app.core.errors import ConflictError
+
         with get_connection() as conn:
             run = conn.execute(
-                "select status from live_runs where id = %s", (run_id,)
+                """
+                select r.status, r.driver_id, r.date,
+                       r.date = (now() at time zone 'Africa/Nairobi')::date as is_today,
+                       exists (
+                           select 1 from run_participation p
+                           where p.run_id = r.id and p.student_id is not null
+                       ) as has_evidence
+                from live_runs r where r.id = %s
+                """,
+                (run_id,),
             ).fetchone()
-            if run and run["status"] != "completed":
+            if run and run["status"] == "completed" and run["is_today"] and run["has_evidence"]:
+                raise ConflictError(
+                    "This run is finished, and its record is the only evidence of "
+                    "who was on the bus today. Deleting it would show those children "
+                    "as never having travelled. Edit the run instead."
+                )
+            if run and run["status"] != "completed" and run["driver_id"]:
+                # Scoped to this run's own roster: a driver runs a morning and an
+                # afternoon route on the same date, and undoing one must not
+                # revoke the absences they marked on the other.
                 conn.execute(
                     """
-                    update live_students set status = 'at-school'
-                    where status = 'on-bus'
-                      and id in (
+                    delete from live_student_absences
+                    where absence_date = %(date)s
+                      and source = 'driver'
+                      and marked_by = %(driver_id)s
+                      and student_id in (
                           select student_id from run_stops
-                          where run_id = %s and student_id is not null
+                          where run_id = %(run_id)s and student_id is not null
                       )
                     """,
-                    (run_id,),
+                    {"date": run["date"], "driver_id": run["driver_id"], "run_id": run_id},
                 )
+            # run_participation and run_stops cascade on the run's own delete.
             conn.execute("delete from live_runs where id = %s", (run_id,))
 
     def run_report(self, run_id: str) -> dict[str, Any]:
@@ -159,9 +268,12 @@ class RunDao:
             ).fetchone()
             if not run:
                 raise NotFoundError("Run was not found")
+            # period tells an afternoon non-boarding from a morning no-show
+            # (U8/R21) — the same child, two different failures, and the office
+            # cannot act on the report without knowing which.
             absent = conn.execute(
                 """
-                select student_id, student_name, reason from run_absences
+                select student_id, student_name, reason, period from run_absences
                 where run_id = %s order by student_name asc
                 """,
                 (run_id,),
@@ -177,7 +289,8 @@ class RunDao:
                     # afternoon run.
                     absent = conn.execute(
                         f"""
-                        select a.student_id, s.name as student_name, a.reason
+                        select a.student_id, s.name as student_name, a.reason,
+                               a.marked_period as period
                         from live_student_absences a
                         join live_students s on s.id = a.student_id
                         join live_student_routes sr
@@ -189,8 +302,13 @@ class RunDao:
                         (run["route_id"], run["date"], run["type"]),
                     ).fetchall()
                     approximate = True
+            # The contact obligation is re-readable per run (U14/R14), so the
+            # office can reopen a force-closed run days later and still see who
+            # was never accounted for and whether anyone rang their family.
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
         report = dict(run)
         report["absent_students"] = [dict(a) for a in absent]
+        report["unaccounted"] = outstanding
         report["approximate"] = approximate
         return report
 
@@ -243,32 +361,84 @@ class RunDao:
             # run to match, so only whole-day rows flag (the %s arm is NULL
             # then, and `a.scope = null` matches nothing).
             active_dict = dict(active) if active else None
-            absent_flag_sql = f"""
-                select s.*, exists (
+            # display_status travels with the roster (U3) so the driver phone
+            # reads the same derived value as the admin list and the parent app.
+            # It used to project the raw status column and show a stale on-bus
+            # child differently from every other surface.
+            def roster_sql(scope_param: str, undo: str) -> str:
+                return f"""
+                select s.*, {display_status_case("s")} as display_status, exists (
                     select 1 from live_student_absences a
                     where a.student_id = s.id
                       and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
-                      and {scope_covers("a.scope", "%s")}
-                ) as absent
+                      and {scope_covers("a.scope", scope_param)}
+                ) as absent{undo}
                 from live_students s
-            """
+                """
+
             if active_dict:
+                # can_undo drives the row's undo affordance (U13/R10) and mirrors
+                # reverse_own_action's conditions exactly: this run, this login's
+                # own action, still reversible. Deriving it on the phone would
+                # mean the button appears on rows the server then refuses — or,
+                # worse, hides on rows it would have allowed. Every terminal
+                # badge looking reversible invites accidental taps; none of them
+                # looking reversible makes the path undiscoverable.
+                #
+                # The absence arm matches reverse_driver_absence's own guard
+                # (source 'driver', marked by this login), so a driver mark that
+                # U8's precedence left attributed to the office or a parent
+                # correctly offers no undo here.
+                undo_sql = """, (
+                        exists (
+                            select 1 from run_participation p
+                            where p.run_id = %(run_id)s and p.student_id = s.id
+                              and (p.dropped_off_at is not null or p.handover_at is not null)
+                              and p.acting_driver_id = %(driver_id)s
+                        )
+                        or exists (
+                            select 1 from live_student_absences a2
+                            where a2.student_id = s.id
+                              and a2.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                              and a2.source = 'driver'
+                              and a2.marked_by = %(driver_id)s
+                        )
+                    ) as can_undo"""
                 students = conn.execute(
-                    absent_flag_sql
+                    roster_sql("%(run_type)s", undo_sql)
                     + """
                     where s.id in (
                         select rs.student_id from run_stops rs
-                        where rs.run_id = %s and rs.student_id is not null
+                        where rs.run_id = %(run_id)s and rs.student_id is not null
                     )
                     order by s.name asc
                     """,
-                    (active_dict["type"], active_dict["id"]),
+                    {
+                        "run_type": active_dict["type"],
+                        "run_id": active_dict["id"],
+                        "driver_id": driver_id,
+                    },
                 ).fetchall()
             else:
+                # No run, so nothing of this driver's to undo on one.
                 students = conn.execute(
-                    absent_flag_sql + " where s.bus_id = %s order by s.name asc",
+                    roster_sql("%s", ", false as can_undo")
+                    + " where s.bus_id = %s order by s.name asc",
                     (None, bus["id"]),
                 ).fetchall()
+            # The closure gate's blocking set, as data rather than only as the
+            # text of a 409 (U13/R11). The driver's end-run screen lists these
+            # names live, so they disappear one by one as each child is
+            # resolved; recomputing the rule on the phone instead would be a
+            # second implementation of the gate, free to drift from the one that
+            # actually refuses.
+            blocking = (
+                participation_dao.unaccounted_on_run(
+                    conn, str(active_dict["id"]), active_dict["type"]
+                )
+                if active_dict
+                else []
+            )
             run_stops = []
             if active_dict:
                 run_stops = [
@@ -285,8 +455,36 @@ class RunDao:
             "active_run": active_dict,
             "run_stops": run_stops,
             "students": [dict(s) for s in students],
+            "blocking": [{"id": str(b["id"]), "name": b["name"]} for b in blocking],
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
         }
+
+    def _assert_service_day(self, conn, run: dict) -> None:
+        """No driver action operates on a run from a past service day (R15).
+
+        The student-level paths get this free: they resolve the run through
+        find_active_run_today, so a stale run is simply not found. The two paths
+        that take a run_id straight from the client — arrive and end — do not,
+        and without this a driver opening the app the next morning could arrive
+        stops and close yesterday's run with today's timestamps.
+
+        Ending is blocked too, not just extending. A day-late close writes
+        today's end_time and today's counts onto yesterday's run, and any child
+        still unaccounted would be swept past by a gate that only sees the
+        roster. The office force-close is the designed exit precisely because it
+        records those children as unaccounted rather than closing over them.
+        """
+        from app.core.errors import ConflictError
+
+        row = conn.execute(
+            "select %s::date < (now() at time zone 'Africa/Nairobi')::date as stale",
+            (run["date"],),
+        ).fetchone()
+        if row and row["stale"]:
+            raise ConflictError(
+                "This run is from a previous day and can no longer be changed. "
+                "Ask the office to close it."
+            )
 
     def find_active_run_today(self, conn, bus_id: str) -> dict[str, Any] | None:
         row = conn.execute(
@@ -430,12 +628,34 @@ class RunDao:
                     """,
                     (run["id"], route["type"]),
                 )
+            if route["type"] == "afternoon":
+                # Record the auto-board as participation, flagged presumed (U2):
+                # the app assumed these children are aboard, nobody observed it.
+                # The distinction is what stops the arrival notification and the
+                # parent card asserting a boarding no actor recorded.
+                for row in conn.execute(
+                    """
+                    select rs.student_id, s.name
+                    from run_stops rs
+                    join live_students s on s.id = rs.student_id
+                    where rs.run_id = %s and rs.student_id is not null
+                      and s.status = 'on-bus'
+                    """,
+                    (run["id"],),
+                ).fetchall():
+                    participation_dao.record_boarding(
+                        conn, str(run["id"]), str(row["student_id"]), row["name"],
+                        str(driver_id), presumed=True,
+                    )
             # Recount students_boarded (never increment): morning counts who is
-            # on the bus, afternoon counts confirmed drop-offs — both 0 at
-            # start in the normal case, but recomputing keeps the counter
-            # honest even for roster students carried over in an odd state.
-            count_status = "dropped-off" if route["type"] == "afternoon" else "on-bus"
-            boarded_count = self._count_run_students_with_status(conn, run["id"], count_status)
+            # aboard, afternoon counts confirmed drop-offs — both 0 at start in
+            # the normal case, but recomputing keeps the counter honest even for
+            # roster students carried over in an odd state.
+            boarded_count = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if route["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -448,8 +668,12 @@ class RunDao:
             # snapshot would rot after student deletion.
             conn.execute(
                 f"""
-                insert into run_absences (run_id, student_id, student_name, reason)
-                select %s, s.id, s.name, a.reason
+                insert into run_absences (run_id, student_id, student_name, reason, period)
+                select %s, s.id, s.name, a.reason,
+                       -- What was individually marked, falling back to the
+                       -- row's coverage for absences nobody witnessed at a
+                       -- stop (an office mark, a parent cancellation).
+                       coalesce(a.marked_period, a.scope)
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
                 join live_student_routes sr
@@ -481,6 +705,7 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
+            self._assert_service_day(conn, run)
             new_completed = min(run["stops_completed"] + 1, run["total_stops"])
             conn.execute(
                 "update live_runs set stops_completed = %s where id = %s", (new_completed, run_id)
@@ -543,45 +768,83 @@ class RunDao:
         return {"run": dict(updated), "arrival_incident": arrival_incident}
 
     def end_run(self, driver_id: str, run_id: str) -> dict[str, Any]:
-        from app.core.errors import ConflictError, ForbiddenError
+        """Complete a run — refused while any roster child is unaccounted (U4).
+
+        The end-of-run sweep is gone. It used to write a terminal status to
+        every non-absent roster child, which meant a child who never boarded was
+        recorded as safely at school and a child the driver never confirmed off
+        the bus was recorded as dropped off. With the gate in place no sweep is
+        needed: every child already has an individually recorded outcome, or the
+        run does not close.
+
+        The run row is locked for the duration so a concurrent driver-end and
+        office force-close cannot both pass their completed check and each write
+        a different outcome for the same children.
+        """
+        from app.core.errors import ClosureRefusedError, ConflictError, ForbiddenError
 
         with get_connection() as conn:
-            run = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+            run = conn.execute(
+                "select * from live_runs where id = %s for update", (run_id,)
+            ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
-            # Capture who was actually on the bus before the sweep wipes it;
-            # notifications must only assert arrival for boarded students.
-            boarded = conn.execute(
-                """
-                select distinct s.id from live_students s
-                where s.id in (select student_id from run_stops where run_id = %s and student_id is not null)
-                  and s.status = 'on-bus'
-                """,
-                (run_id,),
-            ).fetchall()
-            # Persist students_boarded as the final pre-sweep count over the
-            # run's own roster (run_stops), per run type: morning counts who
-            # is on the bus; afternoon counts who was dropped off at their
-            # stop (tap-time drop-offs) before the sweep rewrites statuses.
-            final_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
-            final_count = self._count_run_students_with_status(conn, run_id, final_status)
+            self._assert_service_day(conn, run)
+
+            blocking = participation_dao.unaccounted_on_run(conn, str(run_id), run["type"])
+            if blocking:
+                names = ", ".join(b["name"] for b in blocking)
+                action = (
+                    "Confirm their drop-off, record an off-route hand-over, or mark them absent"
+                    if run["type"] == "afternoon"
+                    else "Board them or mark them absent"
+                )
+                # Typed so the router can alert the office naming the same
+                # children the driver was just told about (U11).
+                raise ClosureRefusedError(
+                    f"Not everyone is accounted for: {names}. {action} before ending the run.",
+                    run_id=str(run_id),
+                    blocking=[dict(b) for b in blocking],
+                )
+            # Who the driver actually observed boarding (U2). Read from
+            # participation, not from the status column: a presumed afternoon
+            # board is not evidence a child rode, and the arrival notification
+            # must never assert arrival for one. This also no longer needs to
+            # run "before the sweep wipes it" — the record outlives the run.
+            boarded_ids = participation_dao.confirmed_boarded_ids(conn, str(run_id))
+            # Persist students_boarded per run type: morning counts who is
+            # aboard; afternoon counts confirmed drop-offs and hand-overs.
+            final_count = (
+                participation_dao.count_dropped_off(conn, str(run_id))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run_id))
+            )
             conn.execute(
                 "update live_runs set status='completed', stops_completed=total_stops, "
                 "students_boarded=%s, "
                 "end_time=to_char(now() at time zone 'Africa/Nairobi','HH24:MI') where id=%s",
                 (final_count, run_id),
             )
-            # Sweep the run's roster (run_stops student_ids), skipping absent.
-            sweep_status = "dropped-off" if run["type"] == "afternoon" else "at-school"
+            # No sweep. Every roster child reached this point with a recorded
+            # outcome — that is what the gate above guarantees — so writing one
+            # here could only manufacture a claim nobody made.
+            #
+            # live_students.status is still updated for children who boarded, so
+            # the vestigial column does not drift while it survives; nothing
+            # derives from it since U3.
+            column_status = "dropped-off" if run["type"] == "afternoon" else "at-school"
             conn.execute(
                 """
                 update live_students set status = %s
-                where id in (select distinct student_id from run_stops where run_id = %s and student_id is not null)
-                    and status <> 'absent'
+                where id in (
+                    select p.student_id from run_participation p
+                    where p.run_id = %s and p.student_id is not null
+                      and p.boarded_at is not null
+                )
                 """,
-                (sweep_status, run_id),
+                (column_status, run_id),
             )
             # Clear the bus live position.
             conn.execute(
@@ -590,8 +853,91 @@ class RunDao:
             )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
         result = dict(updated)
-        result["boarded_student_ids"] = [str(b["id"]) for b in boarded]
+        result["boarded_student_ids"] = boarded_ids
         return result
+
+    def force_close_run(self, admin_id: str, run_id: str) -> dict[str, Any]:
+        """Close a run no driver can resolve (U6/R12-R14).
+
+        A driver whose phone dies, whose shift ends, or who simply forgets leaves
+        the run open — and the partial unique index on (bus, date) then blocks
+        that bus from starting its next route for the day. Past midnight it gets
+        worse: every driver action resolves the run through a date-scoped lookup,
+        so the driver loses even their own release. Without this the only exit
+        is deleting the run, which destroys its report.
+
+        This is not a sweep. Children without an outcome are recorded
+        **unaccounted** — the app saying plainly that nobody knows — rather than
+        given a terminal status nobody observed. That distinction is the whole
+        reason the sweep was removed.
+
+        Returns the run plus the children the office now owes a phone call.
+        """
+        from app.core.errors import ConflictError, NotFoundError
+
+        with get_connection() as conn:
+            run = conn.execute(
+                "select * from live_runs where id = %s for update", (run_id,)
+            ).fetchone()
+            if not run:
+                raise NotFoundError("Run not found")
+            if run["status"] == "completed":
+                raise ConflictError("Run is already completed")
+
+            blocking = participation_dao.unaccounted_on_run(conn, str(run_id), run["type"])
+            participation_dao.record_unaccounted(conn, str(run_id), blocking)
+
+            gate_reached = participation_dao.gate_arrival_recorded(conn, str(run_id))
+            boarded_ids = (
+                participation_dao.confirmed_boarded_ids(conn, str(run_id))
+                if gate_reached and run["type"] == "morning"
+                else []
+            )
+            final_count = (
+                participation_dao.count_dropped_off(conn, str(run_id))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run_id))
+            )
+            # No force_closed_by column: a force-closed run is identifiable by
+            # its unaccounted participation rows, and the office alert records
+            # who did it. Adding two columns for a fact already derivable would
+            # have meant a second migration on a promise of one.
+            conn.execute(
+                """
+                update live_runs
+                set status = 'completed', stops_completed = total_stops,
+                    students_boarded = %s,
+                    end_time = to_char(now() at time zone 'Africa/Nairobi', 'HH24:MI')
+                where id = %s
+                """,
+                (final_count, run_id),
+            )
+            conn.execute(
+                "update live_buses set current_lat = null, current_lng = null where id = %s",
+                (run["bus_id"],),
+            )
+            updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+
+        result = dict(updated)
+        # Only children the driver was recorded as observing aboard, and only
+        # when the gate arrival was itself recorded (R13). The office was not on
+        # the bus; a notification on its say-so would be the manufactured claim
+        # this work removes.
+        result["boarded_student_ids"] = boarded_ids
+        result["gate_arrival_recorded"] = gate_reached
+        result["unaccounted"] = outstanding
+        return result
+
+    def record_parent_contact(self, admin_id: str, run_id: str, student_id: str) -> dict[str, Any]:
+        """Record that the office phoned an unaccounted child's parents (R14)."""
+        from app.core.errors import NotFoundError
+
+        with get_connection() as conn:
+            if not participation_dao.record_contact(conn, str(run_id), student_id, admin_id):
+                raise NotFoundError("No unaccounted child on this run to record contact for")
+            outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+        return {"run_id": str(run_id), "unaccounted": outstanding}
 
     def write_position(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
         """Record the bus position; returns the active run snapshot."""
@@ -643,10 +989,17 @@ class RunDao:
                 "update live_students set status = 'on-bus' where id = %s returning *",
                 (student_id,),
             ).fetchone()
-            # Recount students_boarded from the run's own roster in the SAME
-            # transaction — never increment/decrement, so repeated taps and
-            # board/unboard cycles can't drift the counter (R15).
-            boarded_count = self._count_run_students_with_status(conn, run["id"], "on-bus")
+            # The observed fact, recorded against this run with its actor (U2).
+            # The status write above stays for now: participation and the column
+            # coexist until the follow-up drops it.
+            participation_dao.record_boarding(
+                conn, str(run["id"]), student_id, row["name"], str(driver_id), presumed=False
+            )
+            # Recount students_boarded from participation in the SAME
+            # transaction — never increment/decrement, so repeated taps can't
+            # drift the counter (R15), and it no longer reads a status column
+            # that has stopped tracking boarding.
+            boarded_count = participation_dao.count_boarded(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -682,39 +1035,197 @@ class RunDao:
                 raise ForbiddenError("Student is not on this run")
             if stop["stop_order"] > run["stops_completed"]:
                 raise ConflictError("Stop has not been reached yet")
-            student = conn.execute(
-                "select * from live_students where id = %s", (student_id,)
-            ).fetchone()
-            if not student or student["status"] != "on-bus":
+            # Precondition re-keyed onto participation (U2), not the status
+            # column. The afternoon board is presumed, so a child may legitimately
+            # be mid-transition; what matters is that this run records them
+            # aboard. Keying on status would refuse every afternoon confirmation
+            # the moment boarding stops writing it, and no afternoon run could
+            # then pass the closure gate.
+            aboard = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            if not aboard or aboard["boarded_at"] is None:
                 raise ConflictError("Student is not on the bus")
+            if aboard["dropped_off_at"] is not None or aboard["handover_at"] is not None:
+                raise ConflictError("This drop-off is already confirmed")
             row = conn.execute(
                 "update live_students set status = 'dropped-off' where id = %s returning *",
                 (student_id,),
             ).fetchone()
-            dropped_count = self._count_run_students_with_status(conn, run["id"], "dropped-off")
+            participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
+            dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (dropped_count, run["id"]),
             ).fetchone()
         return dict(row), dict(run)
 
-    def mark_student_absent(
-        self, driver_id: str, student_id: str
+    def record_handover(
+        self, driver_id: str, student_id: str, note: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Driver marks a roster student absent mid-run (R30); returns
+        """Record a hand-over away from the child's own stop (U4/R12).
+
+        A breakdown, a closed road, a guardian collecting at the roadside — the
+        child left the bus, just not where the route said. Without this the
+        driver's only release is marking them absent, which tells the family the
+        child was never on the bus home: false, and the exact class of claim
+        this work removes. Records an accounted outcome with the driver's note
+        and no absence row.
+
+        Unlike a drop-off this does not require the child's stop to have been
+        reached, because by definition it did not happen there.
+        """
+        from app.core.errors import BadRequestError, ConflictError, ForbiddenError
+
+        note = (note or "").strip()
+        if not note:
+            raise BadRequestError("A note is required — say where the child was handed over.")
+
+        with get_connection() as conn:
+            bus_id = self._bus_id_for_driver(conn, driver_id)
+            run = self.find_active_run_today(conn, bus_id) if bus_id else None
+            if not run or str(run["driver_id"]) != str(driver_id):
+                raise ForbiddenError("No active run for this driver")
+            stop = conn.execute(
+                "select 1 from run_stops where run_id = %s and student_id = %s limit 1",
+                (run["id"], student_id),
+            ).fetchone()
+            if not stop:
+                raise ForbiddenError("Student is not on this run")
+            aboard = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            if not aboard or aboard["boarded_at"] is None:
+                raise ConflictError("Student is not on the bus")
+            if aboard["dropped_off_at"] is not None or aboard["handover_at"] is not None:
+                raise ConflictError("This child is already accounted for")
+            participation_dao.record_handover(
+                conn, str(run["id"]), student_id, str(driver_id), note
+            )
+            row = conn.execute(
+                "update live_students set status = 'dropped-off' where id = %s returning *",
+                (student_id,),
+            ).fetchone()
+            dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
+            run = conn.execute(
+                "update live_runs set students_boarded = %s where id = %s returning *",
+                (dropped_count, run["id"]),
+            ).fetchone()
+        return dict(row), dict(run)
+
+    def reverse_own_action(
+        self, driver_id: str, student_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        """Undo this driver's own drop-off, hand-over or absence mark while the
+        run is still open (U5/R10). Returns (student, run, what_was_reversed).
+
+        The closure gate makes a mis-tap consequential. A drop-off confirmed on
+        the wrong child sends that family a false assurance and cannot be taken
+        back; an absence marked in error both misrecords the child and blocks
+        their real drop-off from ever being confirmed, because the drop-off path
+        requires them to be aboard.
+
+        This is a dedicated path, never a relaxation of the boarding toggle.
+        That endpoint's rejection of un-boarding is a stale-client concurrency
+        guard with a justification independent of the finality argument, and
+        relaxing it would regress that protection while appearing to change only
+        UX.
+
+        Scope is deliberately narrow: this driver's account, this run, still
+        open. The driver assistant shares the login, so "their own action" means
+        this login's action — enough to correct a mis-tap, not an audit trail.
+        """
+        from app.core.errors import ConflictError, ForbiddenError
+
+        with get_connection() as conn:
+            bus_id = self._bus_id_for_driver(conn, driver_id)
+            run = self.find_active_run_today(conn, bus_id) if bus_id else None
+            if not run or str(run["driver_id"]) != str(driver_id):
+                raise ForbiddenError("No active run for this driver")
+            stop = conn.execute(
+                "select 1 from run_stops where run_id = %s and student_id = %s limit 1",
+                (run["id"], student_id),
+            ).fetchone()
+            if not stop:
+                raise ForbiddenError("Student is not on this run")
+
+            record = participation_dao.get_for_student(conn, str(run["id"]), student_id)
+            reversed_what: str | None = None
+
+            if record and (record["dropped_off_at"] or record["handover_at"]):
+                if str(record["acting_driver_id"] or "") != str(driver_id):
+                    raise ForbiddenError("That was recorded by a different driver")
+                reversed_what = (
+                    "handover" if record["handover_at"] and not record["dropped_off_at"]
+                    else "dropoff"
+                )
+                participation_dao.reverse_outcome(conn, str(run["id"]), student_id)
+                conn.execute(
+                    "update live_students set status = 'on-bus' where id = %s", (student_id,)
+                )
+            elif AbsenceDao().reverse_driver_absence(conn, student_id, str(driver_id)):
+                reversed_what = "absence"
+                # Back onto the run as boarded: the child was aboard, which is
+                # why the driver could mark them absent from this run at all.
+                name = conn.execute(
+                    "select name from live_students where id = %s", (student_id,)
+                ).fetchone()
+                participation_dao.record_boarding(
+                    conn, str(run["id"]), student_id, name["name"], str(driver_id),
+                    presumed=(run["type"] == "afternoon"),
+                )
+
+            if not reversed_what:
+                raise ConflictError(
+                    "Nothing of yours to undo for this child on this run."
+                )
+
+            counted = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
+            run = conn.execute(
+                "update live_runs set students_boarded = %s where id = %s returning *",
+                (counted, run["id"]),
+            ).fetchone()
+            student = conn.execute(
+                "select * from live_students where id = %s", (student_id,)
+            ).fetchone()
+        return dict(student), dict(run), reversed_what
+
+    def mark_student_absent(
+        self, driver_id: str, student_id: str, *, whole_day: bool = False
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Driver marks a roster student absent mid-run (U8/R17-R20); returns
         (student, run snapshot enriched with route_name/bus_name for the
         caller's post-commit notification + incident tasks).
 
-        Single transaction: upsert today's live_student_absences row
-        (marked_by = the driver; a repeat mark is a reason edit, never a
-        500), append the run_absences snapshot (on conflict do nothing —
-        one row per run+student), set status 'absent', recount
-        students_boarded from the run's roster.
+        Scoped to the period the driver actually witnessed. It used to write a
+        whole-day absence from a single run, which said something the driver was
+        in no position to know: a child who is not at their morning stop may
+        well be riding home that afternoon, and the whole-day row struck them off
+        the afternoon roster too — so the bus never stopped for them, and the
+        record blamed the child for a stop nobody made. Whole-day coverage now
+        needs the driver to say so (`whole_day`), which is a claim they can only
+        make from something a parent told them.
 
-        Staff transition rule (U4): a driver mark is a whole-day absence, so
-        the conflict branch escalates any existing row — a parent's partial
-        cancellation included — to scope='day' and stamps source='driver'
-        (the provenance ratchet's one-way direction).
+        Three fields move independently on a repeat mark, and the distinction is
+        the point:
+
+        - **scope** is coverage, and only ever widens (R19). Morning marked, then
+          afternoon, means the child was absent all day; nothing here may narrow
+          an existing row, because the earlier writer saw something this one did
+          not.
+        - **source** is precedence: office, then parent, then driver (R20). A
+          driver mark no longer re-attributes an office or parent row. The old
+          ratchet ran the other way and let the last actor at the stop overwrite
+          a cancellation the office had recorded deliberately.
+        - **marked_period** is the witness: which period someone individually
+          marked, surviving the collapse to 'day' that widening causes. Without
+          it the run report cannot tell an afternoon non-boarding from a morning
+          no-show, and the derivation cannot tell a driver's period observation
+          from a parent's partial cancellation — only the first of which is
+          evidence the child is not travelling at all.
+
+        marked_by follows source rather than the last write: it is the row's
+        actor, and reverse_driver_absence keys on the pair.
         """
         from app.core.errors import ForbiddenError
 
@@ -730,16 +1241,46 @@ class RunDao:
             ).fetchone()
             if not stop:
                 raise ForbiddenError("Student is not on this run")
+            period = "day" if whole_day else run["type"]
             conn.execute(
                 """
-                insert into live_student_absences
-                    (student_id, absence_date, reason, marked_by, scope, source)
-                values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'day', 'driver')
-                on conflict (student_id, absence_date)
-                do update set reason = excluded.reason, marked_by = excluded.marked_by,
-                              scope = 'day', source = 'driver'
+                insert into live_student_absences as a
+                    (student_id, absence_date, reason, marked_by, scope, source, marked_period)
+                values (
+                    %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
+                    %(reason)s, %(driver)s, %(period)s, 'driver', %(period)s
+                )
+                on conflict (student_id, absence_date) do update set
+                    reason = excluded.reason,
+                    -- Coverage widens, never narrows: two different scopes union
+                    -- to the whole day (R19).
+                    scope = case
+                        when a.scope = excluded.scope then a.scope
+                        else 'day'
+                    end,
+                    -- Office and parent rows keep their attribution (R20).
+                    source = case
+                        when a.source in ('admin', 'parent') then a.source
+                        else excluded.source
+                    end,
+                    marked_by = case
+                        when a.source in ('admin', 'parent') then a.marked_by
+                        else excluded.marked_by
+                    end,
+                    -- Both periods individually witnessed means the whole day
+                    -- was, which is a stronger claim than either mark alone.
+                    marked_period = case
+                        when a.marked_period is null then excluded.marked_period
+                        when a.marked_period = excluded.marked_period then a.marked_period
+                        else 'day'
+                    end
                 """,
-                (student_id, reason, driver_id),
+                {
+                    "student_id": student_id,
+                    "reason": reason,
+                    "driver": driver_id,
+                    "period": period,
+                },
             )
             student = conn.execute(
                 "update live_students set status = 'absent' where id = %s returning *",
@@ -747,15 +1288,22 @@ class RunDao:
             ).fetchone()
             inserted = conn.execute(
                 """
-                insert into run_absences (run_id, student_id, student_name, reason)
-                values (%s, %s, %s, %s)
+                insert into run_absences (run_id, student_id, student_name, reason, period)
+                values (%s, %s, %s, %s, %s)
                 on conflict (run_id, student_id) do nothing
                 returning id
                 """,
-                (run["id"], student_id, student["name"], reason),
+                (run["id"], student_id, student["name"], reason, period),
             ).fetchone()
-            count_status = "dropped-off" if run["type"] == "afternoon" else "on-bus"
-            boarded_count = self._count_run_students_with_status(conn, run["id"], count_status)
+            # A child marked absent was not aboard, so their participation goes
+            # (U2). On an afternoon run this retracts the presumed board the
+            # auto-board wrote — the correction that presumption exists to allow.
+            participation_dao.clear_for_student(conn, str(run["id"]), student_id)
+            boarded_count = (
+                participation_dao.count_dropped_off(conn, str(run["id"]))
+                if run["type"] == "afternoon"
+                else participation_dao.count_boarded(conn, str(run["id"]))
+            )
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
@@ -776,21 +1324,14 @@ class RunDao:
         # newly_recorded lets the API layer keep the school-side incident
         # idempotent per run+student: repeat taps re-notify nothing.
         run["newly_recorded"] = inserted is not None
+        # What the parent message may claim (U8/R21). Not run["type"]: an
+        # explicit whole-day confirmation says more than this run does.
+        run["absence_period"] = period
         return dict(student), run
 
-    def _count_run_students_with_status(self, conn, run_id: str, status: str) -> int:
-        """Distinct students on the run's own roster (run_stops) currently in
-        ``status``. The run-scoped roster, never the derived bus roster."""
-        row = conn.execute(
-            """
-            select count(distinct s.id) as n from live_students s
-            where s.id in (
-                select student_id from run_stops where run_id = %s and student_id is not null
-            ) and s.status = %s
-            """,
-            (run_id, status),
-        ).fetchone()
-        return row["n"]
+    # _count_run_students_with_status is gone (U2): every counter now reads
+    # participation. Counting a status column that no longer tracks boarding
+    # would have frozen students_boarded at whatever the last sweep left.
 
     def _bus_id_for_driver(self, conn, driver_id: str) -> str | None:
         row = conn.execute(

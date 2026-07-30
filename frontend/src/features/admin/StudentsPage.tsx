@@ -50,6 +50,8 @@ import {
   STUDENT_STATUS_FILTERS,
   studentMatchesFilter,
   absenceBadgeLabel,
+  labelFor,
+  variantFor,
   type StudentDisplayStatus,
 } from "@/lib/statusVocabulary";
 
@@ -371,11 +373,15 @@ export function StudentsPage() {
                       </div>
                     </TableCell>
                     <TableCell>
+                      {/* Through the shared lookups, not a direct index: the
+                          `?? s.display_status` fallback echoed the raw slug for
+                          any value the map had not caught up with, which is the
+                          drift the vocabulary exists to prevent. */}
                       <Badge
-                        variant={STUDENT_STATUS_VARIANT[s.display_status as StudentDisplayStatus] ?? "secondary"}
+                        variant={variantFor(STUDENT_STATUS_VARIANT, s.display_status)}
                         className={s.display_status === "unassigned" ? "text-muted-foreground" : undefined}
                       >
-                        {STUDENT_STATUS_LABEL[s.display_status as StudentDisplayStatus] ?? s.display_status}
+                        {labelFor(STUDENT_STATUS_LABEL, s.display_status)}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right">

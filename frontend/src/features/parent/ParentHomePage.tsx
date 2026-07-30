@@ -24,9 +24,11 @@ import {
   type ChildCancellation,
 } from "@/features/parent/parentHooks";
 import {
-  STUDENT_STATUS_LABEL,
+  PARENT_STUDENT_STATUS_LABEL,
+  PARENT_STUDENT_STATUS_NOTE,
   STUDENT_STATUS_VARIANT,
   labelFor,
+  noteFor,
   variantFor,
 } from "@/lib/statusVocabulary";
 
@@ -92,6 +94,11 @@ export function withdrawChoices(
  * `display_status` (absence- and staleness-aware) and falls back to the raw
  * operational `status` for older payloads. Solid fill, slightly larger than
  * the default badge. Shared with the Profile page's My Children card.
+ *
+ * Parent wording, not the operational term (U12/R27): an 'unaccounted' child
+ * reads as "Being confirmed" with a line saying the school will call. The
+ * office raises that phone call obligation on force-close precisely so a person
+ * delivers this news — the app must not get there first with a dispatcher's word.
  */
 export function ChildStatusBadge({
   child,
@@ -107,8 +114,29 @@ export function ChildStatusBadge({
       variant={variantFor(STUDENT_STATUS_VARIANT, status)}
       className={cn("px-3 py-1 text-sm", className)}
     >
-      {labelFor(STUDENT_STATUS_LABEL, status)}
+      {labelFor(PARENT_STUDENT_STATUS_LABEL, status)}
     </Badge>
+  );
+}
+
+/**
+ * The line under the card explaining a status a badge cannot carry on its own.
+ *
+ * Its own full-width row rather than a second line inside the badge column: a
+ * sentence in that narrow right-hand cell sets the column's width and squeezes
+ * the child's name into a three-line stack on a phone.
+ */
+export function ChildStatusNote({
+  child,
+}: {
+  child: { display_status?: string | null; status?: string | null };
+}) {
+  const note = noteFor(PARENT_STUDENT_STATUS_NOTE, child.display_status ?? child.status);
+  if (!note) return null;
+  return (
+    <p data-testid="child-status-note" className="text-xs text-muted-foreground">
+      {note}
+    </p>
   );
 }
 
@@ -263,6 +291,8 @@ export function ParentHomePage() {
                         )}
                       </div>
                     </div>
+
+                    <ChildStatusNote child={child} />
 
                     {onBus && (
                       <p className="flex items-center gap-2 text-sm text-muted-foreground">

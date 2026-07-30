@@ -1,4 +1,5 @@
 from app.core.db import get_connection
+from app.dao.status_sql import display_status_case
 
 
 class PushDao:
@@ -174,11 +175,18 @@ class PushDao:
         return [str(row["parent_id"]) for row in rows]
 
     def students_on_run(self, run_id: str, include_absent: bool = False) -> list[dict]:
-        """Students with a seat on the run's stop roster."""
+        """Students with a seat on the run's stop roster.
+
+        Recipients are filtered on the derived status (U3), not the raw column.
+        The column no longer answers "should this family hear from us": a child
+        the office recorded as unaccounted still reads 'on-bus' there, so a
+        column-based filter kept sending them run notifications — contradicting
+        the rule that their parents hear nothing until the office calls.
+        """
         with get_connection() as conn:
             rows = conn.execute(
-                """
-                select distinct s.id, s.name, s.status
+                f"""
+                select distinct s.id, s.name, {display_status_case("s")} as display_status
                 from run_stops rs
                 join live_students s on s.id = rs.student_id
                 where rs.run_id = %s
@@ -188,7 +196,8 @@ class PushDao:
         students = [dict(row) for row in rows]
         if include_absent:
             return students
-        return [s for s in students if s["status"] != "absent"]
+        silent = {"absent", "unaccounted"}
+        return [s for s in students if s["display_status"] not in silent]
 
     def students_at_stop(self, run_id: str, stop_order: int) -> list[dict]:
         """Students whose stop sits at the given order on the run (coordinates
@@ -196,12 +205,13 @@ class PushDao:
         with get_connection() as conn:
             rows = conn.execute(
                 """
-                select rs.student_id, s.name as student_name, s.status as student_status
+                select rs.student_id, s.name as student_name,
+                       {display_status} as student_status
                 from run_stops rs
                 join live_students s on s.id = rs.student_id
                 where rs.run_id = %s and rs.stop_order = %s
                   and rs.is_school_gate = false and rs.student_id is not null
-                """,
+                """.format(display_status=display_status_case("s")),
                 (run_id, stop_order),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -212,7 +222,7 @@ class PushDao:
             rows = conn.execute(
                 """
                 select rs.stop_order, rs.lat, rs.lng, rs.student_id, s.name as student_name,
-                       s.status as student_status
+                       {display_status} as student_status
                 from run_stops rs
                 join live_students s on s.id = rs.student_id
                 where rs.run_id = %s
@@ -221,10 +231,34 @@ class PushDao:
                   and rs.student_id is not null
                   and rs.lat is not null
                   and rs.lng is not null
-                """,
+                """.format(display_status=display_status_case("s")),
                 (run_id, stops_completed),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def retract_notifications(self, run_id: str, student_id: str, types: list[str]) -> int:
+        """Remove notifications superseded by a driver correction (U5).
+
+        The dedup index is unique on (user, run, student, type), which is what
+        makes a retried tap harmless. It also means a re-confirmation after a
+        reversal would be silently suppressed as a duplicate — the family would
+        keep the false message and never receive the true one.
+
+        Deleting the superseded rows fixes both halves: the parent feed stops
+        showing a claim the driver retracted, and the corrected outcome can be
+        delivered when it happens. The correction notification itself tells the
+        family what changed, so nothing disappears unexplained.
+        """
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                delete from live_notifications
+                where run_id = %s and student_id = %s and type = any(%s)
+                returning id
+                """,
+                (run_id, student_id, types),
+            ).fetchall()
+        return len(rows)
 
     def insert_notification(
         self,

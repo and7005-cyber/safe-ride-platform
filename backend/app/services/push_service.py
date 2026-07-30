@@ -165,16 +165,107 @@ class PushService:
         except Exception:
             logger.exception("notify_student_dropped_off failed")
 
+    def notify_student_handover(self, student: dict, run: dict, note: str) -> None:
+        """Driver handed the child over away from their stop (U4/R12).
+
+        Reuses the 'dropped-off' type on purpose: from the family's side this is
+        the same event — the child left the bus — and the type carries the
+        dedup key and the parent-feed label already. What changes is the body,
+        which says where, because the route's own stop would be the wrong answer.
+        """
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type="dropped-off",
+                    title="Left the bus",
+                    body=(
+                        f"{link['student_name']} left the bus away from their usual stop. "
+                        f"Driver's note: {note}"
+                    ),
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_student_handover failed")
+
+    def notify_correction(self, student: dict, run: dict, reversed_what: str) -> None:
+        """The driver corrected their own mis-tap (U5/R10).
+
+        Its own notification type, because the dedup index keys on
+        (user, run, student, type): reusing 'dropped-off' or 'student-absent'
+        would be suppressed as a duplicate of the very message being corrected,
+        and the family would keep the false one.
+        """
+        try:
+            student_id = str(student["id"])
+            # Retract the message being corrected first. The dedup index is
+            # unique on (user, run, student, type), so leaving it would suppress
+            # the driver's genuine second confirmation as a duplicate — the
+            # family would keep the false message and never get the true one.
+            superseded = (
+                ["student-absent"] if reversed_what == "absence" else ["dropped-off"]
+            )
+            self.dao.retract_notifications(str(run["id"]), student_id, superseded)
+
+            if reversed_what == "absence":
+                type_ = "absence-corrected"
+                title = "Correction: not absent"
+                tail = "was marked absent by mistake. They are on the bus."
+            else:
+                type_ = "dropoff-corrected"
+                title = "Correction: not dropped off"
+                tail = (
+                    "was marked as dropped off by mistake. They are still on the bus — "
+                    "the driver will confirm when they get off."
+                )
+            for link in self.dao.parents_of_students([student_id]):
+                self._notify(
+                    link["parent_id"],
+                    type=type_,
+                    title=title,
+                    body=f"{link['student_name']} {tail}",
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                )
+        except Exception:
+            logger.exception("notify_correction failed")
+
     def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
         """Driver marked the child absent at pickup — tell that child's linked
         parents and nobody else. Run-scoped (run_id + student_id set) so a
         repeat mark within the same run is dedup-suppressed. The school-side
         channel is a student-stamped incident inserted by the caller, never a
-        parent fan-out."""
+        parent fan-out.
+
+        The body states the period covered and claims nothing beyond it
+        (U8/R21). It used to say "will not board the bus today" off a single
+        run — so a parent whose child missed the morning pickup was told they
+        were not coming home either, which the driver had no way of knowing and
+        which was often simply wrong.
+        """
         try:
             student_id = str(student["id"])
+            period = run.get("absence_period") or run.get("type") or "day"
+            name_slot = "{name}"
+            if period == "morning":
+                template = (
+                    f"{name_slot} was not at the stop for the morning pickup, so they are "
+                    "not riding to school. The trip home is unaffected."
+                )
+            elif period == "afternoon":
+                template = (
+                    f"{name_slot} did not board the bus home this afternoon."
+                )
+            else:
+                template = f"{name_slot} is marked absent for the whole day and will not travel."
             for link in self.dao.parents_of_students([student_id]):
-                body = f"{link['student_name']} was marked absent at pickup and will not board the bus today."
+                body = template.format(name=link["student_name"])
                 if reason:
                     body = f"{body} Reason: {reason}"
                 self._notify(
@@ -374,7 +465,7 @@ class PushService:
             bus = self._bus_label(run.get("bus_id"))
             students = [
                 s for s in self.dao.students_at_stop(str(run["id"]), next_order)
-                if s["student_status"] != "absent"
+                if s["student_status"] not in ("absent", "unaccounted")
             ]
             for link in self.dao.parents_of_students([s["student_id"] for s in students]):
                 self._notify(
@@ -399,7 +490,7 @@ class PushService:
             stops = self.dao.remaining_student_stops(str(run["id"]), run["stops_completed"])
             near = [
                 s for s in stops
-                if s["student_status"] != "absent"
+                if s["student_status"] not in ("absent", "unaccounted")
                 and haversine_m(lat, lng, float(s["lat"]), float(s["lng"])) <= radius
             ]
             for link in self.dao.parents_of_students([s["student_id"] for s in near]):
@@ -419,15 +510,20 @@ class PushService:
     # Internals ----------------------------------------------------------------
 
     def _boarded_links(self, run: dict) -> list[dict]:
-        """Parent links for students who actually boarded this run.
+        """Parent links for children the driver actually observed boarding.
 
-        end_run snapshots the pre-sweep on-bus roster into
-        run["boarded_student_ids"]; gate arrivals read live statuses.
+        end_run supplies run["boarded_student_ids"] from participation —
+        confirmed boardings only. A presumed afternoon board is not evidence a
+        child rode, and asserting arrival for one would be a false safety claim.
+
+        The fallback covers callers with no snapshot (a gate arrival mid-run)
+        and reads the derived status, not the raw column: after U2 the column
+        no longer tracks who boarded this run.
         """
         boarded_ids = run.get("boarded_student_ids")
         if boarded_ids is None:
             students = self.dao.students_on_run(str(run["id"]))
-            boarded_ids = [s["id"] for s in students if s.get("status") == "on-bus"]
+            boarded_ids = [s["id"] for s in students if s.get("display_status") == "on-bus"]
         return self.dao.parents_of_students(list(boarded_ids))
 
     def _bus_label(self, bus_id: str | None) -> str:

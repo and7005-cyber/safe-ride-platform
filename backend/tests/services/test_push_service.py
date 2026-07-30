@@ -39,9 +39,14 @@ class FakePushDao:
         return self.bus_parents
 
     def students_on_run(self, run_id, include_absent=False):
+        # Mirrors the real DAO since U3: recipients are filtered on the derived
+        # status, not the stored column. A child the office recorded as
+        # unaccounted must not receive run notifications — their parents hear
+        # from the office first.
         if include_absent:
             return self.run_students
-        return [s for s in self.run_students if s["status"] != "absent"]
+        silent = {"absent", "unaccounted"}
+        return [s for s in self.run_students if s["display_status"] not in silent]
 
     def remaining_student_stops(self, run_id, stops_completed):
         return [s for s in self.stops if s["stop_order"] > stops_completed]
@@ -78,7 +83,7 @@ def link(parent: str, student: str, name: str) -> dict:
 
 
 def test_morning_run_start_sends_run_started(service: PushService, dao: FakePushDao) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "at-school"}]
+    dao.run_students = [{"id": "s1", "name": "Leila", "display_status": "at-school"}]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
     service.notify_run_started(RUN)
@@ -91,7 +96,7 @@ def test_morning_run_start_sends_run_started(service: PushService, dao: FakePush
 
 
 def test_afternoon_run_start_sends_on_way_home(service: PushService, dao: FakePushDao) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "on-bus"}]
+    dao.run_students = [{"id": "s1", "name": "Leila", "display_status": "on-bus"}]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
     service.notify_run_started(AFTERNOON_RUN)
@@ -101,8 +106,8 @@ def test_afternoon_run_start_sends_on_way_home(service: PushService, dao: FakePu
 
 def test_absent_students_are_not_notified(service: PushService, dao: FakePushDao) -> None:
     dao.run_students = [
-        {"id": "s1", "name": "Leila", "status": "absent"},
-        {"id": "s2", "name": "Baraka", "status": "at-school"},
+        {"id": "s1", "name": "Leila", "display_status": "absent"},
+        {"id": "s2", "name": "Baraka", "display_status": "at-school"},
     ]
     dao.parents = {
         "s1": [link("p1", "s1", "Leila")],
@@ -127,7 +132,7 @@ def test_boarding_notifies_each_parent_of_the_student(
 
 
 def test_reached_school_only_for_morning_runs(service: PushService, dao: FakePushDao) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "on-bus"}]
+    dao.run_students = [{"id": "s1", "name": "Leila", "display_status": "on-bus"}]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
     service.notify_reached_school(AFTERNOON_RUN)
@@ -142,8 +147,8 @@ def test_reached_school_skips_students_who_never_boarded(
 ) -> None:
     # Leila missed the bus (still at-school); no false safety assertion.
     dao.run_students = [
-        {"id": "s1", "name": "Leila", "status": "at-school"},
-        {"id": "s2", "name": "Baraka", "status": "on-bus"},
+        {"id": "s1", "name": "Leila", "display_status": "at-school"},
+        {"id": "s2", "name": "Baraka", "display_status": "on-bus"},
     ]
     dao.parents = {
         "s1": [link("p1", "s1", "Leila")],
@@ -157,7 +162,7 @@ def test_reached_school_skips_students_who_never_boarded(
 
 
 def test_reached_school_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:
-    dao.run_students = [{"id": "s1", "name": "Leila", "status": "on-bus"}]
+    dao.run_students = [{"id": "s1", "name": "Leila", "display_status": "on-bus"}]
     dao.parents = {"s1": [link("p1", "s1", "Leila")]}
 
     service.notify_reached_school(RUN)
@@ -172,8 +177,8 @@ def test_afternoon_run_end_sends_nothing(service: PushService, dao: FakePushDao)
     # confirmed must not get a false 'dropped off' push (AE12).
     run = {**AFTERNOON_RUN, "boarded_student_ids": ["s1"]}
     dao.run_students = [
-        {"id": "s1", "name": "Leila", "status": "dropped-off"},
-        {"id": "s2", "name": "Baraka", "status": "dropped-off"},  # swept, unconfirmed
+        {"id": "s1", "name": "Leila", "display_status": "dropped-off"},
+        {"id": "s2", "name": "Baraka", "display_status": "dropped-off"},  # swept, unconfirmed
     ]
     dao.parents = {
         "s1": [link("p1", "s1", "Leila")],
@@ -251,9 +256,35 @@ def test_student_absent_notifies_only_that_students_parents(
     assert {n["user_id"] for n in dao.notifications} == {"p1", "p9"}
     for note in dao.notifications:
         assert "Leila" in note["body"]
-        assert "absent at pickup" in note["body"]
         assert note["run_id"] == "run-1"
         assert note["student_id"] == "s1"
+
+
+def test_student_absent_body_claims_only_the_period_marked() -> None:
+    """U8/R21: the driver saw one run. The body used to say the child "will not
+    board the bus today" off a single morning mark, telling a parent their child
+    was not coming home either — which the driver had no way of knowing."""
+    cases = [
+        ({**RUN, "absence_period": "morning"}, "morning", "home is unaffected"),
+        ({**AFTERNOON_RUN, "absence_period": "afternoon"}, "afternoon", None),
+        ({**RUN, "absence_period": "day"}, "whole day", None),
+    ]
+    for run, must_say, also in cases:
+        dao = FakePushDao()
+        dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+        PushService(dao).notify_student_absent({"id": "s1", "name": "Leila"}, run)
+
+        body = dao.notifications[0]["body"]
+        assert must_say in body.lower(), body
+        if also:
+            assert also in body.lower(), body
+    # A morning mark must not speak for the afternoon.
+    dao = FakePushDao()
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+    PushService(dao).notify_student_absent(
+        {"id": "s1", "name": "Leila"}, {**RUN, "absence_period": "morning"}
+    )
+    assert "today" not in dao.notifications[0]["body"].lower()
 
 
 def test_student_absent_dedups_within_a_run(service: PushService, dao: FakePushDao) -> None:
