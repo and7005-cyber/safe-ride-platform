@@ -196,7 +196,9 @@ test("an admin route broadcast reaches route parents under every period chip", a
     const notice = feedCards.filter({ hasText: marker });
     await expect(notice.first()).toBeVisible({ timeout: 10_000 });
     await expect(notice).toHaveCount(1);
-    await expect(notice.getByText("School Notice", { exact: true })).toBeVisible();
+    // Sentence case since U17 — the parent alerts page rendered Title Case
+    // against the parent home page's sentence case on the same screen.
+    await expect(notice.getByText("School notice", { exact: true })).toBeVisible();
     await expect(notice.getByText(`School notice — ${SEED.driverMorningRoute}`)).toBeVisible();
   }
 });

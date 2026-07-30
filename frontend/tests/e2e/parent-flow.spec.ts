@@ -4,7 +4,10 @@ import { PARENT, SEED, cardContaining, clearCancellationState, emailLogin } from
 // Parent journey: home, tracking, profile, push state, Cancel-a-Ride.
 
 // Labels the derived display_status can render as (R36).
-const STATUS_BADGE_LABEL = /^(At home|At School|On the bus|Dropped off|Absent)$/;
+// The shipped vocabulary (U17). The parent app used to say "At School" and
+// "On the bus" where admin said "At school" and "On bus"; one module now
+// serves all three roles, and this regex tracks it.
+const STATUS_BADGE_LABEL = /^(At home|On bus|At school|Dropped off|Absent today)$/;
 
 test("parent home lists children with status and ETA", async ({ page }) => {
   await emailLogin(page, PARENT.email, PARENT.password);

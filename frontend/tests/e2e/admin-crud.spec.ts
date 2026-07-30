@@ -60,7 +60,10 @@ test("admin can create, edit, search, and delete a bus", async ({ page }) => {
   await fieldInput(dialog(page), "Name").fill(name);
   await fieldInput(dialog(page), "Plate number").fill("KZZ 999E");
   await fieldInput(dialog(page), "Capacity").fill("18");
-  await pickSelectOption(dialog(page), "Status", "Active");
+  // Availability, not status (U9): bus status is derived from its run now, and
+  // the form's Status control is gone. Availability is the one thing no
+  // derivation can produce — whether the bus is in the workshop.
+  await pickSelectOption(dialog(page), "Availability", "In service");
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
 
