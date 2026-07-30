@@ -102,19 +102,42 @@ Each of these was found by running something, not by reading code.
   out of U7 deliberately: the admin form sends complete payloads, and widening
   the fix would have meant deciding whether an admin may unassign a run's bus.
 
-## Release gate not yet satisfied
+## Release gate — satisfied
 
-The plan makes one non-code condition for enabling the closure gate at the pilot
-school:
+The plan's one non-code condition for enabling the closure gate:
 
 > The updated driver guide and a short briefing reach the pilot school's drivers,
 > and the school confirms it, before the closure gate is enabled.
 
-This is not done and is not something the branch can do. The plan's own risk
-analysis names the failure mode: a driver who discovers mid-route that End Run no
-longer works has one obvious escape, and it is marking children absent — which
-tells those families their child was never on the bus. **Release C should not be
-enabled for the pilot until the drivers have been briefed.**
+Confirmed done before Release C was deployed (2026-07-30). The failure mode it
+guards against is worth restating, because it is the reason the condition exists:
+a driver who discovers mid-route that End Run no longer works has one obvious
+escape, and it is marking children absent — which tells those families their
+child was never on the bus.
+
+## Deployed to production — 2026-07-30
+
+All three releases are live, in order.
+
+| Release | PR | What went out |
+| --- | --- | --- |
+| **A** | [#5](https://github.com/and7005-cyber/safe-ride-platform/pull/5) | Migration 010. No behaviour change |
+| **B** | [#6](https://github.com/and7005-cyber/safe-ride-platform/pull/6) | Derived bus status, arrival timestamps, office lifecycle feed, shared vocabulary. Backend + frontend |
+| **C** | [#7](https://github.com/and7005-cyber/safe-ride-platform/pull/7) | Participation, the closure gate, both driver releases, force-close, the surfaces, the guides. Backend + frontend |
+
+Verified against live production after each deploy: migration 010 applied with
+all prior migrations skipped; bus availability backfilled correctly (both buses
+were `idle`, so both became `in-service`); every run row carries `no_progress`,
+`stale` and `contact_pending`; every student row carries a derived
+`display_status`; every absence row carries `marked_period`; the force-close and
+record-contact endpoints answer from their handlers rather than 404-ing as
+unknown routes.
+
+**Certify each release in isolation, not just the whole branch.** Release B's own
+end-to-end suite was red when isolated: three specs still asserted pre-U9/U17
+labels, and the fixes lived further down the branch in work that ships with C.
+B could not have gone out green without commit `077377f`. The branch-level
+certification hid this completely.
 
 ## Deployment notes
 
@@ -122,4 +145,16 @@ enabled for the pilot until the drivers have been briefed.**
 - Runtime-fetched SSM parameters must exist in `af-south-1`.
 - `010_status_lifecycle.sql` is forward-only, like every migration here. Its
   three backfills (bus availability, today's participation, arrival timestamps
-  for already-passed stops) are idempotent.
+  for already-passed stops) are idempotent, and were re-verified by applying the
+  file twice to a populated database at migration 009 — production's state — before
+  Release A went out.
+- **Deploy outside route hours.** The backfills are conditional and touched
+  nothing on the day, but with a run in progress the participation backfill has
+  real work to do, and that is the case it exists for.
+
+## Open item, unrelated to this work
+
+The seeded demo credentials `admin@test.com` / `test1234.` authenticate against
+**production**. They were used for the post-deploy verification above. That is a
+live admin account with a published test password on the real system, and it
+should be closed before the pilot.
