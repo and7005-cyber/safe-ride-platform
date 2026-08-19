@@ -443,6 +443,108 @@ def route_geometry(sequence: list[dict], *, departure: dt.datetime | None = None
     }
 
 
+# --- Duration matrix (fleet planning): directed drive times, all pairs -------
+
+_ROUTE_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+# computeRouteMatrix caps each request at 625 origins×destinations elements for
+# latLng waypoints (the stricter 50-waypoint cap applies only to placeId/address).
+_MATRIX_MAX_ELEMENTS = 625
+# Road distance over straight-line: ~1.4 is a typical urban circuity factor.
+_MATRIX_CIRCUITY = 1.4
+# Average urban bus speed (m/s) for the offline matrix estimate.
+_MATRIX_SPEED_MS = 30 * 1000 / 3600  # 30 km/h
+
+
+def _route_matrix_call(origins: list[dict], destinations: list[dict], key: str) -> list:
+    """One computeRouteMatrix request for a rectangular origins×destinations
+    block. Returns the element list; indexes are relative to this block."""
+    body = {
+        "origins": [{"waypoint": _latlng(p)} for p in origins],
+        "destinations": [{"waypoint": _latlng(p)} for p in destinations],
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_UNAWARE",
+    }
+    resp = httpx.post(
+        _ROUTE_MATRIX_URL,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": key,
+            "X-Goog-FieldMask": "originIndex,destinationIndex,duration,condition",
+        },
+        json=body,
+        timeout=_TIMEOUT,
+    )
+    return resp.json() or []
+
+
+def _google_duration_matrix(points: list[dict], key: str) -> list[list[int]] | None:
+    """Assemble the full N×N matrix from rectangular computeRouteMatrix chunks,
+    each ≤ ``_MATRIX_MAX_ELEMENTS`` elements, stitched back by global index.
+    Returns ``None`` if ANY cell is unusable — the caller must then discard the
+    whole Google result (never a mixed matrix)."""
+    n = len(points)
+    dest_chunk = min(n, _MATRIX_MAX_ELEMENTS)
+    origin_chunk = max(1, _MATRIX_MAX_ELEMENTS // dest_chunk)
+    matrix: list[list[int | None]] = [[None] * n for _ in range(n)]
+    for o0 in range(0, n, origin_chunk):
+        origins = points[o0:o0 + origin_chunk]
+        for d0 in range(0, n, dest_chunk):
+            for el in _route_matrix_call(origins, points[d0:d0 + dest_chunk], key):
+                i, j = el.get("originIndex"), el.get("destinationIndex")
+                if i is None or j is None:
+                    continue
+                if el.get("condition") == "ROUTE_EXISTS":
+                    matrix[o0 + i][d0 + j] = _dur_s(el.get("duration"))
+    for i in range(n):
+        matrix[i][i] = 0  # self-pairs are exact zeros regardless of provider
+    if any(cell is None for row in matrix for cell in row):
+        return None
+    return matrix  # type: ignore[return-value]
+
+
+def _offline_duration_matrix(points: list[dict]) -> list[list[int]]:
+    """Deterministic keyless estimate: haversine × circuity ÷ urban speed."""
+    n = len(points)
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dist = haversine_m(
+                    (points[i]["lat"], points[i]["lng"]), (points[j]["lat"], points[j]["lng"])
+                )
+                matrix[i][j] = int(dist * _MATRIX_CIRCUITY / _MATRIX_SPEED_MS)
+    return matrix
+
+
+def compute_duration_matrix(points: list[dict]) -> dict[str, Any]:
+    """Directed N×N drive-time matrix for an ordered list of ``{lat, lng}``
+    points: ``matrix[i][j]`` is seconds from ``points[i]`` to ``points[j]``
+    (self-pairs 0).
+
+    Returns ``{matrix, degraded, provider}``. With the Google key set, uses
+    Routes API v2 ``computeRouteMatrix`` (latLng waypoints, TRAFFIC_UNAWARE),
+    chunked so no request exceeds 625 elements. Whole-or-nothing: a missing
+    key, any chunk failure, or any unusable element discards ALL Google
+    results and the entire matrix falls back to the deterministic offline
+    estimate with ``degraded: True`` — mirroring the two-provider-signals rule
+    in ``fleet_dao`` regeneration, a matrix is never part-Google/part-offline.
+    The matrix is returned in memory only and never persisted (Google ToS has
+    no caching allowance for durations).
+    """
+    n = len(points)
+    if n <= 1:
+        return {"matrix": [[0] * n for _ in range(n)], "degraded": False, "provider": "trivial"}
+    s = get_settings()
+    if s.google_maps_api_key:
+        try:
+            matrix = _google_duration_matrix(points, s.google_maps_api_key)
+            if matrix is not None:
+                return {"matrix": matrix, "degraded": False, "provider": "google-routes"}
+        except Exception:  # noqa: BLE001 - fall back to the offline estimate
+            pass
+    return {"matrix": _offline_duration_matrix(points), "degraded": True, "provider": "offline"}
+
+
 # --- Places autocomplete (New) ----------------------------------------------
 
 def places_autocomplete(query: str | None) -> list[dict]:
