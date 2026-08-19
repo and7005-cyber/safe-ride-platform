@@ -6,6 +6,7 @@ from app.api import (
     accounts,
     auth,
     fleet,
+    fleet_plans,
     health,
     incidents,
     parent_portal,
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(fleet.router)
+    app.include_router(fleet_plans.router)
     app.include_router(students_live.router)
     app.include_router(runs_live.router)
     app.include_router(incidents.router)
