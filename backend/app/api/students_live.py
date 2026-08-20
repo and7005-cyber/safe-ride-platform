@@ -99,13 +99,26 @@ class BulkRow(BaseModel):
     home_lat: float | None = None
     home_lng: float | None = None
     pickup_time: str | None = None
+    # Retired assignment column (U10/R17): still parsed so old files upload,
+    # but it assigns nothing — route membership is a planning output. A row
+    # carrying it imports the student and gets an informational note.
     route_name: str | None = None
     # Set when a row's home was repaired via the PlacePicker (U8); a raw CSV
-    # row leaves this null and the DAO stamps 'imported'.
+    # row leaves this null and the DAO stamps 'imported'. A confirmed
+    # ambiguous proposal ships as plain coordinates (still 'imported'); only
+    # a hand-placed pin carries 'picked'.
     provenance: str | None = None
+    # U10 duplicate resolution: 'skip' leaves the existing student untouched,
+    # 'update' overwrites their contacts/address (re-triaged). A duplicate row
+    # with neither choice errors — nothing is ever silently doubled.
+    duplicate_action: str | None = None
 
 
 class BulkPayload(BaseModel):
+    # The upload dialog is scoped to one school (U10): every committed row is
+    # stamped with this id — school-less students are invisible to the
+    # school-scoped draft basis and the pin map.
+    school_id: str
     students: list[BulkRow]
 
 
@@ -172,38 +185,52 @@ def delete_student(
     return result
 
 
+# The one per-row wording for the retired assignment column (U10/R17); the
+# validate table and the commit response both surface it verbatim.
+ROUTE_COLUMN_NOTE = "route column ignored — routes come from the fleet plan"
+
+
 def _triage_row(row: BulkRow) -> dict:
     """Geocode one bulk row and classify it (U8/R15): resolved (a confident
     provider result or coords already supplied), ambiguous (only the low-
-    confidence fallback resolved it — the operator should confirm), or failed
-    (no coordinates). Also reports whether route_name resolves to a route."""
-    lat, lng, provider, status = row.home_lat, row.home_lng, None, "resolved"
+    confidence fallback resolved it — the operator should confirm the proposed
+    pin), or failed (no coordinates — the operator places the pin by hand)."""
+    lat, lng, provider, label, status = row.home_lat, row.home_lng, None, None, "resolved"
     if lat is None or lng is None:
         hit = geo_service.geocode(row.home_address, allow_fallback=True) if row.home_address else None
         if hit:
-            lat, lng, provider = hit["lat"], hit["lng"], hit["provider"]
+            lat, lng, provider, label = hit["lat"], hit["lng"], hit["provider"], hit.get("label")
             status = "resolved" if provider in ("google", "mapbox") else "ambiguous"
         else:
             status = "failed"
     return {
         "index": None, "name": row.name, "address": row.home_address,
-        "lat": lat, "lng": lng, "provider": provider, "status": status,
+        "lat": lat, "lng": lng, "provider": provider, "label": label, "status": status,
+        # R17: the column is informational-only now — no resolution lookup, the
+        # same note whether or not a route by that name exists.
         "route_name": row.route_name,
-        "route_found": bool(row.route_name and dao.resolve_route_id_by_name(row.route_name)),
+        "route_note": ROUTE_COLUMN_NOTE if row.route_name else None,
     }
 
 
 @router.post("/bulk/validate")
 def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
-    """Import-time geocode triage (U8/R15-R16): geocode every row and return its
-    tier (resolved / ambiguous / failed) + provider + route resolution, WITHOUT
-    inserting anything. The client shows a persistent repair table for the
-    unresolved rows (ambiguous rows require explicit confirmation) and only then
-    POSTs /bulk to commit."""
+    """Import-time triage (U10/R16-R18): geocode every row and return its tier
+    (resolved / ambiguous / failed) + provider + proposed pin, flag duplicates
+    of existing students at this school by (name, school), and note the retired
+    route column — WITHOUT inserting anything. The client renders the triage
+    table (ambiguous rows confirm the proposed pin in one click, failed rows
+    open the map picker, duplicates choose skip-or-update) and only then POSTs
+    /bulk to commit."""
     def run() -> dict:
         rows = []
         for index, row in enumerate(payload.students):
-            rows.append({**_triage_row(row), "index": index})
+            duplicate = dao.find_bulk_duplicate(row.name, payload.school_id)
+            rows.append({
+                **_triage_row(row),
+                "index": index,
+                "duplicate_of": duplicate,
+            })
         return {"rows": rows}
 
     return safe_call(run)
@@ -214,18 +241,23 @@ def bulk_upload(
     payload: BulkPayload, background_tasks: BackgroundTasks,
     user: dict = Depends(admin_only),
 ):
-    # (student_id, route_id) links collected by run() — read after safe_call
-    # for the U13 seed dispatch (rows without a route seed nothing: no stop).
-    collected: list[tuple[str, str]] = []
+    # Touched student/route ids collected by run() — read after safe_call for
+    # the U13 seed dispatch. Freshly inserted students have no routes yet (no
+    # stop, nothing to seed), but a duplicate-update moves an existing child's
+    # home on their live routes, so their (and their co-riders') missing
+    # baselines are seeded silently like every roster path.
+    touched_students: list[str] = []
+    touched_routes: list[str] = []
 
     def run() -> dict:
         inserted = 0
+        updated = 0
+        skipped = 0
         parent_assignments = 0
-        route_assignments = 0
+        notes: list[str] = []
         errors: list[str] = []
-        # (student_id, route_id) collected across ALL rows, then regenerated once
-        # per affected route (Lambda burst guard, U8) — never per row.
-        links: list[tuple[str, str]] = []
+        if not dao.school_exists(payload.school_id):
+            raise BadRequestError("School not found — pick the school this upload belongs to")
         for index, row in enumerate(payload.students):
             label = row.name or f"row {index + 1}"
             if not row.name or not row.grade or not row.parent_name:
@@ -237,37 +269,61 @@ def bulk_upload(
             if not row.parent_email and not row.parent2_email:
                 errors.append(f"{label}: at least one parent email is required")
                 continue
+            if row.duplicate_action not in (None, "skip", "update"):
+                errors.append(f"{label}: duplicate_action must be 'skip' or 'update'")
+                continue
+            # R17: the retired column never assigns — the student still imports,
+            # and the row gets the informational note instead of a link.
+            if row.route_name:
+                notes.append(f"{label}: {ROUTE_COLUMN_NOTE}")
             try:
-                result = dao.insert_bulk_student(_clean_student(row.model_dump(), geocode_fallback=True))
+                data = _clean_student(row.model_dump(), geocode_fallback=True)
+                data["school_id"] = payload.school_id
+                # Duplicates re-detected server-side at commit (never trusted
+                # from the client): same (name, school) as an existing student.
+                duplicate = dao.find_bulk_duplicate(row.name, payload.school_id)
+                if duplicate is not None:
+                    if row.duplicate_action == "skip":
+                        skipped += 1
+                        continue
+                    if row.duplicate_action == "update":
+                        result = dao.update_bulk_student(str(duplicate["id"]), data)
+                        updated += 1
+                        parent_assignments += result["parent_links"]
+                        touched_students.append(str(duplicate["id"]))
+                        touched_routes.extend(result["route_ids"])
+                        continue
+                    errors.append(
+                        f"{label}: matches an existing student at this school "
+                        "— choose skip or update"
+                    )
+                    continue
+                result = dao.insert_bulk_student(data)
                 inserted += 1
                 parent_assignments += result["parent_links"]
-                if row.route_name:
-                    route_id = dao.resolve_route_id_by_name(row.route_name)
-                    if route_id:
-                        links.append((result["id"], route_id))
-                        route_assignments += 1
-                    else:
-                        errors.append(f"{label}: route '{row.route_name}' not found — student added unassigned")
+                touched_students.append(str(result["id"]))
             except Exception as exc:  # noqa: BLE001 - surfaced per-row to the client
                 errors.append(f"{label}: {exc}")
-        # One regeneration per affected route, after every insert.
-        dao.bulk_link_and_regenerate(links)
-        collected.extend(links)
+        # Duplicate updates moved home pins on live routes: regenerate each
+        # affected route ONCE for the whole upload (Lambda burst guard, U8).
+        dao.regenerate_routes(touched_routes)
         return {
             "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
             "parentAssignments": parent_assignments,
-            "routeAssignments": route_assignments,
+            "notes": notes,
             "errors": errors,
         }
 
     result = safe_call(run)
-    if collected:
+    if touched_students:
         # U13: ONE dispatch for the whole upload (the same burst-guard shape
         # as the single regeneration above), seed-only like every roster path.
         background_tasks.add_task(
             notify_route_changes,
-            route_ids=sorted({str(rid) for _sid, rid in collected}),
-            student_ids=sorted({str(sid) for sid, _rid in collected}),
+            route_ids=sorted(set(touched_routes)),
+            student_ids=sorted(set(touched_students)),
             seed_only=True,
         )
     return result

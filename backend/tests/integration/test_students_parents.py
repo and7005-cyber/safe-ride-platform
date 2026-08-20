@@ -181,19 +181,26 @@ def test_bulk_row_missing_emails_errors_that_row_only(client, admin_headers):
     marker = uuid.uuid4().hex[:6]
     good_name = f"IT BulkGood {marker}"
     bad_name = f"IT BulkBad {marker}"
-    response = client.post(
-        "/api/students/bulk",
-        json={"students": [
-            {"name": good_name, "grade": "G1", "parent_name": "Bulk Parent",
-             "parent_phone": "+254711000002", "parent_email": f"it-bulk-{marker}@test.local"},
-            {"name": bad_name, "grade": "G1", "parent_name": "Bulk Parent",
-             "parent_phone": "+254711000003"},
-        ]},
+    # The bulk payload is school-scoped since U10: every committed row is
+    # stamped with the school so the draft basis and pin map can see it.
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", "lat": -1.30, "lng": 36.80},
         headers=admin_headers,
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
+    ).json()
     try:
+        response = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": [
+                {"name": good_name, "grade": "G1", "parent_name": "Bulk Parent",
+                 "parent_phone": "+254711000002", "parent_email": f"it-bulk-{marker}@test.local"},
+                {"name": bad_name, "grade": "G1", "parent_name": "Bulk Parent",
+                 "parent_phone": "+254711000003"},
+            ]},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
         assert body["inserted"] == 1
         assert len(body["errors"]) == 1
         assert bad_name in body["errors"][0]
@@ -202,6 +209,7 @@ def test_bulk_row_missing_emails_errors_that_row_only(client, admin_headers):
         for s in client.get("/api/students", headers=admin_headers).json():
             if s["name"] in (good_name, bad_name):
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 # Link sync (R11) ----------------------------------------------------------------
@@ -927,95 +935,381 @@ def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_he
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-# CSV geocode triage + route_name wiring (U8, R15-R18) ---------------------------
+# Bulk-upload triage, duplicates, school binding, route-name retirement
+# (U10: R16-R18, AE8) -------------------------------------------------------------
+#
+# Keyless-tier staging (the offline geocoder's determinism): a row with coords
+# triages 'resolved' with no network call; an address-only row goes through the
+# free Nominatim fallback — a well-known Kenyan place name deterministically
+# resolves (provider 'nominatim' -> 'ambiguous'), a junk string deterministically
+# doesn't ('failed'). The suite keeps the fallback calls to a handful per run.
 
-def test_bulk_validate_triages_rows_and_resolves_route_name(client, admin_headers):
-    """U8/R15-R16: /bulk/validate geocodes every row and tags it resolved (coords
-    supplied) / failed (no coords, key-less container can't geocode), and reports
-    whether route_name resolves — WITHOUT inserting anything."""
+ROUTE_COLUMN_NOTE = "route column ignored — routes come from the fleet plan"
+
+# Two loose clusters around the AE8 school (-1.30, 36.80) so a two-bus
+# partition is geometrically natural (the draft-suite convention).
+AE8_SCHOOL = {"lat": -1.3000, "lng": 36.8000}
+AE8_DEPOT_EAST = (-1.285, 36.830)
+AE8_DEPOT_WEST = (-1.320, 36.770)
+
+
+def _bulk_row(marker: str, i: int, **overrides) -> dict:
+    """One valid bulk row (name/grade/parent invariant satisfied)."""
+    row = {
+        "name": f"IT Bulk {marker} {i}",
+        "grade": "G4",
+        "parent_name": f"IT Bulk Parent {marker} {i}",
+        "parent_phone": f"+25471100{i:04d}",
+        "parent_email": f"it-bulk-{marker}-{i}@test.local",
+    }
+    row.update(overrides)
+    return row
+
+
+def _ae8_home(i: int) -> tuple[float, float]:
+    """27 distinct homes, east cluster for even i, west for odd."""
+    if i % 2 == 0:
+        return (-1.290 - (i // 2) * 0.0015, 36.818 + (i // 2) * 0.0011)
+    return (-1.308 - (i // 2) * 0.0015, 36.782 - (i // 2) * 0.0011)
+
+
+def _student_rows(client, admin_headers) -> list[dict]:
+    return client.get("/api/students", headers=admin_headers).json()
+
+
+def _make_plan_bus(client, headers, name: str, capacity: int,
+                   depot: tuple[float, float]) -> dict:
+    created = client.post(
+        "/api/fleet/buses",
+        json={"name": name, "capacity": capacity,
+              "depot_lat": depot[0], "depot_lng": depot[1]},
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    return created.json()
+
+
+def test_bulk_ae8_triage_confirm_place_commit_and_draft_basis(client, admin_headers):
+    """AE8/F5 end-to-end: 30 rows triage 27 resolved / 2 ambiguous / 1 failed;
+    the two ambiguous are confirmed in one action each (the proposed pin is
+    accepted as-is), the failed one is hand-placed (provenance 'picked'); the
+    commit stamps school_id on every row; and the school's next draft basis
+    carries all 30 as plannable — including the three repaired rows."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
-    route = make_route("Express", "morning")
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
+        headers=admin_headers,
+    ).json()
+    bus_a = bus_b = None
+    student_ids: list[str] = []
     try:
-        payload = {"students": [
-            {"name": f"Coords {marker}", "grade": "G4", "parent_name": "P",
-             "parent_phone": "+254711000010", "parent_email": f"c-{marker}@t.local",
-             "home_lat": -1.3, "home_lng": 36.8, "route_name": f"IT U5 Express {marker}"},
-            {"name": f"NoCoords {marker}", "grade": "G4", "parent_name": "P",
-             "parent_phone": "+254711000011", "parent_email": f"n-{marker}@t.local",
-             "home_address": "Somewhere Unresolvable", "route_name": "no-such-route"},
-        ]}
-        r = client.post("/api/students/bulk/validate", json=payload, headers=admin_headers)
-        assert r.status_code == 200, r.text
-        rows = r.json()["rows"]
-        assert rows[0]["status"] == "resolved" and rows[0]["route_found"] is True
-        assert rows[1]["status"] == "failed" and rows[1]["route_found"] is False
-        # Nothing was inserted by validation.
-        names = {s["name"] for s in client.get("/api/students", headers=admin_headers).json()}
-        assert f"Coords {marker}" not in names
+        rows = []
+        for i in range(27):
+            lat, lng = _ae8_home(i)
+            rows.append(_bulk_row(marker, i, home_lat=lat, home_lng=lng,
+                                  home_address=f"IT Bulk Home {marker} {i}"))
+        # Ambiguous: address-only, resolvable ONLY by the low-confidence
+        # fallback (well-known place names near the school).
+        rows.append(_bulk_row(marker, 27, home_address="Nairobi"))
+        rows.append(_bulk_row(marker, 28, home_address="Westlands, Nairobi"))
+        # Failed: address-only junk nothing can locate.
+        rows.append(_bulk_row(marker, 29, home_address=f"zzqx unresolvable {marker}"))
+
+        validated = client.post(
+            "/api/students/bulk/validate",
+            json={"school_id": school["id"], "students": rows},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        triage = validated.json()["rows"]
+        by_status: dict[str, list[dict]] = {"resolved": [], "ambiguous": [], "failed": []}
+        for t in triage:
+            by_status[t["status"]].append(t)
+        assert len(by_status["resolved"]) == 27, triage
+        assert len(by_status["ambiguous"]) == 2, triage
+        assert len(by_status["failed"]) == 1, triage
+        # An ambiguous row carries the fallback's proposed pin for the
+        # one-click confirm; the failed row has nothing to propose.
+        for t in by_status["ambiguous"]:
+            assert t["provider"] == "nominatim"
+            assert t["lat"] is not None and t["lng"] is not None
+        assert by_status["failed"][0]["lat"] is None
+
+        # Validate committed nothing (AE8: triage is read-only).
+        names_now = {s["name"] for s in _student_rows(client, admin_headers)}
+        assert not any(r["name"] in names_now for r in rows)
+
+        # Resolutions: confirming an ambiguous row = accepting the proposed pin
+        # (one action -> the proposal's coords, provenance stays imported);
+        # the failed row is hand-placed on the map (provenance 'picked').
+        for t in by_status["ambiguous"]:
+            rows[t["index"]]["home_lat"] = t["lat"]
+            rows[t["index"]]["home_lng"] = t["lng"]
+        failed_index = by_status["failed"][0]["index"]
+        rows[failed_index]["home_lat"] = -1.2955
+        rows[failed_index]["home_lng"] = 36.8090
+        rows[failed_index]["provenance"] = "picked"
+
+        committed = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": rows},
+            headers=admin_headers,
+        )
+        assert committed.status_code == 200, committed.text
+        body = committed.json()
+        assert body["inserted"] == 30, body
+        assert body["errors"] == [], body
+
+        # School binding: every committed row is stamped — a school-less
+        # student would be invisible to the school-scoped draft basis below.
+        mine = [s for s in _student_rows(client, admin_headers)
+                if s["name"].startswith(f"IT Bulk {marker} ")]
+        student_ids.extend(s["id"] for s in mine)
+        assert len(mine) == 30
+        assert all(str(s["school_id"]) == str(school["id"]) for s in mine)
+        # The hand-placed pin kept its provenance; new intakes default both_ways.
+        placed = next(s for s in mine if s["name"] == f"IT Bulk {marker} 29")
+        assert placed["provenance"] == "picked"
+        assert all(s["ridership_pattern"] == "both_ways" for s in mine)
+
+        # The bulk-imported students appear in this school's next draft basis,
+        # every one plannable — including the two confirmed and the one placed.
+        bus_a = _make_plan_bus(client, admin_headers,
+                               f"IT BulkBus A {marker}", 16, AE8_DEPOT_EAST)
+        bus_b = _make_plan_bus(client, admin_headers,
+                               f"IT BulkBus B {marker}", 16, AE8_DEPOT_WEST)
+        confirmed = client.post(
+            "/api/fleet-plans/confirm-fleet",
+            json={"school_id": school["id"], "bus_ids": [bus_a["id"], bus_b["id"]]},
+            headers=admin_headers,
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        drafted = client.post(
+            "/api/fleet-plans/draft",
+            json={"school_id": school["id"], "seed": 7},
+            headers=admin_headers,
+        )
+        assert drafted.status_code == 200, drafted.text
+        basis = drafted.json()["basis"]
+        assert {s["id"] for s in basis["students"]} == set(student_ids)
+        assert all(s["plannable"] for s in basis["students"])
+        assert drafted.json()["document"]["unplaceable"] == []
     finally:
-        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
+        # Sweep by name prefix, not collected ids: a failure before the commit
+        # assertions must not strand thirty IT rows in the shared stack.
+        for s in _student_rows(client, admin_headers):
+            if s["name"].startswith(f"IT Bulk {marker} "):
+                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        for bus in (bus_a, bus_b):
+            if bus:
+                client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
+        # Deleting the school cascades its plan rows (011 FK).
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_route_name_assigns_students_to_the_route(client, admin_headers):
-    """U8/R18: a bulk row's route_name assigns the student to that route through
-    the same _sync_routes choke point (the R21 constraint applies)."""
+def test_bulk_duplicate_flagged_skip_noops_update_overwrites(client, admin_headers):
+    """U10 duplicates: validate flags a row matching an existing student on
+    (name, school); committing with skip leaves the original untouched;
+    with no choice the row errors (nothing silently doubles); with update the
+    contacts and address are overwritten and the address re-triaged."""
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
+        headers=admin_headers,
+    ).json()
+    name = f"IT Bulk Dup {marker}"
+    original = _bulk_row(marker, 1, name=name, home_lat=-1.291, home_lng=36.812,
+                         home_address="Old Lane")
+    try:
+        first = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": [original]},
+            headers=admin_headers,
+        )
+        assert first.status_code == 200 and first.json()["inserted"] == 1, first.text
+        existing = next(s for s in _student_rows(client, admin_headers) if s["name"] == name)
+
+        # Validate flags the duplicate with who it found.
+        validated = client.post(
+            "/api/students/bulk/validate",
+            json={"school_id": school["id"], "students": [original]},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        flag = validated.json()["rows"][0]["duplicate_of"]
+        assert flag and str(flag["id"]) == str(existing["id"]) and flag["name"] == name
+
+        count_before = len(_student_rows(client, admin_headers))
+
+        # No choice -> the row errors, nothing inserted or updated.
+        undecided = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": [original]},
+            headers=admin_headers,
+        ).json()
+        assert undecided["inserted"] == 0 and undecided["updated"] == 0
+        assert len(undecided["errors"]) == 1
+        assert "skip or update" in undecided["errors"][0]
+
+        # Skip -> a no-op: same row count, contacts and home untouched.
+        skipped = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"],
+                  "students": [{**original, "duplicate_action": "skip"}]},
+            headers=admin_headers,
+        ).json()
+        assert (skipped["inserted"], skipped["updated"], skipped["skipped"]) == (0, 0, 1)
+        assert skipped["errors"] == []
+        untouched = next(s for s in _student_rows(client, admin_headers)
+                         if str(s["id"]) == str(existing["id"]))
+        assert untouched["parent_phone"] == original["parent_phone"]
+        assert untouched["home_address"] == "Old Lane"
+
+        # Update -> contacts/address overwritten, address re-triaged (fresh
+        # coords land), same student id, still exactly one row.
+        revised = {
+            **original,
+            "parent_phone": "+254711009999",
+            "parent_email": f"it-bulk-upd-{marker}@test.local",
+            "home_address": "New Lane",
+            "home_lat": -1.2984, "home_lng": 36.8047,
+            "duplicate_action": "update",
+        }
+        updated = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": [revised]},
+            headers=admin_headers,
+        ).json()
+        assert updated["updated"] == 1 and updated["inserted"] == 0, updated
+        assert len(_student_rows(client, admin_headers)) == count_before
+        after = next(s for s in _student_rows(client, admin_headers)
+                     if str(s["id"]) == str(existing["id"]))
+        assert after["parent_phone"] == "+254711009999"
+        assert after["parent_email"] == f"it-bulk-upd-{marker}@test.local"
+        assert after["home_address"] == "New Lane"
+        assert float(after["home_lat"]) == pytest.approx(-1.2984)
+        assert float(after["home_lng"]) == pytest.approx(36.8047)
+    finally:
+        for s in _student_rows(client, admin_headers):
+            if s["name"] == name:
+                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_bulk_identical_reupload_all_skipped_creates_zero_students(client, admin_headers):
+    """U10: re-uploading an identical file with every duplicate skipped is a
+    complete no-op — zero new students."""
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
+        headers=admin_headers,
+    ).json()
+    rows = [
+        _bulk_row(marker, i, home_lat=-1.29 - i * 0.002, home_lng=36.81 + i * 0.002)
+        for i in range(2)
+    ]
+    try:
+        first = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": rows},
+            headers=admin_headers,
+        ).json()
+        assert first["inserted"] == 2, first
+        count_before = len(_student_rows(client, admin_headers))
+
+        again = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"],
+                  "students": [{**r, "duplicate_action": "skip"} for r in rows]},
+            headers=admin_headers,
+        ).json()
+        assert again["inserted"] == 0 and again["skipped"] == 2 and again["errors"] == []
+        assert len(_student_rows(client, admin_headers)) == count_before
+    finally:
+        for s in _student_rows(client, admin_headers):
+            if s["name"].startswith(f"IT Bulk {marker} "):
+                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_bulk_route_name_imports_without_assigning_and_notes_it(client, admin_headers):
+    """R17 retirement: a row carrying route_name — even one naming a real
+    route — still imports the student, assigns NO route, and surfaces the
+    informational note per row, at validate and at commit."""
     marker = uuid.uuid4().hex[:6]
     school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
     route = make_route("Express", "morning")
-    route_name = f"IT U5 Express {marker}"
-    created_names = [f"Bulk A {marker}", f"Bulk B {marker}"]
+    name = f"IT Bulk RouteName {marker}"
+    row = _bulk_row(marker, 1, name=name, home_lat=-1.3, home_lng=36.8,
+                    route_name=f"IT U5 Express {marker}")
     try:
-        payload = {"students": [
-            {"name": n, "grade": "G4", "parent_name": "P", "parent_phone": "+254711000012",
-             "parent_email": f"{n.replace(' ', '')}@t.local", "home_lat": -1.3, "home_lng": 36.8,
-             "route_name": route_name}
-            for n in created_names
-        ]}
-        r = client.post("/api/students/bulk", json=payload, headers=admin_headers)
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["inserted"] == 2 and body["routeAssignments"] == 2
-        rostered = {s["name"] for s in client.get("/api/students", headers=admin_headers).json()
-                    if str(route["id"]) in [str(x) for x in (s.get("route_ids") or [])]}
-        assert set(created_names) <= rostered
+        validated = client.post(
+            "/api/students/bulk/validate",
+            json={"school_id": school["id"], "students": [row]},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        assert validated.json()["rows"][0]["route_note"] == ROUTE_COLUMN_NOTE
+
+        committed = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"], "students": [row]},
+            headers=admin_headers,
+        )
+        assert committed.status_code == 200, committed.text
+        body = committed.json()
+        assert body["inserted"] == 1, body
+        assert body["notes"] == [f"{name}: {ROUTE_COLUMN_NOTE}"], body
+        assert "routeAssignments" not in body  # the counter died with the path
+        imported = next(s for s in _student_rows(client, admin_headers) if s["name"] == name)
+        assert imported["route_ids"] == []  # nothing assigned
     finally:
-        for s in client.get("/api/students", headers=admin_headers).json():
-            if s["name"] in created_names:
+        for s in _student_rows(client, admin_headers):
+            if s["name"] == name:
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_link_regenerates_each_route_exactly_once(client, admin_headers, monkeypatch):
-    """U8: the burst guard — regeneration is batched per route, so N students
-    onto one route trigger ONE regenerate, not N (a per-row O(rows) Google burst
-    in one Lambda invocation is the verified risk)."""
+def test_bulk_validate_commits_nothing(client, admin_headers):
+    """U10/AE8: /bulk/validate is read-only — the student table is unchanged
+    after a validate, row for row."""
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
+        headers=admin_headers,
+    ).json()
+    try:
+        count_before = len(_student_rows(client, admin_headers))
+        validated = client.post(
+            "/api/students/bulk/validate",
+            json={"school_id": school["id"], "students": [
+                _bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8),
+                _bulk_row(marker, 2, home_address=f"zzqx unresolvable {marker}"),
+            ]},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        statuses = [r["status"] for r in validated.json()["rows"]]
+        assert statuses == ["resolved", "failed"]
+        assert len(_student_rows(client, admin_headers)) == count_before
+    finally:
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
+def test_bulk_duplicate_update_regenerates_each_route_exactly_once(monkeypatch):
+    """U8 burst guard, carried through U10's route-name retirement: the only
+    bulk path still touching routes is the duplicate-update overwrite, and its
+    post-loop regeneration collapses duplicates — one call per affected route,
+    never per row."""
     from app.dao import student_live_dao
 
-    marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
-    route = make_route("Express", "morning")
-    ids = []
-    try:
-        for i in range(4):
-            s = client.post("/api/students", json=student_payload(f"{marker}{i}"), headers=admin_headers)
-            ids.append(s.json()["id"])
-        calls = []
-        monkeypatch.setattr(student_live_dao, "regenerate_route_stops",
-                            lambda conn, rid: calls.append(str(rid)) or True)
-        monkeypatch.setattr(student_live_dao, "_derive_student_bus", lambda conn, sid: None)
-        # Pass an explicit localhost connection (the host can't resolve the
-        # container's 'db' hostname); roll back so the test links don't persist.
-        with psycopg.connect(DB_URL) as conn:
-            student_live_dao._bulk_link_and_regenerate(conn, [(sid, route["id"]) for sid in ids])
-            conn.rollback()
-        # 4 students onto one route -> exactly ONE regeneration, independent of count.
-        assert calls.count(str(route["id"])) == 1
-        assert len(calls) == 1
-    finally:
-        for sid in ids:
-            client.delete(f"/api/students/{sid}", headers=admin_headers)
-        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+    calls: list[str] = []
+    monkeypatch.setattr(student_live_dao, "regenerate_route_stops",
+                        lambda conn, rid: calls.append(str(rid)) or True)
+    student_live_dao._regenerate_routes(None, ["r1", "r1", "r2", "r1"])
+    assert sorted(calls) == ["r1", "r2"]

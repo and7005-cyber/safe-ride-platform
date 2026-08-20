@@ -83,7 +83,21 @@ Click **Add Student** and fill in:
 
 ### Bulk upload
 
-**Bulk Upload** accepts a CSV or Excel file — click **Download template** for the exact format. Columns: `name, grade, parent_name, parent_phone, parent_email, parent2_name, parent_phone2, parent2_email, home_address, home_lat, home_lng, pickup_time, route_name`. Valid rows import; bad rows are reported individually and skipped.
+**Bulk Upload** accepts a CSV or Excel file — click **Download template** for the exact format. Columns: `name, grade, parent_name, parent_phone, parent_email, parent2_name, parent_phone2, parent2_email, home_address, home_lat, home_lng, pickup_time`. Bad rows are reported individually and never block the good ones.
+
+The upload happens in **two steps**, and it is **scoped to a school**: pick the **School** first — every imported student is enrolled there, and the fleet-plan drafts and pin map only see a school's own students.
+
+**Step 1 — check.** Choosing the file doesn't import anything yet. Every row's address is looked up and sorted into three tiers:
+
+- **Located** — the row has coordinates (supplied in the file, or found with confidence). Nothing to do.
+- **Confirm pin** — only a low-confidence lookup found the address. The row shows the proposed location next to the student's name; click **Confirm pin** to accept it. One click per row.
+- **Not located** — the address couldn't be found at all. Click **Place on map** and drop the pin by hand — you're always placing a named student's home on a map, never editing a text string. (A row you leave unplaced still imports; the student is flagged "unresolved address" until you pin them from their record or the pin map.)
+
+The check also flags **duplicates**: a row whose name matches a student already enrolled at that school. Choose per row — **Skip** leaves the existing record untouched, **Update** overwrites their parent contacts and address with the row's values (the new address is looked up again, same tiers). Re-uploading an identical file with every duplicate skipped imports nothing — zero new students.
+
+**Step 2 — import.** Once every proposed pin is confirmed and every duplicate decided, click **Import**. The summary reports rows inserted, updated, and skipped, plus parent assignments created.
+
+**The `route_name` column is retired.** Routes come from the fleet plan now, not the import. An old file that still carries the column uploads fine — the student imports, no route is assigned, and the row gets the note "route column ignored — routes come from the fleet plan".
 
 ### Daily attendance and absences
 

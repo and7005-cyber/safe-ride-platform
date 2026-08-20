@@ -221,6 +221,74 @@ test("admin can create, edit, and delete a student", async ({ page }) => {
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
+// Bulk upload (U10: R16-R18): the two-step validate → review flow. The upload
+// is scoped to a school, rows are triaged (located / confirm pin / not
+// located), and an ambiguous row's proposed pin is accepted with one click
+// before anything is committed. The ambiguous tier rides the keyless
+// fallback geocoder resolving a well-known place name ("Nairobi") — the same
+// mock-free posture as the planner test's real-address geocoding above.
+test("bulk upload triages rows and imports after a one-click pin confirm", async ({ page, request }) => {
+  const nameA = uniqueName("E2E BulkA");
+  const nameB = uniqueName("E2E BulkB");
+  const csv = [
+    "name,grade,parent_name,parent_phone,parent_email,home_address,home_lat,home_lng",
+    `${nameA},Grade 2,E2E Bulk Parent,+254711222444,e2e-bulk-a@test.local,Kileleshwa,-1.2820,36.7780`,
+    `${nameB},Grade 3,E2E Bulk Parent,+254711222555,e2e-bulk-b@test.local,Nairobi,,`,
+  ].join("\n");
+
+  await adminLogin(page);
+  await page.goto("/students");
+  await page.getByRole("button", { name: "Bulk Upload" }).click();
+
+  // The file chooser stays locked until the upload's school scope is picked —
+  // every committed row is stamped with it.
+  await expect(dialog(page).getByRole("button", { name: "Choose file" })).toBeDisabled();
+  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  await dialog(page)
+    .locator('input[type="file"]')
+    .setInputFiles({ name: "students.csv", mimeType: "text/csv", buffer: Buffer.from(csv) });
+
+  // Step 1 triaged without inserting: the coords row is located, the
+  // address-only row proposes a pin and waits for confirmation; the commit
+  // button is gated until every proposal is resolved.
+  const triage = dialog(page).getByTestId("bulk-triage");
+  await expect(triage).toBeVisible({ timeout: 20_000 });
+  await expect(dialog(page).getByTestId("bulk-triage-summary")).toHaveText(
+    /1 located · 1 to confirm · 0 not located/,
+  );
+  await expect(triage.getByText(nameB)).toBeVisible();
+  await expect(dialog(page).getByTestId("bulk-commit")).toBeDisabled();
+
+  // One-click confirm of the proposed pin (row index 1 = the ambiguous row).
+  await dialog(page).getByTestId("bulk-confirm-1").click();
+  await expect(dialog(page).getByTestId("bulk-triage-summary")).toHaveText(
+    /2 located · 0 to confirm · 0 not located/,
+  );
+
+  // Step 2 commits both rows.
+  await expect(dialog(page).getByTestId("bulk-commit")).toBeEnabled();
+  await dialog(page).getByTestId("bulk-commit").click();
+  const result = dialog(page).getByTestId("bulk-result");
+  await expect(result).toBeVisible({ timeout: 20_000 });
+  await expect(result.getByText("2", { exact: true })).toBeVisible();
+  await expect(result.getByText(/students inserted/)).toBeVisible();
+  await dialog(page).getByRole("button", { name: "Done" }).click();
+
+  // Both students landed on the roster.
+  await expect(page.getByRole("row", { name: new RegExp(nameA) })).toBeVisible();
+  await expect(page.getByRole("row", { name: new RegExp(nameB) })).toBeVisible();
+
+  // API cleanup (the beforeAll sweep also catches aborted runs).
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(token);
+  const students = await request.get(`${API_URL}/api/students`, { headers });
+  for (const row of await students.json()) {
+    if ([nameA, nameB].includes(row.name)) {
+      await request.delete(`${API_URL}/api/students/${row.id}`, { headers });
+    }
+  }
+});
+
 test("admin can create and delete a driver account with a PIN", async ({ page }) => {
   const name = uniqueName("E2E Driver");
   const email = `e2e-driver-${Date.now()}@test.local`;
