@@ -1,8 +1,10 @@
 """Fleet-plan endpoints: fleet confirmation, draft generation, current plans,
-discard (U4), plus the review/edit surface (U5) — computed review payload with
+discard (U4), the review/edit surface (U5) — computed review payload with
 wall-clock stop times and the diff vs live, the edit verbs (move / reorder /
-pin / pattern / assign), and the explicit in-draft re-solve. Apply (U6) lands
-later on this same router.
+pin / pattern / assign), the explicit in-draft re-solve — and apply (U6): one
+gated, transactional, audit-logged act that materializes the draft into the
+live route tables, preserves the displaced live state, and notifies affected
+families.
 
 Review-edit contract (R9): every edit re-checks the hard constraints and a
 violation answers 422 with the constraint NAMED ('capacity' or 'stop cap'),
@@ -195,6 +197,47 @@ def resolve_draft(plan_id: str, user: dict = Depends(admin_only)):
     pattern edits as inputs (fresh in-memory matrix). Unpinned manual
     arrangements are discarded — the response says so explicitly."""
     return safe_call(lambda: dao.resolve_draft(plan_id))
+
+
+class ApplyConfirmation(BaseModel):
+    # One basis-drift item (R22), confirmed by kind + student:
+    # 'enrolled' | 'address-changed' | 'departed'.
+    student_id: str
+    kind: str
+
+
+class ApplyAcknowledgment(BaseModel):
+    # One unplaceable child acknowledged by name and leg (R23).
+    student_id: str
+    leg: str
+
+
+class ApplyPayload(BaseModel):
+    # Every basis-drift item since generation must appear here or apply 409s
+    # listing the unconfirmed ones.
+    confirmations: list[ApplyConfirmation] = []
+    # Every document unplaceable (student, leg) must appear here or apply
+    # 422s naming the missing ones.
+    acknowledgments: list[ApplyAcknowledgment] = []
+
+
+@router.post("/{plan_id}/apply")
+def apply_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_only)):
+    """Apply the draft (U6): ONE provider-free transaction — gates re-checked
+    against the locked snapshot, displaced live state preserved as 'previous'
+    (one-level history), routes reconciled in place, links and stops
+    materialized from the document, audit row, feed rows and baselines — then
+    post-commit geometry refresh (never times) and awaited push delivery.
+    Re-applying an applied plan is idempotent by status (200, no side
+    effects)."""
+    return safe_call(
+        lambda: dao.apply_plan(
+            plan_id,
+            confirmations=[c.model_dump() for c in payload.confirmations],
+            acknowledgments=[a.model_dump() for a in payload.acknowledgments],
+            actor=user,
+        )
+    )
 
 
 @router.post("/{plan_id}/discard")

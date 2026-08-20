@@ -289,6 +289,46 @@ class PushDao:
             ).fetchone()
         return dict(row) if row else None
 
+    def insert_plan_notification(
+        self,
+        conn,
+        user_id: str,
+        *,
+        type: str,
+        title: str,
+        body: str,
+        student_id: str | None,
+        bus_id: str | None,
+        run_type: str | None,
+        plan_audit_id: str | None,
+    ) -> dict | None:
+        """Feed-row insert on the CALLER's connection (fleet-plan apply, U6).
+
+        ``insert_notification`` opens its own connection per row, which would
+        COMMIT feed rows independently of the apply transaction — a gate
+        failure after the fan-out would roll the apply back while the feed
+        kept claiming a change that never happened. Threading the apply's
+        connection makes the feed rows part of the same atom.
+
+        run_id stays NULL (no run is involved); ``plan_audit_id`` ties the
+        row to the apply/restore act that produced it and drives the 011 plan
+        dedup arbiter — ``on conflict do nothing`` returns None for a repeat
+        (parent, student, type) within one act, mirroring the run-scoped
+        dedup's contract. Returns the inserted row, or None when suppressed.
+        """
+        row = conn.execute(
+            """
+            insert into live_notifications
+                (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict do nothing
+            returning id, user_id, student_id, bus_id, type, title, body, run_type,
+                      plan_audit_id, read, created_at
+            """,
+            (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id),
+        ).fetchone()
+        return dict(row) if row else None
+
     def list_notifications(
         self,
         user_id: str,

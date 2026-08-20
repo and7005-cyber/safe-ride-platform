@@ -25,6 +25,8 @@ Notification types:
   incident         driver reported an issue on the child's bus
   ride-cancelled   a parent cancelled the child's ride (that child's linked parents only)
   admin-notice     office broadcast to a route (one copy per parent with a child assigned)
+  route-updated    a fleet-plan apply changed the child's stop/time/bus (U6)
+  route-unassigned a fleet-plan apply left the child without a route for a leg (U6)
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -35,6 +37,7 @@ import ipaddress
 import json
 import logging
 import math
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -506,6 +509,40 @@ class PushService:
                 )
         except Exception:
             logger.exception("notify_bus_position failed")
+
+    def deliver_plan_feed_rows(self, rows: list[dict]) -> dict:
+        """Awaited push delivery for feed rows the fleet-plan apply transaction
+        ALREADY wrote (U6) — delivery only, never insertion: the feed rows are
+        the product truth and committed with the apply, so re-inserting here
+        would double them (and the notified-family count counts feed rows,
+        not deliveries). Runs synchronously inside the request — awaited,
+        never a detached thread (the Lambda freeze rule) — with per-recipient
+        isolation: one family's failing send must not cost the rest theirs.
+        One summary line per burst on this logger (saferide.push).
+
+        Each row needs ``user_id``/``title``/``body``/``type``. Returns
+        ``{sent, failed, simulated, elapsed_ms}``; ``simulated`` is True when
+        no push channel is configured (local dev default) and every delivery
+        was a log line."""
+        t0 = time.monotonic()
+        settings = get_settings()
+        fcm_enabled = bool(settings.firebase_service_account_json.strip()) and not self._firebase_failed
+        webpush_enabled = bool(settings.vapid_private_key and settings.vapid_public_key)
+        simulated = not fcm_enabled and not webpush_enabled
+        sent = failed = 0
+        for row in rows:
+            try:
+                self.send_to_user(str(row["user_id"]), row["title"], row["body"], row["type"])
+                sent += 1
+            except Exception:
+                failed += 1
+                logger.exception("plan-apply push failed for user %s", row.get("user_id"))
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "plan-apply push fan-out: sent=%d failed=%d simulated=%s elapsed_ms=%d",
+            sent, failed, simulated, elapsed_ms,
+        )
+        return {"sent": sent, "failed": failed, "simulated": simulated, "elapsed_ms": elapsed_ms}
 
     # Internals ----------------------------------------------------------------
 
