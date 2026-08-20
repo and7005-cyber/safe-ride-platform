@@ -1,6 +1,12 @@
-"""Fleet-plan endpoints (U4): fleet confirmation, draft generation, current
-plans, discard. F1/F4 on the backend — the review/edit surface (U5) and apply
-(U6) land in later units on this same router.
+"""Fleet-plan endpoints: fleet confirmation, draft generation, current plans,
+discard (U4), plus the review/edit surface (U5) — computed review payload with
+wall-clock stop times and the diff vs live, the edit verbs (move / reorder /
+pin / pattern / assign), and the explicit in-draft re-solve. Apply (U6) lands
+later on this same router.
+
+Review-edit contract (R9): every edit re-checks the hard constraints and a
+violation answers 422 with the constraint NAMED ('capacity' or 'stop cap'),
+leaving the draft document unchanged.
 
 All admin-only: plan documents aggregate every enrolled child's name and home
 coordinates, the R19 rationale's aggregate PII target.
@@ -63,6 +69,132 @@ def current_plans(school_id: str, user: dict = Depends(admin_only)):
     """The school's open draft (full document) plus applied/previous metadata
     without payloads. Review computation is U5's job."""
     return safe_call(lambda: dao.current_plans(school_id))
+
+
+@router.get("/review")
+def review(school_id: str, user: dict = Depends(admin_only)):
+    """The open draft's computed review surface (U5: R10/R24): document plus
+    per-child ride times with wall-clock stop times (backward from the gate
+    anchor for AM, forward for PM), per-bus capacity use, total driving,
+    per-leg unplaceable lists, and the diff vs live with the notified-family
+    count. Provider-free: pure arithmetic over the stored durations."""
+    return safe_call(lambda: dao.review(school_id))
+
+
+# --- review edits (U5) ----------------------------------------------------
+# Each edit recomputes the affected route(s) along the fixed sequence and
+# re-checks hard constraints: violations 422 naming 'capacity' or 'stop cap',
+# draft unchanged.
+
+
+class MovePayload(BaseModel):
+    student_id: str
+    to_bus_id: str
+    # None = both legs the child rides (the default). An explicit single leg
+    # on a both-legs rider flips the document pattern to split.
+    legs: list[str] | None = None
+    # 0-based insert position for a NEW stop on the target leg(s); None
+    # appends. Ignored when the child joins an existing same-place stop.
+    position: int | None = None
+
+
+class ReorderPayload(BaseModel):
+    bus_id: str
+    leg: str
+    # The FULL ordered list of the leg's stop keys — the `key` each review
+    # stop row carries — echoed back verbatim in the admin's chosen order
+    # (the shipped stop-order contract's shape).
+    order: list[str]
+
+
+class PinPayload(BaseModel):
+    student_id: str
+    # Bus pin: one bus id for every leg the child rides, or a per-leg mapping
+    # {"morning": ..., "afternoon": ...}. Stored in the document; re-solve
+    # honours it as a solver input.
+    bus: str | dict[str, str] | None = None
+    # Order pin: 0-based stop position, scalar or per-leg mapping.
+    order: int | dict[str, int] | None = None
+    # 'bus' | 'order' | 'all' — removes that pin dimension instead of setting.
+    unpin: str | None = None
+
+
+class PatternPayload(BaseModel):
+    student_id: str
+    pattern: str
+
+
+class AssignPayload(BaseModel):
+    student_id: str
+    bus_id: str
+    # 0-based insert position, scalar or per-leg mapping; None appends.
+    position: int | dict[str, int] | None = None
+    # None = every leg the child is listed unplaceable for.
+    legs: list[str] | None = None
+
+
+@router.post("/{plan_id}/move")
+def move_student(plan_id: str, payload: MovePayload, user: dict = Depends(admin_only)):
+    """Move a placed child between buses — both legs by default; an explicit
+    one-leg move flips the document pattern to split (stored pattern stays
+    authoritative). Recomputes both affected routes' times."""
+    return safe_call(
+        lambda: dao.move_student(
+            plan_id, payload.student_id, payload.to_bus_id,
+            legs=payload.legs, position=payload.position,
+        )
+    )
+
+
+@router.post("/{plan_id}/reorder")
+def reorder_stops(plan_id: str, payload: ReorderPayload, user: dict = Depends(admin_only)):
+    """Reorder one route's stops (explicit full-order echo of stop keys).
+    Recomputes times along the new fixed sequence — never a re-ordering call."""
+    return safe_call(
+        lambda: dao.reorder_stops(plan_id, payload.bus_id, payload.leg, payload.order)
+    )
+
+
+@router.post("/{plan_id}/pin")
+def set_pin(plan_id: str, payload: PinPayload, user: dict = Depends(admin_only)):
+    """Pin/unpin a child: bus pin (per leg or both) and order pin, stored in
+    the document so re-solve honours them."""
+    return safe_call(
+        lambda: dao.set_pin(
+            plan_id, payload.student_id,
+            bus=payload.bus, order=payload.order, unpin=payload.unpin,
+        )
+    )
+
+
+@router.post("/{plan_id}/pattern")
+def set_pattern(plan_id: str, payload: PatternPayload, user: dict = Depends(admin_only)):
+    """Change a child's ridership pattern in the draft only (never
+    live_students). Removing a leg drops the child's stop from that leg and
+    updates times."""
+    return safe_call(
+        lambda: dao.set_pattern(plan_id, payload.student_id, payload.pattern)
+    )
+
+
+@router.post("/{plan_id}/assign")
+def assign_student(plan_id: str, payload: AssignPayload, user: dict = Depends(admin_only)):
+    """Place a currently-unplaceable child onto a bus at an explicit position,
+    per pattern legs — the manual placement path until slot-ins ship."""
+    return safe_call(
+        lambda: dao.assign_student(
+            plan_id, payload.student_id, payload.bus_id,
+            position=payload.position, legs=payload.legs,
+        )
+    )
+
+
+@router.post("/{plan_id}/resolve")
+def resolve_draft(plan_id: str, user: dict = Depends(admin_only)):
+    """Re-run the solver on the draft's basis with the document's pins and
+    pattern edits as inputs (fresh in-memory matrix). Unpinned manual
+    arrangements are discarded — the response says so explicitly."""
+    return safe_call(lambda: dao.resolve_draft(plan_id))
 
 
 @router.post("/{plan_id}/discard")

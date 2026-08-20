@@ -443,6 +443,63 @@ def route_geometry(sequence: list[dict], *, departure: dt.datetime | None = None
     }
 
 
+# --- Fixed-sequence recompute (fleet planning, U5) ----------------------------
+
+def fixed_sequence_geometry(
+    sequence: list[dict], *, departure: dt.datetime | None = None
+) -> dict[str, Any]:
+    """Geometry + per-leg durations along a GIVEN ordered ``sequence`` — never
+    re-orders (U5; U6's post-commit refresh and U8's plan-ordered regeneration
+    reuse it). Nothing shipped before this refreshed a route without handing
+    its order back to an optimiser: ``optimized_order_with_provider`` decides
+    ORDERING, this decides GEOMETRY-ALONG-A-SEQUENCE.
+
+    Returns ``{polyline, total_distance_m, total_duration_s, legs, provider,
+    degraded}`` where ``legs[i]`` is ``sequence[i] -> sequence[i+1]``. With a
+    Google key this is one fixed-order ``route_geometry`` call (8 s timeout,
+    best-effort, TRAFFIC_UNAWARE unless ``departure`` is given). Any failure,
+    misshapen leg list, or missing key falls back WHOLE (never mixed) to the
+    deterministic offline estimate using the SAME constants as
+    :func:`compute_duration_matrix` (haversine × circuity ÷ urban speed) —
+    deliberately NOT ``route_geometry``'s own offline constants, so a
+    review-edit recompute stays consistent with the solver's matrix durations
+    and the keyless integration stack is deterministic. ``degraded`` is True
+    exactly when the offline path was taken.
+    """
+    pts = [p for p in sequence if p.get("lat") is not None and p.get("lng") is not None]
+    if len(pts) < 2:
+        return {
+            "polyline": None,
+            "total_distance_m": 0,
+            "total_duration_s": 0,
+            "legs": [],
+            "provider": "trivial",
+            "degraded": False,
+        }
+    geom = route_geometry(pts, departure=departure)
+    if (
+        geom["provider"] == "google-routes"
+        and len(geom["legs"]) == len(pts) - 1
+        and all(leg.get("duration_s") is not None for leg in geom["legs"])
+    ):
+        return {**geom, "degraded": False}
+    legs = []
+    for a, b in zip(pts, pts[1:]):
+        dist = haversine_m((a["lat"], a["lng"]), (b["lat"], b["lng"]))
+        legs.append({
+            "distance_m": int(dist),
+            "duration_s": int(dist * _MATRIX_CIRCUITY / _MATRIX_SPEED_MS),
+        })
+    return {
+        "polyline": None,
+        "total_distance_m": int(sum(leg["distance_m"] for leg in legs)),
+        "total_duration_s": int(sum(leg["duration_s"] for leg in legs)),
+        "legs": legs,
+        "provider": "offline",
+        "degraded": True,
+    }
+
+
 # --- Duration matrix (fleet planning): directed drive times, all pairs -------
 
 _ROUTE_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
