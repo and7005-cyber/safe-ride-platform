@@ -1,8 +1,10 @@
 from fastapi import APIRouter, BackgroundTasks, Depends
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
+from app.core.db import get_connection
 from app.core.errors import BadRequestError
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
@@ -327,6 +329,74 @@ def bulk_upload(
             seed_only=True,
         )
     return result
+
+
+# Aggregate pin map with audited access (U11/R19) ----------------------------
+
+def _pin_map(school_id: str, actor: dict) -> dict:
+    """Every student pin for one school in ONE audited read (R19).
+
+    One screen showing every child's home is a higher-value target than any
+    single record, so access itself is the audited event: the read and its
+    'pin-map-viewed' live_admin_audit row share a transaction — the response
+    and the row commit or vanish together, and a served pin map without its
+    audit row is impossible. The insert mirrors fleet_plan_dao's apply/restore
+    writers column for column (actor name/email denormalized so the row
+    outlives the account); it lives here rather than a DAO per the U11 file
+    scope — a second consumer should extract the shared helper.
+
+    Students split by triage state: 'placed' (real coordinates — a map marker)
+    vs 'unresolved' (no usable coordinates — listed by name beside the map so
+    the operator can open each one and place the pin). This endpoint is the
+    aggregate's ONLY source; the frontend must not assemble it from the
+    regular students list, which would bypass the audit.
+    """
+    with get_connection() as conn:
+        if conn.execute(
+            "select 1 from live_schools where id = %s", (school_id,)
+        ).fetchone() is None:
+            raise BadRequestError("School not found — pick the school whose pins to view")
+        rows = conn.execute(
+            "select id, name, home_address, home_lat, home_lng, provenance "
+            "from live_students where school_id = %s order by name asc",
+            (school_id,),
+        ).fetchall()
+        placed: list[dict] = []
+        unresolved: list[dict] = []
+        for row in rows:
+            has_pin = row["home_lat"] is not None and row["home_lng"] is not None
+            pin = {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "address": row["home_address"],
+                # Coerced to float: the columns are numeric and a raw Decimal
+                # serializes as a JSON string, which no map marker can place.
+                "lat": float(row["home_lat"]) if has_pin else None,
+                "lng": float(row["home_lng"]) if has_pin else None,
+                "provenance": row["provenance"],
+                "state": "placed" if has_pin else "unresolved",
+            }
+            (placed if has_pin else unresolved).append(pin)
+        conn.execute(
+            "insert into live_admin_audit "
+            "(actor_id, actor_name, actor_email, action, school_id, detail) "
+            "values (%s, %s, %s, 'pin-map-viewed', %s, %s)",
+            (
+                actor.get("id"),
+                actor.get("full_name") or actor.get("email") or "unknown",
+                actor.get("email") or "unknown",
+                school_id,
+                Jsonb({"pin_count": len(placed), "unresolved_count": len(unresolved)}),
+            ),
+        )
+    return {"school_id": school_id, "placed": placed, "unresolved": unresolved}
+
+
+@router.get("/pin-map")
+def pin_map(school_id: str, user: dict = Depends(admin_only)):
+    # Admin-only like the students list, but the aggregate view carries its own
+    # audit trail on top (R19) — see _pin_map. Exactly one audit row per call.
+    return safe_call(lambda: _pin_map(school_id, user))
 
 
 # Absences (#7) --------------------------------------------------------------

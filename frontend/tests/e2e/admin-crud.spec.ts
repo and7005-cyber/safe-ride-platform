@@ -289,6 +289,63 @@ test("bulk upload triages rows and imports after a one-click pin confirm", async
   }
 });
 
+// Aggregate pin map (U11/R19): every pin for the school on one audited view —
+// the dialog reads ONLY the /pin-map endpoint (each fetch writes a
+// 'pin-map-viewed' audit row server-side; asserted in
+// backend/tests/integration/test_pin_map_audit.py) — and a named marker
+// deep-links to the student's normal editor so a mis-placed pin is fixed in
+// the regular flow. The `pin-marker-…` testid is carried by the map marker
+// AND by the key-less fallback row, so the assertion holds either way.
+test("pin map shows a named pin and jumps to the student editor", async ({ page, request }) => {
+  const name = uniqueName("E2E PinKid");
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = authHeaders(token);
+  const schoolsResp = await request.get(`${API_URL}/api/fleet/schools`, { headers });
+  expect(schoolsResp.ok()).toBeTruthy();
+  const school = (await schoolsResp.json()).find((s: any) => s.name === SEED.school);
+  expect(school).toBeTruthy();
+
+  // A student with a placed pin at the seeded school, staged via API.
+  const created = await request.post(`${API_URL}/api/students`, {
+    headers,
+    data: {
+      name, grade: "Grade 2", parent_name: "E2E Pin Parent",
+      parent_phone: "+254711222666", parent_email: "e2e-pin-parent@test.local",
+      home_address: "E2E Pin Lane, Nairobi", home_lat: -1.2921, home_lng: 36.8219,
+      provenance: "imported", school_id: school.id, route_ids: [],
+    },
+  });
+  expect(created.ok()).toBeTruthy();
+  const studentId = (await created.json()).id;
+
+  try {
+    await adminLogin(page);
+    await page.goto("/students");
+    await page.getByRole("button", { name: "Pin map" }).click();
+    await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+
+    // The audited aggregate answers with the student's named pin.
+    await expect(dialog(page).getByTestId("pin-map-summary")).not.toHaveText(
+      "Loading pins…", { timeout: 15_000 },
+    );
+    const marker = dialog(page).getByTestId(`pin-marker-${studentId}`);
+    await expect(marker).toBeVisible({ timeout: 15_000 });
+    await expect(marker).toContainText(name);
+
+    // Clicking the pin lands in the NORMAL edit flow: same dialog, same
+    // PlacePicker a mis-placed pin is fixed with — no parallel editor.
+    await marker.click();
+    const editDialog = page.getByRole("dialog").filter({ hasText: "Edit Student" });
+    await expect(editDialog).toBeVisible();
+    await expect(fieldInput(editDialog, "Name")).toHaveValue(name);
+    await expect(editDialog.getByTestId("student-address")).toBeVisible();
+    await editDialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  } finally {
+    await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
+  }
+});
+
 test("admin can create and delete a driver account with a PIN", async ({ page }) => {
   const name = uniqueName("E2E Driver");
   const email = `e2e-driver-${Date.now()}@test.local`;
