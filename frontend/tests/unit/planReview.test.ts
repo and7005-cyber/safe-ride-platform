@@ -1,13 +1,17 @@
 // U9 — PlanReviewPage pure decision logic (lib/planReview). Covers the plan's
-// unit scenarios: the R22 gate-list builder groups basis-drift rows by kind;
-// diff shaping marks ≥5-minute moves ONLY; the R23 acknowledgment payload
-// includes every unplaceable (student, leg); the "Discard and re-draft"
-// escape appears only above the documented 10-row threshold; and the
-// first-apply copy predicate fires exactly when every diff row is a first
-// communication.
+// unit scenarios: the R22 gate-list builder groups basis-drift rows by kind
+// (for apply's basis list AND restore's server-computed previous.drift rows,
+// each with its own labels); diff shaping marks ≥5-minute moves ONLY; the R23
+// acknowledgment payload includes every unplaceable (student, leg); the
+// "Discard and re-draft" escape appears only above the documented 10-row
+// threshold; the first-apply copy predicate fires exactly when every diff row
+// is a first communication; and the idempotent already-applied receipt copy
+// carries no counts.
 import { describe, expect, it } from "vitest";
 import {
   ACTIVE_RUN_WARNING,
+  ALREADY_APPLIED_DESCRIPTION,
+  ALREADY_APPLIED_TITLE,
   DIFF_BUS_CHANGE,
   DIFF_FIRST_COMMUNICATION,
   DIFF_LEG_REMOVED,
@@ -16,8 +20,10 @@ import {
   DIFF_TIME_MOVE,
   FIRST_APPLY_MESSAGE,
   GATE_ESCAPE_THRESHOLD,
+  GATE_KIND_LABEL,
   NOTIFY_MOVE_THRESHOLD_MIN,
   RESTORE_CONFIRM_MESSAGE,
+  RESTORE_GATE_KIND_LABEL,
   ackKey,
   buildAcknowledgmentPayload,
   buildGateList,
@@ -106,6 +112,30 @@ describe("groupGateRows", () => {
 
   it("returns nothing for an empty list", () => {
     expect(groupGateRows([])).toEqual([]);
+  });
+
+  it("accepts the server's restore drift rows with restore-flavoured labels", () => {
+    // GET /current's previous.drift rows share the gate-kind vocabulary and
+    // {kind, student_id, name} shape, arriving server-sorted by kind
+    // alphabetically — grouping still lands in the fixed dialog order.
+    const drift = [
+      { kind: "departed" as const, student_id: "d1", name: "David" },
+      { kind: "enrolled" as const, student_id: "e1", name: "Elena" },
+      { kind: "enrolled" as const, student_id: "e2", name: "Farah" },
+    ];
+    const groups = groupGateRows(drift, RESTORE_GATE_KIND_LABEL);
+    expect(groups.map((g) => g.kind)).toEqual(["enrolled", "departed"]);
+    expect(groups[0].rows.map((r) => r.name)).toEqual(["Elena", "Farah"]);
+    expect(groups[0].label).toBe(RESTORE_GATE_KIND_LABEL.enrolled);
+    expect(groups[1].label).toBe(RESTORE_GATE_KIND_LABEL.departed);
+    // The restore labels speak of the preserved plan, not the draft.
+    expect(groups[0].label).toContain("preserved");
+    expect(groups[0].label).not.toContain("draft");
+  });
+
+  it("defaults to the draft-flavoured apply labels", () => {
+    const rows = buildGateList([], [live("e", "Elena")]);
+    expect(groupGateRows(rows)[0].label).toBe(GATE_KIND_LABEL.enrolled);
   });
 });
 
@@ -303,5 +333,16 @@ describe("copy pins", () => {
 
   it("states the one-level restore rule", () => {
     expect(RESTORE_CONFIRM_MESSAGE).toContain("Only one step back exists.");
+  });
+
+  it("pins the idempotent already-applied receipt (no counts to interpolate)", () => {
+    // The apply/restore no-op answer carries no routes_written /
+    // notified_family_count — the copy must claim none.
+    expect(ALREADY_APPLIED_TITLE).toBe("Already applied — nothing to redo");
+    expect(ALREADY_APPLIED_DESCRIPTION).toBe(
+      "An earlier request already made this plan live — no routes were " +
+        "rewritten and no families were re-notified.",
+    );
+    expect(ALREADY_APPLIED_DESCRIPTION).not.toContain("undefined");
   });
 });

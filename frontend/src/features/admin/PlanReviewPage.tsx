@@ -32,10 +32,13 @@ import { PlanUnplaceablePanel } from "@/features/admin/components/PlanUnplaceabl
 import { api } from "@/lib/apiClient";
 import {
   ACTIVE_RUN_WARNING,
+  ALREADY_APPLIED_DESCRIPTION,
+  ALREADY_APPLIED_TITLE,
   PLAN_DEGRADED_MESSAGE,
   PLAN_LEGS,
   RESOLVE_CONFIRM_MESSAGE,
   RESTORE_CONFIRM_MESSAGE,
+  RESTORE_GATE_KIND_LABEL,
   buildAcknowledgmentPayload,
   buildGateList,
   flattenUnplaceable,
@@ -44,6 +47,7 @@ import {
   groupGateRows,
   isFirstApplyDiff,
   legLabel,
+  type GateRow,
   type UnplaceableEntry,
 } from "@/lib/planReview";
 import {
@@ -431,6 +435,22 @@ export function PlanReviewPage() {
   const [applyResult, setApplyResult] = useState<any | null>(null);
   const [restoring, setRestoring] = useState(false);
 
+  // Restore's R22 gate: the server's `previous.drift` rows (departed/enrolled
+  // since the capture — the same {kind, student_id, name} shape as the apply
+  // gate list, computed by the same DAO helper as the gate itself), so the
+  // confirmations can be assembled here instead of a blind empty POST.
+  const restoreDrift = useMemo<GateRow[]>(
+    () => ((plans?.previous?.drift ?? []) as GateRow[]),
+    [plans],
+  );
+  const restoreGroups = useMemo(
+    () => groupGateRows(restoreDrift, RESTORE_GATE_KIND_LABEL),
+    [restoreDrift],
+  );
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [restoreConfirmedKeys, setRestoreConfirmedKeys] = useState<Set<string>>(new Set());
+  const [restoreError, setRestoreError] = useState("");
+
   const openApply = () => {
     setConfirmedKeys(new Set());
     setAckKeys(new Set());
@@ -456,7 +476,14 @@ export function PlanReviewPage() {
         acknowledgments: buildAcknowledgmentPayload(unplaceable),
       });
       setApplyOpen(false);
-      setApplyResult({ act: "apply", ...res });
+      if (res.already_applied) {
+        // Idempotent answer (a gateway-timeout retry hitting the now-applied
+        // row): no counts in the response, so no receipt card to build.
+        setApplyResult(null);
+        toast({ title: ALREADY_APPLIED_TITLE, description: ALREADY_APPLIED_DESCRIPTION });
+      } else {
+        setApplyResult({ act: "apply", ...res });
+      }
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["fleet-plans"] }),
         qc.invalidateQueries({ queryKey: ["fleet-plan-review"] }),
@@ -484,6 +511,15 @@ export function PlanReviewPage() {
   const restorePlan = async () => {
     const previous = plans?.previous;
     if (!previous) return;
+    if (restoreDrift.length > 0) {
+      // Roster drift since the capture: restore's R22 gate demands each row
+      // confirmed by (kind, student), so open the gate dialog instead of
+      // dead-ending on the 409 an empty-confirmation POST would earn.
+      setRestoreConfirmedKeys(new Set());
+      setRestoreError("");
+      setRestoreOpen(true);
+      return;
+    }
     if (
       !(await confirm({
         title: "Restore the previous plan?",
@@ -492,13 +528,35 @@ export function PlanReviewPage() {
       }))
     )
       return;
+    await submitRestore([], { viaDialog: false });
+  };
+
+  const submitRestore = async (
+    confirmations: Array<{ kind: string; student_id: string }>,
+    opts: { viaDialog: boolean },
+  ) => {
+    const previous = plans?.previous;
+    if (!previous) return;
     setRestoring(true);
+    setRestoreError("");
     try {
       const res = await api.post(`/api/fleet-plans/${previous.id}/restore`, {
-        confirmations: [],
+        confirmations,
         acknowledgments: [],
       });
-      setApplyResult({ act: "restore", ...res });
+      setRestoreOpen(false);
+      if (res.already_applied) {
+        // Idempotent answer (a gateway-timeout retry hitting the now-applied
+        // row): the response carries no counts, so the toast claims none.
+        setApplyResult(null);
+        toast({ title: ALREADY_APPLIED_TITLE, description: ALREADY_APPLIED_DESCRIPTION });
+      } else {
+        setApplyResult({ act: "restore", ...res });
+        toast({
+          title: "Previous plan restored",
+          description: `${res.routes_written} routes written · ${res.notified_family_count} families notified`,
+        });
+      }
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["fleet-plans"] }),
         qc.invalidateQueries({ queryKey: ["fleet-plan-review"] }),
@@ -506,14 +564,13 @@ export function PlanReviewPage() {
         qc.invalidateQueries({ queryKey: ["students"] }),
         qc.invalidateQueries({ queryKey: ["buses"] }),
       ]);
-      toast({
-        title: "Previous plan restored",
-        description: `${res.routes_written} routes written · ${res.notified_family_count} families notified`,
-      });
     } catch (err) {
-      // Roster/fleet drift since the capture 409s naming each item — surfaced
-      // verbatim; the admin fixes the fleet or re-drafts instead.
-      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+      // Residual drift 409s verbatim — fleet drift (a vanished/shrunk/
+      // re-claimed bus) stays string-only by design; the admin fixes the
+      // fleet or re-drafts instead. Shown in the gate dialog when one is
+      // open, as the toast otherwise.
+      if (opts.viaDialog) setRestoreError((err as Error).message);
+      else toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
       setRestoring(false);
     }
@@ -1186,6 +1243,96 @@ export function PlanReviewPage() {
             </Button>
             <Button onClick={savePlace} disabled={editBusy || !placeBusId} data-testid="place-save">
               Place
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Restore gate dialog: R22 for restore — roster drift since the
+          preserved capture (departed/enrolled; addresses never gate restore)
+          confirmed per row before the POST, the PlanApplyDialog gate
+          pattern. Residual 409s (fleet drift stays string-only by design)
+          surface verbatim below the list. */}
+      <Dialog
+        open={restoreOpen}
+        onOpenChange={(o) => {
+          if (!o && restoring) return;
+          setRestoreOpen(o);
+        }}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto" data-testid="restore-dialog">
+          <DialogHeader>
+            <DialogTitle>Restore the previous plan?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">{RESTORE_CONFIRM_MESSAGE}</p>
+            <div className="space-y-3" data-testid="restore-gate-list">
+              <p className="text-sm font-semibold">
+                The school has changed since this plan was preserved
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Confirm each change to restore the plan as preserved.
+              </p>
+              {restoreGroups.map((group) => (
+                <div
+                  key={group.kind}
+                  className="space-y-1"
+                  data-testid={`restore-gate-group-${group.kind}`}
+                >
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {group.label}
+                  </p>
+                  {group.rows.map((row) => {
+                    const key = `${row.kind}|${row.student_id}`;
+                    return (
+                      <label
+                        key={key}
+                        className="flex items-center gap-2 text-sm"
+                        data-testid={`restore-gate-row-${row.kind}-${row.student_id}`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-primary"
+                          checked={restoreConfirmedKeys.has(key)}
+                          disabled={restoring}
+                          onChange={() => toggleKey(setRestoreConfirmedKeys)(key)}
+                          aria-label={`Confirm ${row.kind}: ${row.name}`}
+                        />
+                        <span>{row.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+            {restoreError && (
+              <p className="text-sm text-destructive" data-testid="restore-error">
+                {restoreError}
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={restoring} onClick={() => setRestoreOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                // The house R22 rule: the checkboxes gate the button, never
+                // the payload — every drift row is sent as a confirmation.
+                submitRestore(
+                  restoreDrift.map((r) => ({ kind: r.kind, student_id: r.student_id })),
+                  { viaDialog: true },
+                )
+              }
+              disabled={
+                restoring ||
+                !restoreDrift.every((r) =>
+                  restoreConfirmedKeys.has(`${r.kind}|${r.student_id}`),
+                )
+              }
+              data-testid="restore-confirm"
+            >
+              {restoring ? "Restoring…" : "Restore plan"}
             </Button>
           </DialogFooter>
         </DialogContent>

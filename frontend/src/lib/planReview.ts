@@ -71,6 +71,16 @@ export const RESTORE_CONFIRM_MESSAGE =
   "Restoring returns to the previous plan; the current one becomes restorable " +
   "in its place. Only one step back exists.";
 
+/** U6/U7 idempotent answer: apply/restore on an already-applied plan returns
+ * `{already_applied, plan}` WITHOUT routes_written / notified_family_count
+ * (the gateway-timeout-retry case the DAO anticipates), so the success toast
+ * must branch on it instead of interpolating counts the response never
+ * carried. */
+export const ALREADY_APPLIED_TITLE = "Already applied — nothing to redo";
+export const ALREADY_APPLIED_DESCRIPTION =
+  "An earlier request already made this plan live — no routes were rewritten " +
+  "and no families were re-notified.";
+
 // --- R22 gate list (basis drift, computed client-side from the draft basis) --
 
 export interface BasisStudentLike {
@@ -108,6 +118,17 @@ export const GATE_KIND_LABEL: Record<GateKind, string> = {
   enrolled: "Enrolled since this draft was generated — they have no seat in it",
   "address-changed": "Address changed since this draft was generated — their stop may be wrong",
   departed: "Departed since this draft was generated — their stop will be dropped",
+};
+
+/** Restore-flavoured R22 labels: the server's `previous.drift` rows share the
+ * gate-kind vocabulary but read against the preserved capture, not the draft
+ * basis. Restore never gates on address changes (communicated stops are put
+ * back verbatim), but the label exists so an unexpected row still renders
+ * honestly rather than blank. */
+export const RESTORE_GATE_KIND_LABEL: Record<GateKind, string> = {
+  enrolled: "Enrolled after this plan was preserved — they will be left without a route",
+  "address-changed": "Address changed since this plan was preserved",
+  departed: "Departed since this plan was preserved — their stop will be dropped",
 };
 
 /**
@@ -158,11 +179,18 @@ export interface GateGroup {
 }
 
 /** Group gate rows by kind in the fixed enrolled → address-changed → departed
- * order, dropping empty groups — the R22 dialog's section structure. */
-export function groupGateRows(rows: GateRow[]): GateGroup[] {
+ * order, dropping empty groups — the R22 dialog's section structure. Serves
+ * both gate dialogs: the apply flow feeds it the client-built basis list with
+ * the default (draft-flavoured) labels; the restore flow feeds it the server's
+ * `previous.drift` rows — the same {kind, student_id, name} shape — with
+ * RESTORE_GATE_KIND_LABEL. */
+export function groupGateRows(
+  rows: GateRow[],
+  labels: Record<GateKind, string> = GATE_KIND_LABEL,
+): GateGroup[] {
   return GATE_KIND_ORDER.map((kind) => ({
     kind,
-    label: GATE_KIND_LABEL[kind],
+    label: labels[kind],
     rows: rows.filter((r) => r.kind === kind),
   })).filter((g) => g.rows.length > 0);
 }
