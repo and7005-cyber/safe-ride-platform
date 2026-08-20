@@ -71,7 +71,9 @@ def create_draft(payload: DraftPayload, user: dict = Depends(admin_only)):
 @router.get("/current")
 def current_plans(school_id: str, user: dict = Depends(admin_only)):
     """The school's open draft (full document) plus applied/previous metadata
-    without payloads. Review computation is U5's job."""
+    without payloads. Review computation is U5's job. The previous metadata
+    carries `drift` — the departed/enrolled rows restore's gate will demand
+    confirmations for, computed by the same helper as the gate itself."""
     return safe_call(lambda: dao.current_plans(school_id))
 
 
@@ -80,8 +82,11 @@ def review(school_id: str, user: dict = Depends(admin_only)):
     """The open draft's computed review surface (U5: R10/R24): document plus
     per-child ride times with wall-clock stop times (backward from the gate
     anchor for AM, forward for PM), per-bus capacity use, total driving,
-    per-leg unplaceable lists, and the diff vs live with the notified-family
-    count. Provider-free: pure arithmetic over the stored durations."""
+    per-leg unplaceable lists, the diff vs live with the notified-family
+    count, and `basis_drift` — the exact enrolled/address-changed/departed
+    rows apply's R22 gate computes, so the apply payload can be assembled
+    without a blind POST. Provider-free: pure arithmetic over the stored
+    durations."""
     return safe_call(lambda: dao.review(school_id))
 
 

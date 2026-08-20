@@ -351,31 +351,31 @@ def _plan_fixed_compute(conn, route: dict, seq_keys: list[str], points: dict[str
     geom = geo_service.fixed_sequence_geometry(seq)
     durations = [leg.get("duration_s") or 0 for leg in geom["legs"]]
 
+    # The SHARED direction-aware ride walk (geo_service.cumulative_ride_seconds
+    # — the one implementation the plan review recompute and the slot-in
+    # materializer also use): rides[i] is stop i's cumulative drive to/from
+    # the gate, the depot entering only as the shipped boundary leg (leading
+    # on morning, trailing on afternoon — never in a ride). The anchor IS the
+    # gate arrival (morning) / departure (afternoon), so each stop's ETA is
+    # one signed ride away from it — identical arithmetic to the previous
+    # departure-plus-cumulative walk, minus the zip truncation that could
+    # silently misalign ETAs when the provider returned fewer legs than the
+    # sequence implies: a short leg list now pads observably (missing legs
+    # count 0) and raises the degraded flag instead.
+    rides, short = geo_service.cumulative_ride_seconds(
+        durations, len(seq_keys), is_afternoon=is_afternoon, has_depot=depot is not None
+    )
     anchor_dt = geo_service.next_departure(anchor_hhmm, default=default)
+    sign = 1 if is_afternoon else -1
+    gate_time = anchor_dt.strftime("%H:%M")
+    group_times = {
+        key: (anchor_dt + dt.timedelta(seconds=sign * rides[i])).strftime("%H:%M")
+        for i, key in enumerate(seq_keys)
+    }
     if is_afternoon:
-        # The anchor IS the gate departure; ETAs run forward from it.
-        departure = anchor_dt
-    else:
-        # Backward arithmetic: the departure is set so the LAST point (the
-        # gate) lands exactly on the anchor — the fixed-order equivalent of
-        # solve_morning_departure, one call, no iteration.
-        departure = anchor_dt - dt.timedelta(seconds=sum(durations))
-    etas = [departure.strftime("%H:%M")]
-    cumulative = 0
-    for secs in durations:
-        cumulative += secs
-        etas.append((departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M"))
-    if is_afternoon:
-        # Append is zip-safe: seq_keys is shorter than etas[1:] when a depot
-        # trails, so zip() truncates the depot ETA off the tail.
-        gate_time, group_times = etas[0], dict(zip(seq_keys, etas[1:]))
         orders = {key: 2 + i for i, key in enumerate(seq_keys)}
         gate_order = 1
     else:
-        # Morning prepend is NOT zip-symmetric (the U7 rule): a leading depot
-        # ETA shifts the stop mapping by one.
-        stop_etas = etas[1:-1] if depot else etas[:-1]
-        gate_time, group_times = etas[-1], dict(zip(seq_keys, stop_etas))
         orders = {key: 1 + i for i, key in enumerate(seq_keys)}
         gate_order = len(seq_keys) + 1
     return {
@@ -385,7 +385,7 @@ def _plan_fixed_compute(conn, route: dict, seq_keys: list[str], points: dict[str
         "gate_time": gate_time,
         "gate_order": gate_order,
         "total_duration_s": geom.get("total_duration_s"),
-        "degraded": bool(geom.get("degraded")),
+        "degraded": bool(geom.get("degraded")) or short,
     }
 
 

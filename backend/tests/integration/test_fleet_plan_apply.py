@@ -40,6 +40,7 @@ test has no subject — stated here rather than tested.
 
 import os
 import random
+import time
 import uuid
 
 import httpx
@@ -262,6 +263,16 @@ def _plan_feed(client, headers) -> list[dict]:
     return [r for r in rows if r["type"] in PLAN_TYPES]
 
 
+def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.25) -> bool:
+    """Poll for a background-task effect (the manual-edit suite's pattern)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 def _minutes(hhmm: str) -> int:
     h, m = (int(x) for x in hhmm.split(":"))
     return h * 60 + m
@@ -478,6 +489,200 @@ def test_apply_gates_unplaceable_enrolment_capacity_departure(client, admin_head
         if enrolled:
             client.delete(f"/api/students/{enrolled['id']}", headers=admin_headers)
         _teardown(client, admin_headers, fx)
+
+
+# --- confirmed-enrolled severing (link-without-stop guard) --------------------------
+
+def test_enrolled_after_draft_manual_placement_is_severed_cleanly(client, admin_headers):
+    """A child enrolled AFTER drafting, manually placed on a live route the
+    document reuses, then confirmed 'enrolled' at the gate: the apply must
+    leave them cleanly unassigned — links severed on every written leg, no
+    stop rows, bus_id/pickup_time NULL (ridership_pattern kept) — never a
+    link-without-stop phantom membership. Their family hears route-unassigned
+    via the leg-removed path (the manual placement silently seeded their
+    baseline), and the baseline is deleted with the send."""
+    marker = uuid.uuid4().hex[:6]
+    pe = signup_parent(client, marker, "pe")
+    fx = _build_plan(
+        client, admin_headers, marker,
+        buses=[("A", 8, DEPOT_EAST)],
+        homes=[EAST_HOMES[0], EAST_HOMES[1]],
+    )
+    school_id = fx["school"]["id"]
+    plan_id = fx["plan"]["id"]
+    bus = fx["buses"][0]
+    route_m = enrolled = None
+    try:
+        # A live morning route on the drafted bus — the (bus, type) pair the
+        # document will REUSE in place at apply.
+        created = client.post(
+            "/api/fleet/routes",
+            json={"name": f"IT Apply Reused {marker}", "type": MORNING,
+                  "bus_id": bus["id"], "school_id": school_id},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        route_m = created.json()
+
+        # Enrolled after drafting, manually placed on that route (a roster
+        # path: membership + stop row + silently seeded baseline).
+        enrolled = _make_student(client, admin_headers, marker, 9, school_id,
+                                 WEST_HOMES[0], email=pe["email"],
+                                 route_ids=[route_m["id"]])
+        assert _links(enrolled["id"]) == {MORNING: bus["id"]}
+        assert _wait_until(lambda: MORNING in _baselines(enrolled["id"])), (
+            "the roster path should silently seed the manual placement's baseline"
+        )
+        pattern_before = next(
+            s["ridership_pattern"]
+            for s in client.get("/api/students", headers=admin_headers).json()
+            if s["id"] == enrolled["id"]
+        )
+
+        review = _review(client, admin_headers, school_id)
+        assert _acks_for(review) == []  # both drafted children placed
+        applied = _apply(
+            client, admin_headers, plan_id,
+            confirmations=[{"student_id": enrolled["id"], "kind": "enrolled"}],
+        )
+        assert applied.status_code == 200, applied.text
+
+        # The reused route survived in place — and carries NO trace of the
+        # confirmed-enrolled child: no link, no stop row.
+        routes_after = _school_routes(client, admin_headers, school_id)
+        assert route_m["id"] in {r["id"] for r in routes_after}
+        assert _links(enrolled["id"]) == {}
+        assert not any(
+            s["student_id"] == enrolled["id"]
+            for r in routes_after for s in r["route_stops"]
+        )
+
+        # Denormalized attributes cleared, pattern kept: cleanly unassigned.
+        live = {s["id"]: s for s in client.get("/api/students", headers=admin_headers).json()}
+        assert live[enrolled["id"]]["bus_id"] is None
+        assert live[enrolled["id"]]["pickup_time"] is None
+        assert live[enrolled["id"]]["ridership_pattern"] == pattern_before
+
+        # The family was told (leg-removed -> route-unassigned) and the
+        # consumed baseline is gone.
+        pe_rows = _plan_feed(client, pe["headers"])
+        assert [r["type"] for r in pe_rows] == ["route-unassigned"]
+        assert pe_rows[0]["student_id"] == enrolled["id"]
+        assert _baselines(enrolled["id"]) == {}
+    finally:
+        if enrolled:
+            client.delete(f"/api/students/{enrolled['id']}", headers=admin_headers)
+        _teardown(client, admin_headers, fx)
+        client.delete(f"/api/accounts/parents/{pe['id']}", headers=admin_headers)
+
+
+# --- multi-trip drift gate ----------------------------------------------------------
+
+def test_bus_entering_multi_trip_chain_after_draft_blocks_apply(client, admin_headers):
+    """A drafted bus that gained a trip_index>=2 route AFTER drafting is fleet
+    drift: apply 409s naming the bus in the fleet-drift vocabulary instead of
+    reaching the reconcile (whose (bus, type, trip_index) unique it would
+    trip). The refused apply leaves zero side effects; removing the chain
+    lets the same apply succeed."""
+    marker = uuid.uuid4().hex[:6]
+    fx = _build_plan(
+        client, admin_headers, marker,
+        buses=[("A", 8, DEPOT_EAST)],
+        homes=[EAST_HOMES[0], EAST_HOMES[1]],
+    )
+    school_id = fx["school"]["id"]
+    plan_id = fx["plan"]["id"]
+    bus = fx["buses"][0]
+    trip2 = None
+    try:
+        created = client.post(
+            "/api/fleet/routes",
+            json={"name": f"IT Apply Trip2 {marker}", "type": MORNING,
+                  "bus_id": bus["id"], "school_id": school_id, "trip_index": 2},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        trip2 = created.json()
+
+        refused = _apply(client, admin_headers, plan_id)
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert bus["name"] in detail
+        assert "multi-trip chain" in detail and "re-draft" in detail
+        assert _plan_status(plan_id) == "draft"
+        assert _audit_rows(school_id) == []
+        assert not any(
+            r["plan_ordered"]
+            for r in _school_routes(client, admin_headers, school_id)
+        )
+
+        # Un-drift the fleet: the same apply then goes through.
+        assert client.delete(
+            f"/api/fleet/routes/{trip2['id']}", headers=admin_headers
+        ).status_code == 200
+        trip2 = None
+        applied = _apply(client, admin_headers, plan_id)
+        assert applied.status_code == 200, applied.text
+        assert _plan_status(plan_id) == "applied"
+    finally:
+        if trip2:
+            client.delete(f"/api/fleet/routes/{trip2['id']}", headers=admin_headers)
+        _teardown(client, admin_headers, fx)
+
+
+# --- collapsed-stop privacy (per-child bodies + baselines) ---------------------------
+
+def test_collapsed_stop_bodies_never_leak_sibling_names(client, admin_headers):
+    """Two families collapsed onto ONE document stop (same coordinates): each
+    recipient's body names only THEIR OWN child's stop (the address-label
+    convention) — family A's text never contains family B's child's name —
+    and each child's communicated baseline carries their own label, never the
+    document's sibling-joined stop name."""
+    marker = uuid.uuid4().hex[:6]
+    pa = signup_parent(client, marker, "na")
+    pb = signup_parent(client, marker, "nb")
+    fx = _build_plan(
+        client, admin_headers, marker,
+        buses=[("A", 8, DEPOT_EAST)],
+        homes=[EAST_HOMES[0], EAST_HOMES[0]],  # identical coords -> one stop
+        emails=[pa["email"], pb["email"]],
+    )
+    school_id = fx["school"]["id"]
+    kid_a, kid_b = fx["students"]
+    label_a = f"IT Apply Home {marker} 0"
+    label_b = f"IT Apply Home {marker} 1"
+    try:
+        review = _review(client, admin_headers, school_id)
+        _bus, stop = _placement(review, kid_a["id"], MORNING)
+        assert stop is not None
+        assert {s["id"] for s in stop["students"]} == {kid_a["id"], kid_b["id"]}, (
+            "same-coordinate homes should collapse into one document stop"
+        )
+
+        applied = _apply(client, admin_headers, fx["plan"]["id"],
+                         acknowledgments=_acks_for(review))
+        assert applied.status_code == 200, applied.text
+
+        rows_a = _plan_feed(client, pa["headers"])
+        rows_b = _plan_feed(client, pb["headers"])
+        assert len(rows_a) == 1 and len(rows_b) == 1
+        assert label_a in rows_a[0]["body"]
+        assert kid_b["name"] not in rows_a[0]["body"]
+        assert label_b not in rows_a[0]["body"]
+        assert label_b in rows_b[0]["body"]
+        assert kid_a["name"] not in rows_b[0]["body"]
+        assert label_a not in rows_b[0]["body"]
+
+        # Baselines are per-child truth: each carries its own address label.
+        for kid, label in ((kid_a, label_a), (kid_b, label_b)):
+            base = _baselines(kid["id"])
+            assert set(base) == {MORNING, AFTERNOON}
+            for leg in (MORNING, AFTERNOON):
+                assert base[leg]["stop_name"] == label
+    finally:
+        _teardown(client, admin_headers, fx)
+        for p in (pa, pb):
+            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
 
 
 # --- AE5 + reconcile + post-apply invariants ---------------------------------------

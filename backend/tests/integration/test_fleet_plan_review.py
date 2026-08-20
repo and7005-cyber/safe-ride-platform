@@ -704,6 +704,91 @@ def test_diff_newly_unplaceable_and_leg_removed(client, admin_headers):
         _teardown(client, admin_headers, fx)
 
 
+def test_diff_place_change_is_physical_not_nominal(client, admin_headers):
+    """The place-change diff compares PLACES, not display names: a baseline
+    carrying the address-label name at the child's exact document coordinates
+    stays silent although the document stop shows a different (solver) name,
+    and a baseline jittered WITHIN the solver's 30 m collapse radius stays
+    silent too — while a genuine move far beyond it still fires (pinned by
+    test_diff_bus_change_time_thresholds_baselines_and_family_count)."""
+    marker = uuid.uuid4().hex[:6]
+    fx = _build_plan(
+        client, admin_headers, marker,
+        buses=[("A", 8, DEPOT_EAST)],
+        homes=[EAST_HOMES[0], EAST_HOMES[1]],
+    )
+    s1, s2 = (s["id"] for s in fx["students"])
+    try:
+        review = _review(client, admin_headers, fx["school"]["id"])
+        bus, stop = _placement(review, s1, MORNING)
+        assert stop is not None
+        # S1: same coords, same time, same bus — but the ADDRESS-LABEL name
+        # (what apply's baselines carry), not the document's display name.
+        _seed_baseline(
+            s1, MORNING,
+            name=f"IT Review Home {marker} 0",
+            lat=stop["lat"], lng=stop["lng"],
+            time=stop["scheduled_time"], bus_id=bus["bus_id"],
+        )
+        _seed_exact_baseline(review, s1, AFTERNOON)
+        # S2: coordinates jittered ~22 m — inside the collapse radius, the
+        # same physical stop.
+        _seed_exact_baseline(review, s2, MORNING, lat_shift=0.0002)
+        _seed_exact_baseline(review, s2, AFTERNOON)
+
+        review = _review(client, admin_headers, fx["school"]["id"])
+        assert not any(
+            row["student_id"] in (s1, s2) for row in review["diff"]["rows"]
+        ), review["diff"]["rows"]
+    finally:
+        _teardown(client, admin_headers, fx)
+
+
+# --- basis drift on the read path (R22) --------------------------------------------
+
+def test_review_carries_basis_drift_rows(client, admin_headers):
+    """The review payload's `basis_drift` is the same enrolled/address-changed
+    /departed list apply's gate will demand confirmations for — computed by
+    the shared helper, so a caller can assemble the apply payload without a
+    blind POST."""
+    marker = uuid.uuid4().hex[:6]
+    fx = _build_plan(
+        client, admin_headers, marker,
+        buses=[("A", 8, DEPOT_EAST)],
+        homes=[EAST_HOMES[0], EAST_HOMES[1]],
+    )
+    school_id = fx["school"]["id"]
+    moved = fx["students"][1]
+    enrolled = None
+    try:
+        review = _review(client, admin_headers, school_id)
+        assert review["basis_drift"] == []
+
+        enrolled = _make_student(client, admin_headers, marker, 9, school_id,
+                                 WEST_HOMES[0])
+        addressed = client.put(
+            f"/api/students/{moved['id']}",
+            json=_student_payload(marker, 1, school_id, WEST_HOMES[1]),
+            headers=admin_headers,
+        )
+        assert addressed.status_code == 200, addressed.text
+
+        drift = _review(client, admin_headers, school_id)["basis_drift"]
+        assert {
+            "kind": "enrolled", "student_id": enrolled["id"],
+            "name": enrolled["name"],
+        } in drift
+        assert {
+            "kind": "address-changed", "student_id": moved["id"],
+            "name": moved["name"],
+        } in drift
+        assert len(drift) == 2
+    finally:
+        if enrolled:
+            client.delete(f"/api/students/{enrolled['id']}", headers=admin_headers)
+        _teardown(client, admin_headers, fx)
+
+
 # --- keyless determinism ---------------------------------------------------------------
 
 def test_keyless_recompute_is_deterministic(client, admin_headers):

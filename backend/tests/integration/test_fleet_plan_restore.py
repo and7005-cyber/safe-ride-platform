@@ -317,6 +317,29 @@ def test_departed_and_enrolled_after_capture_require_confirmation(client, admin_
             f"/api/students/{departed['id']}", headers=admin_headers
         ).status_code == 200
 
+        # The drift is DISCOVERABLE before any blind POST: /current's
+        # previous metadata carries the same rows the restore gate computes
+        # (shared helper), naming the departed child via the capture's
+        # denormalized name — while the capture document itself stays
+        # unexposed (aggregate PII).
+        current = client.get(
+            "/api/fleet-plans/current", params={"school_id": school_id},
+            headers=admin_headers,
+        )
+        assert current.status_code == 200, current.text
+        prev_meta = current.json()["previous"]
+        assert prev_meta["id"] == plan_a["id"]
+        assert "document" not in prev_meta and "basis" not in prev_meta
+        assert {
+            "kind": "departed", "student_id": departed["id"],
+            "name": departed["name"],
+        } in prev_meta["drift"]
+        assert {
+            "kind": "enrolled", "student_id": enrolled["id"],
+            "name": enrolled["name"],
+        } in prev_meta["drift"]
+        assert len(prev_meta["drift"]) == 2
+
         # Unconfirmed → 409 naming BOTH, by kind; nothing changed.
         refused = _restore(client, admin_headers, plan_a["id"])
         assert refused.status_code == 409, refused.text

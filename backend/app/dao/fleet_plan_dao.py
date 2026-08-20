@@ -22,6 +22,7 @@ stack takes the deterministic haversine-degraded path, flagged on the row.
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Mapping
 
 from psycopg.types.json import Jsonb
@@ -227,6 +228,28 @@ def _floats_differ(a: Any, b: Any) -> bool:
     return abs(float(a) - float(b)) > _COORD_EPS
 
 
+def _place_differs(a_lat: Any, a_lng: Any, b_lat: Any, b_lng: Any) -> bool:
+    """Physical place comparison for the place-change diff. A located and an
+    unlocated side differ; two located points are the SAME place within
+    ``plan_solver.STOP_COLLAPSE_RADIUS_M`` (haversine metres — the solver's
+    own collapse radius, so a stop re-labelled or float-jittered inside one
+    collapse cluster never reads as a move); two unlocated points do not
+    differ HERE — the caller falls back to names for those, mirroring the
+    manual-edit writer's guard in push_service."""
+    a_located = a_lat is not None and a_lng is not None
+    b_located = b_lat is not None and b_lng is not None
+    if a_located != b_located:
+        return True
+    if not a_located:
+        return False
+    return (
+        geo_service.haversine_m(
+            (float(a_lat), float(a_lng)), (float(b_lat), float(b_lng))
+        )
+        > plan_solver.STOP_COLLAPSE_RADIUS_M
+    )
+
+
 def diff_plan_vs_live(
     conn, document: Mapping[str, Any], school: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -248,8 +271,11 @@ def diff_plan_vs_live(
       (live_communicated_stops.scheduled_time) for that (student, leg). A
       baseline row whose time is NULL/malformed counts as moved — the family
       is being told a time they were never told.
-    * ``place-change`` — the stop's coordinates or name differ from the
-      baseline stop.
+    * ``place-change`` — the stop physically moved vs the baseline: located
+      coordinates beyond the solver's collapse radius apart (or coordinate
+      presence flipped); names are compared ONLY when both sides are wholly
+      coordinate-less — the manual-edit writer's guard, shared, so a
+      re-labelled stop at the same place never notifies.
     * ``first-communication`` — the child is placed but has NO baseline row
       for that leg. Null baseline notifies (R15): the whole school on first
       apply is intended.
@@ -346,11 +372,19 @@ def diff_plan_vs_live(
                 and abs(new_min - old_min) >= NOTIFY_MOVE_THRESHOLD_MIN
             ):
                 categories.append(DIFF_TIME_MOVE)
-            if (
-                _floats_differ(base["stop_lat"], cur["lat"])
-                or _floats_differ(base["stop_lng"], cur["lng"])
-                or (base["stop_name"] or "") != (cur["stop_name"] or "")
+            if _place_differs(base["stop_lat"], base["stop_lng"], cur["lat"], cur["lng"]):
+                categories.append(DIFF_PLACE_CHANGE)
+            elif (
+                base["stop_lat"] is None
+                and base["stop_lng"] is None
+                and cur["lat"] is None
+                and cur["lng"] is None
+                and (base["stop_name"] or "") != (cur["stop_name"] or "")
             ):
+                # Names decide only for wholly coordinate-less stops — the
+                # manual-edit writer's rule: baselines may carry a different
+                # naming convention (labels vs joined names) for the same
+                # physical place.
                 categories.append(DIFF_PLACE_CHANGE)
         if categories:
             # The placed student's name travels in the document stop rows.
@@ -566,9 +600,16 @@ def _recompute_legs(document: dict, basis: Mapping[str, Any],
     the NEW fixed-sequence recompute (geo_service.fixed_sequence_geometry):
     durations along the GIVEN order — depot → stops → gate for AM, gate →
     stops → depot for PM — never a re-ordering call. Depot legs count only
-    toward driving; ride seconds are cumulative to/from the gate, matching
-    the solver's semantics exactly. Returns True when any recompute took the
-    degraded (offline) path. Refreshes the document objective afterwards."""
+    toward driving; ride seconds walk cumulatively to/from the gate through
+    the shared ``geo_service.cumulative_ride_seconds`` (matching the solver's
+    semantics exactly; a short provider leg list degrades observably instead
+    of crashing). The per-target provider calls are pure request/response, so
+    they run CONCURRENTLY under a bounded ThreadPoolExecutor (at most the
+    2-bus × 2-leg edit fan-out, ≤ 4 workers) and results are assigned back in
+    the original deterministic order — wall-clock under the plan-row lock is
+    the slowest single call (~8 s best-effort timeout), not the sum. Returns
+    True when any recompute took the degraded (offline) path. Refreshes the
+    document objective afterwards."""
     depots = {
         str(f["id"]): (
             {"lat": f["depot_lat"], "lng": f["depot_lng"]}
@@ -579,6 +620,7 @@ def _recompute_legs(document: dict, basis: Mapping[str, Any],
     }
     gate = {"lat": basis["school"]["lat"], "lng": basis["school"]["lng"]}
     degraded_any = False
+    jobs: list[dict] = []  # deterministic (sorted-target) order
     for bus_id, leg in sorted(targets):
         bus_doc = _bus_doc(document, bus_id)
         leg_doc = bus_doc["legs"][leg]
@@ -592,29 +634,29 @@ def _recompute_legs(document: dict, basis: Mapping[str, Any],
             seq = ([depot] if depot else []) + pts + [gate]
         else:
             seq = [gate] + pts + ([depot] if depot else [])
-        geom = geo_service.fixed_sequence_geometry(seq)
-        degraded_any = degraded_any or bool(geom["degraded"])
-        durations = [float(leg_row.get("duration_s") or 0) for leg_row in geom["legs"]]
-        n = len(stops)
-        rides = [0.0] * n
-        if leg == plan_solver.LEG_MORNING:
-            offset = 1 if depot else 0
-            acc = 0.0
-            for i in range(n - 1, -1, -1):
-                acc += durations[offset + i]
-                rides[i] = acc
-        else:
-            acc = 0.0
-            for i in range(n):
-                acc += durations[i]
-                rides[i] = acc
-        ride_rows = [
-            {"student_id": s["id"], "name": s["name"], "ride_seconds": rides[i]}
-            for i, stop in enumerate(stops)
-            for s in stop["students"]
-        ]
-        leg_doc["ride_seconds"] = ride_rows
-        leg_doc["driving_seconds"] = float(sum(durations))
+        jobs.append({"leg": leg, "leg_doc": leg_doc, "stops": stops,
+                     "depot": depot, "seq": seq})
+    if jobs:
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            geoms = list(pool.map(
+                geo_service.fixed_sequence_geometry, [j["seq"] for j in jobs]
+            ))
+        for job, geom in zip(jobs, geoms):
+            leg, leg_doc, stops = job["leg"], job["leg_doc"], job["stops"]
+            degraded_any = degraded_any or bool(geom["degraded"])
+            durations = [float(leg_row.get("duration_s") or 0) for leg_row in geom["legs"]]
+            rides, short = geo_service.cumulative_ride_seconds(
+                durations, len(stops),
+                is_afternoon=leg != plan_solver.LEG_MORNING,
+                has_depot=job["depot"] is not None,
+            )
+            degraded_any = degraded_any or short
+            leg_doc["ride_seconds"] = [
+                {"student_id": s["id"], "name": s["name"], "ride_seconds": rides[i]}
+                for i, stop in enumerate(stops)
+                for s in stop["students"]
+            ]
+            leg_doc["driving_seconds"] = float(sum(durations))
     _refresh_objective(document)
     return degraded_any
 
@@ -633,6 +675,52 @@ def _refresh_objective(document: dict) -> None:
                     worst = ride
             driving += float(leg_doc.get("driving_seconds") or 0.0)
     document["objective"] = [worst, total, driving]
+
+
+def _roster_drift(
+    current_by_id: Mapping[str, Mapping[str, Any]],
+    snapshot_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    address_changes: bool,
+) -> list[dict[str, str]]:
+    """Roster drift between the live student rows and a plan snapshot — THE
+    shared gate-diff (R22): apply's gate feeds it the draft basis
+    (``address_changes=True``: enrolments, coordinate changes vs the
+    snapshot, departures), restore's gate the preserved capture's students
+    (``address_changes=False`` — restore puts back communicated stops
+    verbatim, so an address change never gates it). The same computation also
+    feeds the READ paths (review's ``basis_drift``, /current's previous
+    ``drift``), so what a caller can fetch and what the act's 409 lists can
+    never drift apart.
+
+    ``current_by_id`` rows carry ``name``/``home_lat``/``home_lng``;
+    ``snapshot_by_id`` rows carry ``name``/``lat``/``lng`` (both the basis and
+    the capture denormalize names, so a departed child is still named — the
+    007/010 name-rot precedent). Returns ``[{kind, student_id, name}]``
+    sorted by (kind, name, student_id)."""
+    drift: list[dict[str, str]] = []
+    for sid, row in current_by_id.items():
+        if sid not in snapshot_by_id:
+            drift.append(
+                {"kind": DRIFT_ENROLLED, "student_id": sid, "name": row["name"]}
+            )
+        elif address_changes:
+            b = snapshot_by_id[sid]
+            if _floats_differ(b.get("lat"), row["home_lat"]) or _floats_differ(
+                b.get("lng"), row["home_lng"]
+            ):
+                drift.append({
+                    "kind": DRIFT_ADDRESS_CHANGED, "student_id": sid,
+                    "name": row["name"],
+                })
+    for sid, b in snapshot_by_id.items():
+        if sid not in current_by_id:
+            drift.append({
+                "kind": DRIFT_DEPARTED, "student_id": sid,
+                "name": b.get("name") or sid,
+            })
+    drift.sort(key=lambda d: (d["kind"], d["name"], d["student_id"]))
+    return drift
 
 
 def _fleet_drift_problems(conn, school_id: str, loads: list[tuple[str, str, int]]) -> list[str]:
@@ -1001,7 +1089,14 @@ class FleetPlanDao:
     def current_plans(self, school_id: str) -> dict[str, Any]:
         """The school's open draft (full row) plus applied/previous metadata
         WITHOUT their document/basis payloads. Full review computation is
-        U5's job — the draft's stored document is returned as-is."""
+        U5's job — the draft's stored document is returned as-is.
+
+        The ``previous`` metadata additionally carries ``drift``: the
+        departed/enrolled rows restore's R22 gate computes against the
+        preserved capture (the shared ``_roster_drift``, no address gating —
+        restore's semantics), so a caller can assemble the restore
+        confirmations without a blind POST. The capture document itself
+        stays unexposed (aggregate PII)."""
         with get_connection() as conn:
             school = conn.execute(
                 "select id from live_schools where id = %s", (school_id,)
@@ -1020,15 +1115,34 @@ class FleetPlanDao:
                 "order by applied_at desc nulls last, created_at desc limit 1",
                 (school_id,),
             ).fetchone()
+            # The document is read for the drift computation only — the
+            # response exposes metadata plus the derived drift rows.
             previous = conn.execute(
-                f"select {_META_COLUMNS} from live_fleet_plans "
+                f"select {_META_COLUMNS}, document from live_fleet_plans "
                 "where school_id = %s and status = 'previous'",
                 (school_id,),
             ).fetchone()
+            previous_out = None
+            if previous:
+                students_now = conn.execute(
+                    "select id, name from live_students where school_id = %s",
+                    (school_id,),
+                ).fetchall()
+                capture = previous["document"] or {}
+                drift = _roster_drift(
+                    {str(r["id"]): r for r in students_now},
+                    {str(s["id"]): s for s in capture.get("students") or []},
+                    address_changes=False,
+                )
+                previous_out = {
+                    key: previous[key]
+                    for key in ("id", "status", "created_at", "applied_at")
+                }
+                previous_out["drift"] = drift
         return {
             "draft": dict(draft) if draft else None,
             "applied": dict(applied) if applied else None,
-            "previous": dict(previous) if previous else None,
+            "previous": previous_out,
         }
 
     # --- review surface (U5) --------------------------------------------------
@@ -1036,9 +1150,13 @@ class FleetPlanDao:
     def review(self, school_id: str) -> dict[str, Any]:
         """The open draft's computed review surface (R10/R24): the stored
         document plus per-child ride times with wall-clock stop times, per-bus
-        capacity use, total driving, the per-leg unplaceable lists, and the
-        diff vs live from the shared diff function. Read-only and provider-
-        free: every number is arithmetic over the stored durations."""
+        capacity use, total driving, the per-leg unplaceable lists, the diff
+        vs live from the shared diff function, and ``basis_drift`` — the
+        exact enrolled/address-changed/departed rows apply's R22 gate will
+        demand confirmations for (the shared ``_roster_drift``), so a caller
+        can assemble the apply payload without a blind POST. Read-only and
+        provider-free: every number is arithmetic over the stored
+        durations."""
         with get_connection() as conn:
             school = conn.execute(
                 "select id, name, lat, lng, morning_bell, afternoon_bell "
@@ -1054,6 +1172,19 @@ class FleetPlanDao:
             if not plan or not plan["document"]:
                 raise NotFoundError("No open draft for this school — generate one first")
             document = plan["document"]
+
+            # Basis drift vs CURRENT enrolment — the same rows apply's gate
+            # computes, through the same helper (single source of truth).
+            students_now = conn.execute(
+                "select id, name, home_lat, home_lng from live_students "
+                "where school_id = %s",
+                (school_id,),
+            ).fetchall()
+            basis_drift = _roster_drift(
+                {str(r["id"]): r for r in students_now},
+                {str(s["id"]): s for s in (plan["basis"] or {}).get("students") or []},
+                address_changes=True,
+            )
 
             anchors = plan_gate_anchors(school)
             buses_out: list[dict] = []
@@ -1135,6 +1266,7 @@ class FleetPlanDao:
             "patterns": document.get("patterns") or {},
             "pins": document.get("pins") or {},
             "diff": diff,
+            "basis_drift": basis_drift,
         }
 
     # --- review edits (U5) -----------------------------------------------------
@@ -1576,23 +1708,36 @@ class FleetPlanDao:
         post-commit phases (R8/R21/R22/R23; the plan's U6 step order).
 
         Inside the transaction, in this order: (1) lock the plan row FOR
-        UPDATE first, then the school's live routes in sorted-id order;
-        (2) idempotency by status — re-applying an applied plan (a retry
-        racing a gateway timeout past a late commit) answers the applied
-        state with zero side effects; (3) gates against the locked snapshot —
-        basis drift each confirmed or 409, fleet drift 409 naming the bus,
-        unplaceable acknowledgments or 422 naming them; then the notification
-        diff (the U5 shared function, pre-mutation — see inline comment);
-        (4) capture the displaced live state as ONE JSONB statement and
-        demote previous/applied (delete-then-flip: the partial uniques cannot
+        UPDATE first, then the school's currently-applied plan row (the
+        global lock order is PLAN ROWS BEFORE ROUTE ROWS — accept_slot_in
+        locks the applied plan row before its route rows, so apply taking
+        route rows first would deadlock ABBA against it), then the school's
+        live routes in sorted-id order; (2) idempotency by status —
+        re-applying an applied plan (a retry racing a gateway timeout past a
+        late commit) answers the applied state with zero side effects;
+        (3) gates against the locked snapshot — basis drift (the shared
+        ``_roster_drift`` — review's ``basis_drift`` reads the same rows)
+        each confirmed or 409, fleet drift 409 naming the bus (a drafted bus
+        that ENTERED the multi-trip set since drafting included — its
+        (bus, type) slots are no longer writable), unplaceable
+        acknowledgments or 422 naming them; then the notification diff (the
+        U5 shared function, pre-mutation — see inline comment); (4) capture
+        the displaced live state as ONE JSONB statement and demote
+        previous/applied (delete-then-flip: the partial uniques cannot
         defer); (5) reconcile live_routes in place to the document's
         (bus, type) pairs — multi-trip chains untouched, surplus deleted;
         (6) rewrite live_student_routes delete-before-insert scoped by
-        STUDENT-AND-LEG; (7) materialize stops from the document with the
+        STUDENT-AND-LEG — severing EVERY current student's links on the
+        written legs (document students to relink, absent-from-document
+        students so a post-draft manual placement cannot linger as a
+        link-without-stop; chain riders' legs excluded, restore's rule);
+        (7) materialize stops from the document with the
         document's computed times, gate row per the house convention, and
         ``last_recalc_degraded = TRUE`` as the durable refresh-pending
         marker; (8) re-derive live_students bus/pickup/pattern (morning-clock
-        rule); (9) the ``plan-applied`` audit row; (10) feed rows on THIS
+        rule) — and null bus/pickup for current students the document does
+        not know (pattern kept), so they surface as cleanly unassigned;
+        (9) the ``plan-applied`` audit row; (10) feed rows on THIS
         connection + baseline upserts, then stale-baseline deletes;
         (11) flip the draft to applied and run the final unknown-
         acknowledgment gate. Commit.
@@ -1651,6 +1796,18 @@ class FleetPlanDao:
             ).fetchone()
             if not school:
                 raise NotFoundError("School not found")
+            # ...then the school's currently-applied plan row, BEFORE any
+            # route-row lock — the global order 'plan rows before route
+            # rows': accept_slot_in locks the applied plan row first and its
+            # route rows second, so taking routes before this row would
+            # deadlock ABBA against a concurrent slot-in accept. The locked
+            # row is reused verbatim by the demote in step (4).
+            applied_prev = conn.execute(
+                "select id from live_fleet_plans "
+                "where school_id = %s and status = 'applied' "
+                "order by applied_at desc nulls last, created_at desc limit 1 for update",
+                (school_id,),
+            ).fetchone()
             # ...then every live route of the school in sorted-id order (the
             # global route-lock convention shared with _sync_routes /
             # update_school), so apply and concurrent route writers serialize
@@ -1671,26 +1828,18 @@ class FleetPlanDao:
 
             # (3a) Basis drift (R22): enrolments, address changes (coords
             # differ from the basis snapshot) and departures since generation
-            # — each explicitly confirmed by (kind, student) or 409 listing it.
-            drift: list[tuple[str, str, str]] = []
-            for sid, row in current_by_id.items():
-                if sid not in basis_by_id:
-                    drift.append((DRIFT_ENROLLED, sid, row["name"]))
-                else:
-                    b = basis_by_id[sid]
-                    if _floats_differ(b.get("lat"), row["home_lat"]) or _floats_differ(
-                        b.get("lng"), row["home_lng"]
-                    ):
-                        drift.append((DRIFT_ADDRESS_CHANGED, sid, row["name"]))
-            for sid, b in basis_by_id.items():
-                if sid not in current_by_id:
-                    # The basis denormalizes names, so a departed child can
-                    # still be named (the 007/010 name-rot precedent).
-                    drift.append((DRIFT_DEPARTED, sid, b.get("name") or sid))
-            unconfirmed = [d for d in drift if (d[0], d[1]) not in confirmed]
+            # — each explicitly confirmed by (kind, student) or 409 listing
+            # it. THE shared gate-diff: review's `basis_drift` field serves
+            # these exact rows on the read path, so a caller can assemble the
+            # confirmations without a blind POST.
+            drift = _roster_drift(current_by_id, basis_by_id, address_changes=True)
+            unconfirmed = [
+                d for d in drift if (d["kind"], d["student_id"]) not in confirmed
+            ]
             if unconfirmed:
                 listing = "; ".join(
-                    f"{kind}: {name} ({sid})" for kind, sid, name in sorted(unconfirmed)
+                    f"{d['kind']}: {d['name']} ({d['student_id']})"
+                    for d in unconfirmed
                 )
                 raise ConflictError(
                     "The school has changed since this draft was generated — "
@@ -1718,6 +1867,18 @@ class FleetPlanDao:
                     (str(bus["bus_id"]), bus.get("bus_name") or str(bus["bus_id"]), load)
                 )
             problems = _fleet_drift_problems(conn, school_id, loads)
+            # A drafted bus that ENTERED the multi-trip set since drafting is
+            # fleet drift too: drafting excluded chain buses, so the document
+            # believes this bus's (bus, type, trip_index=1) slots are its to
+            # write — falling through to the reconcile would either orphan an
+            # operating chain or die on the live_routes_bus_type_key unique.
+            # Blocked here, by name, in the fleet-drift vocabulary.
+            now_chained = _multi_trip_bus_ids(conn, [bid for bid, _n, _l in loads])
+            for bid, doc_name, _load in loads:
+                if bid in now_chained:
+                    problems.append(
+                        f"bus {doc_name} now runs a multi-trip chain — re-draft"
+                    )
             if problems:
                 raise ConflictError(
                     "The fleet has drifted since this draft was generated — "
@@ -1765,12 +1926,8 @@ class FleetPlanDao:
             # then demote-before-promote — ordered because the 011 partial
             # uniques enforce immediately ('applied' uniqueness itself is
             # DAO-enforced, so the swap needs no intermediate status).
-            applied_prev = conn.execute(
-                "select id from live_fleet_plans "
-                "where school_id = %s and status = 'applied' "
-                "order by applied_at desc nulls last, created_at desc limit 1 for update",
-                (school_id,),
-            ).fetchone()
+            # ``applied_prev`` was locked in step (1), before the route rows
+            # (the plan-rows-before-route-rows order).
             captured = conn.execute(_CAPTURE_LIVE_SQL, (school_id,)).fetchone()["document"]
             # One-level history is DELIBERATE DESTRUCTION: the displaced
             # 'previous' row is a document holding every child's name and
@@ -1806,6 +1963,19 @@ class FleetPlanDao:
             multi_trip = _multi_trip_bus_ids(
                 conn, sorted({str(r["bus_id"]) for r in routes if r["bus_id"] is not None})
             )
+            # Chain riders' legs stay out of the link-severing scope below —
+            # their membership belongs to a chain the plan never governed
+            # (restore's chain_pairs exclusion, reused verbatim).
+            chain_pairs: set[tuple[str, str]] = set()
+            if multi_trip:
+                for r in conn.execute(
+                    "select sr.student_id, sr.route_type "
+                    "from live_student_routes sr "
+                    "join live_routes r on r.id = sr.route_id "
+                    "where r.school_id = %s and r.bus_id = any(%s::uuid[])",
+                    (school_id, sorted(multi_trip)),
+                ).fetchall():
+                    chain_pairs.add((str(r["student_id"]), r["route_type"]))
             pairs: dict[tuple[str, str], dict] = {}
             for bus in doc_buses:
                 bid = str(bus["bus_id"])
@@ -1893,21 +2063,32 @@ class FleetPlanDao:
             # deferrable unique (student_id, route_type) is GLOBAL, so a stale
             # cross-school link left behind would abort this commit at the
             # deferred check; deleting by student-and-leg clears it wherever
-            # it lives. The scope is every document student (placed AND
-            # unplaceable) for every leg the document writes: a child the
+            # it lives. The scope is EVERY current student, for every leg the
+            # document writes (restore's semantics): document students
+            # (placed AND unplaceable) are severed to relink — a child the
             # plan narrowed or could not place must not keep riding a
-            # materialized route through a stale link.
+            # materialized route through a stale link — and current students
+            # ABSENT from the document (e.g. enrolled after drafting, then
+            # manually placed on a live route this apply reuses, confirmed at
+            # the gate) are severed too, or the stop-row rewrite below would
+            # leave them a link-without-stop phantom membership. Chain
+            # riders' legs are excluded: their membership belongs to a chain
+            # the plan never governed.
             doc_student_ids = {sid for (sid, _leg) in placements} | {
                 str(u["student_id"]) for u in unplaceable
             }
             link_students = sorted(doc_student_ids & current_ids)
             legs_written = sorted({leg for (_bid, leg) in pairs})
             for leg in legs_written:
-                if link_students:
+                sever_ids = sorted(
+                    sid for sid in current_ids
+                    if sid in doc_student_ids or (sid, leg) not in chain_pairs
+                )
+                if sever_ids:
                     conn.execute(
                         "delete from live_student_routes "
                         "where route_type = %s and student_id = any(%s::uuid[])",
-                        (leg, link_students),
+                        (leg, sever_ids),
                     )
             for key, info in pairs.items():
                 rid = route_ids[key]
@@ -1976,6 +2157,20 @@ class FleetPlanDao:
                         sid,
                     ),
                 )
+            # Current students the document does not know (enrolled after
+            # drafting, confirmed at the gate): their links were severed
+            # above, so their denormalized bus/pickup must clear too or they
+            # would read as phantom riders of a bus they no longer link to.
+            # ridership_pattern is left alone (the document has no opinion on
+            # them); chain riders keep everything — their membership survived.
+            for sid in sorted(current_ids - doc_student_ids):
+                if any((sid, leg) in chain_pairs for leg in plan_solver.LEGS):
+                    continue
+                conn.execute(
+                    "update live_students set bus_id = null, pickup_time = null "
+                    "where id = %s",
+                    (sid,),
+                )
 
             # (9) The plan-applied audit row: the self-contained apply record.
             # elapsed_ms covers gates + writes up to this row — a transaction
@@ -2005,12 +2200,21 @@ class FleetPlanDao:
 
             # (10) Feed rows — inserted ON THIS CONNECTION so a rollback takes
             # them too (the shared composer; restore reuses it verbatim).
-            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id)
+            # Bodies and baseline names carry each child's OWN address label
+            # (the _stop_label convention), never the document's sibling-
+            # joined stop name — a collapsed stop's name would leak the other
+            # families' children's names.
+            stop_labels = {
+                sid: _stop_label(current_by_id[sid])
+                for sid in {r["student_id"] for r in diff_rows}
+                if sid in current_by_id
+            }
+            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id, stop_labels)
 
             # Baselines upsert for every notified PLACED (student, leg) — R15
             # updates the baseline only on send (upserts, then stale deletes
             # — the shared writer; restore reuses it verbatim).
-            self._write_baselines(conn, diff_rows)
+            self._write_baselines(conn, diff_rows, stop_labels)
 
             # (11) Promote the draft — the demote already happened in step 4.
             applied_row = conn.execute(
@@ -2084,13 +2288,24 @@ class FleetPlanDao:
     # the fan-out, baseline and refresh phases are ONE implementation each,
     # called by both acts.
 
-    def _write_plan_feed_rows(self, conn, diff_rows: list[dict], audit_id: str) -> list[dict]:
+    def _write_plan_feed_rows(
+        self, conn, diff_rows: list[dict], audit_id: str,
+        stop_labels: Mapping[str, str] | None = None,
+    ) -> list[dict]:
         """Feed rows for one apply/restore act, inserted ON THE CALLER'S
         transaction connection so a rollback takes them too
         (PushDao.insert_notification opens its own connection per row and
         cannot serve here). Composed per student, one row per (family,
         student, type) per act: a both-legs change reads as one message, and
-        the 011 plan dedup arbiter backstops repeats."""
+        the 011 plan dedup arbiter backstops repeats.
+
+        ``stop_labels`` maps student_id → that child's OWN stop label (the
+        ``_stop_label`` address convention the manual-edit writer and the
+        materialized stop rows already use). Parent-facing bodies name ONLY
+        the recipient's child's stop — never the document's sibling-joined
+        stop name, which would leak the other families' children's names to
+        every household sharing a collapsed stop."""
+        stop_labels = stop_labels or {}
         feed_rows: list[dict] = []
         by_student: dict[str, dict] = {}
         for row in diff_rows:
@@ -2103,8 +2318,9 @@ class FleetPlanDao:
         for sid in sorted(by_student):
             g = by_student[sid]
             if g["placed"]:
+                label = stop_labels.get(sid) or "their stop"
                 parts = [
-                    f"{_leg_label(r['leg'])}: {r['current']['stop_name']} at "
+                    f"{_leg_label(r['leg'])}: {label} at "
                     f"{r['current']['scheduled_time']} on "
                     f"{r['current'].get('bus_name') or 'the school bus'}"
                     for r in g["placed"]
@@ -2147,7 +2363,10 @@ class FleetPlanDao:
         return feed_rows
 
     @staticmethod
-    def _write_baselines(conn, diff_rows: list[dict]) -> None:
+    def _write_baselines(
+        conn, diff_rows: list[dict],
+        stop_labels: Mapping[str, str] | None = None,
+    ) -> None:
         """R15 baseline maintenance for one apply/restore act: upsert for
         every notified PLACED (student, leg) — written for every diff row,
         linked family or not, so the first apply seeds baselines for the
@@ -2157,11 +2376,20 @@ class FleetPlanDao:
         deleting the baseline makes a later re-widening a first communication
         again (it must notify even when the new time happens to match the
         stale one) and keeps a still-unplaceable child silent on the next act
-        (neither membership nor baseline — the R15 still-unplaceable rule)."""
+        (neither membership nor baseline — the R15 still-unplaceable rule).
+
+        ``stop_labels`` (apply/restore) overrides the stored ``stop_name``
+        per child with THAT child's own address label — a baseline row is
+        per-child truth and must never carry a collapsed stop's sibling-
+        joined name (another family's child's name). The manual-edit caller
+        passes nothing: its ``current.stop_name`` is already the live stop
+        row's per-child label."""
+        stop_labels = stop_labels or {}
         for row in diff_rows:
             if row["current"] is None:
                 continue
             cur = row["current"]
+            name = stop_labels.get(row["student_id"]) or cur["stop_name"]
             conn.execute(
                 "insert into live_communicated_stops (student_id, route_type, "
                 "stop_name, stop_lat, stop_lng, scheduled_time, bus_id, communicated_at) "
@@ -2170,7 +2398,7 @@ class FleetPlanDao:
                 "stop_name = excluded.stop_name, stop_lat = excluded.stop_lat, "
                 "stop_lng = excluded.stop_lng, scheduled_time = excluded.scheduled_time, "
                 "bus_id = excluded.bus_id, communicated_at = excluded.communicated_at",
-                (row["student_id"], row["leg"], cur["stop_name"], cur["lat"],
+                (row["student_id"], row["leg"], name, cur["lat"],
                  cur["lng"], cur["scheduled_time"], cur["bus_id"]),
             )
         for row in diff_rows:
@@ -2214,7 +2442,10 @@ class FleetPlanDao:
         audit → geometry-refresh → push machinery in the same order.
 
         Inside ONE provider-free transaction, mirroring apply's step order:
-        (1) lock the plan row FOR UPDATE first; (2) idempotency by status —
+        (1) lock the plan row FOR UPDATE first, then the school's
+        currently-applied plan row (plan rows before route rows — the global
+        lock order shared with apply and accept_slot_in, the ABBA guard);
+        (2) idempotency by status —
         restoring the just-restored (now applied) plan answers the applied
         state with zero side effects, so a retry racing a gateway timeout
         cannot toggle the school BACK (the reason restore targets the plan
@@ -2301,6 +2532,17 @@ class FleetPlanDao:
             ).fetchone()
             if not school:
                 raise NotFoundError("School not found")
+            # The school's currently-applied plan row, locked BEFORE any
+            # route-row lock — the global order 'plan rows before route
+            # rows' (accept_slot_in locks the applied plan row first, then
+            # route rows; taking routes first here would deadlock ABBA
+            # against it). Reused verbatim by the demote in step (4).
+            displaced = conn.execute(
+                "select id from live_fleet_plans "
+                "where school_id = %s and status = 'applied' and id <> %s "
+                "order by applied_at desc nulls last, created_at desc limit 1 for update",
+                (school_id, plan_id),
+            ).fetchone()
             routes = conn.execute(
                 "select * from live_routes where school_id = %s order by id for update",
                 (school_id,),
@@ -2324,17 +2566,20 @@ class FleetPlanDao:
             # dropped from every write once confirmed; a child who exists now
             # but has no place in the preserved plan is ENROLLED-after-capture
             # and will be left routeless (per-leg 'unassigned' semantics).
-            drift: list[tuple[str, str, str]] = []
-            for sid, s in capture_students.items():
-                if sid not in current_ids:
-                    drift.append((DRIFT_DEPARTED, sid, s.get("name") or sid))
-            for sid, row in current_by_id.items():
-                if sid not in capture_students:
-                    drift.append((DRIFT_ENROLLED, sid, row["name"]))
-            unconfirmed = [d for d in drift if (d[0], d[1]) not in confirmed]
+            # THE shared gate-diff (`_roster_drift`, no address gating —
+            # restore puts communicated stops back verbatim): /current's
+            # `previous.drift` serves these exact rows on the read path, so
+            # a caller can assemble the confirmations without a blind POST.
+            drift = _roster_drift(
+                current_by_id, capture_students, address_changes=False
+            )
+            unconfirmed = [
+                d for d in drift if (d["kind"], d["student_id"]) not in confirmed
+            ]
             if unconfirmed:
                 listing = "; ".join(
-                    f"{kind}: {name} ({sid})" for kind, sid, name in sorted(unconfirmed)
+                    f"{d['kind']}: {d['name']} ({d['student_id']})"
+                    for d in unconfirmed
                 )
                 raise ConflictError(
                     "The school has changed since this plan was preserved — "
@@ -2452,12 +2697,8 @@ class FleetPlanDao:
                 f"where id = %s returning {_META_COLUMNS}",
                 (plan_id,),
             ).fetchone()
-            displaced = conn.execute(
-                "select id from live_fleet_plans "
-                "where school_id = %s and status = 'applied' and id <> %s "
-                "order by applied_at desc nulls last, created_at desc limit 1 for update",
-                (school_id, plan_id),
-            ).fetchone()
+            # ``displaced`` was locked in step (1), before the route rows
+            # (the plan-rows-before-route-rows order).
             if displaced:
                 # The old applied row becomes the new previous, carrying the
                 # as-evolved capture — the clean one-level toggle.
@@ -2664,9 +2905,16 @@ class FleetPlanDao:
             audit_id = str(audit["id"])
 
             # (10) Feed rows + baselines through the shared writers, on THIS
-            # connection — one atom with everything above.
-            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id)
-            self._write_baselines(conn, diff_rows)
+            # connection — one atom with everything above. Per-child address
+            # labels, apply's rule: bodies and baseline names never carry a
+            # collapsed stop's sibling-joined name.
+            stop_labels = {
+                sid: _stop_label(current_by_id[sid])
+                for sid in {r["student_id"] for r in diff_rows}
+                if sid in current_by_id
+            }
+            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id, stop_labels)
+            self._write_baselines(conn, diff_rows, stop_labels)
 
             # (11) FINAL gate, deliberately the transaction's LAST act (the
             # apply parity position — doubling as the atomicity probe): every
@@ -2728,10 +2976,10 @@ class FleetPlanDao:
 
         Stop rows group by stop_order (siblings share an order — apply's
         materialization convention); stop names re-join the children's names
-        in the solver's convention (the captured ROW names are `_stop_label`
-        address labels, while the baselines apply seeded carry solver stop
-        names — diffing labels against names would cry place-change for every
-        unchanged family). Ride seconds are derived per child from the
+        in the solver's convention purely for display parity with a draft
+        document (the diff never compares names for located stops, and the
+        feed/baseline writers substitute each child's own address label).
+        Ride seconds are derived per child from the
         preserved wall-clock time against the current anchor (AM: anchor −
         time, PM: time − anchor), so ``computed_stop_times`` reproduces the
         preserved times exactly even if the school bell moved since capture.
@@ -3251,22 +3499,11 @@ class FleetPlanDao:
             seq = ([depot] if depot else []) + pts + [gate_pt]
         geom = geo_service.fixed_sequence_geometry(seq)
         durations = [float(row.get("duration_s") or 0) for row in geom["legs"]]
-        n = len(seq_groups)
-        rides = [0.0] * n
-        if is_afternoon:
-            acc = 0.0
-            for i in range(n):
-                acc += durations[i] if i < len(durations) else 0.0
-                rides[i] = acc
-            sign = 1
-        else:
-            offset = 1 if depot else 0
-            acc = 0.0
-            for i in range(n - 1, -1, -1):
-                idx = offset + i
-                acc += durations[idx] if idx < len(durations) else 0.0
-                rides[i] = acc
-            sign = -1
+        rides, short = geo_service.cumulative_ride_seconds(
+            durations, len(seq_groups),
+            is_afternoon=is_afternoon, has_depot=depot is not None,
+        )
+        sign = 1 if is_afternoon else -1
         new_time = None
         for i, g in enumerate(seq_groups):
             time = _shift_hhmm(anchor, sign * rides[i])
@@ -3277,7 +3514,7 @@ class FleetPlanDao:
             )
             if g["order"] == new_order:
                 new_time = time
-        degraded = bool(geom["degraded"])
+        degraded = bool(geom["degraded"]) or short
         conn.execute(
             "update live_routes set polyline = %s, total_distance_m = %s, "
             "total_duration_s = %s, last_recalc_degraded = %s where id = %s",

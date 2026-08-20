@@ -500,6 +500,51 @@ def fixed_sequence_geometry(
     }
 
 
+def cumulative_ride_seconds(
+    durations: list, n_stops: int, *, is_afternoon: bool, has_depot: bool
+) -> tuple[list[float], bool]:
+    """THE direction-aware ride-time walk over fixed-sequence leg durations —
+    the ONE implementation shared by the plan review recompute
+    (``fleet_plan_dao._recompute_legs``), the slot-in materializer
+    (``fleet_plan_dao._materialize_slot_in``) and the plan-ordered live
+    recompute (``fleet_dao._plan_fixed_compute``), so their guards can never
+    diverge again.
+
+    ``durations`` are :func:`fixed_sequence_geometry` leg durations for a
+    morning sequence ``[depot?] + stops + gate`` or an afternoon sequence
+    ``gate + stops + [depot?]``. Returns ``(rides, short)`` where ``rides[i]``
+    is stop ``i``'s cumulative seconds to the gate (morning: summed BACKWARD
+    from the gate; afternoon: summed FORWARD from it). A leading morning
+    depot leg shifts the mapping by one; a trailing afternoon depot leg never
+    enters any ride.
+
+    Guard behavior, decided once: ``fixed_sequence_geometry`` can return
+    FEWER legs than ``len(sequence) - 1`` when sequence points lack
+    coordinates (it drops them before routing). Short input degrades
+    OBSERVABLY — missing legs count 0 seconds (padded at the tail, so
+    earlier legs keep their alignment) and ``short`` is True for the caller
+    to raise its degraded flag — never an IndexError, never a silent
+    zip-truncated misalignment."""
+    offset = 0 if is_afternoon else (1 if has_depot else 0)
+    need = offset + n_stops
+    padded = [float(d or 0) for d in durations]
+    short = len(padded) < need
+    if short:
+        padded += [0.0] * (need - len(padded))
+    rides = [0.0] * n_stops
+    if is_afternoon:
+        acc = 0.0
+        for i in range(n_stops):
+            acc += padded[i]
+            rides[i] = acc
+    else:
+        acc = 0.0
+        for i in range(n_stops - 1, -1, -1):
+            acc += padded[offset + i]
+            rides[i] = acc
+    return rides, short
+
+
 # --- Duration matrix (fleet planning): directed drive times, all pairs -------
 
 _ROUTE_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
