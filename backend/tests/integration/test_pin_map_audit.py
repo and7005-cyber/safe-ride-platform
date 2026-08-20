@@ -252,12 +252,13 @@ def test_pin_map_non_admin_is_403_and_writes_no_audit_row(client, admin_headers)
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_pin_map_unknown_school_is_a_clean_400(client, admin_headers):
-    """A school id nothing matches is refused up front (the bulk-upload guard's
-    wording style), not answered with an empty audited view of nowhere."""
+def test_pin_map_unknown_school_is_a_clean_404(client, admin_headers):
+    """A school id nothing matches is refused up front as a lookup miss — 404,
+    the fleet-plan endpoints' convention — not answered with an empty audited
+    view of nowhere."""
     response = client.get(
         "/api/students/pin-map", params={"school_id": str(uuid.uuid4())},
         headers=admin_headers,
     )
-    assert response.status_code == 400, response.text
+    assert response.status_code == 404, response.text
     assert "school" in response.json()["detail"].lower()

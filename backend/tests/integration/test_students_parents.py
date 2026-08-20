@@ -1301,6 +1301,91 @@ def test_bulk_validate_commits_nothing(client, admin_headers):
         client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
+def test_bulk_without_school_id_is_a_clear_refresh_400(client, admin_headers):
+    """Deploy-skew guard: a stale cached admin tab (backend deployed, CloudFront
+    invalidation still propagating) posts the pre-U10 shape with no school_id.
+    Both bulk endpoints answer with ONE clear 400 telling the operator to
+    refresh — not FastAPI's array-422, which the client degrades to a generic
+    message."""
+    marker = uuid.uuid4().hex[:6]
+    row = _bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8)
+    for path in ("/api/students/bulk/validate", "/api/students/bulk"):
+        response = client.post(path, json={"students": [row]}, headers=admin_headers)
+        assert response.status_code == 400, (path, response.text)
+        assert "refresh" in response.json()["detail"].lower(), (path, response.text)
+
+
+def test_bulk_unknown_school_is_a_404(client, admin_headers):
+    """A school_id that is provided but matches no school is a lookup miss —
+    404, aligned with the fleet-plan endpoints' convention (the missing-field
+    skew case above stays a 400: malformed request, not a miss)."""
+    marker = uuid.uuid4().hex[:6]
+    response = client.post(
+        "/api/students/bulk",
+        json={"school_id": str(uuid.uuid4()),
+              "students": [_bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8)]},
+        headers=admin_headers,
+    )
+    assert response.status_code == 404, response.text
+    assert "school not found" in response.json()["detail"].lower()
+
+
+def test_bulk_two_same_named_rows_share_one_duplicate_flag(client, admin_headers):
+    """Pins the batched duplicate lookup's dict behavior: two same-named rows
+    in one upload (one a case/whitespace variant) both consult the same
+    normalized-name entry — validate flags both against the same existing
+    student, and a commit skipping both no-ops both."""
+    marker = uuid.uuid4().hex[:6]
+    school = client.post(
+        "/api/fleet/schools",
+        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
+        headers=admin_headers,
+    ).json()
+    name = f"IT Bulk Twin {marker}"
+    try:
+        seeded = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"],
+                  "students": [_bulk_row(marker, 1, name=name,
+                                         home_lat=-1.291, home_lng=36.812)]},
+            headers=admin_headers,
+        )
+        assert seeded.status_code == 200 and seeded.json()["inserted"] == 1, seeded.text
+        existing = next(s for s in _student_rows(client, admin_headers) if s["name"] == name)
+
+        twins = [
+            _bulk_row(marker, 2, name=name, home_lat=-1.293, home_lng=36.811),
+            # Case+whitespace variant: the dict is keyed on lower/strip, the
+            # same normalization the old per-row SQL applied.
+            _bulk_row(marker, 3, name=f"  {name.upper()}  ",
+                      home_lat=-1.294, home_lng=36.812),
+        ]
+        validated = client.post(
+            "/api/students/bulk/validate",
+            json={"school_id": school["id"], "students": twins},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        flags = [r["duplicate_of"] for r in validated.json()["rows"]]
+        assert all(f and str(f["id"]) == str(existing["id"]) for f in flags), flags
+
+        count_before = len(_student_rows(client, admin_headers))
+        skipped = client.post(
+            "/api/students/bulk",
+            json={"school_id": school["id"],
+                  "students": [{**t, "duplicate_action": "skip"} for t in twins]},
+            headers=admin_headers,
+        ).json()
+        assert (skipped["inserted"], skipped["updated"], skipped["skipped"]) == (0, 0, 2)
+        assert skipped["errors"] == []
+        assert len(_student_rows(client, admin_headers)) == count_before
+    finally:
+        for s in _student_rows(client, admin_headers):
+            if name.lower() in s["name"].strip().lower():
+                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+
+
 def test_bulk_duplicate_update_regenerates_each_route_exactly_once(monkeypatch):
     """U8 burst guard, carried through U10's route-name retirement: the only
     bulk path still touching routes is the duplicate-update overwrite, and its

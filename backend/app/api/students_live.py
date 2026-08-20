@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
 from app.core.db import get_connection
-from app.core.errors import BadRequestError
+from app.core.errors import BadRequestError, NotFoundError
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
 from app.dao.push_dao import PushDao
@@ -164,9 +164,32 @@ class BulkRow(BaseModel):
 class BulkPayload(BaseModel):
     # The upload dialog is scoped to one school (U10): every committed row is
     # stamped with this id — school-less students are invisible to the
-    # school-scoped draft basis and the pin map.
-    school_id: str
+    # school-scoped draft basis and the pin map. Optional at the MODEL level
+    # only: a stale cached admin tab (backend deployed, CloudFront invalidation
+    # still propagating) posts the pre-U10 shape, and a required field would
+    # answer it with FastAPI's array-422, which the client degrades to a
+    # generic message. _require_school turns the skew window into one clear,
+    # actionable 400 instead; behavior with the field present is unchanged.
+    school_id: str | None = None
     students: list[BulkRow]
+
+
+def _require_school(payload: BulkPayload) -> str:
+    """The bulk school scope, or the one readable stale-tab error (see
+    BulkPayload.school_id). A malformed request, not a lookup miss — 400, not
+    the 404 reserved for a school_id that matches no school."""
+    if not payload.school_id:
+        raise BadRequestError(
+            "School is required — refresh the page to load the updated upload dialog"
+        )
+    return payload.school_id
+
+
+def _bulk_name_key(name: str | None) -> str:
+    """The duplicates dict's key: the same lower/strip normalization the
+    batched DAO lookup uses. A blank name yields "" — never a dict key, so
+    blank rows keep matching nothing (the old per-row behavior)."""
+    return str(name or "").strip().lower()
 
 
 @router.get("")
@@ -282,13 +305,18 @@ def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
     open the map picker, duplicates choose skip-or-update) and only then POSTs
     /bulk to commit."""
     def run() -> dict:
+        school_id = _require_school(payload)
+        # ONE batched duplicate lookup for the whole upload — the per-row
+        # query was O(rows) round-trips per request.
+        duplicates = dao.find_bulk_duplicates(
+            [row.name for row in payload.students], school_id
+        )
         rows = []
         for index, row in enumerate(payload.students):
-            duplicate = dao.find_bulk_duplicate(row.name, payload.school_id)
             rows.append({
                 **_triage_row(row),
                 "index": index,
-                "duplicate_of": duplicate,
+                "duplicate_of": duplicates.get(_bulk_name_key(row.name)),
             })
         return {"rows": rows}
 
@@ -315,8 +343,19 @@ def bulk_upload(
         parent_assignments = 0
         notes: list[str] = []
         errors: list[str] = []
-        if not dao.school_exists(payload.school_id):
-            raise BadRequestError("School not found — pick the school this upload belongs to")
+        school_id = _require_school(payload)
+        if not dao.school_exists(school_id):
+            raise NotFoundError("School not found — pick the school this upload belongs to")
+        # Duplicates re-detected server-side at commit (never trusted from the
+        # client): same (name, school) as an existing student. ONE batched
+        # lookup for the whole upload (the per-row query was O(rows) round-
+        # trips); the dict then grows with each insert so a second same-named
+        # NEW row in the same file is still flagged against the first — the
+        # exact behavior the per-row re-query had, and nothing is ever
+        # silently doubled.
+        duplicates = dao.find_bulk_duplicates(
+            [row.name for row in payload.students], school_id
+        )
         for index, row in enumerate(payload.students):
             label = row.name or f"row {index + 1}"
             if not row.name or not row.grade or not row.parent_name:
@@ -337,10 +376,9 @@ def bulk_upload(
                 notes.append(f"{label}: {ROUTE_COLUMN_NOTE}")
             try:
                 data = _drop_geo_marker(_clean_student(row.model_dump(), geocode_fallback=True))
-                data["school_id"] = payload.school_id
-                # Duplicates re-detected server-side at commit (never trusted
-                # from the client): same (name, school) as an existing student.
-                duplicate = dao.find_bulk_duplicate(row.name, payload.school_id)
+                data["school_id"] = school_id
+                name_key = _bulk_name_key(row.name)
+                duplicate = duplicates.get(name_key)
                 if duplicate is not None:
                     if row.duplicate_action == "skip":
                         skipped += 1
@@ -361,6 +399,15 @@ def bulk_upload(
                 inserted += 1
                 parent_assignments += result["parent_links"]
                 touched_students.append(str(result["id"]))
+                # The fresh insert is now the school's existing student by this
+                # name: register it so a later same-named row in this file is
+                # flagged, in the same duplicate_of shape the lookup returns.
+                if name_key:
+                    duplicates.setdefault(name_key, {
+                        "id": result["id"],
+                        "name": data["name"],
+                        "home_address": data.get("home_address"),
+                    })
             except Exception as exc:  # noqa: BLE001 - surfaced per-row to the client
                 errors.append(f"{label}: {exc}")
         # Duplicate updates moved home pins on live routes: regenerate each
@@ -416,7 +463,7 @@ def _pin_map(school_id: str, actor: dict) -> dict:
         if conn.execute(
             "select 1 from live_schools where id = %s", (school_id,)
         ).fetchone() is None:
-            raise BadRequestError("School not found — pick the school whose pins to view")
+            raise NotFoundError("School not found — pick the school whose pins to view")
         rows = conn.execute(
             "select id, name, home_address, home_lat, home_lng, provenance "
             "from live_students where school_id = %s order by name asc",

@@ -385,21 +385,30 @@ class StudentLiveDao:
                 "select 1 from live_schools where id = %s", (school_id,)
             ).fetchone() is not None
 
-    def find_bulk_duplicate(self, name: str | None, school_id: str) -> dict[str, Any] | None:
-        """An existing student matching a bulk row on (name, school_id) —
-        the U10 duplicate key: same child, same school. Case-insensitive,
-        whitespace-trimmed; None when the name is blank or nothing matches.
-        Returns enough for the triage table to say who it found."""
-        if not name or not name.strip():
-            return None
+    def find_bulk_duplicates(
+        self, names: list[str | None], school_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Existing students matching any bulk row on (name, school_id) — the
+        U10 duplicate key: same child, same school. Batched: ONE query for the
+        whole upload instead of one per row. Case-insensitive, whitespace-
+        trimmed; blank names are ignored. Returns a dict keyed by the
+        normalized (lower/strip) name, each value the same {id, name,
+        home_address} shape the per-row lookup returned, so callers consult it
+        per row without changing the duplicate_of contract. One arbitrary match
+        per name (the old limit-1 behavior)."""
+        wanted = sorted({str(n).strip().lower() for n in names if n and str(n).strip()})
+        if not wanted:
+            return {}
         with get_connection() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 "select id, name, home_address from live_students "
-                "where lower(trim(name)) = lower(trim(%s)) and school_id = %s "
-                "limit 1",
-                (name, school_id),
-            ).fetchone()
-        return dict(row) if row else None
+                "where school_id = %s and lower(trim(name)) = any(%s)",
+                (school_id, wanted),
+            ).fetchall()
+        duplicates: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            duplicates.setdefault(str(row["name"]).strip().lower(), dict(row))
+        return duplicates
 
     def update_bulk_student(self, student_id: str, data: dict) -> dict[str, Any]:
         """The bulk duplicate-update path (U10): overwrite the existing
