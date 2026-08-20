@@ -123,20 +123,31 @@ export function buildReorderPayload(
 interface RouteModeFlags {
   custom_stops?: boolean;
   manual_stop_order?: boolean;
+  /** The route carries an applied fleet plan's stop order (U8): regeneration
+   * preserves it, and only an explicit Recalculate — confirmed, since it
+   * discards the reviewed order — hands it back to the optimiser. */
+  plan_ordered?: boolean;
   last_recalc_degraded?: boolean;
 }
 
-/** One ordering authority per route: custom (planner) > manual > auto. */
-export function routeModeLabel(route: RouteModeFlags): "Planner" | "Manual order" | "Auto" {
+/** One ordering authority per route: custom (planner) > manual > plan > auto. */
+export function routeModeLabel(
+  route: RouteModeFlags,
+): "Planner" | "Manual order" | "Plan order" | "Auto" {
   if (route.custom_stops) return "Planner";
-  return route.manual_stop_order ? "Manual order" : "Auto";
+  if (route.manual_stop_order) return "Manual order";
+  return route.plan_ordered ? "Plan order" : "Auto";
 }
 
 /** Recalculate is offered when there is an order to recompute back to auto
- * (manual mode) or a degraded pass to retry — never on planner routes, where
- * the server 409s and neither flag can be set (008 CHECK / planner save). */
+ * (manual or plan order) or a degraded pass to retry — never on planner
+ * routes, where the server 409s and neither flag can be set (008 CHECK /
+ * planner save). */
 export function showRecalculate(route: RouteModeFlags): boolean {
-  return !route.custom_stops && Boolean(route.manual_stop_order || route.last_recalc_degraded);
+  return (
+    !route.custom_stops &&
+    Boolean(route.manual_stop_order || route.plan_ordered || route.last_recalc_degraded)
+  );
 }
 
 /** The warning badge renders purely from the persisted route flag so the R10
@@ -270,11 +281,25 @@ export function RoutesPage() {
     }
   };
 
-  // Explicit return to auto ordering / retry of a degraded pass (R11).
-  const recalculate = async (routeId: string) => {
-    setBusyRouteId(routeId);
+  // Explicit return to auto ordering / retry of a degraded pass (R11). On a
+  // plan-ordered route this discards the applied fleet plan's reviewed stop
+  // order (U8: the server clears the flag and lets the optimiser re-order),
+  // so it sits behind an explicit confirm naming that consequence.
+  const recalculate = async (route: any) => {
+    if (
+      route.plan_ordered &&
+      !(await confirm({
+        title: "Recalculate this route?",
+        description:
+          "This route follows the applied fleet plan's stop order. Recalculating " +
+          "discards that order and lets the optimiser reorder the stops.",
+        confirmLabel: "Recalculate",
+      }))
+    )
+      return;
+    setBusyRouteId(route.id);
     try {
-      const res = await api.post(`/api/fleet/routes/${routeId}/recalculate`);
+      const res = await api.post(`/api/fleet/routes/${route.id}/recalculate`);
       await qc.invalidateQueries({ queryKey: ["routes"] });
       notifyIfDegraded(res);
     } catch (err) {
@@ -420,9 +445,9 @@ export function RoutesPage() {
                         variant="outline"
                         disabled={busy}
                         data-testid="recalculate-order"
-                        onClick={() => recalculate(route.id)}
+                        onClick={() => recalculate(route)}
                       >
-                        <RefreshCw className="h-3.5 w-3.5" /> Recalculate order & times
+                        <RefreshCw className="h-3.5 w-3.5" /> Recalculate
                       </Button>
                     )}
                   </div>

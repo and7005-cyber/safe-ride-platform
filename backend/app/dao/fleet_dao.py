@@ -4,11 +4,38 @@ import re
 from typing import Any
 
 from app.core.db import get_connection
-from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.core.errors import BadRequestError, ConflictError, NotFoundError, SafeRideError
 from app.dao.status_sql import bus_status_case
 from app.services import geo_service
+# The ONE server-side stop-cap authority (U8): the solver's cap, shared with
+# the frontend's PLANNER_STOPS_CAP meaning. plan_solver is pure logic (stdlib +
+# haversine) — importing the constant does not couple fleet paths to the plan
+# DAO machinery.
+from app.services.plan_solver import DEFAULT_STOP_CAP
 
 logger = logging.getLogger("saferide.fleet")
+
+# Live-edit hard-constraint names (U8: R4/R14). These MIRROR the review-edit
+# vocabulary in fleet_plan_dao (CONSTRAINT_CAPACITY / CONSTRAINT_STOP_CAP):
+# the 422 detail leads with one of these tokens verbatim. Deliberately
+# duplicated, not imported — fleet paths must not couple to plan machinery.
+CONSTRAINT_CAPACITY = "capacity"
+CONSTRAINT_STOP_CAP = "stop cap"
+
+
+class RouteConstraintError(SafeRideError):
+    """A live-route edit violates a hard constraint (U8: R4/R14; AE7 family):
+    422 with the constraint NAMED at the head of the detail, matching the
+    review-edit shape (fleet_plan_dao.PlanConstraintError — mirrored, never
+    imported). Raised under the route-row lock inside the mutating
+    transaction, so the whole edit (link writes included) rolls back.
+
+    Only an edit that INTRODUCES OR WORSENS a violation raises: a route
+    already over a limit stays editable toward compliance — removals are
+    always allowed, and a reorder (same counts) can never trip either check;
+    the caps apply to additions."""
+
+    status_code = 422
 
 # HH:MM (00:00–23:59) — the only shape resolve_gate_anchor / _hhmm_to_min accept.
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
@@ -105,10 +132,11 @@ def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
 
 
 _ROUTE_GEOMETRY_INPUTS_SQL = (
-    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, r.stops_computed, "
+    "select r.id, r.type, r.school_id, r.custom_stops, r.manual_stop_order, r.plan_ordered, "
+    "r.stops_computed, "
     "r.gate_anchor, r.bus_id, r.trip_index, s.morning_bell, s.afternoon_bell, "
     "s.name as school_name, s.lat as school_lat, s.lng as school_lng, "
-    "b.depot_lat, b.depot_lng "
+    "b.depot_lat, b.depot_lng, b.capacity as bus_capacity, b.name as bus_name "
     "from live_routes r left join live_schools s on s.id = r.school_id "
     "left join live_buses b on b.id = r.bus_id "
     "where r.id = %s"
@@ -130,6 +158,9 @@ def _geometry_fingerprint(route, location_keys: list[str], points: dict[str, dic
         str(route["school_id"]) if route["school_id"] is not None else None,
         route["school_lat"], route["school_lng"],
         bool(route["custom_stops"]), bool(route["manual_stop_order"]),
+        # plan_ordered (U8): the flag flipping between the phases (an explicit
+        # recalculate, or an apply) changes which compute is valid — discard.
+        bool(route.get("plan_ordered")),
         # trip_index + depot (U7): a depot move or trip-boundary change alters the
         # prepended/appended leg, so phase 2 must discard a stale phase-1 compute.
         route.get("trip_index"), route.get("depot_lat"), route.get("depot_lng"),
@@ -155,6 +186,209 @@ def _depot_leg(conn, route) -> dict | None:
     return None
 
 
+def _prev_stop_rows(conn, route_id: str) -> list[dict]:
+    """The route's current stop rows in display order — the pre-delete
+    snapshot that feeds the preservation fallback, the plan-ordered fixed
+    sequence (U8), and the 'before' side of the live-edit constraint guard."""
+    return conn.execute(
+        "select name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id "
+        "from live_route_stops where route_id = %s order by stop_order asc, name asc",
+        (route_id,),
+    ).fetchall()
+
+
+def _prev_group_snapshot(prev_rows: list[dict]) -> tuple[dict[str, dict], str | None]:
+    """Key the pre-delete stop rows by location-group identity. Rows arrive in
+    display order, so the first row of a group defines its previous position
+    and time. Returns ``(prev_groups, prev_gate_time)``."""
+    prev_groups: dict[str, dict] = {}
+    prev_gate_time: str | None = None
+    for row in prev_rows:
+        if row["is_school_gate"]:
+            if prev_gate_time is None:
+                prev_gate_time = row["scheduled_time"]
+            continue
+        if row["lat"] is not None and row["lng"] is not None:
+            key = f"{row['lat']:.6f},{row['lng']:.6f}"
+        else:
+            # Coordinate-less rows were keyed by address, and the row name IS
+            # that address (or a surname fallback — covered by the student
+            # alias below).
+            label = (row["name"] or "").strip().lower()
+            key = f"addr:{label}" if label else None
+        rec = None
+        if key is not None:
+            rec = prev_groups.setdefault(
+                key, {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
+            )
+        if row["student_id"] is not None:
+            if rec is None:
+                rec = {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
+            rec["student_times"][str(row["student_id"])] = row["scheduled_time"]
+            # The student link is the stable alias when labels or coordinates
+            # drift (setdefault: the location key stays the primary identity).
+            prev_groups.setdefault(f"student:{row['student_id']}", rec)
+    return prev_groups, prev_gate_time
+
+
+def _surviving_plus_new_keys(
+    location_keys: list[str],
+    by_key: dict[str, list[dict]],
+    prev_groups: dict[str, dict],
+    is_afternoon: bool,
+) -> tuple[list[str], dict[str, dict]]:
+    """Resolve the current location groups against the pre-delete snapshot:
+    surviving groups keep their previous relative order, genuinely new groups
+    append — before the gate on morning routes, last on afternoon (reversed
+    among themselves: the earliest new pickup is dropped last). Returns
+    ``(final_keys, resolved)``. The ONE order authority for both the
+    preservation fallback and the plan-ordered fixed sequence (U8), so the
+    two paths cannot disagree about where a new student lands.
+
+    A group resolves to its pre-delete record by location key first, then via
+    the per-student alias: a coordinate edit re-keys the group while the stale
+    stop rows still carry the old coords, and without the alias the group
+    would be treated as new and lose its preserved order and time. Claim-once
+    (exact location matches first, then alias claims in current display
+    order): a record shared by former siblings can never seed two post-split
+    groups — the loser is genuinely new."""
+    resolved: dict[str, dict] = {}
+    claimed: set[int] = set()
+    for key in location_keys:
+        rec = prev_groups.get(key)
+        if rec is not None and id(rec) not in claimed:
+            claimed.add(id(rec))
+            resolved[key] = rec
+    for key in location_keys:
+        if key in resolved:
+            continue
+        for st in by_key[key]:
+            rec = prev_groups.get(f"student:{st['id']}")
+            if rec is not None and id(rec) not in claimed:
+                claimed.add(id(rec))
+                resolved[key] = rec
+                break
+    surviving = sorted(
+        (k for k in location_keys if k in resolved),
+        key=lambda k: resolved[k]["order"],
+    )
+    new_keys = [k for k in location_keys if k not in resolved]
+    if is_afternoon:
+        # Direction semantics for the appended block too: the earliest
+        # new pickup is dropped last.
+        new_keys.reverse()
+    return surviving + new_keys, resolved
+
+
+def _check_live_edit_constraints(
+    route: dict, students: list[dict], location_keys: list[str], prev_rows: list[dict]
+) -> None:
+    """U8 hard-constraint guard on live-route edits (R4/R14): seat capacity
+    counts children against the bus's capacity, the stop cap counts location
+    groups against the shared ``DEFAULT_STOP_CAP``. Runs in regeneration's
+    locked phase — after the mutation rewrote the links, before any stop
+    write — so every path that can add riders or stops (assignment, student
+    create/update, bulk link) meets one guard, serialized by the route-row
+    lock; raising rolls the whole edit back.
+
+    Blocks ONLY an edit that introduces or worsens a violation, comparing the
+    post-edit load against the pre-edit stop rows: removals always pass, a
+    reorder (same counts) can never trip either check, and a route already
+    over a limit stays editable toward compliance."""
+    prev_student_rows = [
+        r for r in prev_rows if not r["is_school_gate"] and r["student_id"] is not None
+    ]
+    before_children = len(prev_student_rows)
+    before_stops = len({r["stop_order"] for r in prev_student_rows})
+    after_children = len(students)
+    after_stops = len(location_keys)
+
+    capacity = route.get("bus_capacity")
+    if (
+        capacity is not None
+        and after_children > capacity
+        and after_children > before_children
+    ):
+        bus_name = route.get("bus_name") or "the assigned bus"
+        raise RouteConstraintError(
+            f"{CONSTRAINT_CAPACITY}: bus {bus_name} would carry {after_children} "
+            f"children on this route — its capacity is {capacity}; the change "
+            "was not applied"
+        )
+    if after_stops > DEFAULT_STOP_CAP and after_stops > before_stops:
+        raise RouteConstraintError(
+            f"{CONSTRAINT_STOP_CAP}: this route would have {after_stops} stops "
+            f"— the cap is {DEFAULT_STOP_CAP} stops per route; the change "
+            "was not applied"
+        )
+
+
+def _plan_fixed_compute(conn, route: dict, seq_keys: list[str], points: dict[str, dict]) -> dict:
+    """Geometry + times for a plan-ordered route along its FIXED sequence
+    (U8): one ``geo_service.fixed_sequence_geometry`` call — U5's helper,
+    never an ordering call — then wall-clock arithmetic anchored on the gate
+    exactly like the auto path: the gate arrival (morning) / departure
+    (afternoon) IS the resolved anchor, each stop one cumulative leg away.
+    The depot enters as the shipped boundary leg (origin on the first morning
+    trip, destination on the last afternoon trip), shifting the ETA mapping
+    but never appearing as a stop row.
+
+    Returns the auto path's ``computed`` shape plus ``degraded``: True when
+    the offline duration estimate was used. Degraded values are still written
+    by the caller — the non-convergent-solve precedent: computed times land,
+    flagged through the durable channel, never silently."""
+    is_afternoon = route["type"] == "afternoon"
+    anchor_hhmm = resolve_gate_anchor(route)
+    default = _AFTERNOON_DEFAULT if is_afternoon else _MORNING_DEFAULT
+    gate_point = {"lat": route["school_lat"], "lng": route["school_lng"]}
+    depot = _depot_leg(conn, route)
+    stop_points = [points[key] for key in seq_keys]
+    if is_afternoon:
+        seq = [gate_point] + stop_points + ([depot] if depot else [])
+    else:
+        seq = ([depot] if depot else []) + stop_points + [gate_point]
+
+    geom = geo_service.fixed_sequence_geometry(seq)
+    durations = [leg.get("duration_s") or 0 for leg in geom["legs"]]
+
+    anchor_dt = geo_service.next_departure(anchor_hhmm, default=default)
+    if is_afternoon:
+        # The anchor IS the gate departure; ETAs run forward from it.
+        departure = anchor_dt
+    else:
+        # Backward arithmetic: the departure is set so the LAST point (the
+        # gate) lands exactly on the anchor — the fixed-order equivalent of
+        # solve_morning_departure, one call, no iteration.
+        departure = anchor_dt - dt.timedelta(seconds=sum(durations))
+    etas = [departure.strftime("%H:%M")]
+    cumulative = 0
+    for secs in durations:
+        cumulative += secs
+        etas.append((departure + dt.timedelta(seconds=cumulative)).strftime("%H:%M"))
+    if is_afternoon:
+        # Append is zip-safe: seq_keys is shorter than etas[1:] when a depot
+        # trails, so zip() truncates the depot ETA off the tail.
+        gate_time, group_times = etas[0], dict(zip(seq_keys, etas[1:]))
+        orders = {key: 2 + i for i, key in enumerate(seq_keys)}
+        gate_order = 1
+    else:
+        # Morning prepend is NOT zip-symmetric (the U7 rule): a leading depot
+        # ETA shifts the stop mapping by one.
+        stop_etas = etas[1:-1] if depot else etas[:-1]
+        gate_time, group_times = etas[-1], dict(zip(seq_keys, stop_etas))
+        orders = {key: 1 + i for i, key in enumerate(seq_keys)}
+        gate_order = len(seq_keys) + 1
+    return {
+        "seq_keys": list(seq_keys),
+        "orders": orders,
+        "group_times": group_times,
+        "gate_time": gate_time,
+        "gate_order": gate_order,
+        "total_duration_s": geom.get("total_duration_s"),
+        "degraded": bool(geom.get("degraded")),
+    }
+
+
 def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
     """Phase 1 of ``regenerate_route_stops``: read the route + students
     WITHOUT the route-row lock and make the (slow) geo-provider calls.
@@ -167,6 +401,12 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
     missing/custom/manual/empty route); ``degraded_reason`` names the
     failing precondition or provider signal otherwise. Reads only — never
     writes, never locks.
+
+    Plan-ordered routes (U8) take their own branch: no ordering call — the
+    fixed sequence is derived from the current stop rows (surviving order +
+    appended new groups) and extended onto the fingerprint, and ``computed``
+    comes from :func:`_plan_fixed_compute`, present even on the degraded
+    (offline) duration path.
     """
     result: dict[str, Any] = {"fingerprint": None, "computed": None, "degraded_reason": None}
     route = conn.execute(_ROUTE_GEOMETRY_INPUTS_SQL, (route_id,)).fetchone()
@@ -174,7 +414,7 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         return result
 
     students = _assigned_students(conn, route_id)
-    location_keys, _, points = _group_students(students)
+    location_keys, by_key, points = _group_students(students)
     if not location_keys:
         return result
     result["fingerprint"] = _geometry_fingerprint(route, location_keys, points)
@@ -189,6 +429,17 @@ def _compute_route_geometry(conn, route_id: str) -> dict[str, Any]:
         result["degraded_reason"] = (
             "school gate has no coordinates" if has_gate else "route has no school gate"
         )
+        return result
+
+    if route["plan_ordered"]:
+        # Plan order is authoritative (U8): the fixed sequence — surviving
+        # groups in their current stop order, new groups appended — joins the
+        # fingerprint, so a concurrent reorder or roster drift between the
+        # phases discards this compute exactly like any other drift.
+        prev_groups, _ = _prev_group_snapshot(_prev_stop_rows(conn, route_id))
+        seq_keys, _ = _surviving_plus_new_keys(location_keys, by_key, prev_groups, is_afternoon)
+        result["fingerprint"] = (result["fingerprint"], tuple(seq_keys))
+        result["computed"] = _plan_fixed_compute(conn, route, seq_keys, points)
         return result
 
     # Bell-time anchor, one authority (U4): route override -> school bell ->
@@ -290,7 +541,8 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     below — never a partial or stale write (the mutation that caused the
     drift regenerates again with fresh inputs).
 
-    Ordering authority (R9–R11, one authority per route):
+    Ordering authority (R9–R11 + fleet-plan U8, one authority per route:
+    ``custom_stops`` > ``manual_stop_order`` > ``plan_ordered`` > auto):
 
     - ``custom_stops`` routes are untouched: the planner's saved option is
       authoritative until a student assignment flips the flag off (R18).
@@ -325,12 +577,30 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     - Manual routes (``manual_stop_order``, U7) never call geometry and take
       the preservation path unconditionally: an admin-frozen order is a
       choice, not a degradation, so the degraded flag is not raised.
+    - Plan-ordered routes (``plan_ordered``, fleet-plan U8) preserve the
+      applied plan's stop order — never an ordering call — while times and
+      geometry RECOMPUTE along the fixed sequence
+      (``geo_service.fixed_sequence_geometry``): newly assigned students
+      append (before the gate on morning routes, last on afternoon, the
+      frozen-route convention) and every stop's time re-anchors on the gate.
+      Degradation is observable exactly like the auto path: the offline
+      duration estimate still writes times but persists
+      ``last_recalc_degraded`` and returns ``False``. Only the explicit
+      ``recalculate_route_stops`` clears the flag and hands the order back
+      to the optimiser.
 
-    A degraded auto recalculation (fallback taken with students assigned)
-    persists ``last_recalc_degraded = true`` and logs a WARNING — silent
-    degradation is banned (R10). Returns ``False`` exactly in that case, so
-    callers can thread ``stops_recalculated`` into mutation responses;
-    ``True`` otherwise (geometry success, custom/authoritative, empty).
+    Hard-constraint guard (U8: R4/R14): before any write, the locked phase
+    compares the post-edit load against the pre-edit stop rows and raises
+    :class:`RouteConstraintError` (422, constraint named) when the edit
+    introduces or worsens a seat-capacity or stop-cap violation — rolling the
+    whole mutation back. Edits toward compliance always pass.
+
+    A degraded auto or plan-ordered recalculation (fallback or offline
+    estimate with students assigned) persists ``last_recalc_degraded = true``
+    and logs a WARNING — silent degradation is banned (R10). Returns
+    ``False`` exactly in that case, so callers can thread
+    ``stops_recalculated`` into mutation responses; ``True`` otherwise
+    (geometry success, custom/authoritative, empty).
 
     In-progress runs are untouched by construction: runs operate on their own
     ``run_stops`` snapshot (R12).
@@ -350,54 +620,71 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
 
     is_afternoon = route["type"] == "afternoon"
     has_gate = route["school_id"] is not None
+    is_manual = bool(route["manual_stop_order"])
+    is_plan = bool(route["plan_ordered"]) and not is_manual
+    is_auto = not is_manual and not is_plan
 
     # Group students by location, preserving morning pickup order.
     location_keys, by_key, points = _group_students(students)
 
     # Pre-delete snapshot keyed by location-group identity (the keys above),
-    # feeding the preservation fallback. Rows are read in display order so the
-    # first row of a group defines its previous position and time.
-    prev_rows = conn.execute(
-        "select name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id "
-        "from live_route_stops where route_id = %s order by stop_order asc, name asc",
-        (route_id,),
-    ).fetchall()
-    prev_groups: dict[str, dict] = {}
-    prev_gate_time: str | None = None
-    for row in prev_rows:
-        if row["is_school_gate"]:
-            if prev_gate_time is None:
-                prev_gate_time = row["scheduled_time"]
-            continue
-        if row["lat"] is not None and row["lng"] is not None:
-            key = f"{row['lat']:.6f},{row['lng']:.6f}"
-        else:
-            # Coordinate-less rows were keyed by address, and the row name IS
-            # that address (or a surname fallback — covered by the student
-            # alias below).
-            label = (row["name"] or "").strip().lower()
-            key = f"addr:{label}" if label else None
-        rec = None
-        if key is not None:
-            rec = prev_groups.setdefault(
-                key, {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
-            )
-        if row["student_id"] is not None:
-            if rec is None:
-                rec = {"order": row["stop_order"], "time": row["scheduled_time"], "student_times": {}}
-            rec["student_times"][str(row["student_id"])] = row["scheduled_time"]
-            # The student link is the stable alias when labels or coordinates
-            # drift (setdefault: the location key stays the primary identity).
-            prev_groups.setdefault(f"student:{row['student_id']}", rec)
+    # feeding the preservation fallback and the plan-ordered fixed sequence.
+    prev_rows = _prev_stop_rows(conn, route_id)
+
+    # Hard-constraint guard (U8): under the route-row lock, before any write —
+    # an over-capacity / over-cap addition rolls the whole mutation back.
+    _check_live_edit_constraints(route, students, location_keys, prev_rows)
+
+    prev_groups, prev_gate_time = _prev_group_snapshot(prev_rows)
 
     conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
 
     n_locations = len(location_keys)
-    is_auto = not route["manual_stop_order"]
     gate_name = route["school_name"] or "School"
 
-    # --- Geometry path (auto routes with something to compute) ---------------
+    # --- Plan-ordered fixed-sequence path (U8) --------------------------------
     degraded_reason = None
+    if is_plan and n_locations > 0:
+        seq_keys, _ = _surviving_plus_new_keys(location_keys, by_key, prev_groups, is_afternoon)
+        base_fp = _geometry_fingerprint(route, location_keys, points)
+        fp_now = (base_fp, tuple(seq_keys))
+        if pre["fingerprint"] == fp_now and pre["computed"] is not None:
+            computed = pre["computed"]
+            for key in computed["seq_keys"]:
+                for st in by_key[key]:
+                    _insert_stop(conn, route_id, _stop_label(st), computed["orders"][key],
+                                 computed["group_times"][key], st["home_lat"], st["home_lng"],
+                                 False, st["id"])
+            _insert_stop(conn, route_id, gate_name, computed["gate_order"],
+                         computed["gate_time"],
+                         route["school_lat"], route["school_lng"], True, None)
+            degraded = bool(computed.get("degraded"))
+            # Order preserved either way; a recompute on the offline duration
+            # estimate is still flagged through the durable channel (the
+            # non-convergent-solve precedent) — never silent.
+            conn.execute(
+                "update live_routes set last_recalc_degraded = %s, "
+                "stops_computed = true, total_duration_s = %s where id = %s",
+                (degraded, computed.get("total_duration_s"), route_id),
+            )
+            if degraded:
+                logger.warning(
+                    "route %s plan-ordered recompute used the offline duration "
+                    "estimate; order preserved, times recomputed degraded", route_id
+                )
+                return False
+            return True
+        if pre["fingerprint"] in (fp_now, base_fp) and pre["degraded_reason"]:
+            # Precondition failure (uncoordinated group / unlocated gate):
+            # phase 1 named it before deriving the fixed sequence.
+            degraded_reason = pre["degraded_reason"]
+        else:
+            # The route or its students drifted between the unlocked compute
+            # and the locked re-read: the computed times are stale — discard
+            # and fall back to the preservation path observably.
+            degraded_reason = "route/students drifted during recalculation"
+
+    # --- Geometry path (auto routes with something to compute) ---------------
     if is_auto and n_locations > 0:
         if pre["fingerprint"] is not None and pre["fingerprint"] == _geometry_fingerprint(
             route, location_keys, points
@@ -447,42 +734,16 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
     # old inference exactly at the cutover. prev_gate_time is still used below to
     # re-write the gate row's preserved time.
     previously_computed = bool(route["stops_computed"])
-    preserve = previously_computed or not is_auto
+    preserve = previously_computed or is_manual or is_plan
     resolved: dict[str, dict] = {}
     if preserve:
-        # A group resolves to its pre-delete record by location key first,
-        # then via the per-student alias: a coordinate edit re-keys the group
-        # while the stale stop rows still carry the old coords, and without
-        # the alias the group would be treated as new and lose its preserved
-        # order and time. Claim-once (exact location matches first, then
-        # alias claims in current display order): a record shared by
-        # former siblings can never seed two post-split groups — the loser
-        # is genuinely new.
-        claimed: set[int] = set()
-        for key in location_keys:
-            rec = prev_groups.get(key)
-            if rec is not None and id(rec) not in claimed:
-                claimed.add(id(rec))
-                resolved[key] = rec
-        for key in location_keys:
-            if key in resolved:
-                continue
-            for st in by_key[key]:
-                rec = prev_groups.get(f"student:{st['id']}")
-                if rec is not None and id(rec) not in claimed:
-                    claimed.add(id(rec))
-                    resolved[key] = rec
-                    break
-        surviving = sorted(
-            (k for k in location_keys if k in resolved),
-            key=lambda k: resolved[k]["order"],
+        # Surviving groups keep their previous relative order (claim-once
+        # location-key/student-alias resolution) and new groups append — the
+        # shared helper, so this fallback and the plan-ordered fixed sequence
+        # can never disagree (U8).
+        final_keys, resolved = _surviving_plus_new_keys(
+            location_keys, by_key, prev_groups, is_afternoon
         )
-        new_keys = [k for k in location_keys if k not in resolved]
-        if is_afternoon:
-            # Direction semantics for the appended block too: the earliest
-            # new pickup is dropped last.
-            new_keys.reverse()
-        final_keys = surviving + new_keys
     else:
         # Never computed: the original pickup-time-then-name build, wholesale
         # (reversed for afternoon routes — first pickup is dropped last),
@@ -509,9 +770,10 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
         _insert_stop(conn, route_id, gate_name, gate_order, prev_gate_time,
                      route["school_lat"], route["school_lng"], True, None)
 
-    if is_auto and n_locations > 0:
-        # Observable degradation (R10): the durable flag drives the route
-        # card's warning badge and survives reloads; the return value threads
+    if (is_auto or is_plan) and n_locations > 0:
+        # Observable degradation (R10; plan-ordered routes share the auto
+        # path's semantics, U8): the durable flag drives the route card's
+        # warning badge and survives reloads; the return value threads
         # stops_recalculated: false into the mutation response.
         conn.execute(
             "update live_routes set last_recalc_degraded = true where id = %s", (route_id,)
@@ -520,11 +782,12 @@ def regenerate_route_stops(conn, route_id: str) -> bool:
             "route %s stop recalculation degraded (%s); fell back to %s",
             route_id,
             degraded_reason,
-            "preserved previous order and times" if previously_computed else "pickup-time order",
+            "preserved previous order and times"
+            if (previously_computed or is_plan) else "pickup-time order",
         )
         return False
-    if is_auto:
-        # Empty auto route: nothing to compute is not a degradation.
+    if is_auto or is_plan:
+        # Empty route: nothing to compute is not a degradation.
         conn.execute(
             "update live_routes set last_recalc_degraded = false where id = %s", (route_id,)
         )
@@ -551,7 +814,9 @@ def reorder_route_stops(conn, route_id: str, ordered_keys: list[str]) -> None:
     marker the preservation fallback reads.
 
     Custom routes 409 — the planner's saved order is the ordering authority
-    (custom_stops > manual_stop_order > auto).
+    (custom_stops > manual_stop_order > plan_ordered > auto). A manual reorder
+    on a plan-ordered route deliberately leaves ``plan_ordered`` set: manual
+    now outranks it, and only the explicit recalculate clears both flags (U8).
     """
     route = conn.execute(
         "select id, type, custom_stops from live_routes where id = %s for update",
@@ -591,10 +856,14 @@ def reorder_route_stops(conn, route_id: str, ordered_keys: list[str]) -> None:
 
 
 def recalculate_route_stops(conn, route_id: str) -> bool:
-    """Explicit return to automatic ordering (U7, R11): clear
-    ``manual_stop_order`` under the route-row lock, then regenerate
-    immediately through the U6 path. Returns its ``stops_recalculated``
-    signal (False = the rebuild fell back instead of computing geometry).
+    """Explicit return to automatic ordering (U7, R11; fleet-plan U8): clear
+    ``manual_stop_order`` AND ``plan_ordered`` under the route-row lock, then
+    regenerate immediately through the U6 path. This is the ONE release
+    action for both freezes — an admin's manual order and an applied plan's
+    order — so Google re-ordering only ever happens on explicit request; the
+    UI fences the plan-ordered case behind copy warning that the applied
+    plan's order is discarded. Returns its ``stops_recalculated`` signal
+    (False = the rebuild fell back instead of computing geometry).
 
     Custom routes 409: regeneration early-returns on them, and answering 200
     to a recalculation that did nothing is exactly the silent no-op R10 bans.
@@ -611,7 +880,8 @@ def recalculate_route_stops(conn, route_id: str) -> bool:
             "student-based routes"
         )
     conn.execute(
-        "update live_routes set manual_stop_order = false where id = %s", (route_id,)
+        "update live_routes set manual_stop_order = false, plan_ordered = false "
+        "where id = %s", (route_id,)
     )
     return regenerate_route_stops(conn, route_id)
 

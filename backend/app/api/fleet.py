@@ -231,7 +231,11 @@ class StopOrderPayload(BaseModel):
 def set_stop_order(route_id: str, payload: StopOrderPayload, user: dict = Depends(admin_only)):
     """Persist the admin's manual stop order and flip the route to manual mode
     (R11). Set-equality validated server-side: missing, extra, duplicate or
-    foreign keys → 400; planner-saved (custom) routes → 409."""
+    foreign keys → 400; planner-saved (custom) routes → 409. The U8
+    hard-constraint guard never fires here by construction — a reorder keeps
+    the same children and stop count, so it can neither introduce nor worsen
+    a capacity or stop-cap violation (the caps apply to additions, which flow
+    through the assignment paths' regeneration)."""
     return safe_call(
         lambda: (dao.set_route_stop_order(route_id, payload.order), {"ok": True})[1]
     )
@@ -239,9 +243,12 @@ def set_stop_order(route_id: str, payload: StopOrderPayload, user: dict = Depend
 
 @router.post("/routes/{route_id}/recalculate")
 def recalculate_route(route_id: str, user: dict = Depends(admin_only)):
-    """Explicit return to automatic ordering (R11): clears manual mode and
-    regenerates immediately. stops_recalculated: false = the rebuild fell back
-    (degraded) instead of computing geometry. Custom routes → 409."""
+    """Explicit return to automatic ordering (R11; fleet-plan U8): clears
+    manual mode AND plan order — the one release action after which the
+    optimiser may re-order, so the client confirms plan-ordered routes behind
+    copy warning the applied plan's order is discarded — and regenerates
+    immediately. stops_recalculated: false = the rebuild fell back (degraded)
+    instead of computing geometry. Custom routes → 409."""
     return safe_call(
         lambda: {"ok": True, "stops_recalculated": dao.recalculate_route(route_id)}
     )
