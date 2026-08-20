@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, History, RotateCcw, Trash2, Wand2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -519,6 +519,57 @@ export function PlanReviewPage() {
     }
   };
 
+  // --- slot-in proposals (U12) ----------------------------------------------
+  // Stored on the school's APPLIED plan row and generated in the background
+  // when a plannable student lacks a route for a leg their pattern requires.
+  // Polled at the admin cadence so a fresh enrolment's proposal appears
+  // without a reload; visible whenever the school has an applied plan.
+  const slotInsQ = useQuery({
+    queryKey: ["slot-ins", schoolId],
+    queryFn: () => api.get("/api/fleet-plans/slot-ins", { school_id: schoolId }),
+    enabled: Boolean(schoolId) && Boolean(plans?.applied),
+    refetchInterval: 15_000,
+  });
+  const slotIns: any = slotInsQ.data;
+  const [slotInBusy, setSlotInBusy] = useState<string | null>(null);
+
+  const runSlotIn = async (verb: "accept" | "dismiss", p: any) => {
+    setSlotInBusy(p.id);
+    try {
+      await api.post(`/api/fleet-plans/slot-ins/${verb}`, {
+        school_id: schoolId,
+        proposal_id: p.id,
+      });
+      toast(
+        verb === "accept"
+          ? { title: `${p.student_name} placed`, description: p.text }
+          : {
+              title: "Proposal dismissed",
+              description: `${p.student_name} stays unassigned and visible on the Students page.`,
+            },
+      );
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["slot-ins"] }),
+        qc.invalidateQueries({ queryKey: ["routes"] }),
+        qc.invalidateQueries({ queryKey: ["students"] }),
+      ]);
+    } catch (err) {
+      // 409/422 refusals verbatim (aged out, capacity, stale route).
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setSlotInBusy(null);
+    }
+  };
+
+  // Adjust — the documented design choice: with an open draft, the review
+  // surface is where manual placement lives (the Place dialog), so Adjust
+  // jumps there; with NO draft there is nothing to review, so it deep-links
+  // to the Routes page for manual placement on the live routes.
+  const adjustProposal = () => {
+    if (draft) setStep("review");
+    else navigate("/routes");
+  };
+
   // --- render ----------------------------------------------------------------
   const busList = buses as any[];
   const claimableRow = (b: any) => {
@@ -902,6 +953,111 @@ export function PlanReviewPage() {
                 </Card>
               )}
             </div>
+          )}
+
+          {/* ---- Slot-in proposals (U12): shown whenever an applied plan
+               exists, on every step — mid-year placements arrive here. ---- */}
+          {plans?.applied && (
+            <Card data-testid="plan-proposals">
+              <CardHeader className="pb-2">
+                <p className="font-heading text-lg font-semibold">Proposals</p>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  Mid-year enrolments and address changes are slotted into the
+                  applied routes with minimal disruption. A proposal never
+                  applies itself: accept it, adjust the placement by hand, or
+                  dismiss it. Aged proposals stay listed but can no longer be
+                  accepted.
+                </p>
+                {(slotIns?.proposals ?? []).length === 0 &&
+                (slotIns?.unplaceable ?? []).length === 0 ? (
+                  <p className="text-sm text-muted-foreground" data-testid="proposals-empty">
+                    No pending proposals.
+                  </p>
+                ) : (
+                  <ul className="space-y-2">
+                    {(slotIns?.proposals ?? []).map((p: any) => (
+                      <li
+                        key={p.id}
+                        className="flex flex-wrap items-center gap-2 rounded-md border p-2 text-sm"
+                        data-testid={`proposal-${p.id}`}
+                      >
+                        <span>
+                          <span className="font-medium">{p.student_name}</span> — {p.text}
+                        </span>
+                        {p.expired && (
+                          <Badge variant="warning" data-testid="proposal-aged-badge">
+                            Aged out
+                          </Badge>
+                        )}
+                        <span className="ml-auto flex gap-1">
+                          <Button
+                            size="sm"
+                            disabled={Boolean(slotInBusy) || Boolean(p.expired)}
+                            onClick={() => runSlotIn("accept", p)}
+                            data-testid={`proposal-accept-${p.id}`}
+                          >
+                            Accept
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={Boolean(slotInBusy)}
+                            onClick={adjustProposal}
+                            data-testid={`proposal-adjust-${p.id}`}
+                          >
+                            Adjust
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={Boolean(slotInBusy)}
+                            onClick={() => runSlotIn("dismiss", p)}
+                            data-testid={`proposal-dismiss-${p.id}`}
+                          >
+                            Dismiss
+                          </Button>
+                        </span>
+                      </li>
+                    ))}
+                    {(slotIns?.unplaceable ?? []).map((u: any) => (
+                      <li
+                        key={u.id}
+                        className="flex flex-wrap items-center gap-2 rounded-md border border-warning/60 bg-warning/10 p-2 text-sm"
+                        data-testid="slot-in-unplaceable"
+                      >
+                        <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+                        <span>
+                          <span className="font-medium">{u.student_name}</span> — no
+                          feasible insertion ({u.constraint}); place them by hand or
+                          free a seat.
+                        </span>
+                        <span className="ml-auto flex gap-1">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={Boolean(slotInBusy)}
+                            onClick={adjustProposal}
+                          >
+                            Adjust
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={Boolean(slotInBusy)}
+                            onClick={() => runSlotIn("dismiss", u)}
+                            data-testid={`proposal-dismiss-${u.id}`}
+                          >
+                            Dismiss
+                          </Button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
           )}
         </>
       )}

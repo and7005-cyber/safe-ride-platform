@@ -14,12 +14,13 @@ leaving the draft document unchanged.
 All admin-only: plan documents aggregate every enrolled child's name and home
 coordinates, the R19 rationale's aggregate PII target.
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import require_role
 from app.dao.fleet_plan_dao import FleetPlanDao
+from app.services.push_service import notify_route_changes
 
 router = APIRouter(prefix="/api/fleet-plans", tags=["fleet-plans"])
 dao = FleetPlanDao()
@@ -269,3 +270,54 @@ def discard_draft(plan_id: str, user: dict = Depends(admin_only)):
     """Discard an open draft: status flips to discarded and its
     document/basis payloads are scrubbed (metadata kept)."""
     return safe_call(lambda: dao.discard_draft(plan_id))
+
+
+# --- slot-in proposals (U12) -----------------------------------------------
+# Generated in BackgroundTasks by the students_live triggers (beside the U13
+# wiring), stored on the school's APPLIED plan row (slot_in_service documents
+# the decision), and acted on here. All admin-only like every plan surface.
+
+
+class SlotInActionPayload(BaseModel):
+    school_id: str
+    # The stored record's id (from GET /slot-ins).
+    proposal_id: str
+
+
+@router.get("/slot-ins")
+def list_slot_ins(school_id: str, user: dict = Depends(admin_only)):
+    """The school's pending slot-in proposals and unplaceable notices, each
+    stated as position + effect (AE2), with aged-out records marked (never
+    auto-applied, never auto-removed — the student stays visibly
+    unassigned). 404 when the school has no applied plan."""
+    return safe_call(lambda: dao.list_slot_ins(school_id))
+
+
+@router.post("/slot-ins/accept")
+def accept_slot_in(
+    payload: SlotInActionPayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
+    """Accept one proposal (U12): applies JUST that insertion — the stop
+    materialized at the stated position along the fixed order (a frozen
+    route keeps its manual order, AE7), times recomputed along the sequence,
+    the student linked — then notifies ONLY the affected families through
+    the shipped U13 diff/baseline pipeline post-commit (the new child as a
+    first communication, co-riders on the >= 5-minute rule; no audit row —
+    the manual-edit path's contract)."""
+    result = safe_call(
+        lambda: dao.accept_slot_in(payload.school_id, payload.proposal_id)
+    )
+    background_tasks.add_task(
+        notify_route_changes,
+        route_ids=result["route_ids"],
+        student_ids=[result["student_id"]],
+    )
+    return result
+
+
+@router.post("/slot-ins/dismiss")
+def dismiss_slot_in(payload: SlotInActionPayload, user: dict = Depends(admin_only)):
+    """Dismiss one record: removed from the store with zero live-table side
+    effects — the student stays visibly unassigned."""
+    return safe_call(lambda: dao.dismiss_slot_in(payload.school_id, payload.proposal_id))

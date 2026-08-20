@@ -12,6 +12,7 @@ from app.dao.push_dao import PushDao
 from app.dao.student_live_dao import StudentLiveDao
 from app.services import geo_service
 from app.services.push_service import notify_route_changes
+from app.services.slot_in_service import propose_slot_ins
 
 router = APIRouter(prefix="/api/students", tags=["students"])
 dao = StudentLiveDao()
@@ -60,6 +61,50 @@ def _clean_student(data: dict, *, geocode_fallback: bool = True) -> dict:
         hit = geo_service.geocode(data["home_address"], allow_fallback=geocode_fallback)
         if hit:
             data["home_lat"], data["home_lng"] = hit["lat"], hit["lng"]
+            # U12 stability-rule input: WHO resolved it. A fallback provider is
+            # the triage tiers' "ambiguous" (see _triage_row) and must not move
+            # an already-placed pin — _pin_stability consumes and removes this.
+            data["_geo_provider"] = hit["provider"]
+    return data
+
+
+# Providers whose geocode counts as CONFIDENT — the same set _triage_row
+# treats as 'resolved' (anything else is ambiguous, U10/R18).
+CONFIDENT_GEO_PROVIDERS = ("google", "mapbox")
+
+
+def _drop_geo_marker(data: dict) -> dict:
+    """Paths without a prior pin (create, bulk insert) discard the U12
+    stability marker — there is nothing placed to preserve."""
+    data.pop("_geo_provider", None)
+    return data
+
+
+def _pin_stability(student_id: str, data: dict) -> dict:
+    """U12 address-change stability rule (origin: 'an address change for a
+    placed child keeps the existing stop until confidently re-resolved').
+
+    An address edit whose re-geocode came back ambiguous (fallback provider)
+    or failed (no coordinates at all) must NOT drop or move an existing pin:
+    the student keeps their stale coordinates and provenance, so the
+    regeneration that follows keeps the existing stop exactly where families
+    were told it is. The pin moves only on a CONFIDENT re-resolution
+    (google/mapbox — the same set the bulk triage calls 'resolved') or an
+    explicit client pin (payload coordinates, e.g. the PlacePicker's picked
+    pin, which arrives with no geocode marker). A student with no existing
+    pin is untouched — U10's triage owns first-time resolution."""
+    provider = data.pop("_geo_provider", None)
+    has_new = data.get("home_lat") is not None and data.get("home_lng") is not None
+    if has_new and (provider is None or provider in CONFIDENT_GEO_PROVIDERS):
+        return data
+    with get_connection() as conn:
+        row = conn.execute(
+            "select home_lat, home_lng, provenance from live_students where id = %s",
+            (student_id,),
+        ).fetchone()
+    if row and row["home_lat"] is not None and row["home_lng"] is not None:
+        data["home_lat"], data["home_lng"] = row["home_lat"], row["home_lng"]
+        data["provenance"] = row["provenance"]
     return data
 
 
@@ -142,12 +187,16 @@ def create_student(
     # recomputing geometry (the durable signal is live_routes.last_recalc_degraded).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
-    result = safe_call(lambda: dao.create_student(_clean_student(data), route_ids))
+    result = safe_call(lambda: dao.create_student(_drop_geo_marker(_clean_student(data)), route_ids))
     # U13: seed the new child's (and the touched routes' co-riders') missing
     # baselines silently — see the module-level roster-wiring note.
     background_tasks.add_task(
         notify_route_changes, student_ids=[str(result["id"])], seed_only=True
     )
+    # U12: a plannable enrolment with no route for a required leg, at a school
+    # with applied plan routes, gets a slot-in proposal. Best-effort in the
+    # background — a failed generation never fails the enrolment.
+    background_tasks.add_task(propose_slot_ins, [str(result["id"])])
     return result
 
 
@@ -162,12 +211,20 @@ def update_student(
     # U13: capture the routes the student may be about to LEAVE — the update
     # rewrites the links this expansion would otherwise follow.
     prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
-    result = safe_call(lambda: dao.update_student(student_id, _clean_student(data), route_ids))
+    # U12 stability rule: an ambiguous/failed re-geocode keeps the placed pin.
+    result = safe_call(
+        lambda: dao.update_student(
+            student_id, _pin_stability(student_id, _clean_student(data)), route_ids
+        )
+    )
     if result is not None:
         background_tasks.add_task(
             notify_route_changes, route_ids=prior_route_ids,
             student_ids=[student_id], seed_only=True,
         )
+        # U12: a confidently re-resolved address change (or any edit that
+        # leaves a required leg routeless) refreshes the slot-in proposals.
+        background_tasks.add_task(propose_slot_ins, [student_id])
     return result
 
 
@@ -279,7 +336,7 @@ def bulk_upload(
             if row.route_name:
                 notes.append(f"{label}: {ROUTE_COLUMN_NOTE}")
             try:
-                data = _clean_student(row.model_dump(), geocode_fallback=True)
+                data = _drop_geo_marker(_clean_student(row.model_dump(), geocode_fallback=True))
                 data["school_id"] = payload.school_id
                 # Duplicates re-detected server-side at commit (never trusted
                 # from the client): same (name, school) as an existing student.
@@ -328,6 +385,10 @@ def bulk_upload(
             student_ids=sorted(set(touched_students)),
             seed_only=True,
         )
+        # U12: one slot-in generation pass for the whole upload (burst-guard
+        # shape) — plannable rows lacking a required leg at a school with an
+        # applied plan get proposals; everything else no-ops.
+        background_tasks.add_task(propose_slot_ins, sorted(set(touched_students)))
     return result
 
 

@@ -332,3 +332,86 @@ test("restore returns the prior routes and shows the one-level toggle copy", asy
     await destroyPlanFixture(request, fx);
   }
 });
+
+test("a slot-in proposal appears for a mid-year enrolment and Accept places the child", async ({
+  page,
+  request,
+}) => {
+  // U12: with an applied plan live, a plannable enrolment lacking routes gets
+  // a one-line proposal in the Proposals section; Accept applies just that
+  // insertion — the child ends up linked on both legs.
+  const fx = await createPlanFixture(request, {
+    buses: [{ capacity: 15 }],
+    students: [
+      { lat: -1.291, lng: 36.8 },
+      { lat: -1.305, lng: 36.825 },
+    ],
+  });
+  try {
+    await openPlanPage(page, fx.school.name);
+    await confirmFleet(page, fx);
+    await generateDraft(page);
+    await page.getByTestId("plan-to-apply").click();
+    await page.getByTestId("plan-apply").click();
+    await page.getByTestId("apply-dialog").getByTestId("apply-confirm").click();
+    await expect(page.getByTestId("apply-result")).toBeVisible({ timeout: 30_000 });
+
+    // Mid-year enrolment through the API: resolved coordinates, no routes.
+    const enrolResp = await request.post(`${API_URL}/api/students`, {
+      headers: fx.headers,
+      data: {
+        name: uniqueName(`${PREFIX} Child New`),
+        grade: "4",
+        parent_name: "E2E Plan Parent",
+        parent_phone: "+254700123499",
+        parent_email: `e2e-plan-new-${Date.now()}@example.com`,
+        home_address: "Plan stop new, Nairobi",
+        home_lat: -1.298,
+        home_lng: 36.815,
+        school_id: fx.school.id,
+        route_ids: [],
+      },
+    });
+    expect(enrolResp.ok()).toBeTruthy();
+    const newChild = await enrolResp.json();
+    fx.students.push(newChild); // teardown removes it with the fixture
+
+    // Generation runs in the backend's background tasks — wait for the
+    // stored proposal before asserting the UI renders it.
+    await expect
+      .poll(
+        async () => {
+          const res = await request.get(
+            `${API_URL}/api/fleet-plans/slot-ins?school_id=${fx.school.id}`,
+            { headers: fx.headers },
+          );
+          if (!res.ok()) return 0;
+          const body = await res.json();
+          return body.proposals.filter((p: any) => p.student_id === newChild.id).length;
+        },
+        { timeout: 30_000 },
+      )
+      .toBe(1);
+
+    // The Proposals section (visible whenever an applied plan exists) shows
+    // the one-line statement; Accept places the child.
+    await openPlanPage(page, fx.school.name);
+    const proposals = page.getByTestId("plan-proposals");
+    await expect(proposals).toBeVisible();
+    await expect(proposals.getByText(newChild.name, { exact: false })).toBeVisible();
+    await proposals.getByRole("button", { name: "Accept" }).click();
+    await expect(proposals.getByTestId("proposals-empty")).toBeVisible({ timeout: 30_000 });
+
+    // Placed: the child is linked on both legs of the applied plan.
+    await expect
+      .poll(async () => {
+        const res = await request.get(`${API_URL}/api/students`, { headers: fx.headers });
+        if (!res.ok()) return -1;
+        const rows = await res.json();
+        return rows.find((s: any) => s.id === newChild.id)?.route_ids?.length ?? -1;
+      })
+      .toBe(2);
+  } finally {
+    await destroyPlanFixture(request, fx);
+  }
+});
