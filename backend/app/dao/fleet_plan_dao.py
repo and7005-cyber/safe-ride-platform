@@ -1771,22 +1771,33 @@ class FleetPlanDao:
                 "order by applied_at desc nulls last, created_at desc limit 1 for update",
                 (school_id,),
             ).fetchone()
+            captured = conn.execute(_CAPTURE_LIVE_SQL, (school_id,)).fetchone()["document"]
+            # One-level history is DELIBERATE DESTRUCTION: the displaced
+            # 'previous' row is a document holding every child's name and
+            # coordinates (an aggregate PII target), so it is DELETED
+            # outright, never archived — apply→restore→restore stays a
+            # clean toggle and a plan two applies back is gone (the
+            # restore KTD, doubling as retention hygiene).
+            conn.execute(
+                "delete from live_fleet_plans where school_id = %s and status = 'previous'",
+                (school_id,),
+            )
             if applied_prev:
-                captured = conn.execute(_CAPTURE_LIVE_SQL, (school_id,)).fetchone()["document"]
-                # One-level history is DELIBERATE DESTRUCTION: the displaced
-                # 'previous' row is a document holding every child's name and
-                # coordinates (an aggregate PII target), so it is DELETED
-                # outright, never archived — apply→restore→restore stays a
-                # clean toggle and a plan two applies back is gone (the
-                # restore KTD, doubling as retention hygiene).
-                conn.execute(
-                    "delete from live_fleet_plans where school_id = %s and status = 'previous'",
-                    (school_id,),
-                )
                 conn.execute(
                     "update live_fleet_plans set status = 'previous', document = %s "
                     "where id = %s",
                     (Jsonb(captured), applied_prev["id"]),
+                )
+            else:
+                # First apply: there is no applied row to demote, but the
+                # pre-apply live state (possibly hand-built routes, possibly
+                # empty) is still "the plan it replaced" (R21) — preserve it
+                # as a fresh 'previous' row or the first apply would be the
+                # one un-restorable act in the product.
+                conn.execute(
+                    "insert into live_fleet_plans (school_id, status, document, created_by) "
+                    "values (%s, 'previous', %s, %s)",
+                    (school_id, Jsonb(captured), actor.get("id")),
                 )
 
             # (5) Reconcile live_routes IN PLACE to the document's (bus, type)

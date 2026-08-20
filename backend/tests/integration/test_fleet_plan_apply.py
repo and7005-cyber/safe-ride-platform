@@ -760,7 +760,10 @@ def test_notification_matrix_baselines_and_status_lifecycle(client, admin_header
             for leg in (MORNING, AFTERNOON):
                 assert base[leg]["scheduled_time"] == rides1[(sid, leg)]["scheduled_time"]
         assert _baselines(s5) == {}
-        assert _plan_statuses(school_id) == {"draft": 0, "applied": 1, "previous": 0}
+        # Even a FIRST apply preserves the pre-apply live state as 'previous'
+        # (R21: "the plan it replaced" includes hand-built or empty routes) —
+        # the first apply must not be the one un-restorable act.
+        assert _plan_statuses(school_id) == {"draft": 0, "applied": 1, "previous": 1}
 
         # --- re-apply the applied plan: idempotent, zero side effects --------
         again = _apply(client, admin_headers, plan1["id"], acknowledgments=acks)

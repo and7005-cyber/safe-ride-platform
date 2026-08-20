@@ -181,7 +181,9 @@ test("admin can confirm a fleet, draft, move a child, and apply — routes land 
     await expect(
       page
         .getByTestId(`plan-leg-${fx.buses[1].id}-morning`)
-        .getByText(child.name, { exact: false }),
+        .getByTestId("plan-stop-row")
+        .filter({ hasText: child.name })
+        .first(),
     ).toBeVisible();
 
     // Apply with zero gate items (nothing changed since drafting, nobody
