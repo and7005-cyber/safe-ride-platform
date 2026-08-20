@@ -1,10 +1,11 @@
 """Fleet-plan endpoints: fleet confirmation, draft generation, current plans,
 discard (U4), the review/edit surface (U5) — computed review payload with
 wall-clock stop times and the diff vs live, the edit verbs (move / reorder /
-pin / pattern / assign), the explicit in-draft re-solve — and apply (U6): one
+pin / pattern / assign), the explicit in-draft re-solve — apply (U6): one
 gated, transactional, audit-logged act that materializes the draft into the
 live route tables, preserves the displaced live state, and notifies affected
-families.
+families — and restore (U7): the same act with the preserved as-evolved
+capture as its source, toggling apply and previous.
 
 Review-edit contract (R9): every edit re-checks the hard constraints and a
 violation answers 422 with the constraint NAMED ('capacity' or 'stop cap'),
@@ -232,6 +233,29 @@ def apply_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_o
     effects)."""
     return safe_call(
         lambda: dao.apply_plan(
+            plan_id,
+            confirmations=[c.model_dump() for c in payload.confirmations],
+            acknowledgments=[a.model_dump() for a in payload.acknowledgments],
+            actor=user,
+        )
+    )
+
+
+@router.post("/{plan_id}/restore")
+def restore_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_only)):
+    """Restore the preserved 'previous' plan (U7): an apply whose source is
+    the as-evolved capture, addressed by the PRESERVED plan's id (from
+    GET /current) so a gateway-timeout retry hits the now-applied row and
+    no-ops instead of toggling the school back. Same payload as apply: roster
+    drift since the capture (a departed child dropped by name, a child
+    enrolled after the capture left routeless) is confirmed via
+    `confirmations`; fleet drift 409s naming the bus — no partial restore.
+    Same machinery, same order: diff pre-mutation, one-level previous toggle,
+    audit ('plan-restored'), feed rows and baselines in-transaction, then
+    geometry-only refresh and awaited push. Restoring the already-applied
+    plan is a 200 no-op."""
+    return safe_call(
+        lambda: dao.restore_plan(
             plan_id,
             confirmations=[c.model_dump() for c in payload.confirmations],
             acknowledgments=[a.model_dump() for a in payload.acknowledgments],
