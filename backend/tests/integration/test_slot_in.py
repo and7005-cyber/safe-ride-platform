@@ -33,8 +33,21 @@ in the API — and peeking stop rows / links / plan documents). Proposal
 generation runs in BackgroundTasks after the enrolment's response, so
 positive assertions poll; silence assertions ride the causality of a row
 written in the same fan-out transaction (the MEN-suite precedent).
+
+One further sanctioned deviation, for the two generation guards (the
+``SLOT_IN_MAX_MATRIX_POINTS`` size cap and the phase-2 fingerprint-discard
+rule): neither is stageable deterministically through the API alone — the
+cap would need 120+ real students geocoded and applied, and the fingerprint
+needs the applied plan displaced exactly mid-compute. Those tests run the
+REAL ``propose_slot_ins`` entry point (the very function BackgroundTasks
+dispatches) directly in this process against the stack's database via the
+``slot_in_direct`` fixture, patching only the module constant / the matrix
+hook — the world (applied plan, routes, stops, students) is still built and
+observed through the API. Documented as the cheapest honest approach: the
+patched constant shrinks the bound, never the code path under test.
 """
 
+import logging
 import os
 import time
 import uuid
@@ -93,6 +106,26 @@ def admin_headers(client):
 @pytest.fixture(scope="module")
 def parent_headers(client):
     return login(client, PARENT["email"], PARENT["password"])
+
+
+@pytest.fixture()
+def slot_in_direct(monkeypatch):
+    """The slot-in service, imported for DIRECT in-process calls (see the
+    module docstring's sanctioned-deviation note). ``backend/.env`` points
+    DATABASE_URL at the compose-internal ``db`` host, so the env is
+    overridden to the suite's DSN and the settings cache + connection pool
+    are reset on both sides of the test."""
+    monkeypatch.setenv("DATABASE_URL", DSN)
+    from app.core import db as app_db
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    app_db.close_pool()
+    from app.services import slot_in_service
+
+    yield slot_in_service
+    app_db.close_pool()
+    get_settings.cache_clear()
 
 
 # --- builders -----------------------------------------------------------------
@@ -607,6 +640,128 @@ def test_expired_proposal_marked_not_acceptable_then_dismiss(client, admin_heade
         live = {s["id"]: s for s in client.get("/api/students", headers=admin_headers).json()}
         assert live[new_kid["id"]]["route_ids"] == []
         assert live[new_kid["id"]]["display_status"] == "unassigned"
+    finally:
+        _teardown(client, admin_headers,
+                  students=students + ([new_kid] if new_kid else []),
+                  buses=(bus,), schools=(school,))
+
+
+# --- size guard: the CRUD-triggered fan-out is bounded -----------------------------
+
+def test_over_cap_generation_skips_and_student_stays_unassigned(
+        client, admin_headers, slot_in_direct, monkeypatch, caplog):
+    """Over ``SLOT_IN_MAX_MATRIX_POINTS`` the generation pass skips before
+    any matrix call and writes NOTHING: no proposal rows, the student stays
+    visibly unassigned, the slot-in endpoint stays healthy, and exactly one
+    warning names the skip. Staged by patching the cap below this world's
+    point count (school gate + one stop group + the new home = 3) on a
+    direct in-process call of the real entry point — the cheapest honest
+    staging of a large school (see the module docstring)."""
+    marker = uuid.uuid4().hex[:6]
+    school = bus = None
+    students: list[dict] = []
+    new_kid = None
+    try:
+        school = _make_school(client, admin_headers, marker)
+        bus = _make_bus(client, admin_headers, marker, capacity=8)
+        students = [_make_student(client, admin_headers, marker, 0, school["id"], H_FAR)]
+        _apply_fresh_plan(client, admin_headers, school["id"], [bus["id"]])
+
+        # The enrolment's own background pass ran under the DEFAULT cap and
+        # proposed; dismiss that record so the capped rerun faces the clean
+        # "student with no records" slate the guard promises to preserve.
+        new_kid = _make_student(client, admin_headers, marker, 9, school["id"], H_MID)
+        body = _wait_for_records(client, admin_headers, school["id"], new_kid["id"])
+        dismissed = client.post(
+            "/api/fleet-plans/slot-ins/dismiss",
+            json={"school_id": school["id"], "proposal_id": body["proposals"][0]["id"]},
+            headers=admin_headers,
+        )
+        assert dismissed.status_code == 200, dismissed.text
+
+        monkeypatch.setattr(slot_in_direct, "SLOT_IN_MAX_MATRIX_POINTS", 2)
+        with caplog.at_level(logging.INFO, logger="saferide.slot_in"):
+            result = slot_in_direct.propose_slot_ins([new_kid["id"]])
+
+        # A zero summary — NOT None, which would mean a swallowed crash.
+        assert result == {"students": 0, "records": 0}
+        skip_lines = [r for r in caplog.records
+                      if "slot-in generation skipped" in r.getMessage()]
+        assert len(skip_lines) == 1
+        assert "3 points > cap 2" in skip_lines[0].getMessage()
+
+        # Nothing was written; the endpoint is healthy; the student is
+        # visibly unassigned — resolvable via the review surface.
+        body = _slot_ins(client, admin_headers, school["id"])
+        assert body["proposals"] == [] and body["unplaceable"] == []
+        live = {s["id"]: s for s in client.get("/api/students", headers=admin_headers).json()}
+        assert live[new_kid["id"]]["route_ids"] == []
+        assert live[new_kid["id"]]["display_status"] == "unassigned"
+    finally:
+        _teardown(client, admin_headers,
+                  students=students + ([new_kid] if new_kid else []),
+                  buses=(bus,), schools=(school,))
+
+
+# --- fingerprint-discard: a plan displaced mid-compute drops the write -------------
+
+def test_plan_displaced_mid_compute_discards_the_generation_write(
+        client, admin_headers, slot_in_direct, monkeypatch, caplog):
+    """The phase-2 fingerprint rule: proposals scored between the phases are
+    written only if the applied plan row still matches phase 1's (id,
+    applied_at) — otherwise the whole write is dropped silently (best-effort
+    contract). Staged deterministically by hooking the matrix step (the
+    unlocked mid-compute window) to bump ``applied_at`` — what a restore
+    re-applying over the same row does — before returning a stub matrix.
+    The pre-existing record's identity proves the discard: a write that
+    slipped through would have wholesale-replaced it with a fresh id."""
+    marker = uuid.uuid4().hex[:6]
+    school = bus = None
+    students: list[dict] = []
+    new_kid = None
+    try:
+        school = _make_school(client, admin_headers, marker)
+        bus = _make_bus(client, admin_headers, marker, capacity=8)
+        students = [_make_student(client, admin_headers, marker, 0, school["id"], H_FAR)]
+        _apply_fresh_plan(client, admin_headers, school["id"], [bus["id"]])
+
+        new_kid = _make_student(client, admin_headers, marker, 9, school["id"], H_MID)
+        body = _wait_for_records(client, admin_headers, school["id"], new_kid["id"])
+        assert len(body["proposals"]) == 1
+        original_id = body["proposals"][0]["id"]
+
+        def displace_then_stub(points):
+            # Phase 1 committed; nothing is locked — the displacement lands.
+            _pg_exec(
+                "update live_fleet_plans set applied_at = clock_timestamp() "
+                "where school_id = %s and status = 'applied'",
+                (school["id"],),
+            )
+            return (lambda a, b: 60.0), True
+
+        monkeypatch.setattr(slot_in_direct, "_matrix_fn", displace_then_stub)
+        with caplog.at_level(logging.INFO, logger="saferide.slot_in"):
+            result = slot_in_direct.propose_slot_ins([new_kid["id"]])
+
+        assert result == {"students": 0, "records": 0}  # not None: no crash
+        assert any("fingerprint drift" in r.getMessage() for r in caplog.records)
+
+        # The stored record is byte-for-byte the ORIGINAL one — the tampered
+        # pass wrote nothing (a landed write would carry a fresh record id).
+        body = _slot_ins(client, admin_headers, school["id"])
+        assert [r["id"] for r in body["proposals"]] == [original_id]
+        assert body["unplaceable"] == []
+        live = {s["id"]: s for s in client.get("/api/students", headers=admin_headers).json()}
+        assert live[new_kid["id"]]["route_ids"] == []
+
+        # The store stays fully serviceable after the discard: the surviving
+        # proposal still accepts (no lock left behind, no torn document).
+        accepted = client.post(
+            "/api/fleet-plans/slot-ins/accept",
+            json={"school_id": school["id"], "proposal_id": original_id},
+            headers=admin_headers,
+        )
+        assert accepted.status_code == 200, accepted.text
     finally:
         _teardown(client, admin_headers,
                   students=students + ([new_kid] if new_kid else []),

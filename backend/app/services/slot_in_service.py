@@ -62,6 +62,15 @@ is wrapped and logged, never raised. Generation is idempotent per student:
 it replaces any stored records for the triggered students (an address change
 re-proposes; a student whose legs are now all linked has their records
 dropped).
+
+Because the trigger is ordinary CRUD, the pass is bounded and lock-light
+(mirroring ``fleet_dao.regenerate_route_stops``'s two-phase shape): the
+duration-matrix fan-out and the insertion scoring run with NO transaction
+open, the point count is capped by ``SLOT_IN_MAX_MATRIX_POINTS`` (over the
+cap the pass skips with one log line and the student stays visibly
+unassigned), and the plan row is locked only for the short write, which is
+discarded outright if the applied plan changed mid-compute (the
+``_generate_for_school`` fingerprint rule).
 """
 from __future__ import annotations
 
@@ -97,6 +106,17 @@ PROPOSALS_KEY = "slot_in_proposals"
 
 # Configurable aging window (config value, not schema — see module docstring).
 SLOT_IN_AGING_DAYS = int(os.environ.get("SLOT_IN_AGING_DAYS", "14"))
+
+# Bounds the CRUD-triggered background fan-out: generation runs off EVERY
+# ordinary student create/update/bulk-upload, and its duration matrix
+# (``geo_service.compute_duration_matrix``) is a chunked sequential network
+# fan-out with an 8 s timeout per chunk — unbounded, a large school makes
+# routine student CRUD run long. Over this many matrix points (applied
+# routes' stops + school gate + depots + the triggering homes) the pass
+# skips generation with one log line and writes nothing: the student stays
+# visibly unassigned, resolvable via the review surface. Termly planning has
+# no such bound because the admin invoked it deliberately.
+SLOT_IN_MAX_MATRIX_POINTS = int(os.environ.get("SLOT_IN_MAX_MATRIX_POINTS", "120"))
 
 # A per-child ride increase below this rounds to zero minutes and does not
 # count as a delay in the proposal statement.
@@ -248,17 +268,19 @@ def _load_routes(conn, school_id: str) -> list[dict]:
     return out
 
 
-def _matrix_fn(routes: list[dict], school_pt: Point, homes: list[Point]):
-    """One in-memory directed matrix over every point the evaluation can
-    query (applied stops + gate + depots + the new homes). Returns
-    ``(d, degraded)`` — never persisted (U3)."""
-    seen: dict[Point, int] = {}
-    points: list[dict] = []
+def _matrix_points(routes: list[dict], school_pt: Point,
+                   homes: list[Point]) -> list[Point]:
+    """Every deduplicated point the insertion evaluation can query — gate,
+    depots, applied stop groups, the triggering homes — in first-seen order.
+    Split from :func:`_matrix_fn` so the ``SLOT_IN_MAX_MATRIX_POINTS`` guard
+    can count the fan-out BEFORE any provider call is made."""
+    seen: set[Point] = set()
+    points: list[Point] = []
 
     def add(p: Point) -> None:
         if p not in seen:
-            seen[p] = len(points)
-            points.append({"lat": p[0], "lng": p[1]})
+            seen.add(p)
+            points.append(p)
 
     add(school_pt)
     for route in routes:
@@ -268,11 +290,23 @@ def _matrix_fn(routes: list[dict], school_pt: Point, homes: list[Point]):
             add(g["point"])
     for h in homes:
         add(h)
-    result = geo_service.compute_duration_matrix(points)
+    return points
+
+
+def _matrix_fn(points: list[Point]):
+    """One in-memory directed matrix over ``points`` (from
+    :func:`_matrix_points`). Returns ``(d, degraded)`` — never persisted
+    (U3). Must be called with NO transaction open on the generation
+    connection: the provider round-trips must not extend any lock or
+    snapshot (the ``regenerate_route_stops`` rule)."""
+    index = {p: i for i, p in enumerate(points)}
+    result = geo_service.compute_duration_matrix(
+        [{"lat": p[0], "lng": p[1]} for p in points]
+    )
     grid = result["matrix"]
 
     def d(a: Point, b: Point) -> float:
-        return float(grid[seen[a]][seen[b]])
+        return float(grid[index[a]][index[b]])
 
     return d, bool(result["degraded"])
 
@@ -547,27 +581,45 @@ def propose_slot_ins(student_ids: list[str]) -> dict | None:
 
 
 def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | None:
-    """One school's generation pass, on the caller's connection/transaction.
+    """One school's generation pass — two phases, mirroring
+    ``fleet_dao.regenerate_route_stops``: the slow provider work runs with no
+    transaction open, and the plan-row lock is held only for the short write.
 
-    Locks the applied plan row FOR UPDATE (the storage row — serializes
-    concurrent generations and the accept/dismiss writers, and matches
-    apply's plan-row-first lock order; no route locks are taken).
+    Phase 1 (reads only, NO locks): the applied plan's identity fingerprint
+    (id + applied_at), the school, the candidate routes and the triggering
+    students' link state — then COMMIT, so nothing stays open across the
+    matrix fan-out. The duration matrix and the insertion scoring run
+    between the phases on plain in-memory data.
+
+    Size guard: the matrix point count is capped by
+    ``SLOT_IN_MAX_MATRIX_POINTS`` (this is CRUD-triggered work — see the
+    constant's comment). Over the cap the pass skips with one WARNING and
+    writes nothing; the students stay visibly unassigned.
+
+    Phase 2 (short locked write): reopen a transaction, take the applied
+    plan row FOR UPDATE (the storage row — serializes concurrent generations
+    and the accept/dismiss writers, and matches apply's plan-row-first lock
+    order; no route locks are taken), and RE-VALIDATE the row against the
+    phase-1 fingerprint. Fingerprint-discard rule: if the applied plan
+    changed between the phases (a new apply displaced the row — different
+    id — or a restore re-applied over it — same id, new applied_at), the
+    computed proposals were scored against a plan that no longer governs the
+    live routes, so they are dropped silently with one log line — the
+    best-effort contract; the mutation stream that displaced the plan owns
+    any regeneration. On a match, the merge target is the LOCKED row's
+    freshly-read document, so accept/dismiss edits that landed between the
+    phases survive the wholesale per-student replace.
     """
     plan = conn.execute(
-        "select id, document from live_fleet_plans "
+        "select id, applied_at from live_fleet_plans "
         "where school_id = %s and status = 'applied' "
-        "order by applied_at desc nulls last, created_at desc limit 1 for update",
+        "order by applied_at desc nulls last, created_at desc limit 1",
         (school_id,),
     ).fetchone()
-    if not plan:
-        return None  # no applied plan — the trigger condition fails silently
     school = conn.execute(
         "select id, lat, lng from live_schools where id = %s", (school_id,)
     ).fetchone()
-    if not school or school["lat"] is None or school["lng"] is None:
-        return None
-    routes = _load_routes(conn, school_id)
-
+    routes = _load_routes(conn, school_id) if plan else []
     linked: set[tuple[str, str]] = set()
     for r in conn.execute(
         "select sr.student_id, sr.route_type from live_student_routes sr "
@@ -575,6 +627,12 @@ def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | N
         ([str(s["id"]) for s in students],),
     ).fetchall():
         linked.add((str(r["student_id"]), r["route_type"]))
+    conn.commit()  # phase 1 over — no transaction open across provider work
+
+    if not plan:
+        return None  # no applied plan — the trigger condition fails silently
+    if not school or school["lat"] is None or school["lng"] is None:
+        return None
 
     targets: list[tuple[dict, list[str]]] = []
     refreshed: set[str] = set()
@@ -587,12 +645,24 @@ def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | N
         refreshed.add(sid)  # stale records drop even when nothing is needed
         if needed:
             targets.append((s, needed))
+    if not refreshed:
+        return {"students": 0, "records": 0}
 
     new_records: list[dict] = []
     if targets and routes:
         school_pt: Point = (float(school["lat"]), float(school["lng"]))
         homes = [(float(s["home_lat"]), float(s["home_lng"])) for s, _ in targets]
-        d, _degraded = _matrix_fn(routes, school_pt, homes)
+        points = _matrix_points(routes, school_pt, homes)
+        if len(points) > SLOT_IN_MAX_MATRIX_POINTS:
+            logger.warning(
+                "slot-in generation skipped: %d points > cap %d "
+                "(SLOT_IN_MAX_MATRIX_POINTS, school %s) — the triggered "
+                "students stay visibly unassigned, resolvable via the "
+                "review surface",
+                len(points), SLOT_IN_MAX_MATRIX_POINTS, school_id,
+            )
+            return None
+        d, _degraded = _matrix_fn(points)
         base_evals = {
             route["id"]: _route_eval(
                 route, school_pt, d,
@@ -606,14 +676,30 @@ def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | N
                 _proposal_records(s, needed, routes, base_evals, school_pt, d)
             )
 
-    if not refreshed:
-        return {"students": 0, "records": 0}
-    document = dict(plan["document"] or {})
+    # Phase 2 — the short locked write, gated on the plan fingerprint.
+    locked = conn.execute(
+        "select id, applied_at, document from live_fleet_plans "
+        "where school_id = %s and status = 'applied' "
+        "order by applied_at desc nulls last, created_at desc limit 1 for update",
+        (school_id,),
+    ).fetchone()
+    if (locked is None or str(locked["id"]) != str(plan["id"])
+            or locked["applied_at"] != plan["applied_at"]):
+        conn.rollback()  # release the lock now — not at connection close
+        logger.info(
+            "slot-in generation discarded for school %s: the applied plan "
+            "changed mid-compute (fingerprint drift) — proposals dropped, "
+            "best-effort contract",
+            school_id,
+        )
+        return None
+    document = dict(locked["document"] or {})
     kept = [r for r in (document.get(PROPOSALS_KEY) or [])
             if str(r.get("student_id")) not in refreshed]
     document[PROPOSALS_KEY] = kept + new_records
     conn.execute(
         "update live_fleet_plans set document = %s where id = %s",
-        (Jsonb(document), plan["id"]),
+        (Jsonb(document), locked["id"]),
     )
+    conn.commit()  # the lock is held only for the merge just above
     return {"students": len(refreshed), "records": len(new_records)}
