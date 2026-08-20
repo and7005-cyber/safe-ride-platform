@@ -218,22 +218,14 @@ def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
     return stops_recalculated
 
 
-def _bulk_link_and_regenerate(conn, assignments: list[tuple[str, str]]) -> None:
-    """Insert the bulk (student, route) links, then regenerate each affected
-    route ONCE and re-derive each linked student's bus (U8). Takes an explicit
-    connection so the burst-guard batching is unit-testable."""
-    affected: set[str] = set()
-    for student_id, route_id in assignments:
-        conn.execute(
-            "insert into live_student_routes (student_id, route_id) values (%s, %s) "
-            "on conflict (student_id, route_id) do nothing",
-            (student_id, route_id),
-        )
-        affected.add(str(route_id))
-    for route_id in sorted(affected):
+def _regenerate_routes(conn, route_ids: list[str]) -> None:
+    """Regenerate each named route EXACTLY ONCE, duplicates collapsed (the U8
+    Lambda burst guard, kept through U10's route-name retirement: the only bulk
+    path that still touches routes is the duplicate-update overwrite, and a
+    per-row regeneration on a large import is O(rows) Google round-trips in one
+    invocation). Takes an explicit connection so the batching is testable."""
+    for route_id in sorted({str(r) for r in route_ids}):
         regenerate_route_stops(conn, route_id)
-    for student_id in {a[0] for a in assignments}:
-        _derive_student_bus(conn, student_id)
 
 
 class StudentLiveDao:
@@ -353,7 +345,15 @@ class StudentLiveDao:
         """Insert one bulk-upload row; returns ``{id, parent_links}`` (the new
         student id and the count of parent-account links auto-created from its
         email slots). A CSV row's home defaults to provenance 'imported' (U8/U4);
-        a row repaired via the PlacePicker carries its own provenance."""
+        a row repaired via the PlacePicker carries its own provenance.
+
+        ``school_id`` is stamped on every committed row (U10 — the upload dialog
+        is scoped to one school): a school-less student is invisible to the
+        school-scoped fleet-plan draft basis and the pin map, so an import that
+        skipped the stamp would enrol children the planner can never see.
+
+        ``ridership_pattern`` is deliberately NOT in the column list: the 011
+        column default ('both_ways') covers new intakes (R20)."""
         data = {**data, "provenance": data.get("provenance") or "imported"}
         with get_connection() as conn:
             row = conn.execute(
@@ -361,12 +361,13 @@ class StudentLiveDao:
                 insert into live_students
                     (name, grade, parent_name, parent_phone, parent_phone2, parent_email,
                      parent2_name, parent2_email,
-                     home_address, home_lat, home_lng, pickup_time, status, provenance)
+                     home_address, home_lat, home_lng, pickup_time, status, school_id,
+                     provenance)
                 values
                     (%(name)s, %(grade)s, %(parent_name)s, %(parent_phone)s, %(parent_phone2)s,
                      %(parent_email)s, %(parent2_name)s, %(parent2_email)s,
                      %(home_address)s, %(home_lat)s, %(home_lng)s, %(pickup_time)s, 'at-school',
-                     %(provenance)s)
+                     %(school_id)s, %(provenance)s)
                 returning id
                 """,
                 data,
@@ -376,25 +377,122 @@ class StudentLiveDao:
             )
         return {"id": row["id"], "parent_links": assignments}
 
-    def resolve_route_id_by_name(self, name: str | None) -> str | None:
-        """Resolve a CSV ``route_name`` to a route id (U8) — the term-start
-        onboarding column. Case-insensitive exact match; None when unknown or
-        ambiguous (>1 route shares the name)."""
-        if not name or not name.strip():
-            return None
+    def school_exists(self, school_id: str) -> bool:
+        """Guard for the bulk upload's required school scope (U10): one clear
+        error up front beats thirty per-row FK failures."""
+        with get_connection() as conn:
+            return conn.execute(
+                "select 1 from live_schools where id = %s", (school_id,)
+            ).fetchone() is not None
+
+    def find_bulk_duplicates(
+        self, names: list[str | None], school_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Existing students matching any bulk row on (name, school_id) — the
+        U10 duplicate key: same child, same school. Batched: ONE query for the
+        whole upload instead of one per row. Case-insensitive, whitespace-
+        trimmed; blank names are ignored. Returns a dict keyed by the
+        normalized (lower/strip) name, each value the same {id, name,
+        home_address} shape the per-row lookup returned, so callers consult it
+        per row without changing the duplicate_of contract. One arbitrary match
+        per name (the old limit-1 behavior)."""
+        wanted = sorted({str(n).strip().lower() for n in names if n and str(n).strip()})
+        if not wanted:
+            return {}
         with get_connection() as conn:
             rows = conn.execute(
-                "select id from live_routes where lower(name) = lower(%s) limit 2",
-                (name.strip(),),
+                "select id, name, home_address from live_students "
+                "where school_id = %s and lower(trim(name)) = any(%s)",
+                (school_id, wanted),
             ).fetchall()
-        return rows[0]["id"] if len(rows) == 1 else None
+        duplicates: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            duplicates.setdefault(str(row["name"]).strip().lower(), dict(row))
+        return duplicates
 
-    def bulk_link_and_regenerate(self, assignments: list[tuple[str, str]]) -> None:
-        """Link bulk-imported students to their routes and regenerate each
-        affected route EXACTLY ONCE (U8): per-row regeneration on a large import
-        is O(rows) Google round-trips in one Lambda invocation (verified burst
-        risk). route_type is set by the U2 trigger; buses are re-derived after."""
-        if not assignments:
+    def update_bulk_student(self, student_id: str, data: dict) -> dict[str, Any]:
+        """The bulk duplicate-update path (U10): overwrite the existing
+        student's parent contacts and home address with the re-triaged row.
+        Routes, status, school and ridership pattern are untouched — routes
+        come from the fleet plan, and an import must never reset live state.
+
+        PlacePicker provenance contract: an existing 'picked' home pin is the
+        operator's deliberate placement and is never downgraded by an imported
+        row — the address text updates, the coordinates and provenance stay —
+        unless the row itself carries a fresh 'picked' pin (the operator
+        re-placed it in this upload's repair step).
+
+        ``grade`` and ``pickup_time`` update only when the row provides them
+        (a blank CSV cell must not blank a curated value).
+
+        Returns ``{id, parent_links, route_ids}`` — the caller regenerates the
+        returned routes once per route across the whole upload (burst guard),
+        since the overwritten home moves this student's stop."""
+        with get_connection() as conn:
+            before = conn.execute(
+                "select parent_email, parent2_email, provenance, home_lat, home_lng "
+                "from live_students where id = %s",
+                (student_id,),
+            ).fetchone()
+            values = {
+                "id": student_id,
+                "parent_name": data.get("parent_name"),
+                "parent_phone": data.get("parent_phone"),
+                "parent_phone2": data.get("parent_phone2"),
+                "parent_email": data.get("parent_email"),
+                "parent2_name": data.get("parent2_name"),
+                "parent2_email": data.get("parent2_email"),
+                "home_address": data.get("home_address"),
+                "home_lat": data.get("home_lat"),
+                "home_lng": data.get("home_lng"),
+                "provenance": data.get("provenance") or "imported",
+            }
+            if before["provenance"] == "picked" and values["provenance"] != "picked":
+                values["home_lat"] = before["home_lat"]
+                values["home_lng"] = before["home_lng"]
+                values["provenance"] = "picked"
+            conn.execute(
+                """
+                update live_students set
+                    parent_name=%(parent_name)s, parent_phone=%(parent_phone)s,
+                    parent_phone2=%(parent_phone2)s, parent_email=%(parent_email)s,
+                    parent2_name=%(parent2_name)s, parent2_email=%(parent2_email)s,
+                    home_address=%(home_address)s, home_lat=%(home_lat)s,
+                    home_lng=%(home_lng)s, provenance=%(provenance)s
+                where id=%(id)s
+                """,
+                values,
+            )
+            if data.get("grade"):
+                conn.execute(
+                    "update live_students set grade = %s where id = %s",
+                    (data["grade"], student_id),
+                )
+            if data.get("pickup_time"):
+                conn.execute(
+                    "update live_students set pickup_time = %s where id = %s",
+                    (data["pickup_time"], student_id),
+                )
+            assignments = sync_parent_links(
+                conn, student_id,
+                (data.get("parent_email"), data.get("parent2_email")),
+                old_emails=(before["parent_email"], before["parent2_email"]),
+            )
+            route_ids = [
+                str(r["route_id"])
+                for r in conn.execute(
+                    "select route_id from live_student_routes where student_id = %s "
+                    "order by route_id",
+                    (student_id,),
+                ).fetchall()
+            ]
+        return {"id": student_id, "parent_links": assignments, "route_ids": route_ids}
+
+    def regenerate_routes(self, route_ids: list[str]) -> None:
+        """Regenerate the given routes once each (see ``_regenerate_routes``) —
+        the post-loop pass of a bulk upload whose duplicate updates moved home
+        pins on live routes."""
+        if not route_ids:
             return
         with get_connection() as conn:
-            _bulk_link_and_regenerate(conn, assignments)
+            _regenerate_routes(conn, route_ids)

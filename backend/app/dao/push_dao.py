@@ -174,6 +174,35 @@ class PushDao:
             ).fetchall()
         return [str(row["parent_id"]) for row in rows]
 
+    def routes_of_students(self, student_ids: list[str]) -> list[str]:
+        """DISTINCT route ids the given students are currently linked to — the
+        pre-mutation capture for U13's manual-edit fan-out: a student update or
+        delete rewrites/cascades the very links the post-commit fan-out would
+        otherwise expand through, so the caller snapshots them first."""
+        if not student_ids:
+            return []
+        with get_connection() as conn:
+            rows = conn.execute(
+                "select distinct route_id from live_student_routes "
+                "where student_id = any(%s::uuid[])",
+                ([str(s) for s in student_ids],),
+            ).fetchall()
+        return sorted(str(row["route_id"]) for row in rows)
+
+    def students_of_routes(self, route_ids: list[str]) -> list[str]:
+        """DISTINCT student ids linked to the given routes — captured BEFORE a
+        route deletion so U13's fan-out can still diff the members the cascade
+        is about to unlink (their baselines then read as removed)."""
+        if not route_ids:
+            return []
+        with get_connection() as conn:
+            rows = conn.execute(
+                "select distinct student_id from live_student_routes "
+                "where route_id = any(%s::uuid[])",
+                ([str(r) for r in route_ids],),
+            ).fetchall()
+        return sorted(str(row["student_id"]) for row in rows)
+
     def students_on_run(self, run_id: str, include_absent: bool = False) -> list[dict]:
         """Students with a seat on the run's stop roster.
 
@@ -287,6 +316,46 @@ class PushDao:
                 """,
                 (user_id, student_id, run_id, bus_id, type, title, body, run_type),
             ).fetchone()
+        return dict(row) if row else None
+
+    def insert_plan_notification(
+        self,
+        conn,
+        user_id: str,
+        *,
+        type: str,
+        title: str,
+        body: str,
+        student_id: str | None,
+        bus_id: str | None,
+        run_type: str | None,
+        plan_audit_id: str | None,
+    ) -> dict | None:
+        """Feed-row insert on the CALLER's connection (fleet-plan apply, U6).
+
+        ``insert_notification`` opens its own connection per row, which would
+        COMMIT feed rows independently of the apply transaction — a gate
+        failure after the fan-out would roll the apply back while the feed
+        kept claiming a change that never happened. Threading the apply's
+        connection makes the feed rows part of the same atom.
+
+        run_id stays NULL (no run is involved); ``plan_audit_id`` ties the
+        row to the apply/restore act that produced it and drives the 011 plan
+        dedup arbiter — ``on conflict do nothing`` returns None for a repeat
+        (parent, student, type) within one act, mirroring the run-scoped
+        dedup's contract. Returns the inserted row, or None when suppressed.
+        """
+        row = conn.execute(
+            """
+            insert into live_notifications
+                (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict do nothing
+            returning id, user_id, student_id, bus_id, type, title, body, run_type,
+                      plan_audit_id, read, created_at
+            """,
+            (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id),
+        ).fetchone()
         return dict(row) if row else None
 
     def list_notifications(

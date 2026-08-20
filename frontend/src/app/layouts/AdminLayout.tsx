@@ -3,6 +3,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import {
   Bell,
   Bus,
+  ClipboardList,
   Clock,
   GraduationCap,
   LayoutDashboard,
@@ -34,6 +35,7 @@ const NAV = [
   { to: "/fleet-map", label: "Fleet Map", icon: Map },
   { to: "/buses", label: "Buses", icon: Bus },
   { to: "/routes", label: "Routes", icon: RouteIcon },
+  { to: "/fleet-plan", label: "Fleet Plan", icon: ClipboardList },
   { to: "/students", label: "Students", icon: GraduationCap },
   { to: "/runs", label: "Run History", icon: Clock },
   { to: "/schools", label: "Schools", icon: School },

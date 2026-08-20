@@ -200,3 +200,63 @@ def test_places_autocomplete_empty_without_key(no_keys):
 
 def test_place_details_none_without_key(no_keys):
     assert geo_service.place_details("anything") is None
+
+
+# --- cumulative_ride_seconds: the ONE direction-aware ride walk ---------------
+# Shared by fleet_plan_dao._recompute_legs, fleet_plan_dao._materialize_slot_in
+# and fleet_dao._plan_fixed_compute — these tests pin its arithmetic and its
+# decided short-legs guard (pad observably, never crash or misalign).
+
+def test_cumulative_rides_morning_walks_backward_with_leading_depot_offset():
+    # Sequence depot -> s0 -> s1 -> gate: legs [depot->s0, s0->s1, s1->gate].
+    # The depot leg never enters a ride; rides are cumulative TO the gate.
+    rides, short = geo_service.cumulative_ride_seconds(
+        [100, 200, 300], 2, is_afternoon=False, has_depot=True
+    )
+    assert rides == [500.0, 300.0]
+    assert short is False
+
+
+def test_cumulative_rides_morning_without_depot():
+    rides, short = geo_service.cumulative_ride_seconds(
+        [200, 300], 2, is_afternoon=False, has_depot=False
+    )
+    assert rides == [500.0, 300.0]
+    assert short is False
+
+
+def test_cumulative_rides_afternoon_walks_forward_ignoring_trailing_depot():
+    # Sequence gate -> s0 -> s1 -> depot: the trailing depot leg (999) never
+    # enters any ride.
+    rides, short = geo_service.cumulative_ride_seconds(
+        [100, 200, 999], 2, is_afternoon=True, has_depot=True
+    )
+    assert rides == [100.0, 300.0]
+    assert short is False
+
+
+def test_cumulative_rides_none_durations_count_zero():
+    rides, short = geo_service.cumulative_ride_seconds(
+        [None, 50], 2, is_afternoon=True, has_depot=False
+    )
+    assert rides == [0.0, 50.0]
+    assert short is False
+
+
+def test_cumulative_rides_short_legs_pad_and_flag_never_crash():
+    # fixed_sequence_geometry can return fewer legs than sequence-1 when
+    # points lack coordinates: the walk pads missing legs with 0 at the tail
+    # and reports short=True — the caller raises its degraded flag. Before
+    # consolidation the three call sites diverged here (IndexError / silent
+    # zeros / zip misalignment).
+    rides, short = geo_service.cumulative_ride_seconds(
+        [120], 3, is_afternoon=False, has_depot=True
+    )
+    assert short is True
+    assert rides == [0.0, 0.0, 0.0]  # the lone leg is the depot leg
+
+    rides, short = geo_service.cumulative_ride_seconds(
+        [100], 3, is_afternoon=True, has_depot=False
+    )
+    assert short is True
+    assert rides == [100.0, 100.0, 100.0]  # earlier stops keep alignment

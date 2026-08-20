@@ -10,7 +10,7 @@ Administrator accounts are **provisioned by the SafeRide operations team** — t
 
 ## The admin console at a glance
 
-The left sidebar lists the ten sections of the console:
+The left sidebar lists the eleven sections of the console:
 
 | Section | What it is for |
 | --- | --- |
@@ -18,6 +18,7 @@ The left sidebar lists the ten sections of the console:
 | **Fleet Map** | Live bus positions on a map, plus the route planner |
 | **Buses** | The vehicle register |
 | **Routes** | Routes, their stops and stop order; messaging a route's parents |
+| **Fleet Plan** | Drafting a school's whole route network from its students; review, apply, restore |
 | **Students** | Student records, parent contacts, route assignment, daily absences |
 | **Run History** | Every run, with a detailed report per run |
 | **Schools** | School records and gate locations |
@@ -82,7 +83,21 @@ Click **Add Student** and fill in:
 
 ### Bulk upload
 
-**Bulk Upload** accepts a CSV or Excel file — click **Download template** for the exact format. Columns: `name, grade, parent_name, parent_phone, parent_email, parent2_name, parent_phone2, parent2_email, home_address, home_lat, home_lng, pickup_time, route_name`. Valid rows import; bad rows are reported individually and skipped.
+**Bulk Upload** accepts a CSV or Excel file — click **Download template** for the exact format. Columns: `name, grade, parent_name, parent_phone, parent_email, parent2_name, parent_phone2, parent2_email, home_address, home_lat, home_lng, pickup_time`. Bad rows are reported individually and never block the good ones.
+
+The upload happens in **two steps**, and it is **scoped to a school**: pick the **School** first — every imported student is enrolled there, and the fleet-plan drafts and pin map only see a school's own students.
+
+**Step 1 — check.** Choosing the file doesn't import anything yet. Every row's address is looked up and sorted into three tiers:
+
+- **Located** — the row has coordinates (supplied in the file, or found with confidence). Nothing to do.
+- **Confirm pin** — only a low-confidence lookup found the address. The row shows the proposed location next to the student's name; click **Confirm pin** to accept it. One click per row.
+- **Not located** — the address couldn't be found at all. Click **Place on map** and drop the pin by hand — you're always placing a named student's home on a map, never editing a text string. (A row you leave unplaced still imports; the student is flagged "unresolved address" until you pin them from their record or the pin map.)
+
+The check also flags **duplicates**: a row whose name matches a student already enrolled at that school. Choose per row — **Skip** leaves the existing record untouched, **Update** overwrites their parent contacts and address with the row's values (the new address is looked up again, same tiers). Re-uploading an identical file with every duplicate skipped imports nothing — zero new students.
+
+**Step 2 — import.** Once every proposed pin is confirmed and every duplicate decided, click **Import**. The summary reports rows inserted, updated, and skipped, plus parent assignments created.
+
+**The `route_name` column is retired.** Routes come from the fleet plan now, not the import. An old file that still carries the column uploads fine — the student imports, no route is assigned, and the row gets the note "route column ignored — routes come from the fleet plan".
 
 ### Daily attendance and absences
 
@@ -105,9 +120,10 @@ Each route card shows its stops in order on a small map, plus a mode badge:
 
 - **Auto** — the system orders stops automatically.
 - **Manual order** — you've reordered stops with the up/down arrows.
+- **Plan order** — the route came from an applied fleet plan (Fleet Plan page) and keeps the stop order you reviewed there, even as students are added or removed.
 - **Planner** — the route came from the Fleet Map route planner with fixed custom stops.
 
-Per stop you can: **move it up/down**, **edit the pickup time** (this re-sorts the route by time), or **cancel the stop** (removes the student from the route). **Recalculate order & times** rebuilds the ordering automatically; if you see "Order/times not recalculated — check addresses/maps key", some addresses couldn't be located.
+Per stop you can: **move it up/down**, **edit the pickup time** (this re-sorts the route by time), or **cancel the stop** (removes the student from the route). **Recalculate order & times** rebuilds the ordering automatically; if you see "Order/times not recalculated — check addresses/maps key", some addresses couldn't be located. On a **Plan order** route, Recalculate asks for confirmation first — it discards the applied plan's reviewed stop order and lets the optimiser reorder the stops.
 
 ### Messaging a route's parents
 
@@ -127,6 +143,27 @@ The planner (right-hand panel) builds an optimized route from scratch:
 4. Click **Save to Routes**, give the route a **name**, a **school** (required) and optionally a **bus**.
 
 The saved route appears on the Routes page with the **Planner** badge.
+
+## Fleet Plan
+
+The Fleet Plan page drafts a school's complete route network from its enrolled students — who rides which bus, in what order, morning and afternoon — and lets you review and adjust the proposal before making it live. **Nothing on this page changes the live routes until you click Apply.**
+
+Work through the four steps in order:
+
+1. **Fleet** — tick every bus this school may use and click **Confirm fleet**. A claimed bus is unavailable to other schools until it is released here. A bus running multiple trips per period is claimed but excluded from drafting, and a bus without a depot is planned without its depot leg — both are called out under the list.
+2. **Draft** — click **Generate draft**. The system reads every enrolled student's home pin and the confirmed fleet and proposes mirrored morning/afternoon routes. Only one draft is open per school: drafting again asks first, because the new draft **supersedes** the open one and its review edits are discarded. The optional solver seed reproduces a draft exactly; leave it empty normally.
+3. **Review** — the map shows each bus's legs, and the panels beside it show every child's ride time, each bus's seats used per leg, the computed stop times, and — before anything is sent — **the changes families will be told about** with the count of families that will be notified. Children the plan could not seat appear in the red **unplaceable** panel with the reason (no seats, too many stops, no located address); use **Place** to seat one by hand, choosing a bus and a position per leg. You can also reorder stops with the arrows or by dragging, **Move** a child to another bus (moving just one leg splits the pair across buses), **Pin** a child so re-solving keeps them where they are, and change a child's ridership pattern (both ways, morning only, afternoon only, split) — pattern edits live in the draft until you apply. An edit that would break a hard rule (bus capacity, the 24-stop cap) is refused with the rule named, and the draft is unchanged. **Re-solve** re-optimises the whole draft: pinned children and pattern edits are kept; other manual arrangements are discarded.
+4. **Apply** — one explicit act that **replaces the school's live routes** and **notifies every affected family** (changed bus, stop moved 5 or more minutes against what they were last told, first plan, lost seat). If students enrolled, moved house, or left after you drafted, the apply dialog lists each change for individual confirmation — or offers **Discard and re-draft** when the list is long. Any still-unplaceable child must be **acknowledged by name, per leg**: they will have no seat from the next run. Applying between runs takes effect the **same day** — "next run" can mean this afternoon — and if a run is active right now, parents' live tracking will not match the bus until that run ends.
+
+The first apply for a school notifies **every** family. That is intended: it is the first time each family is told a stop and a time.
+
+If a draft carries the badge **"Schedule couldn't be fully optimised — times are approximate"**, live travel times couldn't be fetched and distances were estimated instead. The draft is still reviewable and appliable — treat its times as indicative, and expect the same badge language on any route whose road geometry couldn't be fetched after applying.
+
+### After applying
+
+- The applied routes appear on the **Routes** page with the **Plan order** badge: the stop order you reviewed is preserved through student changes. **Recalculate** on such a route asks first, because it discards the plan's reviewed order (see Routes above).
+- **Restore** (on the Apply step) returns the school to its routes as they were just before the apply — including any manual edits made while those routes were live. The current plan becomes restorable in its place: **only one step back exists**. Restoring passes the same confirmations as an apply and notifies the affected families.
+- **Discard draft** deletes an open draft without touching the live routes.
 
 ## Run History
 

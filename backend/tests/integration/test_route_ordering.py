@@ -1,6 +1,11 @@
-"""Route stop ordering (ops-refinement U6 + U7): geometry recalculation in
-auto mode (U6: R9, R10, R12; AE3 auto half, AE6) and admin manual ordering
-with explicit recalculate (U7: R11–R13; AE3 manual half).
+"""Route stop ordering (ops-refinement U6 + U7 + fleet-plan U8): geometry
+recalculation in auto mode (U6: R9, R10, R12; AE3 auto half, AE6), admin
+manual ordering with explicit recalculate (U7: R11–R13; AE3 manual half), and
+the fleet-plan U8 additions — the live-edit hard-constraint guard (R4/R14:
+seat capacity and the 24-stop cap 422 with the constraint named, blocking
+only edits that introduce or worsen a violation) and the plan-ordered
+regeneration branch (order preserved, times recomputed along the fixed
+sequence; recalculate is the explicit release).
 
 Run with the stack up (scripts/start-local.sh):
 
@@ -236,13 +241,15 @@ def _cleanup(client, admin_headers, *, students=(), routes=(), schools=(), buses
 # Payload surface (R10) ------------------------------------------------------------
 
 def test_routes_payload_serializes_ordering_flags(client, admin_headers):
-    """The routes list carries the two 008 ordering columns — RoutesPage
-    renders the mode chip and the durable degradation badge from them."""
+    """The routes list carries the 008 ordering columns plus 011's
+    plan_ordered — RoutesPage renders the mode chip, the durable degradation
+    badge, and the U8 recalculate confirm from them."""
     routes = client.get("/api/fleet/routes", headers=admin_headers).json()
     assert routes, "seeded routes expected"
     for route in routes:
         assert isinstance(route["manual_stop_order"], bool), route
         assert isinstance(route["last_recalc_degraded"], bool), route
+        assert isinstance(route["plan_ordered"], bool), route
 
 
 # Degraded path end-to-end (API plane; container has no Google key) ----------------
@@ -1886,3 +1893,322 @@ def test_only_the_boundary_trip_gets_the_depot_leg(
         assert r2["total_duration_s"] == LEG_SECONDS * 1
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(t1, t2), schools=(school,), buses=(bus,))
+
+
+# Live-edit hard-constraint guard (fleet-plan U8: R4, R14) --------------------------
+
+def _make_bus(client, admin_headers, marker, capacity):
+    r = client.post(
+        "/api/fleet/buses",
+        json={"name": f"IT RO Cap Bus {marker}", "capacity": capacity},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_assignment_over_bus_capacity_is_blocked_naming_capacity(client, admin_headers):
+    """A 16th child on a 15-seat bus's route → 422 whose detail leads with
+    'capacity' (the U5 review-edit vocabulary, mirrored). The whole create
+    rolls back: no student row survives and the roster stays at 15."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus(client, admin_headers, marker, capacity=15)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], bus_id=bus["id"])
+    kids = []
+    try:
+        # 15 children at ONE location: capacity counts children, not stops.
+        for i in range(15):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, f"C{i:02d}", "06:30", -1.2800, 36.7900),
+                [route["id"]],
+            ))
+
+        blocked = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "X", "06:30", -1.2800, 36.7900),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert blocked.status_code == 422, blocked.text
+        assert blocked.json()["detail"].startswith("capacity"), blocked.json()
+
+        # The 422 rolled the whole create back: roster unchanged, no orphan row.
+        listed = _get_route(client, admin_headers, route["id"])
+        assert len([s for s in _stops(listed) if not s["is_school_gate"]]) == 15
+        students = client.get("/api/students", headers=admin_headers).json()
+        assert not any(s["name"] == f"IT RO Kid X {marker}" for s in students)
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,),
+                 schools=(school,), buses=(bus,))
+
+
+def test_stop_cap_blocks_the_25th_stop_only(client, admin_headers):
+    """Adding a 25th distinct stop → 422 leading with 'stop cap'. The cap
+    applies to ADDITIONS of stops: at the cap, a sibling joining an existing
+    stop still lands (same stop count) and a full reorder passes (a reorder
+    can never be a stop-cap violation)."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    # No bus: the stop cap is independent of seat capacity.
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    try:
+        for i in range(24):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, f"S{i:02d}", "06:30",
+                                 -1.2800 - i * 0.002, 36.7900 + i * 0.002),
+                [route["id"]],
+            ))
+        listed = _get_route(client, admin_headers, route["id"])
+        keys = _ordered_group_keys(_stops(listed))
+        assert len(keys) == 24
+
+        blocked = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "Y", "06:30", -1.4000, 36.9500),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert blocked.status_code == 422, blocked.text
+        assert blocked.json()["detail"].startswith("stop cap"), blocked.json()
+
+        # A sibling at stop S00's exact location adds a child, not a stop —
+        # allowed at the cap (no bus, so no seat constraint here).
+        sibling = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "Z", "06:30", -1.2800, 36.7900),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert sibling.status_code == 200, sibling.text
+        kids.append(sibling.json())
+        listed = _get_route(client, admin_headers, route["id"])
+        assert len(_ordered_group_keys(_stops(listed))) == 24  # still 24 stops
+
+        # Reorder at the cap: same stop count, never a violation.
+        reordered = _reorder(client, admin_headers, route["id"], list(reversed(keys)))
+        assert reordered.status_code == 200, reordered.text
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
+
+
+def test_over_capacity_route_stays_editable_toward_compliance(client, admin_headers):
+    """A route already over its bus's capacity (the bus shrank after
+    assignment) must remain editable toward compliance: time edits, reorders
+    and removals pass — only an edit that WORSENS the violation (another
+    child) is blocked."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    bus = _make_bus(client, admin_headers, marker, capacity=3)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"], bus_id=bus["id"])
+    kids = []
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+
+        # Shrink the bus under its load (a bus edit regenerates nothing
+        # without a depot change): the route is now over capacity 3 > 2.
+        shrunk = client.put(
+            f"/api/fleet/buses/{bus['id']}",
+            json={"name": bus["name"], "capacity": 2},
+            headers=admin_headers,
+        )
+        assert shrunk.status_code == 200, shrunk.text
+
+        # Same-count edits pass while over capacity: a pickup-time edit
+        # (regenerates through the guard) and a full reorder.
+        retimed = client.put(
+            f"/api/fleet/routes/{route['id']}/stops/{kids[0]['id']}",
+            json={"pickup_time": "06:25"},
+            headers=admin_headers,
+        )
+        assert retimed.status_code == 200, retimed.text
+        keys = _ordered_group_keys(_stops(_get_route(client, admin_headers, route["id"])))
+        assert _reorder(
+            client, admin_headers, route["id"], list(reversed(keys))
+        ).status_code == 200
+
+        # Removal (toward compliance) always passes — the frozen route's
+        # regeneration runs the same guard and lets the count drop.
+        removed = client.delete(
+            f"/api/fleet/routes/{route['id']}/stops/{kids[2]['id']}", headers=admin_headers
+        )
+        assert removed.status_code == 200, removed.text
+
+        # Worsening again from at-capacity (2 on a 2-seater) is blocked, and
+        # the guard fires on the manual (frozen) route too.
+        blocked = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "D", "06:35", -1.3200, 36.8400),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert blocked.status_code == 422, blocked.text
+        assert blocked.json()["detail"].startswith("capacity"), blocked.json()
+    finally:
+        _cleanup(client, admin_headers, students=kids, routes=(route,),
+                 schools=(school,), buses=(bus,))
+
+
+# Plan-ordered regeneration branch (fleet-plan U8) ----------------------------------
+
+def patch_fixed_sequence(monkeypatch, geo):
+    """The plan-ordered branch's ONE provider signal: fixed_sequence_geometry
+    at Google quality — a fixed LEG_SECONDS per leg, degraded False. The
+    ordering providers are deliberately NOT patched: the branch must never
+    call them."""
+
+    def fake_fixed(seq, departure=None):
+        legs = [
+            {"distance_m": 1000, "duration_s": LEG_SECONDS}
+            for _ in range(max(len(seq) - 1, 0))
+        ]
+        return {
+            "polyline": "itfake",
+            "total_distance_m": 1000 * len(legs),
+            "total_duration_s": LEG_SECONDS * len(legs),
+            "legs": legs,
+            "provider": "google-routes",
+            "degraded": False,
+        }
+
+    monkeypatch.setattr(geo, "fixed_sequence_geometry", fake_fixed)
+
+    def explode(*args, **kwargs):  # pragma: no cover - failure mode
+        raise AssertionError("plan-ordered regeneration must not call the order optimiser")
+
+    monkeypatch.setattr(geo, "optimized_order_with_provider", explode)
+
+
+def test_plan_ordered_route_preserves_order_and_recomputes_times(
+    client, admin_headers, db, fleet_dao, geo, monkeypatch
+):
+    """Fleet-plan U8: a plan_ordered route (flag + student-linked stop order
+    seeded directly — apply does not exist yet) regenerates WITHOUT any
+    ordering call: the stored order stands, times recompute along the fixed
+    sequence anchored on the gate. Assignment through the key-less container
+    APPENDS the new student before the gate and re-times the fixed sequence
+    on the offline estimate — observably degraded like the auto path; removal
+    never re-orders the survivors. Recalculate is the explicit release: it
+    clears plan_ordered and the optimiser may re-order."""
+    marker = uuid.uuid4().hex[:6]
+    school = _make_school(client, admin_headers, marker)
+    route = _make_route(client, admin_headers, marker, "morning", school["id"])
+    kids = []
+    kid_d = None
+    try:
+        for letter, pickup, lat, lng in (
+            ("A", "06:30", -1.2800, 36.7900),
+            ("B", "06:40", -1.2900, 36.8000),
+            ("C", "06:50", -1.3100, 36.8300),
+        ):
+            kids.append(_make_student(
+                client, admin_headers,
+                _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
+            ))
+        kid_a, kid_b, kid_c = kids
+
+        # Seed the plan order C, A, B directly (the sanctioned psycopg plane):
+        # this is what apply will materialize once U6 ships.
+        for sid, order in ((kid_c["id"], 1), (kid_a["id"], 2), (kid_b["id"], 3)):
+            db.execute(
+                "update live_route_stops set stop_order = %s "
+                "where route_id = %s and student_id = %s",
+                (order, route["id"], sid),
+            )
+        db.execute(
+            "update live_routes set plan_ordered = true where id = %s", (route["id"],)
+        )
+        db.commit()
+
+        # In-process regenerate with a Google-quality fixed-sequence signal:
+        # order preserved, times re-anchored on the 07:00 default gate anchor
+        # (3 legs x 5 min), flag clean, drive total persisted.
+        patch_fixed_sequence(monkeypatch, geo)
+        assert fleet_dao.regenerate_route_stops(db, route["id"]) is True
+        db.commit()
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["plan_ordered"] is True
+        assert listed["manual_stop_order"] is False
+        assert listed["last_recalc_degraded"] is False
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO C Lane {marker}", "06:45"),
+            (f"IT RO A Lane {marker}", "06:50"),
+            (f"IT RO B Lane {marker}", "06:55"),
+            (f"IT RO School {marker}", "07:00"),
+        ]
+        row = db.execute(
+            "select total_duration_s from live_routes where id=%s", (route["id"],)
+        ).fetchone()
+        assert row["total_duration_s"] == LEG_SECONDS * 3
+
+        # Assignment through the key-less container: the survivors' order is
+        # untouched, D appends before the gate, and the whole sequence
+        # re-times on the offline estimate — flagged degraded exactly like
+        # the auto path (stops_recalculated: false + durable flag), with the
+        # gate still landing on the anchor.
+        created = client.post(
+            "/api/students",
+            json={**_student_payload(marker, "D", "06:35", -1.3200, 36.8400),
+                  "route_ids": [route["id"]]},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        kid_d = created.json()
+        assert kid_d["stops_recalculated"] is False
+
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["plan_ordered"] is True
+        assert listed["last_recalc_degraded"] is True
+        stops = _stops(listed)
+        assert [s["name"] for s in stops] == [
+            f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
+            f"IT RO B Lane {marker}", f"IT RO D Lane {marker}",
+            f"IT RO School {marker}",
+        ]
+        assert stops[-1]["scheduled_time"] == "07:00"  # gate = anchor, exactly
+        times = [s["scheduled_time"] for s in stops]
+        assert times == sorted(times)  # recomputed along the fixed sequence
+
+        # Removal via the normal path: survivors keep the plan order.
+        removed = client.delete(
+            f"/api/fleet/routes/{route['id']}/stops/{kid_d['id']}", headers=admin_headers
+        )
+        assert removed.status_code == 200, removed.text
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["plan_ordered"] is True
+        assert [s["name"] for s in _stops(listed)] == [
+            f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
+            f"IT RO B Lane {marker}", f"IT RO School {marker}",
+        ]
+        assert _stops(listed)[-1]["scheduled_time"] == "07:00"
+
+        # Recalculate releases the plan order (clears the flag) and hands the
+        # route back to the optimiser, which may re-order: A, B, C here.
+        patch_google(monkeypatch, geo, order=[0, 1, 2])
+        assert fleet_dao.recalculate_route_stops(db, route["id"]) is True
+        db.commit()
+        listed = _get_route(client, admin_headers, route["id"])
+        assert listed["plan_ordered"] is False
+        assert listed["manual_stop_order"] is False
+        assert listed["last_recalc_degraded"] is False
+        assert [(s["name"], s["scheduled_time"]) for s in _stops(listed)] == [
+            (f"IT RO A Lane {marker}", "06:45"),
+            (f"IT RO B Lane {marker}", "06:50"),
+            (f"IT RO C Lane {marker}", "06:55"),
+            (f"IT RO School {marker}", "07:00"),
+        ]
+    finally:
+        _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,),
+                 schools=(school,))

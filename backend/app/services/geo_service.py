@@ -443,6 +443,210 @@ def route_geometry(sequence: list[dict], *, departure: dt.datetime | None = None
     }
 
 
+# --- Fixed-sequence recompute (fleet planning, U5) ----------------------------
+
+def fixed_sequence_geometry(
+    sequence: list[dict], *, departure: dt.datetime | None = None
+) -> dict[str, Any]:
+    """Geometry + per-leg durations along a GIVEN ordered ``sequence`` — never
+    re-orders (U5; U6's post-commit refresh and U8's plan-ordered regeneration
+    reuse it). Nothing shipped before this refreshed a route without handing
+    its order back to an optimiser: ``optimized_order_with_provider`` decides
+    ORDERING, this decides GEOMETRY-ALONG-A-SEQUENCE.
+
+    Returns ``{polyline, total_distance_m, total_duration_s, legs, provider,
+    degraded}`` where ``legs[i]`` is ``sequence[i] -> sequence[i+1]``. With a
+    Google key this is one fixed-order ``route_geometry`` call (8 s timeout,
+    best-effort, TRAFFIC_UNAWARE unless ``departure`` is given). Any failure,
+    misshapen leg list, or missing key falls back WHOLE (never mixed) to the
+    deterministic offline estimate using the SAME constants as
+    :func:`compute_duration_matrix` (haversine × circuity ÷ urban speed) —
+    deliberately NOT ``route_geometry``'s own offline constants, so a
+    review-edit recompute stays consistent with the solver's matrix durations
+    and the keyless integration stack is deterministic. ``degraded`` is True
+    exactly when the offline path was taken.
+    """
+    pts = [p for p in sequence if p.get("lat") is not None and p.get("lng") is not None]
+    if len(pts) < 2:
+        return {
+            "polyline": None,
+            "total_distance_m": 0,
+            "total_duration_s": 0,
+            "legs": [],
+            "provider": "trivial",
+            "degraded": False,
+        }
+    geom = route_geometry(pts, departure=departure)
+    if (
+        geom["provider"] == "google-routes"
+        and len(geom["legs"]) == len(pts) - 1
+        and all(leg.get("duration_s") is not None for leg in geom["legs"])
+    ):
+        return {**geom, "degraded": False}
+    legs = []
+    for a, b in zip(pts, pts[1:]):
+        dist = haversine_m((a["lat"], a["lng"]), (b["lat"], b["lng"]))
+        legs.append({
+            "distance_m": int(dist),
+            "duration_s": int(dist * _MATRIX_CIRCUITY / _MATRIX_SPEED_MS),
+        })
+    return {
+        "polyline": None,
+        "total_distance_m": int(sum(leg["distance_m"] for leg in legs)),
+        "total_duration_s": int(sum(leg["duration_s"] for leg in legs)),
+        "legs": legs,
+        "provider": "offline",
+        "degraded": True,
+    }
+
+
+def cumulative_ride_seconds(
+    durations: list, n_stops: int, *, is_afternoon: bool, has_depot: bool
+) -> tuple[list[float], bool]:
+    """THE direction-aware ride-time walk over fixed-sequence leg durations —
+    the ONE implementation shared by the plan review recompute
+    (``fleet_plan_dao._recompute_legs``), the slot-in materializer
+    (``fleet_plan_dao._materialize_slot_in``) and the plan-ordered live
+    recompute (``fleet_dao._plan_fixed_compute``), so their guards can never
+    diverge again.
+
+    ``durations`` are :func:`fixed_sequence_geometry` leg durations for a
+    morning sequence ``[depot?] + stops + gate`` or an afternoon sequence
+    ``gate + stops + [depot?]``. Returns ``(rides, short)`` where ``rides[i]``
+    is stop ``i``'s cumulative seconds to the gate (morning: summed BACKWARD
+    from the gate; afternoon: summed FORWARD from it). A leading morning
+    depot leg shifts the mapping by one; a trailing afternoon depot leg never
+    enters any ride.
+
+    Guard behavior, decided once: ``fixed_sequence_geometry`` can return
+    FEWER legs than ``len(sequence) - 1`` when sequence points lack
+    coordinates (it drops them before routing). Short input degrades
+    OBSERVABLY — missing legs count 0 seconds (padded at the tail, so
+    earlier legs keep their alignment) and ``short`` is True for the caller
+    to raise its degraded flag — never an IndexError, never a silent
+    zip-truncated misalignment."""
+    offset = 0 if is_afternoon else (1 if has_depot else 0)
+    need = offset + n_stops
+    padded = [float(d or 0) for d in durations]
+    short = len(padded) < need
+    if short:
+        padded += [0.0] * (need - len(padded))
+    rides = [0.0] * n_stops
+    if is_afternoon:
+        acc = 0.0
+        for i in range(n_stops):
+            acc += padded[i]
+            rides[i] = acc
+    else:
+        acc = 0.0
+        for i in range(n_stops - 1, -1, -1):
+            acc += padded[offset + i]
+            rides[i] = acc
+    return rides, short
+
+
+# --- Duration matrix (fleet planning): directed drive times, all pairs -------
+
+_ROUTE_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+# computeRouteMatrix caps each request at 625 origins×destinations elements for
+# latLng waypoints (the stricter 50-waypoint cap applies only to placeId/address).
+_MATRIX_MAX_ELEMENTS = 625
+# Road distance over straight-line: ~1.4 is a typical urban circuity factor.
+_MATRIX_CIRCUITY = 1.4
+# Average urban bus speed (m/s) for the offline matrix estimate.
+_MATRIX_SPEED_MS = 30 * 1000 / 3600  # 30 km/h
+
+
+def _route_matrix_call(origins: list[dict], destinations: list[dict], key: str) -> list:
+    """One computeRouteMatrix request for a rectangular origins×destinations
+    block. Returns the element list; indexes are relative to this block."""
+    body = {
+        "origins": [{"waypoint": _latlng(p)} for p in origins],
+        "destinations": [{"waypoint": _latlng(p)} for p in destinations],
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_UNAWARE",
+    }
+    resp = httpx.post(
+        _ROUTE_MATRIX_URL,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": key,
+            "X-Goog-FieldMask": "originIndex,destinationIndex,duration,condition",
+        },
+        json=body,
+        timeout=_TIMEOUT,
+    )
+    return resp.json() or []
+
+
+def _google_duration_matrix(points: list[dict], key: str) -> list[list[int]] | None:
+    """Assemble the full N×N matrix from rectangular computeRouteMatrix chunks,
+    each ≤ ``_MATRIX_MAX_ELEMENTS`` elements, stitched back by global index.
+    Returns ``None`` if ANY cell is unusable — the caller must then discard the
+    whole Google result (never a mixed matrix)."""
+    n = len(points)
+    dest_chunk = min(n, _MATRIX_MAX_ELEMENTS)
+    origin_chunk = max(1, _MATRIX_MAX_ELEMENTS // dest_chunk)
+    matrix: list[list[int | None]] = [[None] * n for _ in range(n)]
+    for o0 in range(0, n, origin_chunk):
+        origins = points[o0:o0 + origin_chunk]
+        for d0 in range(0, n, dest_chunk):
+            for el in _route_matrix_call(origins, points[d0:d0 + dest_chunk], key):
+                i, j = el.get("originIndex"), el.get("destinationIndex")
+                if i is None or j is None:
+                    continue
+                if el.get("condition") == "ROUTE_EXISTS":
+                    matrix[o0 + i][d0 + j] = _dur_s(el.get("duration"))
+    for i in range(n):
+        matrix[i][i] = 0  # self-pairs are exact zeros regardless of provider
+    if any(cell is None for row in matrix for cell in row):
+        return None
+    return matrix  # type: ignore[return-value]
+
+
+def _offline_duration_matrix(points: list[dict]) -> list[list[int]]:
+    """Deterministic keyless estimate: haversine × circuity ÷ urban speed."""
+    n = len(points)
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dist = haversine_m(
+                    (points[i]["lat"], points[i]["lng"]), (points[j]["lat"], points[j]["lng"])
+                )
+                matrix[i][j] = int(dist * _MATRIX_CIRCUITY / _MATRIX_SPEED_MS)
+    return matrix
+
+
+def compute_duration_matrix(points: list[dict]) -> dict[str, Any]:
+    """Directed N×N drive-time matrix for an ordered list of ``{lat, lng}``
+    points: ``matrix[i][j]`` is seconds from ``points[i]`` to ``points[j]``
+    (self-pairs 0).
+
+    Returns ``{matrix, degraded, provider}``. With the Google key set, uses
+    Routes API v2 ``computeRouteMatrix`` (latLng waypoints, TRAFFIC_UNAWARE),
+    chunked so no request exceeds 625 elements. Whole-or-nothing: a missing
+    key, any chunk failure, or any unusable element discards ALL Google
+    results and the entire matrix falls back to the deterministic offline
+    estimate with ``degraded: True`` — mirroring the two-provider-signals rule
+    in ``fleet_dao`` regeneration, a matrix is never part-Google/part-offline.
+    The matrix is returned in memory only and never persisted (Google ToS has
+    no caching allowance for durations).
+    """
+    n = len(points)
+    if n <= 1:
+        return {"matrix": [[0] * n for _ in range(n)], "degraded": False, "provider": "trivial"}
+    s = get_settings()
+    if s.google_maps_api_key:
+        try:
+            matrix = _google_duration_matrix(points, s.google_maps_api_key)
+            if matrix is not None:
+                return {"matrix": matrix, "degraded": False, "provider": "google-routes"}
+        except Exception:  # noqa: BLE001 - fall back to the offline estimate
+            pass
+    return {"matrix": _offline_duration_matrix(points), "degraded": True, "provider": "offline"}
+
+
 # --- Places autocomplete (New) ----------------------------------------------
 
 def places_autocomplete(query: str | None) -> list[dict]:

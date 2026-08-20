@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, Upload, UserCheck, UserX } from "lucide-react";
+import { MapPin, Pencil, Plus, Trash2, Upload, UserCheck, UserX } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -35,6 +35,7 @@ import { BulkUploadDialog } from "@/features/admin/components/BulkUploadDialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { PlacePicker, type Provenance } from "@/features/admin/components/PlacePicker";
+import { StudentsPinMap } from "@/features/admin/components/StudentsPinMap";
 import { api } from "@/lib/apiClient";
 import { emailError, parentContactErrors, phoneError } from "@/lib/validation";
 import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
@@ -126,6 +127,7 @@ export function StudentsPage() {
   const { data: absences = [] } = useAbsences(nairobiToday);
   const [open, setOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [pinMapOpen, setPinMapOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
   const [saving, setSaving] = useState(false);
@@ -314,6 +316,7 @@ export function StudentsPage() {
         ]}
         actions={
           <>
+            <Button variant="outline" onClick={() => setPinMapOpen(true)}><MapPin className="h-4 w-4" /> Pin map</Button>
             <Button variant="outline" onClick={() => setBulkOpen(true)}><Upload className="h-4 w-4" /> Bulk Upload</Button>
             <Button onClick={startCreate}><Plus className="h-4 w-4" /> Add Student</Button>
           </>
@@ -572,6 +575,23 @@ export function StudentsPage() {
       </Dialog>
 
       <BulkUploadDialog open={bulkOpen} onOpenChange={setBulkOpen} />
+
+      {/* Aggregate pin map (U11/R19): the dialog's data comes ONLY from the
+          audited /pin-map endpoint. The deep-link back out reads the normal
+          single-student row and opens the regular editor (PlacePicker) — the
+          usual flow for one child, not client-side aggregation. */}
+      <StudentsPinMap
+        open={pinMapOpen}
+        onOpenChange={setPinMapOpen}
+        schools={schools as any[]}
+        initialSchoolId={schoolFilter === "all" ? null : schoolFilter}
+        onEditStudent={(id) => {
+          const s = (students as any[]).find((x) => String(x.id) === String(id));
+          if (!s) return;
+          setPinMapOpen(false);
+          startEdit(s);
+        }}
+      />
     </div>
   );
 }

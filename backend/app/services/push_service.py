@@ -25,6 +25,10 @@ Notification types:
   incident         driver reported an issue on the child's bus
   ride-cancelled   a parent cancelled the child's ride (that child's linked parents only)
   admin-notice     office broadcast to a route (one copy per parent with a child assigned)
+  route-updated    a fleet-plan apply (U6) or a manual live-route edit (U13)
+                   changed the child's stop/time/bus
+  route-unassigned a fleet-plan apply (U6) or a manual live-route edit (U13)
+                   left the child without a route for a leg
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -35,10 +39,12 @@ import ipaddress
 import json
 import logging
 import math
+import time
 from typing import Any
 from urllib.parse import urlparse
 
 from app.core.config import get_settings
+from app.core.db import get_connection
 from app.dao.push_dao import PushDao
 
 logger = logging.getLogger("saferide.push")
@@ -507,6 +513,40 @@ class PushService:
         except Exception:
             logger.exception("notify_bus_position failed")
 
+    def deliver_plan_feed_rows(self, rows: list[dict]) -> dict:
+        """Awaited push delivery for feed rows the fleet-plan apply transaction
+        ALREADY wrote (U6) — delivery only, never insertion: the feed rows are
+        the product truth and committed with the apply, so re-inserting here
+        would double them (and the notified-family count counts feed rows,
+        not deliveries). Runs synchronously inside the request — awaited,
+        never a detached thread (the Lambda freeze rule) — with per-recipient
+        isolation: one family's failing send must not cost the rest theirs.
+        One summary line per burst on this logger (saferide.push).
+
+        Each row needs ``user_id``/``title``/``body``/``type``. Returns
+        ``{sent, failed, simulated, elapsed_ms}``; ``simulated`` is True when
+        no push channel is configured (local dev default) and every delivery
+        was a log line."""
+        t0 = time.monotonic()
+        settings = get_settings()
+        fcm_enabled = bool(settings.firebase_service_account_json.strip()) and not self._firebase_failed
+        webpush_enabled = bool(settings.vapid_private_key and settings.vapid_public_key)
+        simulated = not fcm_enabled and not webpush_enabled
+        sent = failed = 0
+        for row in rows:
+            try:
+                self.send_to_user(str(row["user_id"]), row["title"], row["body"], row["type"])
+                sent += 1
+            except Exception:
+                failed += 1
+                logger.exception("plan-apply push failed for user %s", row.get("user_id"))
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "plan-apply push fan-out: sent=%d failed=%d simulated=%s elapsed_ms=%d",
+            sent, failed, simulated, elapsed_ms,
+        )
+        return {"sent": sent, "failed": failed, "simulated": simulated, "elapsed_ms": elapsed_ms}
+
     # Internals ----------------------------------------------------------------
 
     def _boarded_links(self, run: dict) -> list[dict]:
@@ -683,3 +723,336 @@ class PushService:
             except Exception:
                 logger.exception("web push failed for user %s", user_id)
         return sent
+
+
+# --- manual live-route edit fan-out (fleet-plan U13) ---------------------------
+# Origin R15 requires parent notification for ANY live-route change — "an
+# applied plan or a manual edit". U6/U7 cover apply/restore through
+# diff_plan_vs_live; this module-level helper closes the manual-edit half:
+# after a mutating endpoint's transaction commits, it diffs the LIVE stop
+# truth per (student, leg) against the same live_communicated_stops baseline
+# the plan diff reads, with the same thresholds, and reuses the same feed-row
+# insert (PushDao.insert_plan_notification), baseline writer
+# (FleetPlanDao._write_baselines) and awaited delivery
+# (PushService.deliver_plan_feed_rows).
+
+
+def notify_route_changes(
+    route_ids: list[str] | None = None,
+    student_ids: list[str] | None = None,
+    *,
+    seed_only: bool = False,
+) -> dict | None:
+    """R15 fan-out for a manual live-route edit (U13).
+
+    Dispatched via BackgroundTasks from the mutating endpoint (the broadcast
+    endpoint's house pattern), so it runs AFTER the mutation's transaction
+    committed, in its own short transaction: feed rows and baseline writes
+    commit as one atom, then push delivery is awaited post-commit through
+    ``deliver_plan_feed_rows`` (delivery only — the feed rows are already the
+    product truth).
+
+    Affected students = ``student_ids`` + members of ``route_ids`` + members
+    of the given students' current routes (a pickup-time edit or a roster
+    change reshuffles co-riders too). Callers removing students or deleting
+    routes pass the pre-mutation ids, since the mutation severs the links this
+    expansion would otherwise follow.
+
+    Per affected (student, leg), against ``live_communicated_stops`` — the
+    diff_plan_vs_live category semantics on live truth (same
+    NOTIFY_MOVE_THRESHOLD_MIN, same coordinate epsilon, same NULL-baseline
+    rule):
+
+    * no baseline, stop present  -> first communication: notify and seed.
+    * time moved >= 5 minutes    -> route-updated (baseline NULL/malformed
+      time counts as moved when a real time is now told).
+    * stop place changed         -> route-updated.
+    * bus changed vs baseline    -> route-updated.
+    * baseline for a leg with NO live stop -> route-unassigned, baseline
+      deleted (a later re-assignment is a first communication again).
+
+    Baselines move ONLY on send (the R15 anti-accumulation rule): silent
+    sub-threshold drift keeps the communicated values.
+
+    ``plan_audit_id`` stays NULL on every row: 011's plan-dedup partial
+    unique keys on (user, student, type, plan_audit_id), and Postgres treats
+    NULLs as distinct, so manual-edit rows never collide with apply rows or
+    with each other — repeated manual edits legitimately re-notify. Repeat
+    suppression is the BASELINE's job: an edit that moves nothing against the
+    freshly written baseline produces no row at all.
+
+    ``seed_only=True`` — the roster paths (student create/update/delete,
+    bulk upload): missing baselines are seeded SILENTLY (no feed rows, no
+    updates to existing baselines, no deletions). Deliberate U13 deviation:
+    the roster interaction itself is the communication for a child the admin
+    is editing by hand, and the shipped apply-suite contract
+    (test_fleet_plan_apply's exact-feed assertions) pins roster mutations
+    silent — drift they cause is notified by the NEXT edit or apply, measured
+    against the baseline seeded here.
+
+    Best-effort by design (background context): any failure is logged, never
+    raised into the caller's response path.
+    """
+    # Lazy import — fleet_plan_dao imports PushService at module load, so a
+    # top-level import here would be circular. The constants/helpers are the
+    # SAME objects the plan diff uses: thresholds cannot drift.
+    from app.dao.fleet_plan_dao import (
+        DIFF_BUS_CHANGE,
+        DIFF_FIRST_COMMUNICATION,
+        DIFF_LEG_REMOVED,
+        DIFF_PLACE_CHANGE,
+        DIFF_TIME_MOVE,
+        FleetPlanDao,
+        NOTIFY_MOVE_THRESHOLD_MIN,
+        _floats_differ,
+        _hhmm_to_minutes,
+    )
+
+    try:
+        push_dao = PushDao()
+        feed_rows: list[dict] = []
+        notified: list[dict] = []
+        with get_connection() as conn:
+            # 1. Resolve the affected student set.
+            affected = {str(s) for s in (student_ids or [])}
+            rids = {str(r) for r in (route_ids or [])}
+            if affected:
+                rids |= {
+                    str(r["route_id"])
+                    for r in conn.execute(
+                        "select distinct route_id from live_student_routes "
+                        "where student_id = any(%s::uuid[])",
+                        (sorted(affected),),
+                    ).fetchall()
+                }
+            if rids:
+                affected |= {
+                    str(r["student_id"])
+                    for r in conn.execute(
+                        "select distinct student_id from live_student_routes "
+                        "where route_id = any(%s::uuid[])",
+                        (sorted(rids),),
+                    ).fetchall()
+                }
+            if not affected:
+                return None
+            sids = sorted(affected)
+
+            # 2. Current live truth per (student, leg): membership bus +
+            # the student's own stop row (regeneration writes one row per
+            # student; 009's unique means at most one route per leg).
+            current: dict[tuple[str, str], dict] = {}
+            for r in conn.execute(
+                "select sr.student_id, sr.route_type, r.bus_id, "
+                "b.name as bus_name, st.name as student_name, "
+                "rs.id as stop_id, rs.name as stop_name, rs.lat, rs.lng, "
+                "rs.scheduled_time "
+                "from live_student_routes sr "
+                "join live_routes r on r.id = sr.route_id "
+                "join live_students st on st.id = sr.student_id "
+                "left join live_buses b on b.id = r.bus_id "
+                "left join live_route_stops rs "
+                "on rs.route_id = sr.route_id and rs.student_id = sr.student_id "
+                "where sr.student_id = any(%s::uuid[])",
+                (sids,),
+            ).fetchall():
+                current[(str(r["student_id"]), r["route_type"])] = dict(r)
+
+            baselines: dict[tuple[str, str], dict] = {}
+            for b in conn.execute(
+                "select c.student_id, c.route_type, c.stop_name, c.stop_lat, "
+                "c.stop_lng, c.scheduled_time, c.bus_id, st.name as student_name "
+                "from live_communicated_stops c "
+                "join live_students st on st.id = c.student_id "
+                "where c.student_id = any(%s::uuid[])",
+                (sids,),
+            ).fetchall():
+                baselines[(str(b["student_id"]), b["route_type"])] = dict(b)
+
+            # 3. Diff live vs baseline.
+            for (sid, leg), cur in sorted(current.items()):
+                if cur["stop_id"] is None:
+                    # Membership without a stop row (a planner-saved custom
+                    # route — its stops are not student-linked): neither a
+                    # placement to compare nor evidence of removal. Leave any
+                    # baseline alone.
+                    continue
+                base = baselines.get((sid, leg))
+                if base is None:
+                    categories = [DIFF_FIRST_COMMUNICATION]
+                else:
+                    if seed_only:
+                        continue  # roster paths never touch existing baselines
+                    categories = []
+                    old_min = _hhmm_to_minutes(base["scheduled_time"])
+                    new_min = _hhmm_to_minutes(cur["scheduled_time"])
+                    # Plan-diff rule, adapted for live stops that may carry NO
+                    # time (a never-computed route): a NULL/malformed baseline
+                    # time counts as moved only when a REAL time is now told —
+                    # None -> None must not re-notify on every later edit.
+                    if new_min is not None and (
+                        old_min is None
+                        or abs(new_min - old_min) >= NOTIFY_MOVE_THRESHOLD_MIN
+                    ):
+                        categories.append(DIFF_TIME_MOVE)
+                    # Place: coordinates first (the plan diff's epsilon).
+                    # Names are compared ONLY when both sides are wholly
+                    # coordinate-less (address-keyed stops): apply seeds
+                    # baseline names from the plan document's sibling-joined
+                    # stop names while live rows carry address labels, so a
+                    # name comparison alongside coordinates would
+                    # false-positive every family on the first post-apply
+                    # manual edit.
+                    if _floats_differ(base["stop_lat"], cur["lat"]) or _floats_differ(
+                        base["stop_lng"], cur["lng"]
+                    ):
+                        categories.append(DIFF_PLACE_CHANGE)
+                    elif (
+                        base["stop_lat"] is None
+                        and base["stop_lng"] is None
+                        and cur["lat"] is None
+                        and cur["lng"] is None
+                        and (base["stop_name"] or "") != (cur["stop_name"] or "")
+                    ):
+                        categories.append(DIFF_PLACE_CHANGE)
+                    # Bus: baseline vs current membership bus — both known,
+                    # mirroring the plan diff's known-live-bus guard.
+                    if (
+                        base["bus_id"] is not None
+                        and cur["bus_id"] is not None
+                        and str(base["bus_id"]) != str(cur["bus_id"])
+                    ):
+                        categories.append(DIFF_BUS_CHANGE)
+                    if not categories:
+                        continue
+                notified.append({
+                    "student_id": sid,
+                    "student_name": cur["student_name"],
+                    "leg": leg,
+                    "categories": categories,
+                    "current": {
+                        "stop_name": cur["stop_name"],
+                        "lat": cur["lat"],
+                        "lng": cur["lng"],
+                        "scheduled_time": cur["scheduled_time"],
+                        "bus_id": str(cur["bus_id"]) if cur["bus_id"] is not None else None,
+                        "bus_name": cur["bus_name"],
+                    },
+                })
+
+            # Baselines for legs with no live stop left: the child was
+            # unassigned — route-unassigned, baseline deleted (never in
+            # seed_only mode: roster paths only ever ADD coverage).
+            if not seed_only:
+                for (sid, leg), base in sorted(baselines.items()):
+                    if (sid, leg) in current:
+                        continue
+                    notified.append({
+                        "student_id": sid,
+                        "student_name": base["student_name"],
+                        "leg": leg,
+                        "categories": [DIFF_LEG_REMOVED],
+                        "current": None,
+                    })
+
+            # 4. Feed rows on THIS connection (rollback takes them too), then
+            # baseline maintenance through the SHARED writer: upsert placed,
+            # delete removed — only for notified rows, so the baseline moves
+            # exactly when a notification is sent. Seed-only rows count as
+            # sent: their communication is the roster interaction itself.
+            if notified and not seed_only:
+                families: dict[str, list[str]] = {}
+                for pr in conn.execute(
+                    "select parent_id, student_id from live_parent_students "
+                    "where student_id = any(%s::uuid[])",
+                    (sorted({r["student_id"] for r in notified}),),
+                ).fetchall():
+                    families.setdefault(str(pr["student_id"]), []).append(
+                        str(pr["parent_id"])
+                    )
+                feed_rows = _write_manual_edit_feed_rows(conn, push_dao, notified, families)
+            if notified:
+                FleetPlanDao._write_baselines(conn, notified)
+
+        # 5. Post-commit: awaited push delivery + the one-line fan-out summary
+        # (deliver_plan_feed_rows logs its own line on this logger).
+        push_summary = None
+        if feed_rows:
+            push_summary = PushService(push_dao).deliver_plan_feed_rows(feed_rows)
+        logger.info(
+            "manual-edit fan-out: students=%d notified_rows=%d feed_rows=%d seed_only=%s",
+            len(sids), len(notified), len(feed_rows), seed_only,
+        )
+        return {"rows": len(notified), "feed_rows": len(feed_rows), "push": push_summary}
+    except Exception:
+        logger.exception("notify_route_changes failed")
+        return None
+
+
+def _write_manual_edit_feed_rows(
+    conn, push_dao: PushDao, rows: list[dict], families: dict[str, list[str]]
+) -> list[dict]:
+    """Feed rows for one manual-edit act, inserted on the CALLER's transaction
+    connection — the U6 composer's grouping (one row per (family, student,
+    type) per act: a both-legs change reads as one message) with live-world
+    fallbacks for values a live stop may lack (a never-computed route has no
+    scheduled_time yet).
+
+    ``plan_audit_id`` is NULL — see notify_route_changes: the 011 partial
+    unique treats NULL as distinct, so these rows never dedup against apply
+    rows or each other; repeats are suppressed by the baseline, not the index.
+    """
+    from app.dao.fleet_plan_dao import _leg_label
+
+    feed_rows: list[dict] = []
+    by_student: dict[str, dict] = {}
+    for row in rows:
+        g = by_student.setdefault(
+            row["student_id"],
+            {"name": row["student_name"], "placed": [], "unplaced": []},
+        )
+        (g["placed"] if row["current"] is not None else g["unplaced"]).append(row)
+    for sid in sorted(by_student):
+        g = by_student[sid]
+        family_ids = sorted(families.get(sid, []))
+        if not family_ids:
+            continue  # no linked account: baseline still maintained by caller
+        if g["placed"]:
+            parts = [
+                f"{_leg_label(r['leg'])}: "
+                f"{r['current']['stop_name'] or 'the assigned stop'} at "
+                f"{r['current']['scheduled_time'] or 'a time to be confirmed'} on "
+                f"{r['current']['bus_name'] or 'the school bus'}"
+                for r in g["placed"]
+            ]
+            legs = {r["leg"] for r in g["placed"]}
+            for pid in family_ids:
+                inserted = push_dao.insert_plan_notification(
+                    conn, pid,
+                    type="route-updated", title="Route updated",
+                    body=f"{g['name']} — " + "; ".join(parts) + ".",
+                    student_id=sid,
+                    bus_id=g["placed"][0]["current"]["bus_id"],
+                    run_type=next(iter(legs)) if len(legs) == 1 else None,
+                    plan_audit_id=None,
+                )
+                if inserted:
+                    feed_rows.append(inserted)
+        if g["unplaced"]:
+            parts = [
+                f"the {_leg_label(r['leg']).lower()} was removed from the route"
+                for r in g["unplaced"]
+            ]
+            legs = {r["leg"] for r in g["unplaced"]}
+            for pid in family_ids:
+                inserted = push_dao.insert_plan_notification(
+                    conn, pid,
+                    type="route-unassigned", title="Route change",
+                    body=f"{g['name']} — " + "; ".join(parts) + ".",
+                    student_id=sid, bus_id=None,
+                    run_type=next(iter(legs)) if len(legs) == 1 else None,
+                    plan_audit_id=None,
+                )
+                if inserted:
+                    feed_rows.append(inserted)
+    return feed_rows

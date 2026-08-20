@@ -74,6 +74,28 @@ export function useTodayIncidentCount() {
   });
 }
 
+export function useFleetPlans(schoolId: string | null | undefined) {
+  // The school's open draft (full row: document + basis) plus applied/previous
+  // metadata (U9). No polling — plan state changes only through this surface's
+  // own mutations, which invalidate explicitly.
+  return useQuery({
+    queryKey: ["fleet-plans", schoolId],
+    queryFn: () => api.get("/api/fleet-plans/current", { school_id: schoolId }),
+    enabled: Boolean(schoolId),
+  });
+}
+
+export function usePlanReview(schoolId: string | null | undefined, hasDraft: boolean) {
+  // The computed review surface (U5): ride/stop times, capacity use,
+  // unplaceable lists, diff vs live. 404s without an open draft, so the hook
+  // is gated on one existing rather than retried into an error state.
+  return useQuery({
+    queryKey: ["fleet-plan-review", schoolId],
+    queryFn: () => api.get("/api/fleet-plans/review", { school_id: schoolId }),
+    enabled: Boolean(schoolId) && hasDraft,
+  });
+}
+
 export function useDrivers() {
   return useQuery({ queryKey: ["accounts-drivers"], queryFn: () => api.get("/api/accounts/drivers") });
 }

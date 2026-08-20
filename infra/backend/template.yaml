@@ -364,6 +364,27 @@ Resources:
         Variables:
           DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
 
+  # Read-only go/no-go verification queries against the private-subnet RDS —
+  # the only SQL door besides the migrate Lambda. Fixed check-set allowlist,
+  # server-enforced read-only session, manual IAM-gated invoke only (no API
+  # route). See backend/app/verify_handler.py and infra/scripts/verify-db.sh.
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend
+      Handler: app.verify_handler.handler
+      Timeout: 60
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Environment:
+        Variables:
+          DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+
   # ---------------------------------------------------- Custom domain (gated)
   ApiDomain:
     Type: AWS::ApiGatewayV2::DomainName
@@ -407,5 +428,7 @@ Outputs:
     Value: !Ref ApiFunction
   MigrateFunctionName:
     Value: !Ref MigrateFunction
+  VerifyFunctionName:
+    Value: !Ref VerifyFunction
   DbEndpoint:
     Value: !GetAtt Database.Endpoint.Address

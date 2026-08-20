@@ -8,6 +8,7 @@ import { DashboardPage } from "@/features/admin/DashboardPage";
 import { FleetMapPage } from "@/features/admin/FleetMapPage";
 import { BusesPage } from "@/features/admin/BusesPage";
 import { RoutesPage } from "@/features/admin/RoutesPage";
+import { PlanReviewPage } from "@/features/admin/PlanReviewPage";
 import { SchoolsPage } from "@/features/admin/SchoolsPage";
 import { StudentsPage } from "@/features/admin/StudentsPage";
 import { RunsPage } from "@/features/admin/RunsPage";
@@ -48,6 +49,7 @@ export const router = createBrowserRouter([
   { path: "/fleet-map", element: admin(<FleetMapPage />) },
   { path: "/buses", element: admin(<BusesPage />) },
   { path: "/routes", element: admin(<RoutesPage />) },
+  { path: "/fleet-plan", element: admin(<PlanReviewPage />) },
   { path: "/students", element: admin(<StudentsPage />) },
   { path: "/runs", element: admin(<RunsPage />) },
   { path: "/schools", element: admin(<SchoolsPage />) },
