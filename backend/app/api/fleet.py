@@ -25,7 +25,7 @@ from app.core.validation import clean_phone
 from app.dao.fleet_dao import FleetDao
 from app.dao.push_dao import PushDao
 from app.services import geo_service
-from app.services.push_service import PushService
+from app.services.push_service import PushService, notify_route_changes
 
 router = APIRouter(prefix="/api/fleet", tags=["fleet"])
 dao = FleetDao()
@@ -176,13 +176,33 @@ def create_route(payload: RoutePayload, user: dict = Depends(admin_only)):
 
 
 @router.put("/routes/{route_id}")
-def update_route(route_id: str, payload: RoutePayload, user: dict = Depends(admin_only)):
-    return safe_call(lambda: dao.update_route(route_id, payload.model_dump()))
+def update_route(
+    route_id: str, payload: RoutePayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
+    # U13 (origin R15): a route edit — a bus (re)assignment above all — can
+    # change what every family on the route was told. Post-commit fan-out vs
+    # the communicated baselines, via BackgroundTasks (the broadcast pattern).
+    # create_route needs no fan-out: a brand-new route has no members yet.
+    result = safe_call(lambda: dao.update_route(route_id, payload.model_dump()))
+    if result is not None:
+        background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+    return result
 
 
 @router.delete("/routes/{route_id}")
-def delete_route(route_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: (dao.delete_route(route_id), {"ok": True})[1])
+def delete_route(
+    route_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+):
+    # U13: capture the members BEFORE the delete — the cascade severs the
+    # links the fan-out would otherwise follow. Every member's baseline for
+    # this route's leg then reads as removed: route-unassigned + baseline
+    # delete.
+    members = safe_call(lambda: push_dao.students_of_routes([route_id]))
+    result = safe_call(lambda: (dao.delete_route(route_id), {"ok": True})[1])
+    if members:
+        background_tasks.add_task(notify_route_changes, student_ids=members)
+    return result
 
 
 # Stop-level edits (#1) ------------------------------------------------------
@@ -193,29 +213,46 @@ class StopTimePayload(BaseModel):
 
 @router.put("/routes/{route_id}/stops/{student_id}")
 def set_stop_time(
-    route_id: str, student_id: str, payload: StopTimePayload, user: dict = Depends(admin_only)
+    route_id: str, student_id: str, payload: StopTimePayload,
+    background_tasks: BackgroundTasks, user: dict = Depends(admin_only),
 ):
     # stops_recalculated: false = an affected auto route's rebuild fell back
     # instead of recomputing geometry (U6/R10) — the sibling cancel_stop shape.
-    return safe_call(
+    result = safe_call(
         lambda: {
             "ok": True,
             "stops_recalculated": dao.set_student_pickup_time(student_id, payload.pickup_time),
         }
     )
+    # U13 (origin R15): a pickup-time edit regenerates EVERY route the student
+    # rides — the fan-out expands from the student to those routes' members
+    # and diffs each against the communicated baselines, post-commit.
+    background_tasks.add_task(notify_route_changes, student_ids=[student_id])
+    return result
 
 
 @router.delete("/routes/{route_id}/stops/{student_id}")
-def cancel_stop(route_id: str, student_id: str, user: dict = Depends(admin_only)):
+def cancel_stop(
+    route_id: str, student_id: str, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
     # stops_recalculated: false = the rebuild fell back instead of recomputing
     # geometry; the durable last_recalc_degraded flag rides the route payload
     # (U6/R10).
-    return safe_call(
+    result = safe_call(
         lambda: {
             "ok": True,
             "stops_recalculated": dao.remove_student_from_route(route_id, student_id),
         }
     )
+    # U13: the student id travels explicitly — the link was just severed, so
+    # route expansion alone would miss them. Their baseline for this leg now
+    # reads as removed: route-unassigned + baseline delete; the route's other
+    # members are diffed for reshuffle drift.
+    background_tasks.add_task(
+        notify_route_changes, route_ids=[route_id], student_ids=[student_id]
+    )
+    return result
 
 
 # Manual ordering (U7) ---------------------------------------------------------
@@ -228,7 +265,10 @@ class StopOrderPayload(BaseModel):
 
 
 @router.put("/routes/{route_id}/stop-order")
-def set_stop_order(route_id: str, payload: StopOrderPayload, user: dict = Depends(admin_only)):
+def set_stop_order(
+    route_id: str, payload: StopOrderPayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
     """Persist the admin's manual stop order and flip the route to manual mode
     (R11). Set-equality validated server-side: missing, extra, duplicate or
     foreign keys → 400; planner-saved (custom) routes → 409. The U8
@@ -236,22 +276,33 @@ def set_stop_order(route_id: str, payload: StopOrderPayload, user: dict = Depend
     the same children and stop count, so it can neither introduce nor worsen
     a capacity or stop-cap violation (the caps apply to additions, which flow
     through the assignment paths' regeneration)."""
-    return safe_call(
+    result = safe_call(
         lambda: (dao.set_route_stop_order(route_id, payload.order), {"ok": True})[1]
     )
+    # U13 (origin R15): a reorder keeps each stop's own time, but the members'
+    # live truth may already have drifted from what was last communicated —
+    # diff every member vs their baseline post-commit.
+    background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+    return result
 
 
 @router.post("/routes/{route_id}/recalculate")
-def recalculate_route(route_id: str, user: dict = Depends(admin_only)):
+def recalculate_route(
+    route_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+):
     """Explicit return to automatic ordering (R11; fleet-plan U8): clears
     manual mode AND plan order — the one release action after which the
     optimiser may re-order, so the client confirms plan-ordered routes behind
     copy warning the applied plan's order is discarded — and regenerates
     immediately. stops_recalculated: false = the rebuild fell back (degraded)
     instead of computing geometry. Custom routes → 409."""
-    return safe_call(
+    result = safe_call(
         lambda: {"ok": True, "stops_recalculated": dao.recalculate_route(route_id)}
     )
+    # U13 (origin R15): the recompute may move every member's time — notify
+    # only the >= 5-minute movers vs their communicated baselines.
+    background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+    return result
 
 
 # Route broadcast (U8) ---------------------------------------------------------

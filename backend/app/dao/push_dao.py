@@ -174,6 +174,35 @@ class PushDao:
             ).fetchall()
         return [str(row["parent_id"]) for row in rows]
 
+    def routes_of_students(self, student_ids: list[str]) -> list[str]:
+        """DISTINCT route ids the given students are currently linked to — the
+        pre-mutation capture for U13's manual-edit fan-out: a student update or
+        delete rewrites/cascades the very links the post-commit fan-out would
+        otherwise expand through, so the caller snapshots them first."""
+        if not student_ids:
+            return []
+        with get_connection() as conn:
+            rows = conn.execute(
+                "select distinct route_id from live_student_routes "
+                "where student_id = any(%s::uuid[])",
+                ([str(s) for s in student_ids],),
+            ).fetchall()
+        return sorted(str(row["route_id"]) for row in rows)
+
+    def students_of_routes(self, route_ids: list[str]) -> list[str]:
+        """DISTINCT student ids linked to the given routes — captured BEFORE a
+        route deletion so U13's fan-out can still diff the members the cascade
+        is about to unlink (their baselines then read as removed)."""
+        if not route_ids:
+            return []
+        with get_connection() as conn:
+            rows = conn.execute(
+                "select distinct student_id from live_student_routes "
+                "where route_id = any(%s::uuid[])",
+                ([str(r) for r in route_ids],),
+            ).fetchall()
+        return sorted(str(row["student_id"]) for row in rows)
+
     def students_on_run(self, run_id: str, include_absent: bool = False) -> list[dict]:
         """Students with a seat on the run's stop roster.
 

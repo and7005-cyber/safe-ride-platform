@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
@@ -6,13 +6,25 @@ from app.core.auth import get_current_user, require_role
 from app.core.errors import BadRequestError
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
+from app.dao.push_dao import PushDao
 from app.dao.student_live_dao import StudentLiveDao
 from app.services import geo_service
+from app.services.push_service import notify_route_changes
 
 router = APIRouter(prefix="/api/students", tags=["students"])
 dao = StudentLiveDao()
 absence_dao = AbsenceDao()
+push_dao = PushDao()
 admin_only = require_role("admin")
+
+# U13 (origin R15) roster wiring: every path below that regenerates routes
+# dispatches notify_route_changes post-commit with seed_only=True — missing
+# communicated baselines are seeded SILENTLY, existing ones untouched, no
+# feed rows. Deliberate deviation from the edit paths' full fan-out: the
+# roster interaction itself is the communication for a child the admin is
+# editing by hand, and the shipped apply-suite contract pins roster mutations
+# silent — drift they cause is notified by the NEXT edit or apply, measured
+# against the baselines seeded here.
 
 
 def _clean_student(data: dict, *, geocode_fallback: bool = True) -> dict:
@@ -106,26 +118,58 @@ def list_students(user: dict = Depends(admin_only)):
 
 
 @router.post("")
-def create_student(payload: StudentPayload, user: dict = Depends(admin_only)):
+def create_student(
+    payload: StudentPayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
     # The response carries stops_recalculated (U6/R10): false when an affected
     # auto route fell back to the preserved/pickup-time order instead of
     # recomputing geometry (the durable signal is live_routes.last_recalc_degraded).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
-    return safe_call(lambda: dao.create_student(_clean_student(data), route_ids))
+    result = safe_call(lambda: dao.create_student(_clean_student(data), route_ids))
+    # U13: seed the new child's (and the touched routes' co-riders') missing
+    # baselines silently — see the module-level roster-wiring note.
+    background_tasks.add_task(
+        notify_route_changes, student_ids=[str(result["id"])], seed_only=True
+    )
+    return result
 
 
 @router.put("/{student_id}")
-def update_student(student_id: str, payload: StudentPayload, user: dict = Depends(admin_only)):
+def update_student(
+    student_id: str, payload: StudentPayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
     # Carries stops_recalculated like create (U6/R10).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
-    return safe_call(lambda: dao.update_student(student_id, _clean_student(data), route_ids))
+    # U13: capture the routes the student may be about to LEAVE — the update
+    # rewrites the links this expansion would otherwise follow.
+    prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
+    result = safe_call(lambda: dao.update_student(student_id, _clean_student(data), route_ids))
+    if result is not None:
+        background_tasks.add_task(
+            notify_route_changes, route_ids=prior_route_ids,
+            student_ids=[student_id], seed_only=True,
+        )
+    return result
 
 
 @router.delete("/{student_id}")
-def delete_student(student_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: (dao.delete_student(student_id), {"ok": True})[1])
+def delete_student(
+    student_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+):
+    # U13: pre-capture the routes the cascade is about to unlink; the deleted
+    # child's own baselines cascade away with the student row, so only the
+    # co-riders' missing baselines are seeded (silently).
+    prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
+    result = safe_call(lambda: (dao.delete_student(student_id), {"ok": True})[1])
+    if prior_route_ids:
+        background_tasks.add_task(
+            notify_route_changes, route_ids=prior_route_ids, seed_only=True
+        )
+    return result
 
 
 def _triage_row(row: BulkRow) -> dict:
@@ -166,7 +210,14 @@ def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
 
 
 @router.post("/bulk")
-def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
+def bulk_upload(
+    payload: BulkPayload, background_tasks: BackgroundTasks,
+    user: dict = Depends(admin_only),
+):
+    # (student_id, route_id) links collected by run() — read after safe_call
+    # for the U13 seed dispatch (rows without a route seed nothing: no stop).
+    collected: list[tuple[str, str]] = []
+
     def run() -> dict:
         inserted = 0
         parent_assignments = 0
@@ -201,6 +252,7 @@ def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
                 errors.append(f"{label}: {exc}")
         # One regeneration per affected route, after every insert.
         dao.bulk_link_and_regenerate(links)
+        collected.extend(links)
         return {
             "inserted": inserted,
             "parentAssignments": parent_assignments,
@@ -208,7 +260,17 @@ def bulk_upload(payload: BulkPayload, user: dict = Depends(admin_only)):
             "errors": errors,
         }
 
-    return safe_call(run)
+    result = safe_call(run)
+    if collected:
+        # U13: ONE dispatch for the whole upload (the same burst-guard shape
+        # as the single regeneration above), seed-only like every roster path.
+        background_tasks.add_task(
+            notify_route_changes,
+            route_ids=sorted({str(rid) for _sid, rid in collected}),
+            student_ids=sorted({str(sid) for sid, _rid in collected}),
+            seed_only=True,
+        )
+    return result
 
 
 # Absences (#7) --------------------------------------------------------------
