@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Minimum turnaround between a bus's back-to-back trips in one period (U6/R20):
     # stands in for the unmodeled gate<->wave deadhead. Global for this pass.
     turnaround_buffer_min: int = Field(default=15, alias="TURNAROUND_BUFFER_MIN")
+    # Multiplies only the coarse per-IP auth budgets (login/signup safety nets
+    # sized for shared NATs). Local test stacks raise it so one certification
+    # run's account churn fits a single budget window; the default of 1 is the
+    # production posture. Per-account and PIN budgets never scale.
+    auth_ip_rate_multiplier: int = Field(default=1, alias="AUTH_IP_RATE_MULTIPLIER")
     # Maps provider for geocoding + route optimisation (#4, #9). When neither
     # key is set the app falls back to free OSM Nominatim geocoding and an
     # offline nearest-neighbour optimiser.

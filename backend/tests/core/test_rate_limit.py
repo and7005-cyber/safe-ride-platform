@@ -109,3 +109,21 @@ def test_client_ip_falls_back_when_forwarded_header_missing(
 
 def test_client_ip_handles_missing_request() -> None:
     assert client_ip(None) == "unknown"
+
+
+def test_ip_budget_multiplier_defaults_to_production_posture(monkeypatch) -> None:
+    """The coarse per-IP auth budgets ship at 100 logins / 50 signups unless a
+    stack explicitly opts into a multiplier (the local compose file does; the
+    Lambda template does not). Per-account and PIN budgets never scale."""
+    monkeypatch.delenv("AUTH_IP_RATE_MULTIPLIER", raising=False)
+    from app.core.config import Settings
+
+    assert Settings().auth_ip_rate_multiplier == 1
+
+    from app.api import auth
+
+    multiplier = max(1, auth.get_settings().auth_ip_rate_multiplier)
+    assert auth.login_ip_limiter.max_attempts == 100 * multiplier
+    assert auth.signup_ip_limiter.max_attempts == 50 * multiplier
+    assert auth.login_account_limiter.max_attempts == 10
+    assert auth.pin_ip_limiter.max_attempts == 10

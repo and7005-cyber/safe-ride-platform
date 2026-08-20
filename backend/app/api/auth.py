@@ -26,12 +26,20 @@ _last_reset_link: dict[str, str | None] = {"link": None}
 
 # Brute-force protection. Per-account budgets are the tight ones; per-IP
 # budgets are coarse safety nets sized for shared NATs (school office, test
-# runners) while still blocking credential-stuffing request rates.
-login_ip_limiter = SlidingWindowLimiter(max_attempts=100, window_seconds=300)
+# runners) while still blocking credential-stuffing request rates. The two
+# coarse IP nets scale by AUTH_IP_RATE_MULTIPLIER (default 1 = production
+# posture) so the local stack can absorb a full certification run's account
+# churn; per-account and PIN budgets are security-tight and never scale.
+_IP_BUDGET_MULTIPLIER = max(1, get_settings().auth_ip_rate_multiplier)
+login_ip_limiter = SlidingWindowLimiter(
+    max_attempts=100 * _IP_BUDGET_MULTIPLIER, window_seconds=300
+)
 login_account_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=300)
 # The 4-digit PIN space is tiny, so PIN logins get the strictest IP budget.
 pin_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
-signup_ip_limiter = SlidingWindowLimiter(max_attempts=50, window_seconds=3600)
+signup_ip_limiter = SlidingWindowLimiter(
+    max_attempts=50 * _IP_BUDGET_MULTIPLIER, window_seconds=3600
+)
 forgot_ip_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=60)
 forgot_account_limiter = SlidingWindowLimiter(max_attempts=3, window_seconds=900)
 reset_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)

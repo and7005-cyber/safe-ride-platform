@@ -18,6 +18,11 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
+    environment:
+      # Local-only: widen the coarse per-IP auth nets so one certification
+      # run's account churn fits a single budget window. Production keeps the
+      # default multiplier of 1; per-account and PIN budgets never scale.
+      AUTH_IP_RATE_MULTIPLIER: "20"
     ports:
       - "9001:9001"
     command: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port \"$${API_PORT:-9001}\""]
