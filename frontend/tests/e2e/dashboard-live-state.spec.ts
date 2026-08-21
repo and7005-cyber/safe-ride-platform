@@ -13,11 +13,12 @@ import {
   signInAs,
 } from "./helpers";
 
-// The admin Dashboard as a live status board. From a field report: a driver
-// boarded everyone and ended the run, and the office, watching the Dashboard,
-// still saw the bus on an active run.
+// The admin Dashboard as a live status board. Both journeys came from one field
+// report: a driver boarded everyone and ended the run, and the office, watching
+// the Dashboard, still saw the bus on an active run.
 
-// An assertion may legitimately wait out a full 15s admin poll cycle.
+// Each assertion below may legitimately wait out a full 15s admin poll cycle,
+// and the first journey waits out two.
 test.describe.configure({ timeout: 90_000 });
 
 /** "Today" in the backend's run calendar is Africa/Nairobi (UTC+3). */
@@ -48,15 +49,71 @@ async function startMorningRun(request: APIRequestContext): Promise<{ runId: str
   return { runId: (await started.json()).id, busId: context.bus.id };
 }
 
+/**
+ * The driver's own closing path: arrive every stop, board each child on the
+ * roster, end the run. The closure gate refuses anything less (U4), and a test
+ * that closed the run any other way would not be the reporter's flow.
+ */
+async function boardEveryoneAndEnd(request: APIRequestContext, runId: string): Promise<void> {
+  const token = await apiDriverToken(request);
+  const headers = authHeaders(token);
+  let context = await driverContext(request);
+  for (let i = context.active_run.stops_completed; i < context.active_run.total_stops; i++) {
+    const arrived = await request.post(`${API_URL}/api/runs/driver/arrive`, {
+      headers, data: { run_id: runId },
+    });
+    expect(arrived.ok(), await arrived.text()).toBeTruthy();
+  }
+  context = await driverContext(request);
+  for (const student of context.students) {
+    const boarded = await request.post(`${API_URL}/api/runs/driver/boarding`, {
+      headers, data: { student_id: student.id, on_bus: true },
+    });
+    expect(boarded.ok(), await boarded.text()).toBeTruthy();
+  }
+  const ended = await request.post(`${API_URL}/api/runs/driver/end`, {
+    headers, data: { run_id: runId },
+  });
+  expect(ended.ok(), await ended.text()).toBeTruthy();
+}
+
 test.beforeAll(async ({ request }) => {
   // A leftover from an aborted session shares the watched run's bus and route
   // name on the Active Runs card, so the card's locators would stop being
-  // unique. Hygiene only — the journey plants its own stale run.
+  // unique. Hygiene only — the second journey plants its own stale run.
   purgeStaleRuns((await driverContext(request)).bus.id);
 });
 
 test.afterEach(async ({ request }) => {
   await endActiveRun(request); // never leave an in-progress run behind
+});
+
+test("fleet status follows the run ending while the dashboard stays open", async ({ page, request }) => {
+  const { runId } = await startMorningRun(request);
+
+  await signInAs(page, ADMIN);
+  await expect(page).toHaveURL("/");
+  const activeRuns = cardContaining(page, "Active Runs");
+  const runRow = activeRuns.getByText(`${SEED.driverBus} · ${SEED.driverMorningRoute}`);
+  const fleetRow = cardContaining(page, "Fleet Status")
+    .locator("div.flex.items-center.justify-between")
+    .filter({ hasText: SEED.driverBus });
+  const busStatus = fleetRow.getByText(/^(Active|Idle|Delayed|Out of service)$/);
+  const activeBuses = cardContaining(page, "Active Buses").locator("p.text-3xl");
+
+  await expect(runRow).toBeVisible();
+  await expect(busStatus).toHaveText("Active");
+  const before = Number(await activeBuses.textContent());
+
+  // The office keeps the page open; nothing is reloaded or refocused from here.
+  await boardEveryoneAndEnd(request, runId);
+
+  // The card already polled, so the run leaves it within one cadence...
+  await expect(runRow).toHaveCount(0, { timeout: 25_000 });
+  // ...and the bus line and the tile, which derive from the same server state,
+  // must agree with it instead of holding the pre-run answer until a reload.
+  await expect(busStatus).toHaveText("Idle", { timeout: 25_000 });
+  await expect(activeBuses).toHaveText(String(before - 1));
 });
 
 test("a run left open on a previous day is flagged on the dashboard as needing closing", async ({ page, request }) => {

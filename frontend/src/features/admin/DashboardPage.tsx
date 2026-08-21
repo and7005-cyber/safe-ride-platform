@@ -5,7 +5,14 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { RunFlagBadges } from "@/features/admin/components/RunFlagBadges";
 import { StatCard } from "@/features/admin/components/StatCard";
-import { useActiveRuns, useBuses, useRuns, useStudents, useTodayIncidentCount } from "@/lib/queries";
+import {
+  POLL_ADMIN,
+  useActiveRuns,
+  useBuses,
+  useRuns,
+  useStudents,
+  useTodayIncidentCount,
+} from "@/lib/queries";
 import {
   BUS_STATUS_LABEL,
   BUS_STATUS_VARIANT,
@@ -17,12 +24,15 @@ import {
 
 // Status labels come from the shared vocabulary (U17) — no page defines its own.
 export function DashboardPage() {
-  const { data: buses = [] } = useBuses();
-  const { data: runs = [] } = useRuns();
-  // Server-side predicate (today Nairobi + non-completed), polled so ended runs
-  // drop off the card without a reload.
+  // Every tile polls on the admin cadence, not only the Active Runs card. The
+  // board is read beside a driver's phone and the tab stays visible, so nothing
+  // else ever refetches: a bus kept reading "Active" after its run had ended
+  // and the card beside it had already dropped the run.
+  const { data: buses = [] } = useBuses({ poll: POLL_ADMIN });
+  const { data: runs = [] } = useRuns({ poll: POLL_ADMIN });
+  // Server-side predicate (non-completed, up to and including today Nairobi).
   const { data: liveRuns = [] } = useActiveRuns();
-  const { data: students = [] } = useStudents();
+  const { data: students = [] } = useStudents({ poll: POLL_ADMIN });
   const { data: todayIncidents } = useTodayIncidentCount();
 
   const today = new Date().toISOString().split("T")[0];
