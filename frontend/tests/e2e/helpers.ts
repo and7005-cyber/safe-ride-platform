@@ -160,12 +160,43 @@ export function authHeaders(token: string) {
  * gains no new dependency.
  */
 export function purgeRun(runId: string): void {
+  psql(`delete from live_runs where id = '${runId}'`);
+}
+
+/**
+ * Move a run into a previous service day. **Setup for stale-run specs only.**
+ *
+ * In SQL, as the integration suite's backdate_run does: nothing in the product
+ * can change a run's service day, and waiting for midnight is not a test. A
+ * backdated run falls out of every driver path, so the spec that creates one
+ * must purgeRun it itself — endActiveRun will not find it.
+ */
+export function backdateRun(runId: string, days = 1): void {
+  psql(`update live_runs set date = date - ${days} where id = '${runId}'`);
+}
+
+/**
+ * Remove a bus's open runs from previous days. **Teardown only.**
+ *
+ * A spec aborted mid-run, or a manual session, leaves a run open that no later
+ * run can close — the driver paths are pinned to today. Such a leftover carries
+ * the same bus and route name as the run a spec is watching on the Active Runs
+ * card, so it breaks strict locators there; clearing it is hygiene, not a
+ * contract.
+ */
+export function purgeStaleRuns(busId: string): void {
+  psql(
+    `delete from live_runs where bus_id = '${busId}' and status <> 'completed'`
+    + " and date < (now() at time zone 'Africa/Nairobi')::date",
+  );
+}
+
+function psql(sql: string): void {
   execFileSync(
     "docker",
     [
       "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
-      "psql", "-U", "saferide", "-d", "saferide", "-q",
-      "-c", `delete from live_runs where id = '${runId}'`,
+      "psql", "-U", "saferide", "-d", "saferide", "-q", "-c", sql,
     ],
     { stdio: "ignore", cwd: REPO_ROOT },
   );

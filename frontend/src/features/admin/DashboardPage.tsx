@@ -1,7 +1,9 @@
 import { format } from "date-fns";
 import { Bus, Clock, TriangleAlert, Users } from "lucide-react";
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { RunFlagBadges } from "@/features/admin/components/RunFlagBadges";
 import { StatCard } from "@/features/admin/components/StatCard";
 import { useActiveRuns, useBuses, useRuns, useStudents, useTodayIncidentCount } from "@/lib/queries";
 import {
@@ -67,14 +69,27 @@ export function DashboardPage() {
             ) : (
               <div className="space-y-3">
                 {liveRuns.map((run: any) => (
-                  <div key={run.id} className="flex items-center justify-between rounded-lg border p-3">
+                  <div key={run.id} className="flex items-center justify-between gap-3 rounded-lg border p-3">
                     <div>
                       <p className="font-medium">{run.bus_name ?? "Bus"} · {run.route_name ?? run.type}</p>
                       <p className="text-xs text-muted-foreground">
                         {run.stops_completed}/{run.total_stops} stops · {run.students_boarded}/{run.total_students} boarded
                       </p>
+                      {/* Listed on purpose (R15): a run open past its service
+                          day is invisible to every driver path, and the office
+                          is who closes it. Without its date it read as the bus
+                          being out right now. */}
+                      {run.stale && (
+                        <p className="text-xs text-muted-foreground">
+                          Left open since {run.date} ·{" "}
+                          <Link to="/runs" className="underline">close it in Run History</Link>
+                        </p>
+                      )}
                     </div>
-                    <Badge variant={variantFor(RUN_STATUS_VARIANT, run.status)}>{labelFor(RUN_STATUS_LABEL, run.status)}</Badge>
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
+                      <Badge variant={variantFor(RUN_STATUS_VARIANT, run.status)}>{labelFor(RUN_STATUS_LABEL, run.status)}</Badge>
+                      <RunFlagBadges run={run} />
+                    </div>
                   </div>
                 ))}
               </div>
