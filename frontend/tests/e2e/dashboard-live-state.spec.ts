@@ -9,13 +9,17 @@ import {
   cardContaining,
   endActiveRun,
   purgeRun,
-  purgeStaleRuns,
   signInAs,
 } from "./helpers";
 
 // The admin Dashboard as a live status board. Both journeys came from one field
 // report: a driver boarded everyone and ended the run, and the office, watching
 // the Dashboard, still saw the bus on an active run.
+//
+// The seed itself ships a run left open on 2026-06-16 for the same bus and
+// route (backend/db/seeds/003_local_snapshot.sql). It sits on the Active Runs
+// card flagged "Needs closing", so every row locator below tells the run it
+// watches apart from that one instead of deleting seed data.
 
 // Each assertion below may legitimately wait out a full 15s admin poll cycle,
 // and the first journey waits out two.
@@ -36,7 +40,7 @@ async function driverContext(request: APIRequestContext) {
 }
 
 /** Start the seeded morning route through the driver API. */
-async function startMorningRun(request: APIRequestContext): Promise<{ runId: string; busId: string }> {
+async function startMorningRun(request: APIRequestContext): Promise<string> {
   const token = await apiDriverToken(request);
   const context = await driverContext(request);
   const route = context.routes.find((r: any) => r.type === "morning");
@@ -46,7 +50,7 @@ async function startMorningRun(request: APIRequestContext): Promise<{ runId: str
     data: { route_id: route.id },
   });
   expect(started.ok(), await started.text()).toBeTruthy();
-  return { runId: (await started.json()).id, busId: context.bus.id };
+  return (await started.json()).id;
 }
 
 /**
@@ -77,24 +81,20 @@ async function boardEveryoneAndEnd(request: APIRequestContext, runId: string): P
   expect(ended.ok(), await ended.text()).toBeTruthy();
 }
 
-test.beforeAll(async ({ request }) => {
-  // A leftover from an aborted session shares the watched run's bus and route
-  // name on the Active Runs card, so the card's locators would stop being
-  // unique. Hygiene only — the second journey plants its own stale run.
-  purgeStaleRuns((await driverContext(request)).bus.id);
-});
-
 test.afterEach(async ({ request }) => {
   await endActiveRun(request); // never leave an in-progress run behind
 });
 
 test("fleet status follows the run ending while the dashboard stays open", async ({ page, request }) => {
-  const { runId } = await startMorningRun(request);
+  const runId = await startMorningRun(request);
 
   await signInAs(page, ADMIN);
   await expect(page).toHaveURL("/");
-  const activeRuns = cardContaining(page, "Active Runs");
-  const runRow = activeRuns.getByText(`${SEED.driverBus} · ${SEED.driverMorningRoute}`);
+  // Today's run is the bus's unflagged row; the seeded stale one carries the flag.
+  const runRow = cardContaining(page, "Active Runs")
+    .locator("div.rounded-lg.border")
+    .filter({ hasText: `${SEED.driverBus} · ${SEED.driverMorningRoute}` })
+    .filter({ hasNotText: "Needs closing" });
   const fleetRow = cardContaining(page, "Fleet Status")
     .locator("div.flex.items-center.justify-between")
     .filter({ hasText: SEED.driverBus });
@@ -117,21 +117,24 @@ test("fleet status follows the run ending while the dashboard stays open", async
 });
 
 test("a run left open on a previous day is flagged on the dashboard as needing closing", async ({ page, request }) => {
-  const { runId } = await startMorningRun(request);
+  const runId = await startMorningRun(request);
   try {
     backdateRun(runId);
 
     await signInAs(page, ADMIN);
+    // Told apart from the seeded stale run by the date it was left open on —
+    // the one fact that distinguishes it from a run happening now.
     const row = cardContaining(page, "Active Runs")
       .locator("div.rounded-lg.border")
-      .filter({ hasText: SEED.driverBus });
+      .filter({ hasText: SEED.driverBus })
+      .filter({ hasText: nairobiDate(-1) });
     // Listed on purpose (R15): a run that outlived its service day is invisible
     // to every driver path, and the office is who closes it.
     await expect(row).toBeVisible();
     // But it must not read like a run in progress on the bus right now: the Runs
     // page flags it, and the Dashboard is where the office actually looks.
     await expect(row.getByText("Needs closing")).toBeVisible();
-    await expect(row.getByText(nairobiDate(-1))).toBeVisible();
+    await expect(row.getByRole("link", { name: "close it in Run History" })).toHaveAttribute("href", "/runs");
   } finally {
     // Backdated, so neither the driver nor endActiveRun can reach it.
     purgeRun(runId);
