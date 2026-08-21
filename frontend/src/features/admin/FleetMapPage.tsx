@@ -32,7 +32,7 @@ import { PlacePicker, type Provenance, type ResolvedPlace } from "@/features/adm
 import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
-import { useBuses, useSchools } from "@/lib/queries";
+import { POLL_LIVE, useBuses, useSchools } from "@/lib/queries";
 
 // Distinct, high-contrast colours assigned deterministically per bus.
 const PALETTE = [
@@ -94,7 +94,7 @@ const fmtMin = (s?: number) => (s == null ? "—" : `${Math.max(1, Math.round(s 
 
 export function FleetMapPage() {
   // Live polling so the map keeps up as buses arrive at stops.
-  const { data: buses = [] } = useBuses({ poll: true });
+  const { data: buses = [] } = useBuses({ poll: POLL_LIVE });
   const { data: schools = [] } = useSchools();
   const { toast } = useToast();
   const navigate = useNavigate();

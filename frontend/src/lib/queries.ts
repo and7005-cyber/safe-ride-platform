@@ -8,13 +8,15 @@ import { api } from "@/lib/apiClient";
 export const POLL_ADMIN = 15_000;
 export const POLL_LIVE = 5_000;
 
-export function useBuses(opts?: { poll?: boolean }) {
+// Live surfaces pass the cadence they need (`poll`, in ms); list/edit pages
+// keep the one-shot fetch. A visible tab never refetches on its own — React
+// Query's focus refetch fires on visibilitychange only — so a status board left
+// open beside the driver's phone holds its first answer until it polls.
+export function useBuses(opts?: { poll?: number }) {
   return useQuery({
     queryKey: ["buses"],
     queryFn: () => api.get("/api/fleet/buses"),
-    // The fleet map opts into live polling so it shows all active buses moving;
-    // other pages keep the one-shot fetch.
-    refetchInterval: opts?.poll ? POLL_LIVE : undefined,
+    refetchInterval: opts?.poll,
   });
 }
 
@@ -26,8 +28,12 @@ export function useSchools() {
   return useQuery({ queryKey: ["schools"], queryFn: () => api.get("/api/fleet/schools") });
 }
 
-export function useStudents() {
-  return useQuery({ queryKey: ["students"], queryFn: () => api.get("/api/students") });
+export function useStudents(opts?: { poll?: number }) {
+  return useQuery({
+    queryKey: ["students"],
+    queryFn: () => api.get("/api/students"),
+    refetchInterval: opts?.poll,
+  });
 }
 
 export function useAbsences(date?: string) {
@@ -37,8 +43,12 @@ export function useAbsences(date?: string) {
   });
 }
 
-export function useRuns() {
-  return useQuery({ queryKey: ["runs"], queryFn: () => api.get("/api/runs") });
+export function useRuns(opts?: { poll?: number }) {
+  return useQuery({
+    queryKey: ["runs"],
+    queryFn: () => api.get("/api/runs"),
+    refetchInterval: opts?.poll,
+  });
 }
 
 export function useActiveRuns() {

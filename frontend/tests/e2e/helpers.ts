@@ -160,12 +160,27 @@ export function authHeaders(token: string) {
  * gains no new dependency.
  */
 export function purgeRun(runId: string): void {
+  psql(`delete from live_runs where id = '${runId}'`);
+}
+
+/**
+ * Move a run into a previous service day. **Setup for stale-run specs only.**
+ *
+ * In SQL, as the integration suite's backdate_run does: nothing in the product
+ * can change a run's service day, and waiting for midnight is not a test. A
+ * backdated run falls out of every driver path, so the spec that creates one
+ * must purgeRun it itself — endActiveRun will not find it.
+ */
+export function backdateRun(runId: string, days = 1): void {
+  psql(`update live_runs set date = date - ${days} where id = '${runId}'`);
+}
+
+function psql(sql: string): void {
   execFileSync(
     "docker",
     [
       "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
-      "psql", "-U", "saferide", "-d", "saferide", "-q",
-      "-c", `delete from live_runs where id = '${runId}'`,
+      "psql", "-U", "saferide", "-d", "saferide", "-q", "-c", sql,
     ],
     { stdio: "ignore", cwd: REPO_ROOT },
   );

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Pencil, PhoneCall, Plus, SquareX, Trash2 } from "lucide-react";
+import { Pencil, PhoneCall, Plus, SquareX, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -32,6 +32,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
+import { RunFlagBadges } from "@/features/admin/components/RunFlagBadges";
 import { api } from "@/lib/apiClient";
 import { useBuses, useRoutes, useRuns } from "@/lib/queries";
 import {
@@ -220,27 +221,7 @@ export function RunsPage() {
                   <TableCell>
                     <div className="flex flex-wrap items-center gap-1.5">
                       <Badge variant={variantFor(RUN_STATUS_VARIANT, r.status)}>{labelFor(RUN_STATUS_LABEL, r.status)}</Badge>
-                      {/* Distinct from the office-set 'delayed' status (U14/R26):
-                          delay is a human judgement about the schedule, this is
-                          the absence of arrival taps — often a dead phone, which
-                          is the case force-close exists for. */}
-                      {r.no_progress && (
-                        <Badge variant="destructive" data-testid="no-progress">
-                          <AlertTriangle className="h-3 w-3" /> No taps
-                        </Badge>
-                      )}
-                      {/* A run open past its service day. It has fallen out of
-                          every driver path, so only the office can end it. */}
-                      {r.stale && (
-                        <Badge variant="warning" data-testid="stale-run">Needs closing</Badge>
-                      )}
-                      {/* Survives the force-close dialog being dismissed — the
-                          obligation is the point, so it has to be rediscoverable. */}
-                      {Number(r.contact_pending ?? 0) > 0 && (
-                        <Badge variant="destructive" data-testid="contact-pending">
-                          <PhoneCall className="h-3 w-3" /> {r.contact_pending} to call
-                        </Badge>
-                      )}
+                      <RunFlagBadges run={r} />
                     </div>
                   </TableCell>
                   <TableCell className="text-right">
