@@ -72,7 +72,10 @@ test("a new parent can sign up and reaches the parent home", async ({ page }) =>
 test("sign-up offers parent only: the role choice is gone (U13)", async ({ page }) => {
   // Staff join through their school's offers and drivers are set up by the
   // school office — the form has no role select and no driver option at all.
-  await page.goto("/auth");
+  // domcontentloaded: under the full parallel run the dev server can serve
+  // the last asset slowly; this assertion set needs the DOM, not the "load"
+  // event, and the expect below still auto-waits for hydration.
+  await page.goto("/auth", { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Sign up", exact: true }).click();
 
   await expect(page.getByText(/This creates a parent account/)).toBeVisible();
