@@ -5,6 +5,11 @@ SafeRide is a Phase 1 school transport MVP for Nairobi private schools. It inclu
 ## What Is Included
 
 - Admin dashboard for live active trips.
+- Multi-tenant schools: per-school staff roles (director / transport
+  coordinator), a school switcher for multi-school staff, parent links across
+  schools with explicit acceptance, and a Kuumbai provider console (two-step
+  sign-in, school provisioning, audited step-in) — with isolation layered from
+  scoped queries down to database row-level security.
 - School setup workflows for buses, drivers, students, parent contacts, parent links, trips, and ordered student stops.
 - Daily attendance marking for absent students and alternative transport.
 - Driver PIN login with short-lived session tokens.
@@ -75,11 +80,12 @@ Open the local Vite URL shown in the terminal. Start the local FastAPI/Postgres 
 
 Main routes:
 
-- `/` - admin dashboard (fleet map, buses, routes, students, runs, schools,
-  parents, drivers, alerts under the admin console)
-- `/auth` - email/password and driver-PIN sign in
+- `/` - admin console for the active school (fleet map, buses, routes,
+  students, runs, parents, drivers, alerts, staff, settings)
+- `/auth` - email/password and driver-PIN sign in (parent-only sign-up)
 - `/driver` - driver home (run, boarding, incident tabs)
 - `/parent` - parent home (track, alerts, profile tabs)
+- `/provider` - Kuumbai provider console (school list, accounts, audit)
 
 ## Local FastAPI/Postgres Stack
 
@@ -115,11 +121,11 @@ The API runs at `http://localhost:9001`. The frontend should use:
 VITE_API_BASE_URL=http://localhost:9001
 ```
 
-Demo logins (local seed only):
-
-- Admin: `admin@test.com` / `test1234.`
-- Parent: `and7005@gmail.com` / `Test1234`
-- Driver: `and7005@yahoo.it` / `Test1234`, PIN `1234`
+Demo identities (local seed only): the seed provisions two demo schools with a
+director, a coordinator, a driver (with PIN), a parent, and an unenrolled
+provider account. The emails, passwords and PIN are deliberately not listed
+here — see the tenancy-fixtures tail of `backend/db/seeds/003_local_snapshot.sql`
+(applied by `scripts/reset-local-db.sh`) for the seeded credentials.
 
 ### Demo seed safety
 
@@ -140,8 +146,9 @@ have been exposed.
 The local FastAPI/Postgres stack is ready when:
 
 - `curl http://localhost:9001/api/health` returns `{"status":"ok"}`.
-- The seeded driver PIN `1234` opens the driver home at `/driver`.
+- The seeded driver PIN (see the seed file) opens the driver home at `/driver`.
 - The seeded parent login lands on `/parent` and shows only their children.
+- The seeded director login lands on the admin console scoped to school #1.
 - `scripts/certify.sh` passes (or the individual suites under Testing below).
 
 ## Legacy Supabase Reference
@@ -212,10 +219,53 @@ setup guide and architecture.
 
 ## Security Notes
 
+### Multi-tenant isolation
+
+The platform is multi-tenant: every school is a walled space on the one
+deployment, enforced in layers so that no single forgotten filter can leak a
+child's data.
+
+- **One school per request.** Every school-scoped request names its school in
+  the `X-School-Id` header. The server resolves the caller's access key for
+  exactly that school — a staff or driver membership, a parent's accepted
+  child links, or a provider's active step-in — and never trusts the header
+  without checking the key. Driver and parent surfaces derive their school
+  set server-side instead of accepting a header.
+- **Server-side role matrix.** Per-school roles (director, transport
+  coordinator, driver) replace the old global role. Guards are enforced on
+  the server per route: deletions of completed records and staff management
+  are director-only; hiding a control in the UI is never the only barrier.
+- **Layered data isolation.** Every DAO statement carries a typed school
+  scope in its predicates; the scope is also written into a
+  transaction-local GUC (`saferide.school_ids`); and the database itself is
+  the backstop — the API connects as a dedicated runtime role
+  (`saferide_app`, `LOGIN NOBYPASSRLS`, not the owner) against row-level
+  security policies on every school-owned table. Composite
+  `(id, school_id)` foreign keys make a cross-school reference (say, school
+  B's bus on school A's route) unrepresentable at the schema level.
+- **Not-found, never forbidden.** A record belonging to another school is
+  answered exactly like a record that does not exist (404) — requests can
+  never be used to probe what another school holds. (The wrong role at a
+  school you *do* belong to is a plain 403.)
+- **Attributed actions.** Every staff create/change/removal is written to a
+  per-school audit trail under the acting person; provider (Kuumbai)
+  step-ins and actions land in the same trail flagged provider-originated,
+  masked as "SafeRide" on school-facing screens and readable unmasked only
+  provider-side.
+- **Provider second factor.** Provider accounts — the only accounts that can
+  reach more than one school — sign in with a TOTP second step, and
+  sensitive provider actions require a code fresh within 15 minutes.
+
+### General
+
 - Passwords are PBKDF2-hashed; driver PINs are HMAC-peppered and unique.
-- Sessions store only SHA-256 token hashes and slide-expire after 16 hours.
-- All API endpoints require a bearer token and enforce roles server-side
-  (admin / driver / parent); parents can only read their own children.
+  Staff temporary passwords are server-generated, shown once, expire unused
+  after 72 hours, and must be replaced at first sign-in.
+- Sessions store only SHA-256 token hashes and slide-expire after 16 hours;
+  removing a role or resetting a password revokes the affected sessions at
+  once.
+- All API endpoints require a bearer token; parents can only read their own
+  children.
 - Credential endpoints are rate-limited per IP and per account (reverse-proxy
   aware via `TRUST_PROXY_HEADERS`).
 - Demo seeds are double-gated and refuse to run outside local dev.
