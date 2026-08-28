@@ -554,3 +554,37 @@ INSERT INTO public.live_route_stops (id, route_id, name, stop_order, scheduled_t
   ('30f00000-0000-0000-0000-00000000010b', '40000000-0000-0000-0000-00000000000b', 'Langata, Nairobi', 1, '06:50', -1.361900, 36.744300, false, '50000000-0000-0000-0000-00000000000b'),
   ('30f00000-0000-0000-0000-00000000020b', '40000000-0000-0000-0000-00000000000b', 'IT Second School', 2, NULL, -1.351200, 36.752800, true, NULL)
 ON CONFLICT (id) DO NOTHING;
+
+-- Tenancy memberships & codes (U3): the membership rows and school codes the
+-- scoped application reads. Runs after migration 013 on every reset/start.
+DO $$
+BEGIN
+  IF coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' THEN
+    RAISE EXCEPTION 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  END IF;
+END $$;
+
+UPDATE public.live_schools SET code = 'GFA-001'
+  WHERE id = '5cae0000-0000-0000-0000-000000000001' AND code IS DISTINCT FROM 'GFA-001';
+UPDATE public.live_schools SET code = 'ITS-002'
+  WHERE id = '5cae0000-0000-0000-0000-000000000002' AND code IS DISTINCT FROM 'ITS-002';
+
+-- Staff memberships (school A = Greenfield locally, school B = IT Second).
+-- admin@test.com keeps an interim director membership, mirroring production's
+-- rollout state, so the legacy e2e identity still works on the scoped code.
+INSERT INTO public.school_memberships (id, user_id, school_id, role, state, accepted_at) VALUES
+  ('60000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000011', '5cae0000-0000-0000-0000-000000000001', 'director',    'active', now()),
+  ('60000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000012', '5cae0000-0000-0000-0000-000000000001', 'coordinator', 'active', now()),
+  ('60000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000013', '5cae0000-0000-0000-0000-000000000002', 'director',    'active', now()),
+  ('60000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000001', '5cae0000-0000-0000-0000-000000000001', 'director',    'active', now()),
+  ('60000000-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000003', '5cae0000-0000-0000-0000-000000000001', 'driver',      'active', now()),
+  ('60000000-0000-0000-0000-000000000006', 'a0000000-0000-0000-0000-000000000004', '5cae0000-0000-0000-0000-000000000001', 'driver',      'active', now()),
+  ('60000000-0000-0000-0000-000000000007', 'a0000000-0000-0000-0000-000000000005', '5cae0000-0000-0000-0000-000000000001', 'driver',      'active', now()),
+  ('60000000-0000-0000-0000-000000000008', 'a0000000-0000-0000-0000-000000000015', '5cae0000-0000-0000-0000-000000000002', 'driver',      'active', now())
+ON CONFLICT (id) DO NOTHING;
+
+-- The provider identity stays UNENROLLED (no second factor yet): the U10
+-- suites exercise the enrolment path and cache the revealed secret.
+INSERT INTO public.provider_accounts (user_id, totp_salt)
+VALUES ('a0000000-0000-0000-0000-000000000014', '5eedab1e5a17c0ffee00000000000001')
+ON CONFLICT (user_id) DO NOTHING;
