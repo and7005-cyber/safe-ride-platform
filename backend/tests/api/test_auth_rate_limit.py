@@ -60,6 +60,13 @@ def test_successful_pin_login_clears_ip_budget(
 def test_login_is_rate_limited_per_account(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # U10: the login flow asks the provider branch first; a DB-less unit test
+    # stubs it to "not a provider" so the standard stubbed path decides.
+    monkeypatch.setattr(
+        auth_api.provider_service,
+        "begin_provider_login",
+        lambda email, password: None,
+    )
     monkeypatch.setattr(
         auth_api.service,
         "login",
@@ -93,6 +100,11 @@ def test_login_is_rate_limited_per_account(
 def test_successful_login_clears_account_budget(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        auth_api.provider_service,
+        "begin_provider_login",
+        lambda email, password: None,
+    )
     monkeypatch.setattr(auth_api.service, "login", lambda email, password: {"token": "t"})
 
     payload = {"email": "parent@test.com", "password": "right"}

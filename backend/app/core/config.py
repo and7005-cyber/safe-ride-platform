@@ -35,6 +35,11 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     pin_pepper: str = Field(default="saferide-local-pin-pepper", alias="PIN_PEPPER")
+    # Provider second factor (U10): TOTP secrets are derived per account from
+    # this pepper + the row's salt and never stored. Production holds it in
+    # SSM (/saferide/totp-pepper); rotating it forces every provider to
+    # re-enrol (the stored pepper key id names the cause).
+    totp_pepper: str = Field(default="saferide-local-totp-pepper", alias="TOTP_PEPPER")
     app_base_url: str = Field(default="http://localhost:5173", alias="APP_BASE_URL")
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",

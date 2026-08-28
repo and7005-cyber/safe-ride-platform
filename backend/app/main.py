@@ -13,6 +13,7 @@ from app.api import (
     health,
     incidents,
     parent_portal,
+    provider,
     push,
     runs_live,
     staff,
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(incidents.router)
     app.include_router(accounts.router)
     app.include_router(staff.router)
+    app.include_router(provider.router)
     app.include_router(parent_portal.router)
     app.include_router(push.router)
 

@@ -290,10 +290,67 @@ def test_parent_scope_carries_accepted_link_schools_and_staff_routes_hide(client
 # --- provider step-in gate ---------------------------------------------------
 
 
+def provider_tok(client) -> str:
+    """U10: provider sign-in is two-step (password → pre-auth → code). This
+    suite pins the step-in GUARD, not the login flow (test_provider.py owns
+    that), so enrolment is arranged in SQL and the caller's finally block
+    restores the seeded UNENROLLED state via ``restore_provider_enrolment``."""
+    import app.api.auth as auth_api
+    from app.core.config import get_settings
+    from app.core.totp import current_step, derive_secret, pepper_key, totp_code
+
+    auth_api.totp_ip_limiter.reset()
+    pepper = get_settings().totp_pepper
+    with db() as conn:
+        salt = conn.execute(
+            """
+            update provider_accounts
+            set totp_enrolled_at = coalesce(totp_enrolled_at, now()),
+                totp_pepper_key = %s, totp_last_step = null
+            where user_id = %s
+            returning totp_salt
+            """,
+            (pepper_key(pepper), user_id_of(PROVIDER)),
+        ).fetchone()[0]
+    start = client.post(
+        "/api/auth/login", json={"email": PROVIDER, "password": TEST_PASSWORD}
+    )
+    assert start.status_code == 200, start.text
+    assert "token" not in start.json()  # never a session from the password
+    code = totp_code(derive_secret(pepper, salt), current_step())
+    resp = client.post(
+        "/api/auth/totp", json={"token": start.json()["preauth"], "code": code}
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["token"]
+
+
+def restore_provider_enrolment(token: str | None = None) -> None:
+    """Back to the seed: unenrolled, original salt untouched; the test's own
+    session removed so nothing lingers on the shared identity."""
+    from app.core.security import hash_session_token
+
+    with db() as conn:
+        conn.execute(
+            "update provider_accounts set totp_enrolled_at = null, "
+            "totp_last_step = null, totp_pepper_key = null where user_id = %s",
+            (user_id_of(PROVIDER),),
+        )
+        conn.execute(
+            "delete from auth_preauth_tokens where user_id = %s",
+            (user_id_of(PROVIDER),),
+        )
+        if token:
+            conn.execute(
+                "delete from auth_sessions where token_hash = %s",
+                (hash_session_token(token),),
+            )
+
+
 def test_provider_needs_an_active_step_in_for_that_school(client):
     from app.core.security import hash_session_token
 
-    token = tok(client, PROVIDER)
+    token = provider_tok(client)
     assert client.get("/t/staff", headers=hdr(token, SCHOOL_A_ID)).status_code == 403
 
     provider_id = user_id_of(PROVIDER)
@@ -332,6 +389,7 @@ def test_provider_needs_an_active_step_in_for_that_school(client):
             conn.execute(
                 "delete from provider_support_sessions where id = %s", (support_id,)
             )
+        restore_provider_enrolment(token)
 
 
 # --- temporary passwords (R30) -----------------------------------------------

@@ -35,6 +35,20 @@ PASSWORD_CHANGE_EXEMPT_PATHS = frozenset(
     {"/api/auth/me", "/api/auth/logout", "/api/auth/change-password"}
 )
 
+# Paths an UNENROLLED provider's session may still call (U10/R20): the same
+# allowlist mechanism as must-change-password. Until the second factor is
+# confirmed, everything else — every provider and school route included —
+# answers 409 `totp-enrolment-required`.
+TOTP_ENROLMENT_EXEMPT_PATHS = frozenset(
+    {
+        "/api/auth/me",
+        "/api/auth/logout",
+        "/api/auth/change-password",
+        "/api/provider/totp/enrol",
+        "/api/provider/totp/confirm",
+    }
+)
+
 
 class ScopeError(Exception):
     """Resolution failure carrying the HTTP status the guard should raise."""
@@ -101,6 +115,10 @@ def guc_value(scope: Scope | None) -> str:
 
 def is_password_change_exempt(path: str) -> bool:
     return path in PASSWORD_CHANGE_EXEMPT_PATHS
+
+
+def is_totp_enrolment_exempt(path: str) -> bool:
+    return path in TOTP_ENROLMENT_EXEMPT_PATHS
 
 
 # --- pure resolution ---------------------------------------------------------

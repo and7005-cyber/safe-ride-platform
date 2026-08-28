@@ -21,6 +21,14 @@ class PinLoginRequest(_CamelModel):
     pin: str
 
 
+class TotpRequest(_CamelModel):
+    """The provider login's second step (U10): the pre-auth token from the
+    password step, plus the authenticator code once enrolled."""
+
+    token: str
+    code: str | None = None
+
+
 class ForgotPasswordRequest(_CamelModel):
     email: str
 
@@ -72,6 +80,21 @@ class OfferOut(MembershipOut):
 class ProviderStateOut(_CamelModel):
     is_provider: bool = Field(default=True, alias="isProvider")
     totp_enrolled: bool = Field(default=False, alias="totpEnrolled")
+    # When the CALLING session last verified a code (U10): the step-up dialog
+    # shows the code input up front once this is stale (>15 minutes) or null.
+    totp_verified_at: str | None = Field(default=None, alias="totpVerifiedAt")
+
+
+class SupportSessionOut(_CamelModel):
+    """The calling session's live step-in (U10/AE29): feeds the persistent
+    support banner (school, reason, started time)."""
+
+    id: str
+    school_id: str = Field(alias="schoolId")
+    school_name: str | None = Field(default=None, alias="schoolName")
+    school_code: str | None = Field(default=None, alias="schoolCode")
+    reason: str | None = None
+    started_at: str | None = Field(default=None, alias="startedAt")
 
 
 class MeResponse(_CamelModel):
@@ -90,4 +113,7 @@ class MeResponse(_CamelModel):
     pending_offers: list[OfferOut] = Field(default=[], alias="pendingOffers")
     active_school_id: str | None = Field(default=None, alias="activeSchoolId")
     provider: ProviderStateOut | None = None
+    support_session: SupportSessionOut | None = Field(
+        default=None, alias="supportSession"
+    )
     must_change_password: bool = Field(default=False, alias="mustChangePassword")

@@ -3,7 +3,7 @@ from collections.abc import Callable
 
 from fastapi import Depends, Header, HTTPException, Request
 
-from app.core.scope import is_password_change_exempt
+from app.core.scope import is_password_change_exempt, is_totp_enrolment_exempt
 from app.services.auth_service import AuthService
 
 _service = AuthService()
@@ -33,6 +33,21 @@ def get_current_user(
             detail={
                 "code": "password-change-required",
                 "message": "You must change your temporary password first",
+            },
+        )
+    provider_state = user.get("provider")
+    if (
+        provider_state is not None
+        and not provider_state.get("totp_enrolled")
+        and not is_totp_enrolment_exempt(request.url.path)
+    ):
+        # An unenrolled provider's session opens nothing but enrolment (U10):
+        # every provider and school route answers 409 until confirm succeeds.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "totp-enrolment-required",
+                "message": "You must enrol your second factor first",
             },
         )
     return {

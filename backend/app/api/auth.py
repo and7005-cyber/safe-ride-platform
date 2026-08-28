@@ -20,11 +20,15 @@ from app.schemas.auth import (
     ProviderStateOut,
     ResetPasswordRequest,
     SignupRequest,
+    SupportSessionOut,
+    TotpRequest,
 )
 from app.services.auth_service import AuthService
+from app.services.provider_service import AuthCodeError, ProviderService
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 service = AuthService()
+provider_service = ProviderService()
 memberships_dao = MembershipDao()
 T = TypeVar("T")
 
@@ -42,6 +46,10 @@ login_ip_limiter = SlidingWindowLimiter(
     max_attempts=100 * _IP_BUDGET_MULTIPLIER, window_seconds=300
 )
 login_account_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=300)
+# The provider code step (U10): its own per-IP net on top of the pre-auth
+# token's five-attempt budget — the token caps one stolen password, the IP
+# budget caps token-farming request rates. Never scaled.
+totp_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
 # The 4-digit PIN space is tiny, so PIN logins get the strictest IP budget.
 pin_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
 signup_ip_limiter = SlidingWindowLimiter(
@@ -60,6 +68,13 @@ _RESET_LIMIT_MESSAGE = "Too many password reset attempts. Try again shortly."
 
 
 def map_error(error: Exception) -> HTTPException:
+    if isinstance(error, AuthCodeError):
+        # Second-factor refusals the client must branch on (U10): the detail
+        # carries a machine code (`preauth-voided`, `totp-step-up-required`).
+        return HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        )
     if isinstance(error, SafeRideError):
         return to_http_exception(error)
     if isinstance(error, PsycopgError) and error.sqlstate == "23505":
@@ -91,11 +106,33 @@ def login(request: LoginRequest, http_request: Request):
     account_key = f"{ip}|{request.email.strip().lower()}"
     login_ip_limiter.check(ip, _LOGIN_LIMIT_MESSAGE)
     login_account_limiter.check(account_key, _LOGIN_LIMIT_MESSAGE)
-    result = safe_call(lambda: service.login(request.email, request.password))
+    result = safe_call(lambda: _login_flow(request.email, request.password))
     # A successful login clears the account budget so legitimate users who
     # mistype a few times are not locked out after signing in.
     login_account_limiter.clear(account_key)
     return result
+
+
+def _login_flow(email: str, password: str):
+    """An active provider identity NEVER gets a session from the password
+    alone (U10/AE19): it gets a five-minute pre-auth token and the flag for
+    the second step. Everyone else follows the standard login."""
+    preauth = provider_service.begin_provider_login(email, password)
+    if preauth is not None:
+        return preauth
+    return service.login(email, password)
+
+
+@router.post("/totp")
+def totp(request: TotpRequest, http_request: Request):
+    """The provider login's second step: pre-auth token (+ code once
+    enrolled) → bearer session with ``totp_verified_at`` stamped."""
+    totp_ip_limiter.check(
+        client_ip(http_request), "Too many code attempts. Try again shortly."
+    )
+    return safe_call(
+        lambda: provider_service.complete_totp(request.token, request.code)
+    )
 
 
 @router.post("/pin-login")
@@ -114,6 +151,9 @@ def logout(authorization: str | None = Header(default=None)):
     token = ""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
+    # A stepped-in provider's logout also ends the support session, with its
+    # own cause on the record (U10/AE29). No-op for everyone else.
+    provider_service.end_support_on_logout(token)
     service.logout(token)
     return {"ok": True}
 
@@ -152,8 +192,29 @@ def me(user: dict = Depends(get_current_user)):
         ],
         activeSchoolId=user.get("last_school_id"),
         provider=(
-            ProviderStateOut(totpEnrolled=bool(provider.get("totp_enrolled")))
+            ProviderStateOut(
+                totpEnrolled=bool(provider.get("totp_enrolled")),
+                # Step-up freshness (U10): the dialog shows the code input up
+                # front when the session's last code is stale.
+                totpVerifiedAt=(
+                    user["totp_verified_at"].isoformat()
+                    if user.get("totp_verified_at")
+                    else None
+                ),
+            )
             if provider
+            else None
+        ),
+        supportSession=(
+            SupportSessionOut(
+                id=support["id"],
+                schoolId=support["school_id"],
+                schoolName=support.get("school_name"),
+                schoolCode=support.get("school_code"),
+                reason=support.get("reason"),
+                startedAt=support.get("started_at"),
+            )
+            if (support := user.get("support_session"))
             else None
         ),
         mustChangePassword=user.get("must_change_password", False),

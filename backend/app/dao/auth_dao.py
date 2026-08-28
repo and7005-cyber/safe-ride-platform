@@ -112,8 +112,11 @@ class AuthDao:
                         where p.user_id = u.id and p.removed_at is null
                        ) as provider,
                        (select jsonb_build_object(
-                                'id', ss.id::text, 'school_id', ss.school_id::text)
+                                'id', ss.id::text, 'school_id', ss.school_id::text,
+                                'reason', ss.reason, 'started_at', ss.started_at,
+                                'school_name', ssc.name, 'school_code', ssc.code)
                         from provider_support_sessions ss
+                        join live_schools ssc on ssc.id = ss.school_id
                         where ss.id = s.support_session_id
                           and ss.ended_at is null
                           and ss.started_at > now() - interval '4 hours'
@@ -166,6 +169,97 @@ class AuthDao:
             conn.execute(
                 "update auth_sessions set revoked_at = now() where user_id = %s and revoked_at is null",
                 (user_id,),
+            )
+
+    # --- provider pre-auth tokens (U10) --------------------------------------
+    # The bridge between the password step and the code step: five-minute,
+    # single-use, attempt-counted rows in ``auth_preauth_tokens``. They are a
+    # separate table from sessions on purpose — a pre-auth token can never be
+    # presented as a bearer session. ``set_user_password`` and ``disable_user``
+    # above already void them alongside reset tokens.
+
+    def create_preauth_token(
+        self, user_id: str, token_hash: str, ttl_minutes: int = 5
+    ) -> None:
+        with get_global_connection() as conn:
+            conn.execute(
+                """
+                insert into auth_preauth_tokens (user_id, token_hash, expires_at)
+                values (%s, %s, now() + make_interval(mins => %s))
+                """,
+                (user_id, token_hash, ttl_minutes),
+            )
+
+    def get_preauth_token(self, token_hash: str) -> dict[str, Any] | None:
+        """The raw row, whatever its state — the service tells an exhausted
+        (voided) token apart from a merely wrong code by ``attempts``."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                select id, user_id, expires_at, used_at, attempts,
+                       expires_at <= now() as expired
+                from auth_preauth_tokens
+                where token_hash = %s
+                """,
+                (token_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_preauth_failure(
+        self, token_id: str, max_attempts: int
+    ) -> dict[str, Any]:
+        """One wrong code: bump the counter and, atomically, void the token on
+        the ``max_attempts``-th failure. Returns {'attempts', 'voided'}."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                update auth_preauth_tokens
+                set attempts = attempts + 1,
+                    used_at = case
+                        when attempts + 1 >= %s then coalesce(used_at, now())
+                        else used_at
+                    end
+                where id = %s
+                returning attempts, used_at is not null as voided
+                """,
+                (max_attempts, token_id),
+            ).fetchone()
+        return dict(row) if row else {"attempts": max_attempts, "voided": True}
+
+    def consume_preauth_token(self, token_id: str) -> bool:
+        """Single-use: returns False when a concurrent request already won."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                update auth_preauth_tokens set used_at = now()
+                where id = %s and used_at is null and expires_at > now()
+                returning id
+                """,
+                (token_id,),
+            ).fetchone()
+        return row is not None
+
+    def create_totp_session(
+        self, user_id: str, token_hash: str, ttl_hours: int = 16
+    ) -> None:
+        """A session born code-verified: ``totp_verified_at`` stamped at
+        creation (the step-up freshness clock starts here)."""
+        with get_global_connection() as conn:
+            conn.execute(
+                """
+                insert into auth_sessions
+                    (user_id, token_hash, expires_at, totp_verified_at)
+                values (%s, %s, now() + make_interval(hours => %s), now())
+                """,
+                (user_id, token_hash, ttl_hours),
+            )
+
+    def refresh_session_totp(self, session_id: str) -> None:
+        """A fresh code presented mid-session (step-up) restarts the clock."""
+        with get_global_connection() as conn:
+            conn.execute(
+                "update auth_sessions set totp_verified_at = now() where id = %s",
+                (session_id,),
             )
 
     def create_reset_token(self, user_id: str, token_hash: str, ttl_minutes: int = 60) -> None:
