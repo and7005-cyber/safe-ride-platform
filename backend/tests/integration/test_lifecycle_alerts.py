@@ -492,15 +492,19 @@ def test_the_today_counter_uses_the_nairobi_day(client, admin_headers, fleet):
     with psycopg.connect(DSN, autocommit=True) as pg:
         pg.execute(
             """
-            insert into live_incidents (bus_id, bus_name, type, description, created_at)
+            insert into live_incidents (bus_id, bus_name, type, description,
+                                        school_id, created_at)
             values (
                 %s, %s, 'other', 'IT nairobi-boundary probe',
+                -- U7: the tile is per school now, so the staged row must carry
+                -- the bus's school or it is invisible to the scoped count.
+                (select school_id from live_buses where id = %s),
                 -- 00:30 on today's Nairobi date, expressed as the instant it is.
                 ((now() at time zone 'Africa/Nairobi')::date + time '00:30')
                     at time zone 'Africa/Nairobi'
             )
             """,
-            (fleet["bus"]["id"], fleet["bus"]["name"]),
+            (fleet["bus"]["id"], fleet["bus"]["name"], fleet["bus"]["id"]),
         )
     try:
         after = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]

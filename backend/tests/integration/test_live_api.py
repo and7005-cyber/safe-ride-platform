@@ -411,7 +411,11 @@ def test_route_options_orders_stops(client, admin_headers):
     assert len(data["options"]) == 2
     assert all("stops" in o and o["stops"] for o in data["options"])
     by_time = next(o for o in data["options"] if o["strategy"] == "By pickup time")
-    assert [s["label"] for s in by_time["stops"]] == ["Far", "Near"]
+    # U7: the preview always solves against the ACTIVE school, so the school
+    # gate rides at the end of every option; the child stops keep their order.
+    labels = [s["label"] for s in by_time["stops"]]
+    assert labels[:2] == ["Far", "Near"]
+    assert by_time["stops"][-1].get("is_school"), labels
 
 
 def test_student_keeps_both_routes_on_update(client, admin_headers):
