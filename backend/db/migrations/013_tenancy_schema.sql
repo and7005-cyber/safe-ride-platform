@@ -220,6 +220,7 @@ $$;
 create or replace function tenancy_stamp_school_one(target uuid)
 returns jsonb
 language plpgsql
+set search_path = public
 as $$
 declare
   counts jsonb := '{}'::jsonb;

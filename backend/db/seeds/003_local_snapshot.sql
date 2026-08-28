@@ -588,3 +588,20 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO public.provider_accounts (user_id, totp_salt)
 VALUES ('a0000000-0000-0000-0000-000000000014', '5eedab1e5a17c0ffee00000000000001')
 ON CONFLICT (user_id) DO NOTHING;
+
+-- Tenancy local parity (U4): stamp every orphan scope to the local school A
+-- (the populated snapshot school) and record the local-tail move, activating
+-- the post-seed assertions. School B rows keep their own scope: the stamp
+-- derives from parents first and only falls back to the argument.
+DO $$
+BEGIN
+  IF coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' THEN
+    RAISE EXCEPTION 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  END IF;
+  -- Schema-qualified: the dump above empties the session search_path.
+  PERFORM public.tenancy_stamp_school_one('5cae0000-0000-0000-0000-000000000001'::uuid);
+  IF NOT EXISTS (SELECT 1 FROM public.tenancy_move_log WHERE phase = 'local-tail') THEN
+    INSERT INTO public.tenancy_move_log (phase, detail)
+    VALUES ('local-tail', jsonb_build_object('target_school', '5cae0000-0000-0000-0000-000000000001'));
+  END IF;
+END $$;
