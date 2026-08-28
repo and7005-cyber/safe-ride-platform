@@ -20,7 +20,9 @@ def _validate_hhmm(v: str | None) -> str | None:
 from app.api._helpers import safe_call
 from app.core.auth import get_current_user, require_role
 from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.core.permissions import require_director, require_staff
 from app.core.rate_limit import SlidingWindowLimiter
+from app.core.scope import SchoolScope
 from app.core.validation import clean_phone
 from app.dao.fleet_dao import FleetDao
 from app.dao.push_dao import PushDao
@@ -111,56 +113,80 @@ class RoutePayload(BaseModel):
     total_duration_s: int | None = None
 
 
-# Buses ----------------------------------------------------------------------
+# Buses (U6: school-scoped) --------------------------------------------------
 
 @router.get("/buses")
-def list_buses(user: dict = Depends(get_current_user)):
-    return safe_call(dao.list_buses)
+def list_buses(scope: SchoolScope = Depends(require_staff)):
+    return safe_call(lambda: dao.list_buses(scope))
 
 
 @router.post("/buses")
-def create_bus(payload: BusPayload, user: dict = Depends(admin_only)):
+def create_bus(
+    payload: BusPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    # Any stray school_id in the payload is dropped by the model (extra keys
+    # ignored); the DAO stamps scope.school_id (R28's bus-side twin).
     data = payload.model_dump()
     data["driver_phone"] = clean_phone(data.get("driver_phone"), field="driver phone")
-    return safe_call(lambda: dao.create_bus(data))
+    return safe_call(lambda: dao.create_bus(scope, data, actor=user))
 
 
 @router.put("/buses/{bus_id}")
-def update_bus(bus_id: str, payload: BusPayload, user: dict = Depends(admin_only)):
+def update_bus(
+    bus_id: str,
+    payload: BusPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     data = payload.model_dump()
     data["driver_phone"] = clean_phone(data.get("driver_phone"), field="driver phone")
-    return safe_call(lambda: dao.update_bus(bus_id, data))
+    return safe_call(lambda: dao.update_bus(scope, bus_id, data, actor=user))
 
 
 @router.delete("/buses/{bus_id}")
-def delete_bus(bus_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: (dao.delete_bus(bus_id), {"ok": True})[1])
+def delete_bus(
+    bus_id: str,
+    scope: SchoolScope = Depends(require_director),
+    user: dict = Depends(get_current_user),
+):
+    return safe_call(lambda: (dao.delete_bus(scope, bus_id, actor=user), {"ok": True})[1])
 
 
-# Schools --------------------------------------------------------------------
+# Schools (U6: the school record is the active school's settings, R4) ---------
+# POST /schools and DELETE /schools/{id} are gone: creation moves to the
+# provider console (U10) and deletion is out of scope this version (R23).
 
 @router.get("/schools")
-def list_schools(user: dict = Depends(get_current_user)):
-    return safe_call(dao.list_schools)
+def list_schools(scope: SchoolScope = Depends(require_staff)):
+    # Compatibility window (Release 4): a ONE-element list — the active
+    # school — because six pickers in the shipped frontend expect a list.
+    return safe_call(lambda: [dao.get_school(scope)])
 
 
-@router.post("/schools")
-def create_school(payload: SchoolPayload, user: dict = Depends(admin_only)):
-    data = payload.model_dump()
-    data["phone"] = clean_phone(data.get("phone"), field="school phone", allow_landline=True)
-    return safe_call(lambda: dao.create_school(data))
+@router.get("/school")
+def get_school(scope: SchoolScope = Depends(require_staff)):
+    """The active school's settings row (same shape as one list element)."""
+    return safe_call(lambda: dao.get_school(scope))
 
 
 @router.put("/schools/{school_id}")
-def update_school(school_id: str, payload: SchoolPayload, user: dict = Depends(admin_only)):
-    data = payload.model_dump()
-    data["phone"] = clean_phone(data.get("phone"), field="school phone", allow_landline=True)
-    return safe_call(lambda: dao.update_school(school_id, data))
+def update_school(
+    school_id: str,
+    payload: SchoolPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    def run():
+        if school_id != scope.school_id:
+            # Another school's settings do not exist for this caller (R3).
+            raise NotFoundError("School not found")
+        data = payload.model_dump()
+        data["phone"] = clean_phone(data.get("phone"), field="school phone", allow_landline=True)
+        return dao.update_school(scope, data, actor=user)
 
-
-@router.delete("/schools/{school_id}")
-def delete_school(school_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: (dao.delete_school(school_id), {"ok": True})[1])
+    return safe_call(run)
 
 
 # Routes ---------------------------------------------------------------------

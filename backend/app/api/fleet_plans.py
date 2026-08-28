@@ -19,6 +19,8 @@ from pydantic import BaseModel
 
 from app.api._helpers import safe_call
 from app.core.auth import require_role
+from app.core.permissions import require_staff
+from app.core.scope import SchoolScope
 from app.dao.fleet_plan_dao import FleetPlanDao
 from app.services.push_service import notify_route_changes
 
@@ -28,10 +30,12 @@ admin_only = require_role("admin")
 
 
 class ConfirmFleetPayload(BaseModel):
-    school_id: str
-    # The complete claimed set for the school: listed buses are claimed,
-    # previously claimed buses missing from the list are released (unless
-    # they carry the school's applied plan routes).
+    # U6: the school comes from the request scope; the field is kept so the
+    # shipped frontend's payload still parses, and it is IGNORED.
+    school_id: str | None = None
+    # The buses to include in drafting. Buses are school-owned since U6
+    # (created stamped with their school), so there is no claim to take or
+    # release any more — this validates the selection and reports notices.
     bus_ids: list[str] = []
 
 
@@ -46,11 +50,15 @@ class DraftPayload(BaseModel):
 
 
 @router.post("/confirm-fleet")
-def confirm_fleet(payload: ConfirmFleetPayload, user: dict = Depends(admin_only)):
-    """Assign buses to the school (F1 step 1). A bus claimed by a different
-    school 409s naming both; the response carries per-bus notices (multi-trip
-    excluded from drafting, depot-less proceeds)."""
-    return safe_call(lambda: dao.confirm_fleet(payload.school_id, payload.bus_ids))
+def confirm_fleet(
+    payload: ConfirmFleetPayload, scope: SchoolScope = Depends(require_staff)
+):
+    """Validate the drafting fleet selection (F1 step 1). Buses are owned by
+    their school since U6, so the claim machinery is gone: every selected bus
+    must be one of the ACTIVE school's own — anything else answers 404 — and
+    the response carries per-bus notices (multi-trip excluded from drafting,
+    depot-less proceeds). Read-only."""
+    return safe_call(lambda: dao.confirm_fleet(scope, payload.bus_ids))
 
 
 @router.post("/draft")

@@ -1,7 +1,9 @@
 from typing import Any
 
 from app.core.db import get_connection
-from app.core.errors import ConflictError
+from app.core.errors import ConflictError, NotFoundError
+from app.core.scope import SchoolScope
+from app.dao.audit_dao import record_audit
 from app.dao.fleet_dao import regenerate_route_stops
 from app.dao.status_sql import display_status_case
 
@@ -149,12 +151,28 @@ def _derive_student_bus(conn, student_id: str) -> None:
     )
 
 
-def _sync_routes(conn, student_id: str, route_ids: list[str]) -> bool:
+def _sync_routes(conn, student_id: str, route_ids: list[str], school_id: str | None = None) -> bool:
     """Reconcile a student's route links and regenerate the affected routes.
+
+    ``school_id`` (U6): when given, every requested route must belong to that
+    school — a route of ANOTHER school answers 404, as if it did not exist
+    (R3/R36). Routes with no school yet (pre-U7 writers) stay assignable
+    inside the compatibility window; only a route positively owned elsewhere
+    is refused.
 
     Returns the aggregate ``stops_recalculated`` signal (U6/R10): False when
     any affected route's regeneration fell back instead of computing geometry;
     True otherwise (including when no route membership changed)."""
+    if school_id is not None and route_ids:
+        wanted_ids = [str(rid) for rid in route_ids if rid]
+        if wanted_ids:
+            foreign = conn.execute(
+                "select 1 from live_routes where id::text = any(%s) "
+                "and school_id is not null and school_id <> %s limit 1",
+                (wanted_ids, school_id),
+            ).fetchone()
+            if foreign:
+                raise NotFoundError("Route not found")
     existing = conn.execute(
         "select id, route_id from live_student_routes where student_id = %s", (student_id,)
     ).fetchall()
@@ -229,13 +247,14 @@ def _regenerate_routes(conn, route_ids: list[str]) -> None:
 
 
 class StudentLiveDao:
-    def list_students(self) -> list[dict[str, Any]]:
-        """All students, each with ``route_ids`` and a derived
-        ``display_status`` — the parent-portal derivation (app.dao.status_sql)
-        wrapped by the admin-only unassigned rule: a student with zero route
-        assignments displays 'unassigned', overriding everything (R1–R4). The
-        raw ``status`` stays in the payload untouched."""
-        with get_connection() as conn:
+    def list_students(self, scope: SchoolScope) -> list[dict[str, Any]]:
+        """The scope school's students (U6), each with ``route_ids`` and a
+        derived ``display_status`` — the parent-portal derivation
+        (app.dao.status_sql) wrapped by the admin-only unassigned rule: a
+        student with zero route assignments displays 'unassigned', overriding
+        everything (R1–R4). The raw ``status`` stays in the payload
+        untouched."""
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 f"""
                 select s.*,
@@ -247,8 +266,10 @@ class StudentLiveDao:
                            else {display_status_case("s")}
                        end as display_status
                 from live_students s
+                where s.school_id = %s
                 order by s.name asc
-                """
+                """,
+                (scope.school_id,),
             ).fetchall()
             result = []
             for row in rows:
@@ -260,8 +281,10 @@ class StudentLiveDao:
                 result.append(item)
         return result
 
-    def create_student(self, data: dict, route_ids: list[str]) -> dict[str, Any]:
-        with get_connection() as conn:
+    def create_student(self, scope: SchoolScope, data: dict, route_ids: list[str], *, actor: dict) -> dict[str, Any]:
+        with get_connection(scope) as conn:
+            # school_id comes from the scope, never the payload (U6): a stray
+            # client-supplied school id is overridden, not rejected.
             row = conn.execute(
                 """
                 insert into live_students
@@ -275,26 +298,41 @@ class StudentLiveDao:
                      coalesce(%(status)s,'at-school'), %(school_id)s, %(provenance)s)
                 returning *
                 """,
-                data,
+                {**data, "school_id": scope.school_id},
             ).fetchone()
             # bus_id is derived from the assigned route(s), not set by hand (#3).
-            stops_recalculated = _sync_routes(conn, row["id"], route_ids)
+            stops_recalculated = _sync_routes(
+                conn, row["id"], route_ids, school_id=scope.school_id
+            )
             sync_parent_links(conn, row["id"], (data.get("parent_email"), data.get("parent2_email")))
-            row = conn.execute("select * from live_students where id = %s", (row["id"],)).fetchone()
+            record_audit(
+                conn, action="student-created", actor=actor, scope=scope,
+                resource_type="student", resource_id=row["id"], detail={},
+            )
+            row = conn.execute(
+                "select * from live_students where id = %s and school_id = %s",
+                (row["id"], scope.school_id),
+            ).fetchone()
         # stops_recalculated: false = the routes fell back to the preserved /
         # pickup-time order instead of recomputing geometry (U6/R10).
         return {**dict(row), "stops_recalculated": stops_recalculated}
 
-    def update_student(self, student_id: str, data: dict, route_ids: list[str]) -> dict[str, Any] | None:
-        with get_connection() as conn:
+    def update_student(self, scope: SchoolScope, student_id: str, data: dict, route_ids: list[str], *, actor: dict) -> dict[str, Any]:
+        with get_connection(scope) as conn:
             before = conn.execute(
-                "select parent_email, parent2_email from live_students where id = %s",
-                (student_id,),
+                "select parent_email, parent2_email from live_students "
+                "where id = %s and school_id = %s",
+                (student_id, scope.school_id),
             ).fetchone()
+            if not before:
+                # Another school's student does not exist here (R3).
+                raise NotFoundError("Student not found")
             # No status in this UPDATE, ever: the payload's status (defaulted to
             # 'at-school') used to silently reset a live on-bus/dropped-off
             # status on every admin edit (R7). Status is written only by the
             # run lifecycle; the insert default is the single exception.
+            # school_id stays the scope's (U6) — a payload cannot move a child
+            # between schools.
             row = conn.execute(
                 """
                 update live_students set
@@ -304,27 +342,36 @@ class StudentLiveDao:
                     parent2_email=%(parent2_email)s, home_address=%(home_address)s,
                     home_lat=%(home_lat)s, home_lng=%(home_lng)s, pickup_time=%(pickup_time)s,
                     school_id=%(school_id)s, provenance=%(provenance)s
-                where id=%(id)s returning *
+                where id=%(id)s and school_id=%(school_id)s returning *
                 """,
-                {**data, "id": student_id},
+                {**data, "id": student_id, "school_id": scope.school_id},
             ).fetchone()
             stops_recalculated = True
             if row:
                 # bus_id is derived from the assigned route(s) inside _sync_routes (#3).
-                stops_recalculated = _sync_routes(conn, student_id, route_ids)
+                stops_recalculated = _sync_routes(
+                    conn, student_id, route_ids, school_id=scope.school_id
+                )
                 sync_parent_links(
                     conn,
                     student_id,
                     (data.get("parent_email"), data.get("parent2_email")),
                     old_emails=(before["parent_email"], before["parent2_email"]) if before else None,
                 )
-                row = conn.execute("select * from live_students where id = %s", (student_id,)).fetchone()
+                record_audit(
+                    conn, action="student-updated", actor=actor, scope=scope,
+                    resource_type="student", resource_id=student_id, detail={},
+                )
+                row = conn.execute(
+                    "select * from live_students where id = %s and school_id = %s",
+                    (student_id, scope.school_id),
+                ).fetchone()
         if not row:
-            return None
+            raise NotFoundError("Student not found")
         return {**dict(row), "stops_recalculated": stops_recalculated}
 
-    def delete_student(self, student_id: str) -> None:
-        with get_connection() as conn:
+    def delete_student(self, scope: SchoolScope, student_id: str, *, actor: dict) -> None:
+        with get_connection(scope) as conn:
             # Cancelling a student must also cancel their stop on every route
             # they were on (#1, #6) — regenerate after the cascade delete clears
             # their live_student_routes rows. order by route_id: the same
@@ -332,30 +379,44 @@ class StudentLiveDao:
             affected = [
                 r["route_id"]
                 for r in conn.execute(
-                    "select route_id from live_student_routes where student_id = %s "
-                    "order by route_id",
-                    (student_id,),
+                    "select sr.route_id from live_student_routes sr "
+                    "join live_students s on s.id = sr.student_id and s.school_id = %s "
+                    "where sr.student_id = %s order by sr.route_id",
+                    (scope.school_id, student_id),
                 ).fetchall()
             ]
-            conn.execute("delete from live_students where id = %s", (student_id,))
+            row = conn.execute(
+                "delete from live_students where id = %s and school_id = %s returning id",
+                (student_id, scope.school_id),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Student not found")
+            record_audit(
+                conn, action="student-deleted", actor=actor, scope=scope,
+                resource_type="student", resource_id=student_id, detail={},
+            )
             for route_id in affected:
                 regenerate_route_stops(conn, route_id)
 
-    def insert_bulk_student(self, data: dict) -> dict[str, Any]:
+    def insert_bulk_student(self, scope: SchoolScope, data: dict) -> dict[str, Any]:
         """Insert one bulk-upload row; returns ``{id, parent_links}`` (the new
         student id and the count of parent-account links auto-created from its
         email slots). A CSV row's home defaults to provenance 'imported' (U8/U4);
         a row repaired via the PlacePicker carries its own provenance.
 
-        ``school_id`` is stamped on every committed row (U10 — the upload dialog
-        is scoped to one school): a school-less student is invisible to the
-        school-scoped fleet-plan draft basis and the pin map, so an import that
-        skipped the stamp would enrol children the planner can never see.
+        ``school_id`` is stamped from the request scope (U6/U10): a school-less
+        student is invisible to the school-scoped fleet-plan draft basis and
+        the pin map, so an import that skipped the stamp would enrol children
+        the planner can never see.
 
         ``ridership_pattern`` is deliberately NOT in the column list: the 011
         column default ('both_ways') covers new intakes (R20)."""
-        data = {**data, "provenance": data.get("provenance") or "imported"}
-        with get_connection() as conn:
+        data = {
+            **data,
+            "provenance": data.get("provenance") or "imported",
+            "school_id": scope.school_id,
+        }
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
                 insert into live_students
@@ -377,16 +438,8 @@ class StudentLiveDao:
             )
         return {"id": row["id"], "parent_links": assignments}
 
-    def school_exists(self, school_id: str) -> bool:
-        """Guard for the bulk upload's required school scope (U10): one clear
-        error up front beats thirty per-row FK failures."""
-        with get_connection() as conn:
-            return conn.execute(
-                "select 1 from live_schools where id = %s", (school_id,)
-            ).fetchone() is not None
-
     def find_bulk_duplicates(
-        self, names: list[str | None], school_id: str
+        self, scope: SchoolScope, names: list[str | None]
     ) -> dict[str, dict[str, Any]]:
         """Existing students matching any bulk row on (name, school_id) — the
         U10 duplicate key: same child, same school. Batched: ONE query for the
@@ -399,18 +452,18 @@ class StudentLiveDao:
         wanted = sorted({str(n).strip().lower() for n in names if n and str(n).strip()})
         if not wanted:
             return {}
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 "select id, name, home_address from live_students "
                 "where school_id = %s and lower(trim(name)) = any(%s)",
-                (school_id, wanted),
+                (scope.school_id, wanted),
             ).fetchall()
         duplicates: dict[str, dict[str, Any]] = {}
         for row in rows:
             duplicates.setdefault(str(row["name"]).strip().lower(), dict(row))
         return duplicates
 
-    def update_bulk_student(self, student_id: str, data: dict) -> dict[str, Any]:
+    def update_bulk_student(self, scope: SchoolScope, student_id: str, data: dict) -> dict[str, Any]:
         """The bulk duplicate-update path (U10): overwrite the existing
         student's parent contacts and home address with the re-triaged row.
         Routes, status, school and ridership pattern are untouched — routes
@@ -428,12 +481,16 @@ class StudentLiveDao:
         Returns ``{id, parent_links, route_ids}`` — the caller regenerates the
         returned routes once per route across the whole upload (burst guard),
         since the overwritten home moves this student's stop."""
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             before = conn.execute(
                 "select parent_email, parent2_email, provenance, home_lat, home_lng "
-                "from live_students where id = %s",
-                (student_id,),
+                "from live_students where id = %s and school_id = %s",
+                (student_id, scope.school_id),
             ).fetchone()
+            if not before:
+                # The duplicate id always comes from this school's own lookup;
+                # a mismatch means the row moved or vanished mid-upload.
+                raise NotFoundError("Student not found")
             values = {
                 "id": student_id,
                 "parent_name": data.get("parent_name"),
@@ -459,19 +516,19 @@ class StudentLiveDao:
                     parent2_name=%(parent2_name)s, parent2_email=%(parent2_email)s,
                     home_address=%(home_address)s, home_lat=%(home_lat)s,
                     home_lng=%(home_lng)s, provenance=%(provenance)s
-                where id=%(id)s
+                where id=%(id)s and school_id=%(school_id)s
                 """,
-                values,
+                {**values, "school_id": scope.school_id},
             )
             if data.get("grade"):
                 conn.execute(
-                    "update live_students set grade = %s where id = %s",
-                    (data["grade"], student_id),
+                    "update live_students set grade = %s where id = %s and school_id = %s",
+                    (data["grade"], student_id, scope.school_id),
                 )
             if data.get("pickup_time"):
                 conn.execute(
-                    "update live_students set pickup_time = %s where id = %s",
-                    (data["pickup_time"], student_id),
+                    "update live_students set pickup_time = %s where id = %s and school_id = %s",
+                    (data["pickup_time"], student_id, scope.school_id),
                 )
             assignments = sync_parent_links(
                 conn, student_id,
@@ -488,11 +545,86 @@ class StudentLiveDao:
             ]
         return {"id": student_id, "parent_links": assignments, "route_ids": route_ids}
 
-    def regenerate_routes(self, route_ids: list[str]) -> None:
+    def regenerate_routes(self, scope: SchoolScope, route_ids: list[str]) -> None:
         """Regenerate the given routes once each (see ``_regenerate_routes``) —
         the post-loop pass of a bulk upload whose duplicate updates moved home
         pins on live routes."""
         if not route_ids:
             return
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             _regenerate_routes(conn, route_ids)
+
+    def record_import(self, scope: SchoolScope, actor: dict, detail: dict) -> None:
+        """The bulk upload's single 'students-imported' audit row (U6/U9).
+        The upload itself is deliberately multi-transaction (per-row error
+        capture), so the summary row rides its own transaction after the
+        loop; ``detail`` is counts only — never names or emails."""
+        with get_connection(scope) as conn:
+            record_audit(
+                conn, action="students-imported", actor=actor, scope=scope,
+                resource_type="school", resource_id=scope.school_id, detail=detail,
+            )
+
+    # --- pin map + pin stability (U6: the two router-level connection uses
+    # fold into the DAO so the scope seam covers them) ------------------------
+
+    def student_pin_snapshot(self, scope: SchoolScope, student_id: str) -> dict[str, Any] | None:
+        """The student's current pin (coordinates + provenance) for the U12
+        stability rule — scoped: a foreign student yields None and the update
+        that follows answers 404."""
+        with get_connection(scope) as conn:
+            row = conn.execute(
+                "select home_lat, home_lng, provenance from live_students "
+                "where id = %s and school_id = %s",
+                (student_id, scope.school_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pin_map(self, scope: SchoolScope, *, actor: dict) -> dict[str, Any]:
+        """Every student pin for the ACTIVE school in ONE audited read (R19).
+
+        One screen showing every child's home is a higher-value target than any
+        single record, so access itself is the audited event: the read and its
+        'pin-map-viewed' live_admin_audit row share a transaction — the
+        response and the row commit or vanish together, and a served pin map
+        without its audit row is impossible.
+
+        Students split by triage state: 'placed' (real coordinates — a map
+        marker) vs 'unresolved' (no usable coordinates — listed by name beside
+        the map so the operator can open each one and place the pin). This is
+        the aggregate's ONLY source; the frontend must not assemble it from
+        the regular students list, which would bypass the audit.
+        """
+        with get_connection(scope) as conn:
+            rows = conn.execute(
+                "select id, name, home_address, home_lat, home_lng, provenance "
+                "from live_students where school_id = %s order by name asc",
+                (scope.school_id,),
+            ).fetchall()
+            placed: list[dict] = []
+            unresolved: list[dict] = []
+            for row in rows:
+                has_pin = row["home_lat"] is not None and row["home_lng"] is not None
+                pin = {
+                    "id": str(row["id"]),
+                    "name": row["name"],
+                    "address": row["home_address"],
+                    # Coerced to float: the columns are numeric and a raw
+                    # Decimal serializes as a JSON string, which no map marker
+                    # can place.
+                    "lat": float(row["home_lat"]) if has_pin else None,
+                    "lng": float(row["home_lng"]) if has_pin else None,
+                    "provenance": row["provenance"],
+                    "state": "placed" if has_pin else "unresolved",
+                }
+                (placed if has_pin else unresolved).append(pin)
+            record_audit(
+                conn,
+                action="pin-map-viewed",
+                actor=actor,
+                scope=scope,
+                resource_type="school",
+                resource_id=scope.school_id,
+                detail={"pin_count": len(placed), "unresolved_count": len(unresolved)},
+            )
+        return {"school_id": scope.school_id, "placed": placed, "unresolved": unresolved}

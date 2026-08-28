@@ -96,6 +96,62 @@ def provider_headers() -> dict[str, str]:
     return login(PROVIDER)
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def temp_school(
+    name: str,
+    *,
+    director_email: str = DIRECTOR_A,
+    lat: float | None = None,
+    lng: float | None = None,
+):
+    """A throwaway school plus an active director membership, via SQL.
+
+    School creation has no staff API surface any more (it arrives with the
+    provider console, U10), so isolation suites provision their sandbox school
+    directly. Yields the school id; the exit sweeps everything the test may
+    have left inside the school — its own rows first, then the membership and
+    the school row. Seeded schools are never touched.
+    """
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        school_id = str(
+            pg.execute(
+                "insert into live_schools (name, lat, lng) values (%s, %s, %s) returning id",
+                (name, lat, lng),
+            ).fetchone()[0]
+        )
+        user_id = str(
+            pg.execute(
+                "select id from app_users where email = %s", (director_email,)
+            ).fetchone()[0]
+        )
+        pg.execute(
+            "insert into school_memberships (user_id, school_id, role, state, accepted_at) "
+            "values (%s, %s, 'director', 'active', now())",
+            (user_id, school_id),
+        )
+    try:
+        yield school_id
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as pg:
+            pg.execute(
+                "delete from live_student_absences where student_id in "
+                "(select id from live_students where school_id = %s)",
+                (school_id,),
+            )
+            for table in (
+                "live_runs", "live_students", "live_routes", "live_buses",
+                "live_fleet_plans", "live_incidents", "live_admin_audit",
+                "school_memberships",
+            ):
+                pg.execute(
+                    f"delete from {table} where school_id = %s", (school_id,)  # noqa: S608
+                )
+            pg.execute("delete from live_schools where id = %s", (school_id,))
+
+
 @pytest.fixture(scope="session")
 def in_process_db():
     """Point the app's process-global connection pool at the suite's DSN.

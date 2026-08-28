@@ -5,6 +5,8 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.core.errors import BadRequestError, ConflictError, NotFoundError, SafeRideError
+from app.core.scope import SchoolScope
+from app.dao.audit_dao import record_audit
 from app.dao.status_sql import bus_status_case
 from app.services import geo_service
 # The ONE server-side stop-cap authority (U8): the solver's cap, shared with
@@ -1004,17 +1006,38 @@ def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
     )
 
 
+def _check_driver_at_school(conn, driver_id: str, school_id: str) -> None:
+    """A bus's driver must hold an ACTIVE driver membership at the bus's own
+    school (R28). The membership row is locked so a concurrent driver removal
+    serializes with the assignment; the caller locks (or inserts) the bus row
+    FIRST — bus before membership is the one cross-table order every path
+    takes (see also delete_driver), the apply_restore sorted-lock discipline.
+    The refusal wording is neutral by design: it must never name, or even
+    imply the existence of, another school (R34's sibling rule).
+    """
+    row = conn.execute(
+        "select id from school_memberships "
+        "where user_id = %s and school_id = %s and role = 'driver' "
+        "and state = 'active' and removed_at is null "
+        "order by id limit 1 for update",
+        (driver_id, school_id),
+    ).fetchone()
+    if not row:
+        raise ConflictError("That driver is not available for this school")
+
+
 class FleetDao:
     # --- buses -------------------------------------------------------------
 
-    def list_buses(self) -> list[dict[str, Any]]:
-        with get_connection() as conn:
+    def list_buses(self, scope: SchoolScope) -> list[dict[str, Any]]:
+        with get_connection(scope) as conn:
             # derived_status (U9) replaces the hand-maintained status column as
             # the value every admin surface reads. The raw column still travels
             # in the payload (select *) but nothing should render it.
             rows = conn.execute(
                 f"select b.*, {bus_status_case('b')} as derived_status "
-                "from live_buses b order by b.name asc"
+                "from live_buses b where b.school_id = %s order by b.name asc",
+                (scope.school_id,),
             ).fetchall()
             buses = [dict(r) for r in rows]
             # Derive a live position status from the bus's active run (no GPS):
@@ -1056,22 +1079,33 @@ class FleetDao:
                     b["position_label"] = f"At {stop['name']}" + (" · en route to next" if nxt else "")
         return buses
 
-    def create_bus(self, data: dict) -> dict[str, Any]:
-        with get_connection() as conn:
+    def create_bus(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:
+        with get_connection(scope) as conn:
+            # school_id comes from the scope, never the client (U6). The
+            # insert claims the new row before the membership check locks the
+            # driver's row (bus -> membership, the one cross-table order).
             row = conn.execute(
                 """
                 insert into live_buses (name, plate_number, driver_id, driver_name, driver_phone,
-                    capacity, availability, depot_lat, depot_lng, depot_address, depot_provenance)
+                    capacity, availability, depot_lat, depot_lng, depot_address, depot_provenance,
+                    school_id)
                 values (%(name)s, %(plate_number)s, %(driver_id)s, %(driver_name)s, %(driver_phone)s,
                         coalesce(%(capacity)s, 45), coalesce(%(availability)s, 'in-service'),
-                        %(depot_lat)s, %(depot_lng)s, %(depot_address)s, %(depot_provenance)s)
+                        %(depot_lat)s, %(depot_lng)s, %(depot_address)s, %(depot_provenance)s,
+                        %(school_id)s)
                 returning *
                 """,
-                data,
+                {**data, "school_id": scope.school_id},
             ).fetchone()
+            if data.get("driver_id"):
+                _check_driver_at_school(conn, data["driver_id"], scope.school_id)
+            record_audit(
+                conn, action="bus-created", actor=actor, scope=scope,
+                resource_type="bus", resource_id=row["id"], detail={},
+            )
         return dict(row)
 
-    def update_bus(self, bus_id: str, data: dict) -> dict[str, Any] | None:
+    def update_bus(self, scope: SchoolScope, bus_id: str, data: dict, actor: dict) -> dict[str, Any]:
         """Update a bus. Note two deliberate omissions (U9).
 
         `status` is no longer written by any path — it is derived at read time
@@ -1084,11 +1118,21 @@ class FleetDao:
         saves a depot by re-sending the bus's whole field set, and a coalesce to
         'in-service' would quietly return an out-of-service bus to service on
         every depot move — the same silent-reset defect in a new place.
+
+        U6: scoped by school — another school's bus does not exist here (404);
+        the bus row is locked before the driver-membership check (the one
+        cross-table order), so an assignment cannot race a driver removal.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             before = conn.execute(
-                "select depot_lat, depot_lng from live_buses where id = %s", (bus_id,)
+                "select depot_lat, depot_lng from live_buses "
+                "where id = %s and school_id = %s for update",
+                (bus_id, scope.school_id),
             ).fetchone()
+            if not before:
+                raise NotFoundError("Bus not found")
+            if data.get("driver_id"):
+                _check_driver_at_school(conn, data["driver_id"], scope.school_id)
             row = conn.execute(
                 """
                 update live_buses set
@@ -1098,12 +1142,14 @@ class FleetDao:
                     availability = coalesce(%(availability)s, availability),
                     depot_lat = %(depot_lat)s, depot_lng = %(depot_lng)s,
                     depot_address = %(depot_address)s, depot_provenance = %(depot_provenance)s
-                where id = %(id)s returning *
+                where id = %(id)s and school_id = %(school_id)s returning *
                 """,
-                {**data, "id": bus_id},
+                {**data, "id": bus_id, "school_id": scope.school_id},
             ).fetchone()
-            if not row:
-                return None
+            record_audit(
+                conn, action="bus-updated", actor=actor, scope=scope,
+                resource_type="bus", resource_id=bus_id, detail={},
+            )
             # A depot move changes the boundary-trip geometry (U7): regenerate
             # this bus's routes so the first-morning origin / last-afternoon
             # destination leg is recomputed. order by id: the global lock order.
@@ -1120,66 +1166,79 @@ class FleetDao:
         # One transaction per route (mirrors update_school): a depot edit fans
         # out to each affected route's regeneration + provider calls.
         for route_id in route_ids:
-            with get_connection() as conn:
+            with get_connection(scope) as conn:
                 regenerate_route_stops(conn, route_id)
                 _check_turnaround_feasibility(conn, bus_id, "morning")
                 _check_turnaround_feasibility(conn, bus_id, "afternoon")
         return dict(row)
 
-    def delete_bus(self, bus_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_buses where id = %s", (bus_id,))
+    def delete_bus(self, scope: SchoolScope, bus_id: str, actor: dict) -> None:
+        with get_connection(scope) as conn:
+            row = conn.execute(
+                "delete from live_buses where id = %s and school_id = %s returning id",
+                (bus_id, scope.school_id),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Bus not found")
+            record_audit(
+                conn, action="bus-deleted", actor=actor, scope=scope,
+                resource_type="bus", resource_id=bus_id, detail={},
+            )
 
     # --- schools -----------------------------------------------------------
 
     def list_schools(self) -> list[dict[str, Any]]:
+        # Catalog read (live_schools carries no row policy). The router no
+        # longer exposes it wholesale; route_options still resolves a school's
+        # bells/coordinates through it until the route family converts (U7).
         with get_connection() as conn:
             rows = conn.execute("select * from live_schools order by name asc").fetchall()
         return [dict(r) for r in rows]
 
-    def create_school(self, data: dict) -> dict[str, Any]:
-        with get_connection() as conn:
+    def get_school(self, scope: SchoolScope) -> dict[str, Any]:
+        """The active school's settings row (R4): the scope IS the id."""
+        with get_connection(scope) as conn:
             row = conn.execute(
-                "insert into live_schools (name, address, phone, lat, lng, morning_bell, afternoon_bell) "
-                "values (%(name)s, %(address)s, %(phone)s, %(lat)s, %(lng)s, "
-                "%(morning_bell)s, %(afternoon_bell)s) returning *",
-                data,
+                "select * from live_schools where id = %s", (scope.school_id,)
             ).fetchone()
+        if not row:
+            raise NotFoundError("School not found")
         return dict(row)
 
-    def update_school(self, school_id: str, data: dict) -> dict[str, Any] | None:
-        with get_connection() as conn:
+    def update_school(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:
+        """Update the ACTIVE school's settings (U6): the router already pinned
+        the path id to scope.school_id, and the predicate repeats it."""
+        with get_connection(scope) as conn:
             row = conn.execute(
                 "update live_schools set name=%(name)s, address=%(address)s, phone=%(phone)s, "
                 "lat=%(lat)s, lng=%(lng)s, morning_bell=%(morning_bell)s, "
                 "afternoon_bell=%(afternoon_bell)s where id=%(id)s returning *",
-                {**data, "id": school_id},
+                {**data, "id": scope.school_id},
             ).fetchone()
-            if row:
-                # order by id: the global route-lock order (student_live_dao's
-                # _sync_routes) — concurrent multi-route writers cannot deadlock.
-                route_ids = [
-                    r["id"]
-                    for r in conn.execute(
-                        "select id from live_routes where school_id = %s order by id",
-                        (school_id,),
-                    ).fetchall()
-                ]
-        if not row:
-            return None
+            if not row:
+                raise NotFoundError("School not found")
+            record_audit(
+                conn, action="school-updated", actor=actor, scope=scope,
+                resource_type="school", resource_id=scope.school_id, detail={},
+            )
+            # order by id: the global route-lock order (student_live_dao's
+            # _sync_routes) — concurrent multi-route writers cannot deadlock.
+            route_ids = [
+                r["id"]
+                for r in conn.execute(
+                    "select id from live_routes where school_id = %s order by id",
+                    (scope.school_id,),
+                ).fetchall()
+            ]
         # One transaction per route: a school edit fans out to every route's
         # regeneration — provider calls included — and must not hold N route
         # locks (nor park the committed school row behind them) for the whole
         # sweep. Each route rebuilds and commits independently; regeneration
         # tolerates a route deleted in between (early-returns True).
         for route_id in route_ids:
-            with get_connection() as conn:
+            with get_connection(scope) as conn:
                 regenerate_route_stops(conn, route_id)
         return dict(row)
-
-    def delete_school(self, school_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_schools where id = %s", (school_id,))
 
     # --- routes ------------------------------------------------------------
 

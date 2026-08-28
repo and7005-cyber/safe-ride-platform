@@ -204,9 +204,13 @@ def test_acknowledge_writes_one_audit_row_and_masked_list_display(
 
 
 def test_absence_list_carries_the_marker_display(staff_actor):
+    from app.core.scope import SchoolScope
     from app.dao.absence_dao import AbsenceDao
 
     dao = AbsenceDao()
+    scope = SchoolScope(
+        user_id=staff_actor["id"], school_id=SCHOOL_A_ID, role="director"
+    )
     with db() as conn:
         student_id = str(
             conn.execute(
@@ -217,17 +221,25 @@ def test_absence_list_carries_the_marker_display(staff_actor):
         prior_status = conn.execute(
             "select status from live_students where id = %s", (student_id,)
         ).fetchone()[0]
-    marked = dao.mark_absent(student_id, "2031-01-06", "IT attribution", staff_actor["id"])
+    marked = dao.mark_absent(
+        scope, student_id, "2031-01-06", "IT attribution", actor=staff_actor
+    )
     try:
         listed = [
             a
-            for a in dao.list_absences("2031-01-06")
+            for a in dao.list_absences(scope, "2031-01-06")
             if str(a["student_id"]) == student_id
         ]
         assert len(listed) == 1
         assert listed[0]["marked_by_display"] == staff_actor["full_name"]
         assert str(listed[0]["marked_by"]) == staff_actor["id"]
+        # U6: the mark writes exactly one attributed audit row in-transaction.
+        rows = audit_rows("absence-marked", str(marked["id"]))
+        assert len(rows) == 1
+        assert rows[0]["actor_kind"] == "staff"
+        assert str(rows[0]["school_id"]) == SCHOOL_A_ID
     finally:
+        purge_audit(str(marked["id"]))
         with db() as conn:
             conn.execute(
                 "delete from live_student_absences where id = %s", (marked["id"],)

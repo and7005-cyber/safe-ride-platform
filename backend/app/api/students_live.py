@@ -1,14 +1,13 @@
 from fastapi import APIRouter, BackgroundTasks, Depends
-from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
-from app.core.auth import get_current_user, require_role
-from app.core.db import get_connection
-from app.core.errors import BadRequestError, NotFoundError
+from app.core.auth import get_current_user
+from app.core.errors import BadRequestError
+from app.core.permissions import require_director, require_staff
+from app.core.scope import SchoolScope
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
-from app.dao.audit_dao import record_audit
 from app.dao.push_dao import PushDao
 from app.dao.student_live_dao import StudentLiveDao
 from app.services import geo_service
@@ -19,7 +18,6 @@ router = APIRouter(prefix="/api/students", tags=["students"])
 dao = StudentLiveDao()
 absence_dao = AbsenceDao()
 push_dao = PushDao()
-admin_only = require_role("admin")
 
 # U13 (origin R15) roster wiring: every path below that regenerates routes
 # dispatches notify_route_changes post-commit with seed_only=True — missing
@@ -81,7 +79,7 @@ def _drop_geo_marker(data: dict) -> dict:
     return data
 
 
-def _pin_stability(student_id: str, data: dict) -> dict:
+def _pin_stability(scope: SchoolScope, student_id: str, data: dict) -> dict:
     """U12 address-change stability rule (origin: 'an address change for a
     placed child keeps the existing stop until confidently re-resolved').
 
@@ -93,16 +91,15 @@ def _pin_stability(student_id: str, data: dict) -> dict:
     (google/mapbox — the same set the bulk triage calls 'resolved') or an
     explicit client pin (payload coordinates, e.g. the PlacePicker's picked
     pin, which arrives with no geocode marker). A student with no existing
-    pin is untouched — U10's triage owns first-time resolution."""
+    pin is untouched — U10's triage owns first-time resolution.
+
+    The prior-pin read goes through the scoped DAO (U6): a foreign student
+    yields no row here and the update itself answers 404 right after."""
     provider = data.pop("_geo_provider", None)
     has_new = data.get("home_lat") is not None and data.get("home_lng") is not None
     if has_new and (provider is None or provider in CONFIDENT_GEO_PROVIDERS):
         return data
-    with get_connection() as conn:
-        row = conn.execute(
-            "select home_lat, home_lng, provenance from live_students where id = %s",
-            (student_id,),
-        ).fetchone()
+    row = dao.student_pin_snapshot(scope, student_id)
     if row and row["home_lat"] is not None and row["home_lng"] is not None:
         data["home_lat"], data["home_lng"] = row["home_lat"], row["home_lng"]
         data["provenance"] = row["provenance"]
@@ -163,27 +160,11 @@ class BulkRow(BaseModel):
 
 
 class BulkPayload(BaseModel):
-    # The upload dialog is scoped to one school (U10): every committed row is
-    # stamped with this id — school-less students are invisible to the
-    # school-scoped draft basis and the pin map. Optional at the MODEL level
-    # only: a stale cached admin tab (backend deployed, CloudFront invalidation
-    # still propagating) posts the pre-U10 shape, and a required field would
-    # answer it with FastAPI's array-422, which the client degrades to a
-    # generic message. _require_school turns the skew window into one clear,
-    # actionable 400 instead; behavior with the field present is unchanged.
+    # U6: the upload's school comes from the request scope now. The field is
+    # kept so the shipped dialog's payload (which still sends it) parses, and
+    # it is IGNORED — the Release 4 stray-school_id rule.
     school_id: str | None = None
     students: list[BulkRow]
-
-
-def _require_school(payload: BulkPayload) -> str:
-    """The bulk school scope, or the one readable stale-tab error (see
-    BulkPayload.school_id). A malformed request, not a lookup miss — 400, not
-    the 404 reserved for a school_id that matches no school."""
-    if not payload.school_id:
-        raise BadRequestError(
-            "School is required — refresh the page to load the updated upload dialog"
-        )
-    return payload.school_id
 
 
 def _bulk_name_key(name: str | None) -> str:
@@ -194,24 +175,29 @@ def _bulk_name_key(name: str | None) -> str:
 
 
 @router.get("")
-def list_students(user: dict = Depends(admin_only)):
-    # Admin-only: rows carry parent contact PII and home coordinates, and the
+def list_students(scope: SchoolScope = Depends(require_staff)):
+    # Staff-only: rows carry parent contact PII and home coordinates, and the
     # email slots gate parent-account linking (R11). Drivers get their roster
     # via /api/runs/driver/context; parents via /api/parent-portal/children.
-    return safe_call(dao.list_students)
+    return safe_call(lambda: dao.list_students(scope))
 
 
 @router.post("")
 def create_student(
     payload: StudentPayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # The response carries stops_recalculated (U6/R10): false when an affected
     # auto route fell back to the preserved/pickup-time order instead of
     # recomputing geometry (the durable signal is live_routes.last_recalc_degraded).
     data = payload.model_dump()
     route_ids = data.pop("route_ids")
-    result = safe_call(lambda: dao.create_student(_drop_geo_marker(_clean_student(data)), route_ids))
+    result = safe_call(
+        lambda: dao.create_student(
+            scope, _drop_geo_marker(_clean_student(data)), route_ids, actor=user
+        )
+    )
     # U13: seed the new child's (and the touched routes' co-riders') missing
     # baselines silently — see the module-level roster-wiring note.
     background_tasks.add_task(
@@ -227,7 +213,8 @@ def create_student(
 @router.put("/{student_id}")
 def update_student(
     student_id: str, payload: StudentPayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # Carries stops_recalculated like create (U6/R10).
     data = payload.model_dump()
@@ -238,7 +225,9 @@ def update_student(
     # U12 stability rule: an ambiguous/failed re-geocode keeps the placed pin.
     result = safe_call(
         lambda: dao.update_student(
-            student_id, _pin_stability(student_id, _clean_student(data)), route_ids
+            scope, student_id,
+            _pin_stability(scope, student_id, _clean_student(data)), route_ids,
+            actor=user,
         )
     )
     if result is not None:
@@ -254,13 +243,17 @@ def update_student(
 
 @router.delete("/{student_id}")
 def delete_student(
-    student_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+    student_id: str, background_tasks: BackgroundTasks,
+    scope: SchoolScope = Depends(require_director),
+    user: dict = Depends(get_current_user),
 ):
     # U13: pre-capture the routes the cascade is about to unlink; the deleted
     # child's own baselines cascade away with the student row, so only the
     # co-riders' missing baselines are seeded (silently).
     prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
-    result = safe_call(lambda: (dao.delete_student(student_id), {"ok": True})[1])
+    result = safe_call(
+        lambda: (dao.delete_student(scope, student_id, actor=user), {"ok": True})[1]
+    )
     if prior_route_ids:
         background_tasks.add_task(
             notify_route_changes, route_ids=prior_route_ids, seed_only=True
@@ -297,20 +290,20 @@ def _triage_row(row: BulkRow) -> dict:
 
 
 @router.post("/bulk/validate")
-def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
+def bulk_validate(payload: BulkPayload, scope: SchoolScope = Depends(require_staff)):
     """Import-time triage (U10/R16-R18): geocode every row and return its tier
     (resolved / ambiguous / failed) + provider + proposed pin, flag duplicates
     of existing students at this school by (name, school), and note the retired
     route column — WITHOUT inserting anything. The client renders the triage
     table (ambiguous rows confirm the proposed pin in one click, failed rows
     open the map picker, duplicates choose skip-or-update) and only then POSTs
-    /bulk to commit."""
+    /bulk to commit. The school is the request scope (U6); the payload's
+    school_id is ignored."""
     def run() -> dict:
-        school_id = _require_school(payload)
         # ONE batched duplicate lookup for the whole upload — the per-row
         # query was O(rows) round-trips per request.
         duplicates = dao.find_bulk_duplicates(
-            [row.name for row in payload.students], school_id
+            scope, [row.name for row in payload.students]
         )
         rows = []
         for index, row in enumerate(payload.students):
@@ -327,7 +320,8 @@ def bulk_validate(payload: BulkPayload, user: dict = Depends(admin_only)):
 @router.post("/bulk")
 def bulk_upload(
     payload: BulkPayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # Touched student/route ids collected by run() — read after safe_call for
     # the U13 seed dispatch. Freshly inserted students have no routes yet (no
@@ -344,9 +338,9 @@ def bulk_upload(
         parent_assignments = 0
         notes: list[str] = []
         errors: list[str] = []
-        school_id = _require_school(payload)
-        if not dao.school_exists(school_id):
-            raise NotFoundError("School not found — pick the school this upload belongs to")
+        # U6: the upload belongs to the request scope's school — the payload's
+        # school_id (if any) is ignored, and the scope school always exists.
+        school_id = scope.school_id
         # Duplicates re-detected server-side at commit (never trusted from the
         # client): same (name, school) as an existing student. ONE batched
         # lookup for the whole upload (the per-row query was O(rows) round-
@@ -355,7 +349,7 @@ def bulk_upload(
         # exact behavior the per-row re-query had, and nothing is ever
         # silently doubled.
         duplicates = dao.find_bulk_duplicates(
-            [row.name for row in payload.students], school_id
+            scope, [row.name for row in payload.students]
         )
         for index, row in enumerate(payload.students):
             label = row.name or f"row {index + 1}"
@@ -385,7 +379,7 @@ def bulk_upload(
                         skipped += 1
                         continue
                     if row.duplicate_action == "update":
-                        result = dao.update_bulk_student(str(duplicate["id"]), data)
+                        result = dao.update_bulk_student(scope, str(duplicate["id"]), data)
                         updated += 1
                         parent_assignments += result["parent_links"]
                         touched_students.append(str(duplicate["id"]))
@@ -396,7 +390,7 @@ def bulk_upload(
                         "— choose skip or update"
                     )
                     continue
-                result = dao.insert_bulk_student(data)
+                result = dao.insert_bulk_student(scope, data)
                 inserted += 1
                 parent_assignments += result["parent_links"]
                 touched_students.append(str(result["id"]))
@@ -413,7 +407,16 @@ def bulk_upload(
                 errors.append(f"{label}: {exc}")
         # Duplicate updates moved home pins on live routes: regenerate each
         # affected route ONCE for the whole upload (Lambda burst guard, U8).
-        dao.regenerate_routes(touched_routes)
+        dao.regenerate_routes(scope, touched_routes)
+        if inserted or updated:
+            # One 'students-imported' audit row per upload (U6/U9). The bulk
+            # path is deliberately multi-transaction (per-row error capture),
+            # so the summary row rides its own small transaction after the
+            # loop — counts only, never names.
+            dao.record_import(scope, user, {
+                "inserted": inserted, "updated": updated,
+                "skipped": skipped, "errors": len(errors),
+            })
         return {
             "inserted": inserted,
             "updated": updated,
@@ -442,67 +445,18 @@ def bulk_upload(
 
 # Aggregate pin map with audited access (U11/R19) ----------------------------
 
-def _pin_map(school_id: str, actor: dict) -> dict:
-    """Every student pin for one school in ONE audited read (R19).
-
-    One screen showing every child's home is a higher-value target than any
-    single record, so access itself is the audited event: the read and its
-    'pin-map-viewed' live_admin_audit row share a transaction — the response
-    and the row commit or vanish together, and a served pin map without its
-    audit row is impossible. The insert mirrors fleet_plan_dao's apply/restore
-    writers column for column (actor name/email denormalized so the row
-    outlives the account); it lives here rather than a DAO per the U11 file
-    scope — a second consumer should extract the shared helper.
-
-    Students split by triage state: 'placed' (real coordinates — a map marker)
-    vs 'unresolved' (no usable coordinates — listed by name beside the map so
-    the operator can open each one and place the pin). This endpoint is the
-    aggregate's ONLY source; the frontend must not assemble it from the
-    regular students list, which would bypass the audit.
-    """
-    with get_connection() as conn:
-        if conn.execute(
-            "select 1 from live_schools where id = %s", (school_id,)
-        ).fetchone() is None:
-            raise NotFoundError("School not found — pick the school whose pins to view")
-        rows = conn.execute(
-            "select id, name, home_address, home_lat, home_lng, provenance "
-            "from live_students where school_id = %s order by name asc",
-            (school_id,),
-        ).fetchall()
-        placed: list[dict] = []
-        unresolved: list[dict] = []
-        for row in rows:
-            has_pin = row["home_lat"] is not None and row["home_lng"] is not None
-            pin = {
-                "id": str(row["id"]),
-                "name": row["name"],
-                "address": row["home_address"],
-                # Coerced to float: the columns are numeric and a raw Decimal
-                # serializes as a JSON string, which no map marker can place.
-                "lat": float(row["home_lat"]) if has_pin else None,
-                "lng": float(row["home_lng"]) if has_pin else None,
-                "provenance": row["provenance"],
-                "state": "placed" if has_pin else "unresolved",
-            }
-            (placed if has_pin else unresolved).append(pin)
-        record_audit(
-            conn,
-            action="pin-map-viewed",
-            actor=actor,
-            school_id=school_id,
-            resource_type="school",
-            resource_id=school_id,
-            detail={"pin_count": len(placed), "unresolved_count": len(unresolved)},
-        )
-    return {"school_id": school_id, "placed": placed, "unresolved": unresolved}
-
-
 @router.get("/pin-map")
-def pin_map(school_id: str, user: dict = Depends(admin_only)):
-    # Admin-only like the students list, but the aggregate view carries its own
-    # audit trail on top (R19) — see _pin_map. Exactly one audit row per call.
-    return safe_call(lambda: _pin_map(school_id, user))
+def pin_map(
+    school_id: str | None = None,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    # Staff-only like the students list, but the aggregate view carries its
+    # own audit trail on top (R19) — see StudentLiveDao.pin_map: exactly one
+    # 'pin-map-viewed' audit row per call, in the read's own transaction.
+    # U6: the school IS the request scope; the legacy school_id query param
+    # is accepted and ignored (the stray-school-id rule).
+    return safe_call(lambda: dao.pin_map(scope, actor=user))
 
 
 # Absences (#7) --------------------------------------------------------------
@@ -514,32 +468,49 @@ class AbsencePayload(BaseModel):
 
 
 @router.get("/absences")
-def list_absences(date: str | None = None, user: dict = Depends(admin_only)):
-    # Admin-only: named child absences are exactly the data the incidents
+def list_absences(
+    date: str | None = None, scope: SchoolScope = Depends(require_staff)
+):
+    # Staff-only: named child absences are exactly the data the incidents
     # feed was locked down for; the sole consumer is the admin StudentsPage.
     # Rows carry scope ('day'/'morning'/'afternoon') and source
     # ('parent'/'driver'/'admin') so the UI can render partial parent
-    # cancellations and gate its actions on provenance (U4).
-    return safe_call(lambda: absence_dao.list_absences(date))
+    # cancellations and gate its actions on provenance (U4). Scoped through
+    # the student's school (U6).
+    return safe_call(lambda: absence_dao.list_absences(scope, date))
 
 
 @router.post("/absences")
-def mark_absent(payload: AbsencePayload, user: dict = Depends(admin_only)):
+def mark_absent(
+    payload: AbsencePayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     # date=None defaults to today (Africa/Nairobi) inside the DAO. A
     # today-dated mark also sets the live status to 'absent' and appends the
     # run_absences snapshot of any active run carrying the student (R25b);
     # other dates are bookkeeping only. An admin mark is always whole-day:
     # the DAO escalates an existing partial parent cancellation to
-    # scope='day', source='admin' (U4).
+    # scope='day', source='admin' (U4). Another school's student → 404 (U6).
     return safe_call(
-        lambda: absence_dao.mark_absent(payload.student_id, payload.date, payload.reason, user["id"])
+        lambda: absence_dao.mark_absent(
+            scope, payload.student_id, payload.date, payload.reason, actor=user
+        )
     )
 
 
 @router.delete("/absences/{absence_id}")
-def clear_absence(absence_id: str, user: dict = Depends(admin_only)):
+def clear_absence(
+    absence_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     # Clearing a today-dated absence 409s while the student is involved in an
     # active run of a type the absence covers ("End the run first"), else
     # resets an 'absent' status to 'at-school' when the row was whole-day.
-    # Past/future-dated clears have no status side-effects.
-    return safe_call(lambda: (absence_dao.clear_absence(absence_id), {"ok": True})[1])
+    # Past/future-dated clears have no status side-effects. Mark AND clear
+    # stay require_staff (U6 decision): both are operational day-to-day acts,
+    # not history destruction — a coordinator clears a mistaken mark.
+    return safe_call(
+        lambda: (absence_dao.clear_absence(scope, absence_id, actor=user), {"ok": True})[1]
+    )
