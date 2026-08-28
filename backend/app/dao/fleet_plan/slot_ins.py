@@ -359,11 +359,11 @@ class SlotInOps:
             # nothing else moves, nothing recomputes.
             conn.execute(
                 "insert into live_route_stops (route_id, name, stop_order, "
-                "scheduled_time, lat, lng, is_school_gate, student_id) "
-                "values (%s, %s, %s, %s, %s, %s, false, %s)",
+                "scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+                "values (%s, %s, %s, %s, %s, %s, false, %s, (select school_id from live_routes where id = %s))",
                 (rid, _stop_label(student), join_group["order"],
                  join_group["time"], join_group["lat"], join_group["lng"],
-                 str(student["id"])),
+                 str(student["id"]), rid),
             )
             return {
                 "position": groups.index(join_group), "join": True,
@@ -381,10 +381,10 @@ class SlotInOps:
         )
         conn.execute(
             "insert into live_route_stops (route_id, name, stop_order, "
-            "scheduled_time, lat, lng, is_school_gate, student_id) "
-            "values (%s, %s, %s, null, %s, %s, false, %s)",
+            "scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+            "values (%s, %s, %s, null, %s, %s, false, %s, (select school_id from live_routes where id = %s))",
             (rid, _stop_label(student), new_order, home[0], home[1],
-             str(student["id"])),
+             str(student["id"]), rid),
         )
         seq_groups = (groups[:pos]
                       + [{"order": new_order, "lat": home[0], "lng": home[1]}]

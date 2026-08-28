@@ -462,8 +462,8 @@ class ApplyRestoreOps:
                         sid = str(s["id"])
                         conn.execute(
                             "insert into live_route_stops (route_id, name, stop_order, "
-                            "scheduled_time, lat, lng, is_school_gate, student_id) "
-                            "values (%s, %s, %s, %s, %s, %s, false, %s)",
+                            "scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+                            "values (%s, %s, %s, %s, %s, %s, false, %s, (select school_id from live_routes where id = %s))",
                             (
                                 rid,
                                 _stop_label(current_by_id[sid]),
@@ -472,15 +472,16 @@ class ApplyRestoreOps:
                                 stop.get("lat"),
                                 stop.get("lng"),
                                 sid,
+                                rid,
                             ),
                         )
                 gate_order = 1 if is_afternoon else len(info["stops"]) + 1
                 conn.execute(
                     "insert into live_route_stops (route_id, name, stop_order, "
-                    "scheduled_time, lat, lng, is_school_gate, student_id) "
-                    "values (%s, %s, %s, %s, %s, %s, true, null)",
+                    "scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+                    "values (%s, %s, %s, %s, %s, %s, true, null, (select school_id from live_routes where id = %s))",
                     (rid, school["name"] or "School", gate_order, anchors[leg],
-                     school["lat"], school["lng"]),
+                     school["lat"], school["lng"], rid),
                 )
 
             # (8) Re-derive the denormalized student attributes from the
@@ -738,14 +739,18 @@ class ApplyRestoreOps:
             name = stop_labels.get(row["student_id"]) or cur["stop_name"]
             conn.execute(
                 "insert into live_communicated_stops (student_id, route_type, "
-                "stop_name, stop_lat, stop_lng, scheduled_time, bus_id, communicated_at) "
-                "values (%s, %s, %s, %s, %s, %s, %s, now()) "
+                "stop_name, stop_lat, stop_lng, scheduled_time, bus_id, communicated_at, "
+                "school_id) "
+                "values (%s, %s, %s, %s, %s, %s, %s, now(), "
+                "(select school_id from live_students where id = %s)) "
                 "on conflict (student_id, route_type) do update set "
                 "stop_name = excluded.stop_name, stop_lat = excluded.stop_lat, "
                 "stop_lng = excluded.stop_lng, scheduled_time = excluded.scheduled_time, "
-                "bus_id = excluded.bus_id, communicated_at = excluded.communicated_at",
+                "bus_id = excluded.bus_id, communicated_at = excluded.communicated_at, "
+                "school_id = excluded.school_id",
                 (row["student_id"], row["leg"], name, cur["lat"],
-                 cur["lng"], cur["scheduled_time"], cur["bus_id"]),
+                 cur["lng"], cur["scheduled_time"], cur["bus_id"],
+                 row["student_id"]),
             )
         for row in diff_rows:
             if row["current"] is None:
@@ -1183,12 +1188,12 @@ class ApplyRestoreOps:
                 for r in item["kept"]:
                     conn.execute(
                         "insert into live_route_stops (route_id, name, stop_order, "
-                        "scheduled_time, lat, lng, is_school_gate, student_id) "
-                        "values (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        "scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+                        "values (%s, %s, %s, %s, %s, %s, %s, %s, (select school_id from live_routes where id = %s))",
                         (
                             rid, r.get("name"), r.get("stop_order"),
                             r.get("scheduled_time"), r.get("lat"), r.get("lng"),
-                            bool(r.get("is_school_gate")), r.get("student_id"),
+                            bool(r.get("is_school_gate")), r.get("student_id"), rid,
                         ),
                     )
 

@@ -127,9 +127,9 @@ def _group_students(
 def _insert_stop(conn, route_id: str, name: str, order: int, time: str | None,
                  lat: float | None, lng: float | None, is_gate: bool, student_id) -> None:
     conn.execute(
-        "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (route_id, name, order, time, lat, lng, is_gate, student_id),
+        "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, (select school_id from live_routes where id = %s))",
+        (route_id, name, order, time, lat, lng, is_gate, student_id, route_id),
     )
 
 
@@ -981,8 +981,8 @@ def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
     conn.execute("delete from live_route_stops where route_id = %s", (route_id,))
     for order, stop in enumerate(stops, start=1):
         conn.execute(
-            "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) "
-            "values (%s, %s, %s, %s, %s, %s, %s, null)",
+            "insert into live_route_stops (route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+            "values (%s, %s, %s, %s, %s, %s, %s, null, (select school_id from live_routes where id = %s))",
             (
                 route_id,
                 stop.get("label") or "Stop",
@@ -991,6 +991,7 @@ def _write_custom_stops(conn, route_id: str, stops: list[dict]) -> None:
                 stop.get("lat"),
                 stop.get("lng"),
                 bool(stop.get("is_school")),
+                route_id,
             ),
         )
     # U3: a planner-saved route is "computed" — mark it so a later

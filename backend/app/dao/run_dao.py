@@ -744,12 +744,14 @@ class RunDao:
             # snapshot would rot after student deletion.
             conn.execute(
                 f"""
-                insert into run_absences (run_id, student_id, student_name, reason, period)
+                insert into run_absences (run_id, student_id, student_name, reason, period,
+                                          school_id)
                 select %s, s.id, s.name, a.reason,
                        -- What was individually marked, falling back to the
                        -- row's coverage for absences nobody witnessed at a
                        -- stop (an office mark, a parent cancellation).
-                       coalesce(a.marked_period, a.scope)
+                       coalesce(a.marked_period, a.scope),
+                       %s
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
                 join live_student_routes sr
@@ -758,7 +760,7 @@ class RunDao:
                   and {scope_covers("a.scope", "%s")}
                 on conflict (run_id, student_id) do nothing
                 """,
-                (run["id"], route_id, route["type"]),
+                (run["id"], route["school_id"], route_id, route["type"]),
             )
             # Position the bus at the school when the run starts; from here the
             # position is the last stop the driver arrives at (no device GPS).
@@ -1409,12 +1411,14 @@ class RunDao:
             ).fetchone()
             inserted = conn.execute(
                 """
-                insert into run_absences (run_id, student_id, student_name, reason, period)
-                values (%s, %s, %s, %s, %s)
+                insert into run_absences (run_id, student_id, student_name, reason, period,
+                                          school_id)
+                values (%s, %s, %s, %s, %s,
+                        (select school_id from live_runs where id = %s))
                 on conflict (run_id, student_id) do nothing
                 returning id
                 """,
-                (run["id"], student_id, student["name"], reason, period),
+                (run["id"], student_id, student["name"], reason, period, run["id"]),
             ).fetchone()
             # A child marked absent was not aboard, so their participation goes
             # (U2). On an afternoon run this retracts the presumed board the

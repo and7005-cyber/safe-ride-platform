@@ -29,14 +29,16 @@ def record_boarding(
     conn.execute(
         """
         insert into run_participation
-            (run_id, student_id, student_name, boarded_at, boarded_presumed, acting_driver_id)
-        values (%s, %s, %s, now(), %s, %s)
+            (run_id, student_id, student_name, boarded_at, boarded_presumed, acting_driver_id,
+             school_id)
+        values (%s, %s, %s, now(), %s, %s, (select school_id from live_runs where id = %s))
         on conflict (run_id, student_id) do update set
             boarded_at = coalesce(run_participation.boarded_at, excluded.boarded_at),
             boarded_presumed = run_participation.boarded_presumed and excluded.boarded_presumed,
-            acting_driver_id = coalesce(excluded.acting_driver_id, run_participation.acting_driver_id)
+            acting_driver_id = coalesce(excluded.acting_driver_id, run_participation.acting_driver_id),
+            school_id = coalesce(run_participation.school_id, excluded.school_id)
         """,
-        (run_id, student_id, student_name, presumed, driver_id),
+        (run_id, student_id, student_name, presumed, driver_id, run_id),
     )
 
 
@@ -235,12 +237,13 @@ def record_unaccounted(conn, run_id: str, blocking: list[dict[str, Any]]) -> Non
         conn.execute(
             """
             insert into run_participation
-                (run_id, student_id, student_name, unaccounted_at)
-            values (%s, %s, %s, now())
+                (run_id, student_id, student_name, unaccounted_at, school_id)
+            values (%s, %s, %s, now(), (select school_id from live_runs where id = %s))
             on conflict (run_id, student_id) do update set
-                unaccounted_at = coalesce(run_participation.unaccounted_at, excluded.unaccounted_at)
+                unaccounted_at = coalesce(run_participation.unaccounted_at, excluded.unaccounted_at),
+                school_id = coalesce(run_participation.school_id, excluded.school_id)
             """,
-            (run_id, child["id"], child["name"]),
+            (run_id, child["id"], child["name"], run_id),
         )
 
 

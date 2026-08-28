@@ -146,8 +146,9 @@ class AbsenceDao:
                 )
                 conn.execute(
                     """
-                    insert into run_absences (run_id, student_id, student_name, reason, period)
-                    select r.id, s.id, s.name, %s, 'day'
+                    insert into run_absences (run_id, student_id, student_name, reason, period,
+                                              school_id)
+                    select r.id, s.id, s.name, %s, 'day', r.school_id
                     from live_runs r
                     join live_students s on s.id = %s and s.school_id = %s
                     where r.status <> 'completed'
@@ -257,8 +258,9 @@ class AbsenceDao:
                     )
                 conn.execute(
                     f"""
-                    insert into run_absences (run_id, student_id, student_name, reason, period)
-                    select r.id, s.id, s.name, %s, %s
+                    insert into run_absences (run_id, student_id, student_name, reason, period,
+                                              school_id)
+                    select r.id, s.id, s.name, %s, %s, r.school_id
                     from live_runs r
                     join live_students s on s.id = %s
                     where r.status <> 'completed'
