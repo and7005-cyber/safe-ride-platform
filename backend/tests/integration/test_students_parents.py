@@ -467,6 +467,16 @@ def create_linked_student(client, admin_headers, marker: str, route_ids=None, **
         headers=admin_headers,
     )
     assert created.status_code == 200, created.text
+    # U11: the account signed up before the student existed, so its first link
+    # at this school is OFFERED, not granted — accept the pending card(s) so
+    # the tests exercise the accepted surface these fixtures always meant.
+    pending = client.get("/api/parent-portal/pending", headers=parent_headers)
+    for card in (pending.json() if pending.status_code == 200 else []):
+        accepted = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert accepted.status_code == 200, accepted.text
     return created.json(), parent_id, email, parent_headers
 
 

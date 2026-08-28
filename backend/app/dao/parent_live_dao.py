@@ -1,6 +1,8 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.core.scope import ParentScope
+from app.dao.audit_dao import record_audit
 from app.dao.status_sql import display_status_case
 
 
@@ -14,13 +16,25 @@ def _mask_stop_name(name: str, is_own: bool, is_gate: bool) -> str:
 
 
 class ParentLiveDao:
+    """Every method takes the request's ``ParentScope`` and threads it into
+    ``get_connection`` explicitly (U11) — the same seam the school surfaces
+    adopted in U7, so U14's row security can rely on the armed GUC here too.
+    The parent's identity is ``scope.user_id``; reads key on ACCEPTED links
+    only (``_child_ids`` is the single choke point), while the pending
+    surface below is the one place a not-yet-accepted school appears — as a
+    school-level card, never as child data."""
+
     def _child_ids(self, conn, parent_id: str) -> list[str]:
+        # Accepted links only (U11/R31): a pending link grants NO read of the
+        # child — every parent read funnels through this filter.
         rows = conn.execute(
-            "select student_id from live_parent_students where parent_id = %s", (parent_id,)
+            "select student_id from live_parent_students "
+            "where parent_id = %s and status = 'accepted'",
+            (parent_id,),
         ).fetchall()
         return [r["student_id"] for r in rows]
 
-    def list_children(self, parent_id: str) -> list[dict[str, Any]]:
+    def list_children(self, scope: ParentScope) -> list[dict[str, Any]]:
         """The parent's children, each with a derived ``display_status``.
 
         ``display_status`` is computed at read time, never stored (the raw
@@ -38,8 +52,8 @@ class ParentLiveDao:
         one half is still withdrawable, which is exactly when the UI should
         offer the action (U13's dialog picks the half).
         """
-        with get_connection() as conn:
-            ids = self._child_ids(conn, parent_id)
+        with get_connection(scope) as conn:
+            ids = self._child_ids(conn, scope.user_id)
             if not ids:
                 return []
             rows = conn.execute(
@@ -92,7 +106,7 @@ class ParentLiveDao:
             children.append(child)
         return children
 
-    def cancel_ride_context(self, parent_id: str, student_id: str) -> dict[str, Any] | None:
+    def cancel_ride_context(self, scope: ParentScope, student_id: str) -> dict[str, Any] | None:
         """Ownership check + guard snapshot for Cancel-a-Ride (U5), one read.
 
         None means the student is not linked to this parent — the 404
@@ -116,8 +130,8 @@ class ParentLiveDao:
         friendly messages; the atomic set_scope / withdraw_scope statements
         stay the authority under concurrency.
         """
-        with get_connection() as conn:
-            ids = [str(cid) for cid in self._child_ids(conn, parent_id)]
+        with get_connection(scope) as conn:
+            ids = [str(cid) for cid in self._child_ids(conn, scope.user_id)]
             if str(student_id) not in ids:
                 return None  # ownership: not this parent's child
             # display_status, not the raw column (U3): the Cancel-a-Ride guard
@@ -175,9 +189,9 @@ class ParentLiveDao:
             "route_buses": route_buses,
         }
 
-    def get_track(self, parent_id: str, student_id: str) -> dict[str, Any] | None:
-        with get_connection() as conn:
-            ids = [str(cid) for cid in self._child_ids(conn, parent_id)]
+    def get_track(self, scope: ParentScope, student_id: str) -> dict[str, Any] | None:
+        with get_connection(scope) as conn:
+            ids = [str(cid) for cid in self._child_ids(conn, scope.user_id)]
             if str(student_id) not in ids:
                 return None  # ownership: not this parent's child
             student = conn.execute(
@@ -246,7 +260,7 @@ class ParentLiveDao:
 
     def list_alerts(
         self,
-        parent_id: str,
+        scope: ParentScope,
         window_hours: int | None = None,
         min_age_hours: int | None = None,
         limit: int = 50,
@@ -261,8 +275,8 @@ class ParentLiveDao:
         (R35/R36: display windows over a feed that never deletes rows).
         """
         limit = max(1, min(int(limit), 200))
-        with get_connection() as conn:
-            ids = self._child_ids(conn, parent_id)
+        with get_connection(scope) as conn:
+            ids = self._child_ids(conn, scope.user_id)
             if not ids:
                 return []
             bus_rows = conn.execute(
@@ -308,10 +322,134 @@ class ParentLiveDao:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_profile(self, parent_id: str) -> dict[str, Any]:
-        with get_connection() as conn:
+    def get_profile(self, scope: ParentScope) -> dict[str, Any]:
+        with get_connection(scope) as conn:
             user = conn.execute(
-                "select id, email, full_name, phone from app_users where id = %s", (parent_id,)
+                "select id, email, full_name, phone from app_users where id = %s",
+                (scope.user_id,),
             ).fetchone()
-            children = self.list_children(parent_id)
+        children = self.list_children(scope)
         return {"profile": dict(user) if user else None, "children": children}
+
+    # --- pending links (U11: R31/R32, AE10/AE21/AE22) -------------------------
+
+    def list_pending(self, scope: ParentScope) -> list[dict[str, Any]]:
+        """The calling parent's pending links, GROUPED BY SCHOOL — one card
+        per school: schoolId, schoolName, offeredAt (earliest), linkCount.
+
+        Deliberately NO student fields of any kind (AE22): until the parent
+        accepts, the school's offer discloses only that the school claims a
+        link — a child's name, grade or id in this payload would leak data
+        the parent has not confirmed a right to.
+        """
+        with get_connection(scope) as conn:
+            rows = conn.execute(
+                """
+                select ps.school_id, sc.name as school_name,
+                       min(ps.offered_at) as offered_at, count(*) as link_count
+                from live_parent_students ps
+                join live_schools sc on sc.id = ps.school_id
+                where ps.parent_id = %s and ps.status = 'pending'
+                group by ps.school_id, sc.name
+                order by min(ps.offered_at) asc nulls last, sc.name asc
+                """,
+                (scope.user_id,),
+            ).fetchall()
+        return [
+            {
+                "schoolId": str(r["school_id"]),
+                "schoolName": r["school_name"],
+                "offeredAt": r["offered_at"],
+                "linkCount": r["link_count"],
+            }
+            for r in rows
+        ]
+
+    def has_pending_at(self, scope: ParentScope, school_id: str) -> bool:
+        """Gate for accept/decline: the route verifies the parent really has a
+        pending link at ``school_id`` (under their ordinary accepted-school
+        scope) BEFORE widening the scope to include that school — a caller
+        must not get a widened GUC out of a school id they merely guessed."""
+        with get_connection(scope) as conn:
+            row = conn.execute(
+                "select 1 from live_parent_students "
+                "where parent_id = %s and school_id = %s and status = 'pending' limit 1",
+                (scope.user_id, school_id),
+            ).fetchone()
+        return bool(row)
+
+    def accept_pending(self, scope: ParentScope, school_id: str) -> int:
+        """Activate EVERY pending link of this parent at the school. ``scope``
+        is the widened ParentScope (accepted schools ∪ the pending school) so
+        the write passes the database backstop. Returns links activated."""
+        with get_connection(scope) as conn:
+            rows = conn.execute(
+                """
+                update live_parent_students
+                set status = 'accepted', decided_at = now()
+                where parent_id = %s and school_id = %s and status = 'pending'
+                returning id
+                """,
+                (scope.user_id, school_id),
+            ).fetchall()
+        return len(rows)
+
+    def decline_pending(
+        self, scope: ParentScope, school_id: str, *, actor: dict, email: str
+    ) -> int:
+        """Decline a school's pending card (AE22), one transaction: DELETE the
+        parent's pending links there, blank whichever email slot on each
+        affected student equals the caller's email (case-insensitive), raise
+        ONE school-stamped 'mismatched email' incident naming the EMAIL —
+        never the child (the school knows its own students; the alert is
+        about the address) — and record the parent-link-declined audit row,
+        whose detail carries the link count and deliberately no email.
+
+        ``scope`` is the widened ParentScope including this school. Returns
+        the number of links removed (0 when nothing was pending — the caller
+        keeps its 404 contract).
+        """
+        with get_connection(scope) as conn:
+            rows = conn.execute(
+                """
+                delete from live_parent_students
+                where parent_id = %s and school_id = %s and status = 'pending'
+                returning student_id
+                """,
+                (scope.user_id, school_id),
+            ).fetchall()
+            if not rows:
+                return 0
+            student_ids = [r["student_id"] for r in rows]
+            conn.execute(
+                """
+                update live_students set
+                    parent_email = case
+                        when lower(parent_email) = lower(%(email)s) then null
+                        else parent_email end,
+                    parent2_email = case
+                        when lower(parent2_email) = lower(%(email)s) then null
+                        else parent2_email end
+                where id = any(%(ids)s) and school_id = %(school_id)s
+                """,
+                {"email": email, "ids": student_ids, "school_id": school_id},
+            )
+            # The signup auto-link incident's shape (type 'other', no student
+            # or bus stamp — it never reaches a parent feed), school-stamped.
+            conn.execute(
+                "insert into live_incidents (type, description, school_id) "
+                "values ('other', %s, %s)",
+                (
+                    f"Mismatched email: {email} declined the parent link for "
+                    "this school — the parent email on the student record may "
+                    "be wrong. Please verify the family's contact details.",
+                    school_id,
+                ),
+            )
+            record_audit(
+                conn, action="parent-link-declined", actor=actor,
+                school_id=school_id, resource_type="parent",
+                resource_id=str(scope.user_id),
+                detail={"link_count": len(student_ids)},
+            )
+        return len(student_ids)

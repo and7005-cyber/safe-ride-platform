@@ -2,7 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection, get_global_connection
 from app.core.errors import ConflictError, NotFoundError
-from app.core.scope import SchoolScope
+from app.core.scope import ParentScope, SchoolScope
 from app.dao.audit_dao import record_audit
 from app.dao.student_live_dao import _ConnParentLinks, link_account_to_matching_students
 
@@ -276,15 +276,25 @@ class AccountDao:
 
     def link_parent_to_matching_students(self, parent_id, email: str) -> int:
         """Link a (new) parent account to every student carrying its email in
-        either parent slot (R11), honouring the per-student link cap. Returns
-        the number of links created.
+        either parent slot (R11/R31), honouring the per-student link cap.
+        Returns the number of links created.
 
-        Signup emails are self-asserted and unverified, so every auto-link
-        also raises an admin-visible incident (no bus/student stamp, so it
-        never reaches a parent feed): the office knows its families and can
-        catch an email claimed by the wrong person before it matters.
+        Matching reads through migration 013's SECURITY DEFINER
+        ``parent_signup_matches`` — the platform-wide scan has no scope of its
+        own, and the DAO raises rather than degrading to zero matches if the
+        function is missing. Matches grouped by school decide the link status
+        (one school → ``accepted``, more → all ``pending`` — U11); the links
+        and the per-school incidents are then created under a constructed
+        ``ParentScope`` of the matched schools, passed explicitly to
+        ``get_connection`` so the writes pass the database backstop.
+
+        Signup emails are self-asserted and unverified, so every school with
+        created links also gets an admin-visible incident (school-stamped, no
+        bus/student stamp, so it never reaches a parent feed): the office
+        knows its families and can catch an email claimed by the wrong person
+        before it matters.
         """
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             eligible = conn.execute(
                 """
                 select 1 from app_users u
@@ -298,24 +308,41 @@ class AccountDao:
                 # U8 hygiene: a provider or disabled identity is never linked
                 # as a parent, even if its email lands in a student slot.
                 return 0
+            matches = _ConnParentLinks(conn).signup_matches(email)
+        if not matches:
+            return 0
+        matched_schools = tuple(
+            sorted({str(m["school_id"]) for m in matches if m["school_id"] is not None})
+        )
+        scope = ParentScope(user_id=str(parent_id), school_ids=matched_schools)
+        with get_connection(scope) as conn:
             created = link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
-            if created:
+            by_school: dict[str, list[dict]] = {}
+            for link in created:
+                if link["school_id"] is not None:
+                    by_school.setdefault(str(link["school_id"]), []).append(link)
+            for school_id, links in sorted(by_school.items()):
                 names = [
                     r["name"]
                     for r in conn.execute(
-                        """
-                        select s.name from live_students s
-                        join live_parent_students ps on ps.student_id = s.id
-                        where ps.parent_id = %s order by s.name
-                        """,
-                        (parent_id,),
+                        "select name from live_students where id = any(%s) order by name",
+                        ([link["student_id"] for link in links],),
                     ).fetchall()
                 ]
-                conn.execute(
-                    "insert into live_incidents (type, description) values ('other', %s)",
-                    (
+                if links[0]["status"] == "accepted":
+                    description = (
                         f"Parent signup auto-linked: {email} now tracks "
-                        f"{', '.join(names)} — verify this is the child's parent.",
-                    ),
+                        f"{', '.join(names)} — verify this is the child's parent."
+                    )
+                else:
+                    description = (
+                        f"Parent signup: {email} matches {', '.join(names)} — "
+                        "the link is awaiting the parent's confirmation. "
+                        "Verify this is the child's parent."
+                    )
+                conn.execute(
+                    "insert into live_incidents (type, description, school_id) "
+                    "values ('other', %s, %s)",
+                    (description, school_id),
                 )
-            return created
+            return len(created)

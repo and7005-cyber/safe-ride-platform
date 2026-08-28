@@ -31,7 +31,7 @@ withdraw check the marking rather than using whole-day scope as its proxy.
 """
 from typing import Any
 
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection
 from app.core.errors import NotFoundError
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import record_audit
@@ -170,7 +170,8 @@ class AbsenceDao:
         return result
 
     def set_scope(
-        self, student_id: str, scope: str, actor_user_id: str, reason: str | None = None
+        self, student_id: str, scope: str, actor_user_id: str, reason: str | None = None,
+        *, parent_scope: object = UNSET,
     ) -> dict[str, Any] | None:
         """Parent transition (U4): upsert a TODAY absence at ``scope`` as ONE
         atomic statement. Merge rule in the DO UPDATE expression: same scope
@@ -205,9 +206,13 @@ class AbsenceDao:
         still expected, and the completed report must list who never
         boarded. Boarded children never reach this point — the API layer
         rejects an on-bus child on an active covered run (R16).
+
+        ``parent_scope`` (U11): the caller's ParentScope, threaded explicitly
+        into the connection seam like every converted DAO; UNSET keeps the
+        context-var fallback for legacy call sites.
         """
         _validate_scope(scope)
-        with get_connection() as conn:
+        with get_connection(parent_scope) as conn:
             row = conn.execute(
                 """
                 with prior as (
@@ -270,7 +275,8 @@ class AbsenceDao:
         return result
 
     def withdraw_scope(
-        self, student_id: str, scope: str, actor_user_id: str
+        self, student_id: str, scope: str, actor_user_id: str,
+        *, parent_scope: object = UNSET,
     ) -> dict[str, Any] | None:
         """Parent withdrawal (U4), the same single-statement atomicity as
         set_scope: withdrawing one half of a merged 'day' downgrades the row
@@ -317,7 +323,7 @@ class AbsenceDao:
                                            and sr.student_id = a.student_id)
                             )
                       )"""
-        with get_connection() as conn:
+        with get_connection(parent_scope) as conn:
             row = conn.execute(
                 f"""
                 with downgraded as (

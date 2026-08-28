@@ -2,7 +2,7 @@ from typing import Any
 
 from app.core.db import get_connection
 from app.core.errors import NotFoundError
-from app.core.scope import SchoolScope
+from app.core.scope import ParentScope, SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 
 # One sentence shape for every run-lifecycle row: "<where>: <what>. <detail>".
@@ -208,6 +208,7 @@ class IncidentDao:
 
     def create_cancellation_incident(
         self,
+        scope: ParentScope,
         student_id: str,
         description: str,
         bus_id: str | None,
@@ -228,9 +229,12 @@ class IncidentDao:
         acting parent is named only in the description. run_id stays NULL
         (the cancellation precedes any run); run_type carries the period,
         scope-mapped (whole-day → NULL). school_id is derived from the child
-        (U7) so the alert lands on exactly one school's list.
+        (U7) so the alert lands on exactly one school's list. ``scope`` is the
+        acting parent's ParentScope, threaded explicitly (U11) — the child's
+        school is one of its accepted schools, so the armed GUC covers the
+        stamped row.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
                 insert into live_incidents

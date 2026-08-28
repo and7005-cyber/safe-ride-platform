@@ -50,19 +50,45 @@ class _ConnParentLinks:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def students_with_email(self, email: str) -> list[Any]:
+    def signup_matches(self, email: str) -> list[dict]:
+        """Every student carrying ``email`` in a parent slot, ACROSS schools,
+        via migration 013's SECURITY DEFINER ``parent_signup_matches`` — the
+        one sanctioned platform-wide scan (it must keep working under RLS,
+        where a plain table read would silently see nothing). The probe makes
+        a missing function a loud failure, never an empty match list.
+        """
+        probe = self._conn.execute(
+            "select to_regprocedure('parent_signup_matches(text)') as fn"
+        ).fetchone()
+        if probe["fn"] is None:
+            raise RuntimeError(
+                "parent_signup_matches(text) is missing (migration 013): "
+                "signup matching must not silently degrade to zero matches"
+            )
         rows = self._conn.execute(
-            "select id from live_students "
-            "where lower(parent_email) = lower(%s) or lower(parent2_email) = lower(%s)",
-            (email, email),
+            "select * from parent_signup_matches(%s)", (email,)
         ).fetchall()
-        return [r["id"] for r in rows]
+        return [dict(r) for r in rows]
 
-    def add_link(self, parent_id, student_id) -> None:
+    def has_accepted_at_school(self, parent_id, school_id) -> bool:
+        # The R31 acceptance rule's key: only an ACCEPTED link at THIS school
+        # lets a new link skip the pending handshake.
+        row = self._conn.execute(
+            "select 1 from live_parent_students "
+            "where parent_id = %s and school_id = %s and status = 'accepted' limit 1",
+            (parent_id, school_id),
+        ).fetchone()
+        return bool(row)
+
+    def add_link(self, parent_id, student_id, school_id, status: str) -> None:
+        # Every link row is stamped with the child's school (R31); a pending
+        # link records when it was offered so the parent's card can say so.
         self._conn.execute(
-            "insert into live_parent_students (parent_id, student_id) values (%s, %s) "
+            "insert into live_parent_students "
+            "    (parent_id, student_id, school_id, status, offered_at) "
+            "values (%s, %s, %s, %s, case when %s = 'pending' then now() end) "
             "on conflict (parent_id, student_id) do nothing",
-            (parent_id, student_id),
+            (parent_id, student_id, school_id, status, status),
         )
 
     def remove_link(self, link_id) -> None:
@@ -81,19 +107,26 @@ def _slot_emails(emails) -> list[str]:
     return slots
 
 
-def sync_parent_links(db, student_id, emails, old_emails=None) -> int:
-    """Reconcile ``live_parent_students`` with a student's parent email slots (R11).
+def sync_parent_links(db, student_id, emails, old_emails=None, *, school_id) -> int:
+    """Reconcile ``live_parent_students`` with a student's parent email slots
+    (R11, R31).
 
     ``db`` is a live connection or a ``_ConnParentLinks``-shaped store.
     ``emails`` is the slot-ordered ``(parent_email, parent2_email)`` pair after
-    the write; ``old_emails`` the pair before it (``None`` on create). Links
-    are upserted for parent-role accounts whose email matches either slot
-    case-insensitively. Pruning is per-slot: a link is removed only when its
+    the write; ``old_emails`` the pair before it (``None`` on create);
+    ``school_id`` the child's school — every link row is stamped with it.
+    Links are created for parent-role accounts whose email matches either slot
+    case-insensitively: ``accepted`` when the account already has an ACCEPTED
+    child at THIS school (the family is known here), else ``pending`` — the
+    parent must confirm a school they have never accepted before it may see
+    them (U11/R31). Pruning is per-slot: a link is removed only when its
     account email matched a slot value that was REMOVED in this write — an
     unrelated edit, or an edit to the other slot, must never sever a link,
     and a drifted link (account email renamed after linking, matching no old
-    slot) is never pruned. The student never exceeds ``MAX_PARENT_LINKS``;
-    when accounts compete for the last seat, slot order wins.
+    slot) is never pruned. The student never exceeds ``MAX_PARENT_LINKS``
+    counting accepted AND pending rows; when accounts compete for the last
+    seat, slot order wins. A previously declined email has no row left, so
+    re-entering it simply creates a fresh pending link.
 
     Returns the number of links created.
     """
@@ -115,24 +148,47 @@ def sync_parent_links(db, student_id, emails, old_emails=None) -> int:
             break
         account_id = store.parent_account_id(email)
         if account_id is not None and account_id not in linked_ids:
-            store.add_link(account_id, student_id)
+            status = (
+                "accepted"
+                if store.has_accepted_at_school(account_id, school_id)
+                else "pending"
+            )
+            store.add_link(account_id, student_id, school_id, status)
             linked_ids.add(account_id)
             created += 1
     return created
 
 
-def link_account_to_matching_students(store, parent_id, email: str) -> int:
-    """Signup-side of R11: link a fresh parent account to every student whose
-    email slots carry its email, honouring the per-student link cap.
+def link_account_to_matching_students(store, parent_id, email: str) -> list[dict]:
+    """Signup-side of R11/R31: link a fresh parent account to every student
+    whose email slots carry its email, honouring the per-student link cap.
 
-    Returns the number of links created.
+    Matches come from ``store.signup_matches`` (the platform-wide
+    ``parent_signup_matches`` scan) and are grouped by school: exactly ONE
+    school → every link ``accepted`` (the single-school signup keeps its
+    immediate auto-link); MORE than one school → every link ``pending`` (a
+    self-asserted email must not fan a fresh account across schools without
+    the parent confirming each); zero → nothing.
+
+    Returns the created links as ``{student_id, school_id, status}`` dicts so
+    the caller can raise its per-school signup incidents.
     """
-    created = 0
-    for student_id in store.students_with_email(email):
+    matches = store.signup_matches(email)
+    if not matches:
+        return []
+    schools = {match["school_id"] for match in matches}
+    status = "accepted" if len(schools) == 1 else "pending"
+    created: list[dict] = []
+    for match in matches:
+        student_id = match["student_id"]
         links = store.student_links(student_id)
         if len(links) < MAX_PARENT_LINKS and parent_id not in {l["parent_id"] for l in links}:
-            store.add_link(parent_id, student_id)
-            created += 1
+            store.add_link(parent_id, student_id, match["school_id"], status)
+            created.append({
+                "student_id": student_id,
+                "school_id": match["school_id"],
+                "status": status,
+            })
     return created
 
 
@@ -310,7 +366,10 @@ class StudentLiveDao:
             stops_recalculated = _sync_routes(
                 conn, row["id"], route_ids, school_id=scope.school_id
             )
-            sync_parent_links(conn, row["id"], (data.get("parent_email"), data.get("parent2_email")))
+            sync_parent_links(
+                conn, row["id"], (data.get("parent_email"), data.get("parent2_email")),
+                school_id=scope.school_id,
+            )
             record_audit(
                 conn, action="student-created", actor=actor, scope=scope,
                 resource_type="student", resource_id=row["id"], detail={},
@@ -363,6 +422,7 @@ class StudentLiveDao:
                     student_id,
                     (data.get("parent_email"), data.get("parent2_email")),
                     old_emails=(before["parent_email"], before["parent2_email"]) if before else None,
+                    school_id=scope.school_id,
                 )
                 record_audit(
                     conn, action="student-updated", actor=actor, scope=scope,
@@ -440,7 +500,8 @@ class StudentLiveDao:
                 data,
             ).fetchone()
             assignments = sync_parent_links(
-                conn, row["id"], (data.get("parent_email"), data.get("parent2_email"))
+                conn, row["id"], (data.get("parent_email"), data.get("parent2_email")),
+                school_id=scope.school_id,
             )
         return {"id": row["id"], "parent_links": assignments}
 
@@ -540,6 +601,7 @@ class StudentLiveDao:
                 conn, student_id,
                 (data.get("parent_email"), data.get("parent2_email")),
                 old_emails=(before["parent_email"], before["parent2_email"]),
+                school_id=scope.school_id,
             )
             route_ids = [
                 str(r["route_id"])
