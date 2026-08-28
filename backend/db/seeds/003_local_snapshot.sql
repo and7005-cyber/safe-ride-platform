@@ -528,8 +528,8 @@ INSERT INTO public.app_user_roles (user_id, role) VALUES
   ('a0000000-0000-0000-0000-000000000015', 'driver')
 ON CONFLICT (user_id) DO NOTHING;
 
-INSERT INTO public.live_buses (id, name, plate_number, driver_id, driver_name, driver_phone, capacity, status)
-VALUES ('146a0000-0000-0000-0000-00000000000b', 'IT Bus B', 'KDB 002B', 'a0000000-0000-0000-0000-000000000015', 'Dan Wekesa', '+254700000015', 30, 'idle')
+INSERT INTO public.live_buses (id, name, plate_number, driver_id, driver_name, driver_phone, capacity, status, school_id)
+VALUES ('146a0000-0000-0000-0000-00000000000b', 'IT Bus B', 'KDB 002B', 'a0000000-0000-0000-0000-000000000015', 'Dan Wekesa', '+254700000015', 30, 'idle', '5cae0000-0000-0000-0000-000000000002')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO public.live_routes (id, name, type, bus_id, school_id)
