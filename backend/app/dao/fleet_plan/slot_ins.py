@@ -229,9 +229,10 @@ class SlotInOps:
                     (leg, sid),
                 )
                 conn.execute(
-                    "insert into live_student_routes (student_id, route_id) "
-                    "values (%s, %s) on conflict (student_id, route_id) do nothing",
-                    (sid, str(route["id"])),
+                    "insert into live_student_routes (student_id, route_id, school_id) "
+                    "values (%s, %s, (select school_id from live_routes where id = %s)) "
+                    "on conflict (student_id, route_id) do nothing",
+                    (sid, str(route["id"]), str(route["id"])),
                 )
                 result = self._materialize_slot_in(conn, route, info, dict(student))
                 degraded_any = degraded_any or result["degraded"]

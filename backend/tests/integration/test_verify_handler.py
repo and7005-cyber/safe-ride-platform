@@ -94,8 +94,8 @@ def test_baseline_and_post_apply_are_graceful_for_any_school(verify):
     # operator compares observations against the checklist.
     with psycopg.connect(DSN, autocommit=True) as conn:
         school_id = conn.execute(
-            "insert into live_schools (name, lat, lng) "
-            "values ('IT VerifySchool', -1.3, 36.8) returning id"
+            "insert into live_schools (name, lat, lng, code) "
+            "values ('IT VerifySchool', -1.3, 36.8, 'IT-VFY') returning id"
         ).fetchone()[0]
     try:
         for checks in ("baseline", "post-apply"):

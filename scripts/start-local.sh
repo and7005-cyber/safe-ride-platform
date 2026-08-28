@@ -179,6 +179,12 @@ apply_migration_and_seed() {
   create_app_role
   apply_migrations
   apply_seed
+  # U14: 015's data-dependent steps defer themselves on an empty database;
+  # the post-seed second pass arms the constraints and row security
+  # (double-apply is a designed no-op).
+  echo "Re-applying 015 post-seed (constraints + row security)..."
+  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 < "$MIGRATIONS_DIR/015_tenancy_constraints_rls.sql"
 }
 
 start_frontend() {

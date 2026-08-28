@@ -242,13 +242,15 @@ def _seed_baseline(student_id: str, leg: str, *, name, lat, lng, time, bus_id=No
     with psycopg.connect(DSN, autocommit=True) as pg:
         pg.execute(
             "insert into live_communicated_stops "
-            "(student_id, route_type, stop_name, stop_lat, stop_lng, scheduled_time, bus_id) "
-            "values (%s, %s, %s, %s, %s, %s, %s) "
+            "(student_id, route_type, stop_name, stop_lat, stop_lng, scheduled_time, bus_id, "
+            "school_id) "
+            "values (%s, %s, %s, %s, %s, %s, %s, "
+            "(select school_id from live_students where id = %s)) "
             "on conflict (student_id, route_type) do update set "
             "stop_name = excluded.stop_name, stop_lat = excluded.stop_lat, "
             "stop_lng = excluded.stop_lng, scheduled_time = excluded.scheduled_time, "
-            "bus_id = excluded.bus_id",
-            (student_id, leg, name, lat, lng, time, bus_id),
+            "bus_id = excluded.bus_id, school_id = excluded.school_id",
+            (student_id, leg, name, lat, lng, time, bus_id, student_id),
         )
 
 

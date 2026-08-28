@@ -222,10 +222,12 @@ class AbsenceDao:
                       and absence_date = (now() at time zone 'Africa/Nairobi')::date
                 )
                 insert into live_student_absences as a
-                    (student_id, absence_date, reason, marked_by, scope, source)
+                    (student_id, absence_date, reason, marked_by, scope, source,
+                     school_id)
                 values (
                     %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
-                    %(reason)s, %(actor)s, %(scope)s, 'parent'
+                    %(reason)s, %(actor)s, %(scope)s, 'parent',
+                    (select school_id from live_students where id = %(student_id)s)
                 )
                 on conflict (student_id, absence_date) do update
                     set scope = case

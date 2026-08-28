@@ -440,9 +440,10 @@ class ApplyRestoreOps:
                 for stop in info["stops"]:
                     for s in stop["students"]:
                         conn.execute(
-                            "insert into live_student_routes (student_id, route_id) "
-                            "values (%s, %s) on conflict (student_id, route_id) do nothing",
-                            (str(s["id"]), rid),
+                            "insert into live_student_routes (student_id, route_id, school_id) "
+                            "values (%s, %s, (select school_id from live_routes where id = %s)) "
+                            "on conflict (student_id, route_id) do nothing",
+                            (str(s["id"]), rid, rid),
                         )
 
             # (7) Materialize stops from the document: student-linked rows in
@@ -1174,9 +1175,10 @@ class ApplyRestoreOps:
                 for s in item["route"].get("students") or []:
                     if str(s["id"]) in current_ids:
                         conn.execute(
-                            "insert into live_student_routes (student_id, route_id) "
-                            "values (%s, %s) on conflict (student_id, route_id) do nothing",
-                            (str(s["id"]), rid),
+                            "insert into live_student_routes (student_id, route_id, school_id) "
+                            "values (%s, %s, (select school_id from live_routes where id = %s)) "
+                            "on conflict (student_id, route_id) do nothing",
+                            (str(s["id"]), rid, rid),
                         )
 
             # (7) Materialize stops VERBATIM from the captured rows — names,

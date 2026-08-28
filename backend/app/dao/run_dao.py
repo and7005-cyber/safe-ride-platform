@@ -649,10 +649,10 @@ class RunDao:
             ).fetchone()
             for s in kept:
                 conn.execute(
-                    "insert into run_stops (run_id, stop_order, name, scheduled_time, lat, lng, is_school_gate, student_id) "
-                    "values (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    "insert into run_stops (run_id, stop_order, name, scheduled_time, lat, lng, is_school_gate, student_id, school_id) "
+                    "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (run["id"], order_map[s["stop_order"]], s["name"], s["scheduled_time"], s["lat"],
-                     s["lng"], s["is_school_gate"], s["student_id"]),
+                     s["lng"], s["is_school_gate"], s["student_id"], route["school_id"]),
                 )
             # Both run types operate on the RUN's roster (the run_stops student
             # set) — never the derived live_students.bus_id (see KTDs).

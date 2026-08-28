@@ -121,11 +121,14 @@ class AuthDao:
                           and ss.ended_at is null
                           and ss.started_at > now() - interval '4 hours'
                        ) as support_session,
-                       (select coalesce(array_agg(distinct st.school_id::text), '{{}}')
+                       -- From the link rows' own stamp, never a live_students
+                       -- join: scope derivation runs on a GUC-less connection,
+                       -- and under RLS (015) a student join would see nothing —
+                       -- the access key cannot depend on tables it unlocks.
+                       (select coalesce(array_agg(distinct ps.school_id::text), '{{}}')
                         from live_parent_students ps
-                        join live_students st on st.id = ps.student_id
                         where ps.parent_id = u.id and ps.status = 'accepted'
-                          and st.school_id is not null
+                          and ps.school_id is not null
                        ) as parent_school_ids
                 from auth_sessions s
                 join app_users u on u.id = s.user_id

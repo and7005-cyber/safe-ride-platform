@@ -271,9 +271,10 @@ def _sync_routes(conn, student_id: str, route_ids: list[str], school_id: str | N
             affected.add(route_id)
     for route_id in wanted - set(existing_by_route):
         conn.execute(
-            "insert into live_student_routes (student_id, route_id) values (%s, %s) "
+            "insert into live_student_routes (student_id, route_id, school_id) "
+            "values (%s, %s, (select school_id from live_routes where id = %s)) "
             "on conflict (student_id, route_id) do nothing",
-            (student_id, route_id),
+            (student_id, route_id, route_id),
         )
         added.add(route_id)
         affected.add(route_id)

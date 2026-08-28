@@ -7,6 +7,7 @@ its docstring.
 """
 
 import os
+import uuid
 
 import psycopg
 
@@ -118,8 +119,9 @@ def temp_school(
     with psycopg.connect(DSN, autocommit=True) as pg:
         school_id = str(
             pg.execute(
-                "insert into live_schools (name, lat, lng) values (%s, %s, %s) returning id",
-                (name, lat, lng),
+                "insert into live_schools (name, lat, lng, code) "
+                "values (%s, %s, %s, %s) returning id",
+                (name, lat, lng, f"IT-{uuid.uuid4().hex[:6].upper()}"),
             ).fetchone()[0]
         )
         user_id = str(
@@ -208,9 +210,9 @@ def school_sandbox(
     with psycopg.connect(DSN, autocommit=True) as pg:
         school_id = str(
             pg.execute(
-                "insert into live_schools (name, lat, lng, morning_bell, afternoon_bell) "
-                "values (%s, %s, %s, %s, %s) returning id",
-                (name, lat, lng, morning_bell, afternoon_bell),
+                "insert into live_schools (name, lat, lng, morning_bell, afternoon_bell, code) "
+                "values (%s, %s, %s, %s, %s, %s) returning id",
+                (name, lat, lng, morning_bell, afternoon_bell, f"IT-{marker.upper()}"),
             ).fetchone()[0]
         )
         admin_id = str(

@@ -112,6 +112,14 @@ for migration_path in "$MIGRATIONS_DIR"/*.sql; do
 done
 
 
+# Tenancy (U14): migration 015's constraints and RLS need seeded data, but the
+# local order applies migrations before seeds — its empty-DB guard defers every
+# data-dependent step to this second pass (double-apply is a designed no-op,
+# and by now the local marker table exists so the demo admin stays alive).
+echo "Re-applying 015 post-seed (constraints + row security)..."
+docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v ON_ERROR_STOP=1 < "$MIGRATIONS_DIR/015_tenancy_constraints_rls.sql"
+
 # Tenancy (U1): post-seed integrity assertions. Activate once the data move has
 # run locally (the seed tail stamps scopes after migration 014 exists); until
 # then they are a no-op. Extended by U14 with orphan and RLS checks.
@@ -131,6 +139,20 @@ begin
         raise exception 'post-seed: % % rows with NULL school_id', n, t;
       end if;
     end loop;
+    -- U14: the second 015 pass must have armed row security everywhere...
+    select count(*) into n from pg_class c
+    where c.relrowsecurity and c.relname in (
+      'live_buses','live_routes','live_students','live_runs','live_fleet_plans',
+      'live_incidents','live_student_absences','live_communicated_stops',
+      'live_student_routes','live_route_stops','run_stops','run_absences',
+      'run_participation','live_admin_audit');
+    if n <> 14 then
+      raise exception 'post-seed: row security enabled on % tables, expected 14', n;
+    end if;
+    -- ...and the runtime role must hold its grants.
+    if not has_table_privilege('saferide_app', 'public.live_students', 'select') then
+      raise exception 'post-seed: saferide_app is missing table grants';
+    end if;
   end if;
 end
 $$;

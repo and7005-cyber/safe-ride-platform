@@ -23,6 +23,10 @@ services:
       # run's account churn fits a single budget window. Production keeps the
       # default multiplier of 1; per-account and PIN budgets never scale.
       AUTH_IP_RATE_MULTIPLIER: "20"
+      # U14/Release 5: the API runs under the LOGIN NOBYPASSRLS runtime role,
+      # so migration 015's policies bind every query. Migrations and seeds
+      # keep using the master role (the reset/start scripts).
+      DATABASE_URL: postgresql://saferide_app:${DB_APP_PASSWORD:-saferide}@db:5432/saferide
     ports:
       - "9001:9001"
     command: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port \"$${API_PORT:-9001}\""]

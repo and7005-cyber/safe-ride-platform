@@ -294,9 +294,11 @@ def test_completed_run_delete_is_director_only_and_refusals_stand(client):
                                 date_sql="current_date")
         with db() as conn:
             conn.execute(
-                "insert into run_participation (run_id, student_id, student_name, boarded_at) "
-                "values (%s, %s, 'IT U7 Evidence', now())",
-                (evidence_run, STUDENT_A_FAITH_ID),
+                "insert into run_participation (run_id, student_id, student_name, boarded_at, "
+                "school_id) "
+                "values (%s, %s, 'IT U7 Evidence', now(), "
+                "(select school_id from live_runs where id = %s))",
+                (evidence_run, STUDENT_A_FAITH_ID, evidence_run),
             )
         still_refused = client.delete(
             f"/api/runs/{evidence_run}", headers=hdr(client, DIRECTOR_A, SCHOOL_A_ID)

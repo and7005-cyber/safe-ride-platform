@@ -819,8 +819,9 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         sx = _make_student(client, admin_headers, marker + "2", 0, school2["id"],
                            EAST_HOMES[3], email=px["email"])
         _pg_exec(
-            "insert into live_student_routes (student_id, route_id) values (%s, %s)",
-            (sx["id"], chain_2["id"]),
+            "insert into live_student_routes (student_id, route_id, school_id) "
+            "values (%s, %s, (select school_id from live_routes where id = %s))",
+            (sx["id"], chain_2["id"], chain_2["id"]),
         )
         students.append(sx)
         narrowed = _edit(client, admin_headers, plan["id"], "pattern",

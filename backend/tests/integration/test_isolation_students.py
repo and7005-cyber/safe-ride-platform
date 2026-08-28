@@ -385,9 +385,10 @@ def test_absences_are_scoped_through_the_student(client):
         with db() as conn:
             b_absence_id = str(conn.execute(
                 "insert into live_student_absences "
-                "(student_id, absence_date, scope, source) "
-                "values (%s, %s::date, 'day', 'admin') returning id",
-                (STUDENT_B_ID, date),
+                "(student_id, absence_date, scope, source, school_id) "
+                "values (%s, %s::date, 'day', 'admin', "
+                "(select school_id from live_students where id = %s)) returning id",
+                (STUDENT_B_ID, date, STUDENT_B_ID),
             ).fetchone()["id"])
         listed = client.get(
             "/api/students/absences",
