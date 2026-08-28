@@ -32,6 +32,12 @@ import uuid
 import psycopg
 from psycopg.rows import dict_row
 
+from app.core.tenancy import (
+    GREENFIELD_SCHOOL_ID,
+    SCHOOL_OWNED_TABLES,
+    SEED_DEMO_EMAILS,
+)
+
 # One statement per (label, sql, needs_school) entry. needs_school entries
 # bind the validated school_id once per placeholder occurrence.
 _CHECK_SETS: dict[str, list[tuple[str, str, bool]]] = {
@@ -205,6 +211,103 @@ _CHECK_SETS: dict[str, list[tuple[str, str, bool]]] = {
         ),
     ],
 }
+
+
+# --- Tenancy check sets (U2) -------------------------------------------------
+# Gates for the five tenancy releases (plan Operational Notes). The SQL is
+# generated from app.core.tenancy's canonical table list at authoring time so
+# a table cannot fall out of the checked surface; entries that reference
+# objects an environment does not yet have (pre-013 columns, RLS grants) come
+# back as labeled per-check errors — observations, not crashes.
+
+_CHECK_SETS["tenancy-preflight"] = [
+    (
+        "school-rows",
+        "select id, name, created_at from live_schools order by created_at",
+        False,
+    ),
+    (
+        "users-by-role",
+        "select coalesce(r.role, '(none)') as role, count(*) from app_users u "
+        "left join app_user_roles r on r.user_id = u.id group by 1 order by 1",
+        False,
+    ),
+    ("null-scope-counts", """select 'live_buses' as tbl, count(*) as null_scope from live_buses where school_id is null union all select 'live_routes' as tbl, count(*) as null_scope from live_routes where school_id is null union all select 'live_students' as tbl, count(*) as null_scope from live_students where school_id is null union all select 'live_runs' as tbl, count(*) as null_scope from live_runs where school_id is null""", False),
+    ("school-references", """select 'live_buses' as tbl, school_id::text as school_id, count(*) as row_count from live_buses where school_id is not null group by 1, 2 union all select 'live_routes' as tbl, school_id::text as school_id, count(*) as row_count from live_routes where school_id is not null group by 1, 2 union all select 'live_students' as tbl, school_id::text as school_id, count(*) as row_count from live_students where school_id is not null group by 1, 2 union all select 'live_runs' as tbl, school_id::text as school_id, count(*) as row_count from live_runs where school_id is not null group by 1, 2 union all select 'live_fleet_plans' as tbl, school_id::text as school_id, count(*) as row_count from live_fleet_plans where school_id is not null group by 1, 2 order by 1, 2""", False),
+    (
+        "audit-by-school",
+        "select school_id::text as school_id, count(*) from live_admin_audit "
+        "group by 1 order by 1",
+        False,
+    ),
+    (
+        "demo-identities",
+        "select u.email, u.created_at, "
+        "exists (select 1 from live_buses b where b.driver_id = u.id) as drives_live_bus "
+        "from app_users u where u.email in ('admin@test.com', 'and7005@gmail.com', 'and7005@yahoo.it', 'francis@saferide.test', 'mary@saferide.test') order by u.email",
+        False,
+    ),
+    (
+        "open-runs",
+        "select count(*) as open_runs from live_runs where status <> 'completed'",
+        False,
+    ),
+]
+
+_CHECK_SETS["tenancy-post-move"] = [
+    ("null-scope-counts", """select 'live_buses' as tbl, count(*) as null_scope from live_buses where school_id is null union all select 'live_routes' as tbl, count(*) as null_scope from live_routes where school_id is null union all select 'live_students' as tbl, count(*) as null_scope from live_students where school_id is null union all select 'live_runs' as tbl, count(*) as null_scope from live_runs where school_id is null union all select 'live_fleet_plans' as tbl, count(*) as null_scope from live_fleet_plans where school_id is null union all select 'live_incidents' as tbl, count(*) as null_scope from live_incidents where school_id is null union all select 'live_student_absences' as tbl, count(*) as null_scope from live_student_absences where school_id is null union all select 'live_communicated_stops' as tbl, count(*) as null_scope from live_communicated_stops where school_id is null union all select 'live_student_routes' as tbl, count(*) as null_scope from live_student_routes where school_id is null union all select 'live_route_stops' as tbl, count(*) as null_scope from live_route_stops where school_id is null union all select 'run_stops' as tbl, count(*) as null_scope from run_stops where school_id is null union all select 'run_absences' as tbl, count(*) as null_scope from run_absences where school_id is null union all select 'run_participation' as tbl, count(*) as null_scope from run_participation where school_id is null""", False),
+    ("school-rows", "select id, name, code from live_schools order by name", False),
+    (
+        "greenfield-row",
+        "select count(*) as greenfield_rows from live_schools where id = '5cae0000-0000-0000-0000-000000000001'",
+        False,
+    ),
+    (
+        "memberships",
+        "select role, state, count(*) from school_memberships "
+        "where removed_at is null group by 1, 2 order by 1, 2",
+        False,
+    ),
+    (
+        "providers",
+        "select count(*) as active_providers from provider_accounts where removed_at is null",
+        False,
+    ),
+    (
+        "disabled-identities",
+        "select email, disabled_at is not null as disabled from app_users "
+        "where email in ('admin@test.com', 'and7005@gmail.com', 'and7005@yahoo.it', 'francis@saferide.test', 'mary@saferide.test') order by email",
+        False,
+    ),
+    ("move-log", "select * from tenancy_move_log order by created_at", False),
+]
+
+_CHECK_SETS["tenancy-rls"] = [
+    # Assume the runtime role for the rest of this connection (membership is
+    # granted by the migrate handler's role step; one-statement form because
+    # every entry runs as its own autocommit statement).
+    ("assume-app-role", "select set_config('role', 'saferide_app', false) as role", False),
+    ("current-user", "select current_user, session_user", False),
+    (
+        "rls-enabled",
+        "select relname, relrowsecurity, relforcerowsecurity from pg_class "
+        "where relname in ('live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation') order by relname",
+        False,
+    ),
+    ("no-guc-row-visibility", """select 'live_buses' as tbl, count(*) as visible_rows from live_buses union all select 'live_routes' as tbl, count(*) as visible_rows from live_routes union all select 'live_students' as tbl, count(*) as visible_rows from live_students union all select 'live_runs' as tbl, count(*) as visible_rows from live_runs union all select 'live_fleet_plans' as tbl, count(*) as visible_rows from live_fleet_plans union all select 'live_incidents' as tbl, count(*) as visible_rows from live_incidents union all select 'live_student_absences' as tbl, count(*) as visible_rows from live_student_absences union all select 'live_communicated_stops' as tbl, count(*) as visible_rows from live_communicated_stops union all select 'live_student_routes' as tbl, count(*) as visible_rows from live_student_routes union all select 'live_route_stops' as tbl, count(*) as visible_rows from live_route_stops union all select 'run_stops' as tbl, count(*) as visible_rows from run_stops union all select 'run_absences' as tbl, count(*) as visible_rows from run_absences union all select 'run_participation' as tbl, count(*) as visible_rows from run_participation""", False),
+    (
+        "set-school-guc",
+        "select set_config('saferide.school_ids', %s, false) as school_ids",
+        True,
+    ),
+    ("cross-school-visibility", """select 'live_buses' as tbl, count(*) as foreign_rows from live_buses where school_id::text <> %s union all select 'live_routes' as tbl, count(*) as foreign_rows from live_routes where school_id::text <> %s union all select 'live_students' as tbl, count(*) as foreign_rows from live_students where school_id::text <> %s union all select 'live_runs' as tbl, count(*) as foreign_rows from live_runs where school_id::text <> %s union all select 'live_fleet_plans' as tbl, count(*) as foreign_rows from live_fleet_plans where school_id::text <> %s union all select 'live_incidents' as tbl, count(*) as foreign_rows from live_incidents where school_id::text <> %s union all select 'live_student_absences' as tbl, count(*) as foreign_rows from live_student_absences where school_id::text <> %s union all select 'live_communicated_stops' as tbl, count(*) as foreign_rows from live_communicated_stops where school_id::text <> %s union all select 'live_student_routes' as tbl, count(*) as foreign_rows from live_student_routes where school_id::text <> %s union all select 'live_route_stops' as tbl, count(*) as foreign_rows from live_route_stops where school_id::text <> %s union all select 'run_stops' as tbl, count(*) as foreign_rows from run_stops where school_id::text <> %s union all select 'run_absences' as tbl, count(*) as foreign_rows from run_absences where school_id::text <> %s union all select 'run_participation' as tbl, count(*) as foreign_rows from run_participation where school_id::text <> %s""", True),
+    ("provider-health-fn", "select * from provider_school_health()", False),
+]
+
+# The canonical list and the generated SQL must not drift.
+assert set(SCHOOL_OWNED_TABLES) == {'live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation'}
+assert GREENFIELD_SCHOOL_ID == '5cae0000-0000-0000-0000-000000000001'
+assert set(SEED_DEMO_EMAILS) == {'admin@test.com', 'and7005@gmail.com', 'and7005@yahoo.it', 'francis@saferide.test', 'mary@saferide.test'}
 
 
 def _database_url() -> str:

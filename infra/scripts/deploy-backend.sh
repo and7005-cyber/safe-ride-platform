@@ -25,6 +25,35 @@ ssm_secret() { # name -> value (creates a random one if missing)
 
 DB_PASSWORD="$(ssm_secret /saferide/db-password)"
 PIN_PEPPER="$(ssm_secret /saferide/pin-pepper)"
+DB_APP_PASSWORD_VAL="$(ssm_secret /saferide/db-app-password)"
+
+# Tenancy (U2): the TOTP pepper and the provider bootstrap must PRE-EXIST —
+# never minted here. A silently re-minted pepper would re-enrol every
+# provider's second factor, and a minted bootstrap would insert garbage
+# accounts. Create both with scripts/provider-bootstrap.sh before deploying.
+TOTP_PEPPER_VAL="$(aws ssm get-parameter --name /saferide/totp-pepper --with-decryption \
+  --query Parameter.Value --output text 2>/dev/null || true)"
+if [ -z "$TOTP_PEPPER_VAL" ] || [ "$TOTP_PEPPER_VAL" = "None" ]; then
+  echo "ERROR: SSM /saferide/totp-pepper is missing. Run scripts/provider-bootstrap.sh first." >&2
+  exit 1
+fi
+PROVIDER_BOOTSTRAP_RAW="$(aws ssm get-parameter --name /saferide/provider-bootstrap \
+  --region "$BACKEND_REGION" --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
+if [ -z "$PROVIDER_BOOTSTRAP_RAW" ] || [ "$PROVIDER_BOOTSTRAP_RAW" = "None" ]; then
+  echo "ERROR: SSM /saferide/provider-bootstrap ($BACKEND_REGION) is missing. Run scripts/provider-bootstrap.sh first." >&2
+  exit 1
+fi
+if ! printf '%s' "$PROVIDER_BOOTSTRAP_RAW" | python3 -c "
+import base64, json, sys
+raw = sys.stdin.read().strip()
+if not raw.startswith('{'):
+    raw = base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)).decode()
+data = json.loads(raw)
+assert isinstance(data['version'], int) and data['providers']
+" 2>/dev/null; then
+  echo "ERROR: SSM /saferide/provider-bootstrap is not parseable bootstrap JSON. Re-run scripts/provider-bootstrap.sh." >&2
+  exit 1
+fi
 
 # Google Maps server key: prefer SSM; seed it once from backend/.env when
 # missing (it cannot be auto-generated like the secrets above).
@@ -81,7 +110,7 @@ sam build --use-container
 
 echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_ARN:-<none>})"
 # SAM rejects empty Key= overrides, so only pass the cert ARN when we have one.
-DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}")
+DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAppPassword=${DB_APP_PASSWORD_VAL}" "TotpPepper=${TOTP_PEPPER_VAL}")
 [ -n "$API_CERT_ARN" ] && DEPLOY_PARAMS+=("ApiCertificateArn=${API_CERT_ARN}")
 [ -n "$GOOGLE_MAPS_KEY" ] && DEPLOY_PARAMS+=("GoogleMapsApiKey=${GOOGLE_MAPS_KEY}")
 # Push params: only pass non-empty (SAM rejects empty Key= overrides; the
