@@ -107,7 +107,8 @@ test("coordinator gets no Staff entry, no deletes, and /staff bounces (U12/R8)",
   // NON-completed run (open-run cleanup, AE27) may show one.
   await page.goto("/runs");
   const completedRows = page.getByRole("row").filter({ has: page.getByText("Completed", { exact: true }) });
-  expect(await completedRows.count()).toBeGreaterThan(0);
+  // Auto-waits for the query to land — a bare count() races the page load.
+  await expect(completedRows.first()).toBeVisible();
   await expect(completedRows.first().getByTitle("Delete run")).toHaveCount(0);
 
   // The coordinator still works inside the active school card (no switcher —

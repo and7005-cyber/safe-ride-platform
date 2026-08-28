@@ -114,7 +114,8 @@ test("admin edits the active school's settings (no create or delete, U12/R23)", 
 
   await page.getByTestId("afternoon-bell").fill("16:05");
   await page.getByRole("button", { name: "Save" }).click();
-  await expect(page.getByText("School settings saved")).toBeVisible();
+  // .first(): the toast text also lands in sonner's aria-live announcer.
+  await expect(page.getByText("School settings saved").first()).toBeVisible();
 
   const after = await (await request.get(`${API_URL}/api/fleet/school`, { headers })).json();
   expect(after.afternoon_bell).toBe("16:05");
@@ -571,11 +572,14 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
 
   await page.getByTestId("get-route-options").click();
 
-  // An ordered, enriched route comes back with totals and stops.
+  // An ordered, enriched route comes back with totals and stops. The two
+  // addresses plus the school-gate anchor (U12: the plan is always solved
+  // against the tab's active school, so the gate rides along as a stop).
   await expect(page.getByTestId("route-result")).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("button", { name: "Optimised (traffic-aware)" })).toBeVisible();
   await expect(page.getByTestId("route-distance")).not.toHaveText("—");
-  await expect(page.getByTestId("route-stops").locator("li")).toHaveCount(2);
+  await expect(page.getByTestId("route-stops").locator("li")).toHaveCount(3);
+  await expect(page.getByTestId("route-stops").getByText("School", { exact: true })).toBeVisible();
 
   // Reorder (drag-to-reorder uses the same backend path) recomputes the route.
   await page.getByRole("button", { name: "Move down" }).first().click();
@@ -630,16 +634,16 @@ test("a parent cancellation shows a scoped badge and an office alert without cha
     const row = page.getByRole("row", { name: new RegExp(SEED.parentChild) });
     // Display honesty (R19): a partial cancellation gates that run's roster and
     // never rewrites the displayed day status. The selector pins the status
-    // cell (index 7) — a day-absent student would read "Absent today" in both
-    // the name badge and the status cell, and this assertion must fail for that
-    // shape.
+    // cell (index 6 — the School column left with the single-school console,
+    // U12) — a day-absent student would read "Absent today" in both the name
+    // badge and the status cell, and this assertion must fail for that shape.
     //
     // The undisturbed value is "At home", not "At school": since U3 the status
     // is derived from participation, and a child with none today is simply not
     // in the system's care. "At school" was the raw column's leftover from
     // whenever it was last written, which is the staleness the derivation
     // removed.
-    await expect(row.getByRole("cell").nth(7).getByText("At home")).toBeVisible();
+    await expect(row.getByRole("cell").nth(6).getByText("At home")).toBeVisible();
     // The name cell carries the scope-labelled absence badge (U10).
     await expect(row.getByText("Absent (PM)")).toBeVisible();
     await expect(row.getByText("Absent today")).toHaveCount(0);

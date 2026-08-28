@@ -75,9 +75,10 @@ test("director creates a coordinator: temp password once, forced change, capabil
     await expect(reveal).toHaveCount(0);
 
     // The member row lists the role and an unset "password set on" (they
-    // still hold the temporary password).
+    // still hold the temporary password). Exact match: the name cell ("E2E
+    // Coordinator") contains the same word and would trip strict mode.
     const row = page.getByRole("row").filter({ hasText: email });
-    await expect(row.getByText("Coordinator")).toBeVisible();
+    await expect(row.getByText("Coordinator", { exact: true })).toBeVisible();
     await expect(row).toContainText("—");
 
     // --- First sign-in forces the change screen (AE16) --------------------
@@ -86,7 +87,8 @@ test("director creates a coordinator: temp password once, forced change, capabil
       sessionStorage.removeItem("saferide-school");
     });
     await emailLogin(page, email, tempPassword);
-    await expect(page.getByRole("heading", { name: "Change your password" })).toBeVisible();
+    // The card title (CardTitle renders a div, not a heading, app-wide).
+    await expect(page.getByText("Change your password")).toBeVisible();
 
     // The CURRENT (temporary) password is required even here.
     await page.locator("#current-password").fill(tempPassword);
