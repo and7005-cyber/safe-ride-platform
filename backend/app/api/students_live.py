@@ -8,6 +8,7 @@ from app.core.db import get_connection
 from app.core.errors import BadRequestError, NotFoundError
 from app.core.validation import clean_email, clean_phone
 from app.dao.absence_dao import AbsenceDao
+from app.dao.audit_dao import record_audit
 from app.dao.push_dao import PushDao
 from app.dao.student_live_dao import StudentLiveDao
 from app.services import geo_service
@@ -485,17 +486,14 @@ def _pin_map(school_id: str, actor: dict) -> dict:
                 "state": "placed" if has_pin else "unresolved",
             }
             (placed if has_pin else unresolved).append(pin)
-        conn.execute(
-            "insert into live_admin_audit "
-            "(actor_id, actor_name, actor_email, action, school_id, detail) "
-            "values (%s, %s, %s, 'pin-map-viewed', %s, %s)",
-            (
-                actor.get("id"),
-                actor.get("full_name") or actor.get("email") or "unknown",
-                actor.get("email") or "unknown",
-                school_id,
-                Jsonb({"pin_count": len(placed), "unresolved_count": len(unresolved)}),
-            ),
+        record_audit(
+            conn,
+            action="pin-map-viewed",
+            actor=actor,
+            school_id=school_id,
+            resource_type="school",
+            resource_id=school_id,
+            detail={"pin_count": len(placed), "unresolved_count": len(unresolved)},
         )
     return {"school_id": school_id, "placed": placed, "unresolved": unresolved}
 

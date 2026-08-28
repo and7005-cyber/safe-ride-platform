@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
 from app.dao import participation_dao
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
@@ -257,7 +258,13 @@ class RunDao:
             run = conn.execute(
                 """
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
-                       u.full_name as driver_name
+                       u.full_name as driver_name,
+                       (select case when aa.actor_kind = 'provider' then 'SafeRide'
+                               else aa.actor_name end
+                        from live_admin_audit aa
+                        where aa.action = 'run-force-closed'
+                          and aa.resource_id = r.id::text
+                        order by aa.created_at desc limit 1) as force_closed_by_display
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -856,7 +863,7 @@ class RunDao:
         result["boarded_student_ids"] = boarded_ids
         return result
 
-    def force_close_run(self, admin_id: str, run_id: str) -> dict[str, Any]:
+    def force_close_run(self, actor: dict[str, Any], run_id: str) -> dict[str, Any]:
         """Close a run no driver can resolve (U6/R12-R14).
 
         A driver whose phone dies, whose shift ends, or who simply forgets leaves
@@ -898,10 +905,9 @@ class RunDao:
                 if run["type"] == "afternoon"
                 else participation_dao.count_boarded(conn, str(run_id))
             )
-            # No force_closed_by column: a force-closed run is identifiable by
-            # its unaccounted participation rows, and the office alert records
-            # who did it. Adding two columns for a fact already derivable would
-            # have meant a second migration on a promise of one.
+            # No force_closed_by column: the audit row below records who did it
+            # (U9), and a force-closed run stays identifiable by its
+            # unaccounted participation rows.
             conn.execute(
                 """
                 update live_runs
@@ -918,6 +924,15 @@ class RunDao:
             )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+            record_audit(
+                conn,
+                action="run-force-closed",
+                actor=actor,
+                school_id=str(run["school_id"]) if run.get("school_id") else None,
+                resource_type="run",
+                resource_id=str(run_id),
+                detail={"unaccounted_count": len(outstanding)},
+            )
 
         result = dict(updated)
         # Only children the driver was recorded as observing aboard, and only
@@ -927,6 +942,7 @@ class RunDao:
         result["boarded_student_ids"] = boarded_ids
         result["gate_arrival_recorded"] = gate_reached
         result["unaccounted"] = outstanding
+        result["force_closed_by_display"] = actor_display(actor)
         return result
 
     def record_parent_contact(self, admin_id: str, run_id: str, student_id: str) -> dict[str, Any]:

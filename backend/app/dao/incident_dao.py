@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.dao.audit_dao import actor_display, record_audit
 
 # One sentence shape for every run-lifecycle row: "<where>: <what>. <detail>".
 # The office reads this feed by scanning it, and four new event types arriving
@@ -19,7 +20,18 @@ class IncidentDao:
     def list_incidents(self) -> list[dict[str, Any]]:
         with get_connection() as conn:
             rows = conn.execute(
-                "select * from live_incidents order by created_at desc"
+                """
+                select i.*,
+                       case when i.acknowledged_by is null then null
+                            when p.user_id is not null then 'SafeRide'
+                            else coalesce(u.full_name, u.email) end
+                           as acknowledged_by_display
+                from live_incidents i
+                left join app_users u on u.id = i.acknowledged_by
+                left join provider_accounts p
+                    on p.user_id = i.acknowledged_by and p.removed_at is null
+                order by i.created_at desc
+                """
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -227,14 +239,27 @@ class IncidentDao:
             ).fetchone()
         return dict(row)
 
-    def acknowledge(self, incident_id: str, admin_id: str) -> dict[str, Any] | None:
+    def acknowledge(self, incident_id: str, actor: dict[str, Any]) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(
                 "update live_incidents set acknowledged=true, acknowledged_at=now(), acknowledged_by=%s "
                 "where id=%s returning *",
-                (admin_id, incident_id),
+                (actor.get("id"), incident_id),
             ).fetchone()
-        return dict(row) if row else None
+            if row:
+                record_audit(
+                    conn,
+                    action="incident-acknowledged",
+                    actor=actor,
+                    school_id=str(row["school_id"]) if row.get("school_id") else None,
+                    resource_type="incident",
+                    resource_id=str(incident_id),
+                )
+        if not row:
+            return None
+        result = dict(row)
+        result["acknowledged_by_display"] = actor_display(actor)
+        return result
 
     def delete_incident(self, incident_id: str) -> None:
         with get_connection() as conn:

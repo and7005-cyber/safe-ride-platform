@@ -71,10 +71,17 @@ class AbsenceDao:
             rows = conn.execute(
                 """
                 select a.id, a.student_id, a.absence_date, a.reason, a.created_at,
-                       a.scope, a.source, a.marked_period,
-                       s.name as student_name, s.grade
+                       a.scope, a.source, a.marked_period, a.marked_by,
+                       s.name as student_name, s.grade,
+                       case when a.marked_by is null then null
+                            when p.user_id is not null then 'SafeRide'
+                            else coalesce(u.full_name, u.email) end
+                           as marked_by_display
                 from live_student_absences a
                 join live_students s on s.id = a.student_id
+                left join app_users u on u.id = a.marked_by
+                left join provider_accounts p
+                    on p.user_id = a.marked_by and p.removed_at is null
                 where %s::date is null or a.absence_date = %s::date
                 order by a.absence_date desc, s.name asc
                 """,

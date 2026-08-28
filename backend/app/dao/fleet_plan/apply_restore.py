@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 from psycopg.types.json import Jsonb
 
+from app.dao.audit_dao import record_audit
+
 from app.core.db import get_connection
 from app.core.errors import ConflictError, NotFoundError
 from app.dao.fleet_dao import _depot_leg, _stop_label
@@ -523,19 +525,15 @@ class ApplyRestoreOps:
                 "degraded": bool(plan["degraded"]),
                 "elapsed_ms": int((time.monotonic() - t_start) * 1000),
             }
-            audit = conn.execute(
-                "insert into live_admin_audit "
-                "(actor_id, actor_name, actor_email, action, school_id, detail) "
-                "values (%s, %s, %s, 'plan-applied', %s, %s) returning id",
-                (
-                    actor.get("id"),
-                    actor.get("full_name") or actor.get("email") or "unknown",
-                    actor.get("email") or "unknown",
-                    school_id,
-                    Jsonb(detail),
-                ),
-            ).fetchone()
-            audit_id = str(audit["id"])
+            audit_id = record_audit(
+                conn,
+                action="plan-applied",
+                actor=actor,
+                school_id=school_id,
+                resource_type="plan",
+                resource_id=str(plan["id"]),
+                detail=detail,
+            )
 
             # (10) Feed rows — inserted ON THIS CONNECTION so a rollback takes
             # them too (the shared composer; restore reuses it verbatim).
@@ -1229,19 +1227,15 @@ class ApplyRestoreOps:
                 "degraded": bool(plan["degraded"]),
                 "elapsed_ms": int((time.monotonic() - t_start) * 1000),
             }
-            audit = conn.execute(
-                "insert into live_admin_audit "
-                "(actor_id, actor_name, actor_email, action, school_id, detail) "
-                "values (%s, %s, %s, 'plan-restored', %s, %s) returning id",
-                (
-                    actor.get("id"),
-                    actor.get("full_name") or actor.get("email") or "unknown",
-                    actor.get("email") or "unknown",
-                    school_id,
-                    Jsonb(detail),
-                ),
-            ).fetchone()
-            audit_id = str(audit["id"])
+            audit_id = record_audit(
+                conn,
+                action="plan-restored",
+                actor=actor,
+                school_id=school_id,
+                resource_type="plan",
+                resource_id=str(plan["id"]),
+                detail=detail,
+            )
 
             # (10) Feed rows + baselines through the shared writers, on THIS
             # connection — one atom with everything above. Per-child address

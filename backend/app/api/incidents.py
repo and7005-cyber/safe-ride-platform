@@ -62,7 +62,7 @@ def report_incident(
 
 @router.post("/{incident_id}/acknowledge")
 def acknowledge(incident_id: str, user: dict = Depends(admin_only)):
-    return safe_call(lambda: dao.acknowledge(incident_id, user["id"]))
+    return safe_call(lambda: dao.acknowledge(incident_id, user))
 
 
 @router.delete("/{incident_id}")

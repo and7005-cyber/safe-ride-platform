@@ -111,7 +111,7 @@ def force_close_run(
     evidence to notify on. notify_run_ended then sends to exactly that set,
     so there is one decision point rather than two that can disagree.
     """
-    result = safe_call(lambda: dao.force_close_run(user["id"], run_id))
+    result = safe_call(lambda: dao.force_close_run(user, run_id))
     background_tasks.add_task(push_service.notify_run_ended, result)
     outstanding = [c["student_name"] for c in result.get("unaccounted") or []]
     background_tasks.add_task(
