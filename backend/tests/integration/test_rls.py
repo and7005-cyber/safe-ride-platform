@@ -267,3 +267,21 @@ def test_migration_015_double_applies_cleanly():
         assert result.status in (
             ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
         ), result.error_message.decode()
+
+
+def test_record_audit_survives_a_guc_less_provider_write():
+    """Regression: INSERT..RETURNING read-back was refused by the SELECT
+    policy on GUC-less connections — record_audit must mint its id client-side
+    and succeed for provider-kind rows exactly as the split policy intends."""
+    from app.dao.audit_dao import record_audit
+
+    with app_conn() as conn:
+        arm(conn)  # deliberately no school
+        audit_id = record_audit(
+            conn,
+            action="provider-step-out",
+            actor={"id": None, "full_name": "IT RLS Probe",
+                   "provider": {"totp_enrolled": True}},
+        )
+        assert uuid.UUID(audit_id)
+        conn.rollback()

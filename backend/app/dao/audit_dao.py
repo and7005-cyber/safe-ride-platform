@@ -17,6 +17,7 @@ provider rows out entirely, the provider-side reader (U10) sees everything.
 details (names, addresses); counts and ids only.
 """
 
+import uuid
 from typing import Any
 
 from psycopg import Connection
@@ -109,15 +110,20 @@ def record_audit(
             support_session_id = actor["support_session"]["id"]
 
     actor = actor or {}
-    row = conn.execute(
+    # The id is minted client-side, NOT via RETURNING: PostgreSQL applies the
+    # table's SELECT policy to INSERT..RETURNING rows, so a read-back would
+    # 42501 on any connection whose GUC does not cover the row's school —
+    # exactly the GUC-less provider writes the split policy admits on purpose.
+    audit_id = str(uuid.uuid4())
+    conn.execute(
         """
         insert into live_admin_audit
-            (actor_id, actor_name, actor_email, actor_kind, support_session_id,
+            (id, actor_id, actor_name, actor_email, actor_kind, support_session_id,
              action, school_id, resource_type, resource_id, detail)
-        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        returning id
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
+            audit_id,
             actor.get("id"),
             actor.get("full_name") or actor.get("email") or "unknown",
             actor.get("email") or "unknown",
@@ -129,5 +135,5 @@ def record_audit(
             str(resource_id) if resource_id is not None else None,
             Jsonb(detail or {}),
         ),
-    ).fetchone()
-    return str(row["id"])
+    )
+    return audit_id

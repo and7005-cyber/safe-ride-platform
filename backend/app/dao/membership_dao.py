@@ -353,6 +353,13 @@ class MembershipDao:
             ).fetchone()
             if not row:
                 raise NotFoundError("Offer not found")
+            # Staff-kind audit rows must land inside an armed school GUC
+            # (migration 015's split policy) — arm it from the offer's own
+            # school; transaction-local, so nothing leaks past this call.
+            conn.execute(
+                "select set_config('saferide.school_ids', %s, true)",
+                (str(row["school_id"]),),
+            )
             record_audit(
                 conn, action="staff-offer-accepted", actor=actor,
                 school_id=str(row["school_id"]),
@@ -375,6 +382,13 @@ class MembershipDao:
             ).fetchone()
             if not row:
                 raise NotFoundError("Offer not found")
+            # Staff-kind audit rows must land inside an armed school GUC
+            # (migration 015's split policy) — arm it from the offer's own
+            # school; transaction-local, so nothing leaks past this call.
+            conn.execute(
+                "select set_config('saferide.school_ids', %s, true)",
+                (str(row["school_id"]),),
+            )
             record_audit(
                 conn, action="staff-offer-declined", actor=actor,
                 school_id=str(row["school_id"]),

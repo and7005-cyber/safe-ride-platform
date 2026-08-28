@@ -82,6 +82,13 @@ test("offer → accept → choose → switch: two schools stay isolated on scree
   await expect(offerCard).toContainText("Derek Director");
   await offerCard.getByRole("button", { name: "Accept" }).click();
 
+  // Accepting does not interrupt the tab that already has an active school
+  // (the sign-in auto-selected the only membership); the chooser interstitial
+  // is for a session with several memberships and NO active school — a fresh
+  // sign-in (which clears the tab store) is exactly that state.
+  await expect(page.getByTestId("active-school-card")).toBeVisible();
+  await signInAs(page, DIRECTOR_A);
+
   // --- Two memberships, no school in this tab: the chooser lands ----------
   const chooseA = page.getByTestId(`choose-school-${SCHOOL_A_ID}`);
   const chooseB = page.getByTestId(`choose-school-${SCHOOL_B_ID}`);

@@ -57,7 +57,7 @@ export function PlanFleetStep({
       setFleetNotices(res.notices ?? []);
       await qc.invalidateQueries({ queryKey: schoolKey("buses") });
       toast({
-        title: `Fleet confirmed — ${res.buses.length} bus${res.buses.length === 1 ? "" : "es"} claimed`,
+        title: `Fleet confirmed — ${res.buses.length} bus${res.buses.length === 1 ? "" : "es"} selected`,
       });
       onConfirmed();
     } catch (err) {
@@ -84,9 +84,9 @@ export function PlanFleetStep({
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          Tick every bus this school's plan may use. A claimed bus is
-          unavailable to other schools; deselected buses are released
-          unless they carry this school's applied plan routes.
+          Tick every bus this school's plan may use. Buses belong to this
+          school alone, so selecting them here only shapes the plan —
+          deselected buses stay available for your other routes.
         </p>
         {busList.length === 0 ? (
           <p className="text-sm text-muted-foreground">

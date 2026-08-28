@@ -1053,3 +1053,51 @@ def test_provider_and_disabled_emails_never_auto_link_as_parents(client):
             )
         purge_audit(*student_ids)
         purge_accounts(disabled_id, control_id, provider_parent_id)
+
+
+def test_offer_accept_end_to_end_on_the_live_stack():
+    """Regression (found by e2e under RLS): the offer-accept audit is a
+    staff-kind row written on the auth surface, which needs the offer's own
+    school armed on the connection — before the fix the whole accept rolled
+    back with 42501 and no staff offer could ever be accepted. Runs over the
+    LIVE api container (the in-process suites run as the master role, where
+    row security never binds)."""
+    import httpx
+
+    from conftest import API_URL, COORDINATOR_A, DIRECTOR_B, SCHOOL_B_ID, TEST_PASSWORD
+
+    with httpx.Client(base_url=API_URL, timeout=30) as live:
+        director = live.post(
+            "/api/auth/login",
+            json={"email": DIRECTOR_B, "password": TEST_PASSWORD},
+        ).json()["token"]
+        d_hdr = {"Authorization": f"Bearer {director}", "X-School-Id": SCHOOL_B_ID}
+        offered = live.post(
+            "/api/staff", json={"email": COORDINATOR_A, "role": "coordinator"},
+            headers=d_hdr,
+        )
+        assert offered.status_code == 200, offered.text
+        assert offered.json()["status"] == "offered"
+
+        coordinator = live.post(
+            "/api/auth/login",
+            json={"email": COORDINATOR_A, "password": TEST_PASSWORD},
+        ).json()["token"]
+        c_hdr = {"Authorization": f"Bearer {coordinator}"}
+        try:
+            me = live.get("/api/auth/me", headers=c_hdr).json()
+            offer = next(
+                o for o in me["pendingOffers"] if o["schoolId"] == SCHOOL_B_ID
+            )
+            accepted = live.post(
+                f"/api/auth/offers/{offer['id']}/accept", headers=c_hdr
+            )
+            assert accepted.status_code == 200, accepted.text
+            me = live.get("/api/auth/me", headers=c_hdr).json()
+            assert SCHOOL_B_ID in [m["schoolId"] for m in me["memberships"]]
+        finally:
+            coordinator_id = str(user_id_of(COORDINATOR_A))
+            removed = live.delete(
+                f"/api/staff/{coordinator_id}", headers=d_hdr
+            )
+            assert removed.status_code in (204, 404), removed.text

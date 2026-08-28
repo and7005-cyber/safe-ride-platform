@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -25,6 +26,8 @@ from app.schemas.auth import (
 )
 from app.services.auth_service import AuthService
 from app.services.provider_service import AuthCodeError, ProviderService
+
+_scope_logger = logging.getLogger("saferide.scope")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 service = AuthService()
@@ -79,6 +82,16 @@ def map_error(error: Exception) -> HTTPException:
         return to_http_exception(error)
     if isinstance(error, PsycopgError) and error.sqlstate == "23505":
         return HTTPException(status_code=409, detail="Record already exists")
+    if isinstance(error, PsycopgError) and error.sqlstate == "42501":
+        # Same contract as api/_helpers.map_error: a row-security denial is a
+        # scope bug — log loudly, answer with not-found.
+        diag = getattr(error, "diag", None)
+        _scope_logger.error(
+            "row-security denial sqlstate=42501 table=%s message=%s",
+            getattr(diag, "table_name", None),
+            getattr(diag, "message_primary", None),
+        )
+        return HTTPException(status_code=404, detail="Not found")
     return HTTPException(status_code=500, detail="Unexpected backend error")
 
 
