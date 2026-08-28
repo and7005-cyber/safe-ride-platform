@@ -102,6 +102,22 @@ wait_for_http() {
   done
 }
 
+create_app_role() {
+  # Tenancy (U1): keep the local runtime role in sync (see reset-local-db.sh).
+  local pw="${DB_APP_PASSWORD:-saferide}"
+  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 <<SQL
+do \$\$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'saferide_app') then
+    execute format('create role saferide_app login nobypassrls password %L', '${pw}');
+  else
+    execute format('alter role saferide_app with login nobypassrls password %L', '${pw}');
+  end if;
+end
+\$\$;
+SQL
+}
+
 apply_migrations() {
   if [ ! -d "$MIGRATIONS_DIR" ]; then
     echo "Cannot initialize local database: migrations directory is missing at $MIGRATIONS_DIR." >&2
@@ -160,6 +176,7 @@ apply_seed() {
 }
 
 apply_migration_and_seed() {
+  create_app_role
   apply_migrations
   apply_seed
 }

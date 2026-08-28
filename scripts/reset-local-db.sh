@@ -53,6 +53,23 @@ drop schema public cascade;
 create schema public;
 SQL
 
+
+# Tenancy (U1): the runtime application role exists locally before migrations,
+# so migration 013's grants apply and (from U14) the API can run as a
+# non-owner role that row-level security actually binds.
+DB_APP_PASSWORD="${DB_APP_PASSWORD:-saferide}"
+docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 <<SQL
+do \$\$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'saferide_app') then
+    execute format('create role saferide_app login nobypassrls password %L', '${DB_APP_PASSWORD}');
+  else
+    execute format('alter role saferide_app with login nobypassrls password %L', '${DB_APP_PASSWORD}');
+  end if;
+end
+\$\$;
+SQL
+
 for migration_path in "$MIGRATIONS_DIR"/*.sql; do
   if [ ! -f "$migration_path" ]; then
     echo "No migration files found in $MIGRATIONS_DIR." >&2
@@ -93,5 +110,30 @@ for migration_path in "$MIGRATIONS_DIR"/*.sql; do
   docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
     "insert into ${MIGRATION_MARKER_TABLE} (id) values ('${migration_id}') on conflict (id) do nothing;"
 done
+
+
+# Tenancy (U1): post-seed integrity assertions. Activate once the data move has
+# run locally (the seed tail stamps scopes after migration 014 exists); until
+# then they are a no-op. Extended by U14 with orphan and RLS checks.
+echo "Running post-seed integrity assertions..."
+docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 <<'SQL'
+do $$
+declare moved boolean := false; n bigint; t text;
+begin
+  -- Table references resolve at parse time, so the move-log probe is dynamic.
+  if to_regclass('public.tenancy_move_log') is not null then
+    execute 'select exists (select 1 from public.tenancy_move_log)' into moved;
+  end if;
+  if moved then
+    foreach t in array array['live_students', 'live_buses', 'live_routes'] loop
+      execute format('select count(*) from public.%I where school_id is null', t) into n;
+      if n > 0 then
+        raise exception 'post-seed: % % rows with NULL school_id', n, t;
+      end if;
+    end loop;
+  end if;
+end
+$$;
+SQL
 
 echo "Local SafeRide database reset and seeded."

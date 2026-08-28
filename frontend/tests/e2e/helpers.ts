@@ -12,6 +12,22 @@ export const ADMIN = { email: "admin@test.com", password: "test1234." };
 export const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
 export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "0322" };
 
+// Tenancy identities (U1): seeded staff/provider accounts for the
+// multi-tenant suites (backend/db/seeds/003_local_snapshot.sql tail).
+export const DIRECTOR_A = { email: "director.a@saferide.test", password: "Test1234" };
+export const COORDINATOR_A = { email: "coordinator.a@saferide.test", password: "Test1234" };
+export const DIRECTOR_B = { email: "director.b@saferide.test", password: "Test1234" };
+export const PROVIDER = { email: "provider@kuumbai.test", password: "Test1234" };
+export const DRIVER_B = { email: "driver.b@saferide.test", password: "Test1234", pin: "7391" };
+export const SCHOOL_A_ID = "5cae0000-0000-0000-0000-000000000001";
+export const SCHOOL_B_ID = "5cae0000-0000-0000-0000-000000000002";
+export const SEED_B = {
+  school: "IT Second School",
+  bus: "IT Bus B",
+  student: "Ben Barasa",
+  route: "IT B — Morning",
+};
+
 export const SEED = {
   school: "Greenfield Academy",
   /** The demo driver's (Daniel Kamau) live bus. */
@@ -73,11 +89,16 @@ async function cachedToken(
 export async function signInAs(
   page: Page,
   account: { email: string; password: string },
+  schoolId?: string,
 ): Promise<void> {
   const token = await cachedToken(page.request, account.email, account.password);
   // Any app-origin document, so localStorage is writable before the app boots.
   await page.goto("/auth");
   await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  // Tenancy (U1/U12): the active school is per-tab, in sessionStorage.
+  if (schoolId) {
+    await page.evaluate((s) => sessionStorage.setItem("saferide-school", s), schoolId);
+  }
   await page.goto("/");
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }

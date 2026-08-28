@@ -494,3 +494,63 @@ UPDATE public.live_incidents i
 SET run_type = r.type
 FROM public.live_runs r
 WHERE i.run_id = r.id AND i.run_type IS NULL;
+
+
+-- Tenancy fixtures (U1): a second school with its own staff, driver, bus,
+-- route and student, plus the platform identities the multi-tenant suites use.
+-- Same guard as above: local development only.
+DO $$
+BEGIN
+  IF coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' THEN
+    RAISE EXCEPTION 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  END IF;
+END $$;
+
+INSERT INTO public.live_schools (id, name, address, phone, lat, lng)
+VALUES ('5cae0000-0000-0000-0000-000000000002', 'IT Second School', 'Langata Road, Nairobi', '+254709000002', -1.351200, 36.752800)
+ON CONFLICT (id) DO NOTHING;
+
+-- Staff and platform identities (password Test1234 for all; provider has no
+-- legacy role row on purpose — pre-membership code must refuse it everywhere).
+INSERT INTO public.app_users (id, email, password_hash, full_name, phone, pin_hash) VALUES
+  ('a0000000-0000-0000-0000-000000000011', 'director.a@saferide.test',    'pbkdf2_sha256$200000$da9c3e99fc6c60bd51d453efbb87ab2c$xs0pntq+o/wU1l98yALd+gbVuexx3eUWj0Pop5v4BUE=', 'Dora Director',     '+254700000011', NULL),
+  ('a0000000-0000-0000-0000-000000000012', 'coordinator.a@saferide.test', 'pbkdf2_sha256$200000$da9c3e99fc6c60bd51d453efbb87ab2c$xs0pntq+o/wU1l98yALd+gbVuexx3eUWj0Pop5v4BUE=', 'Carla Coordinator', '+254700000012', NULL),
+  ('a0000000-0000-0000-0000-000000000013', 'director.b@saferide.test',    'pbkdf2_sha256$200000$da9c3e99fc6c60bd51d453efbb87ab2c$xs0pntq+o/wU1l98yALd+gbVuexx3eUWj0Pop5v4BUE=', 'Derek Director',    '+254700000013', NULL),
+  ('a0000000-0000-0000-0000-000000000014', 'provider@kuumbai.test',       'pbkdf2_sha256$200000$da9c3e99fc6c60bd51d453efbb87ab2c$xs0pntq+o/wU1l98yALd+gbVuexx3eUWj0Pop5v4BUE=', 'Kaya Provider',     '+254700000014', NULL),
+  ('a0000000-0000-0000-0000-000000000015', 'driver.b@saferide.test',      'pbkdf2_sha256$200000$da9c3e99fc6c60bd51d453efbb87ab2c$xs0pntq+o/wU1l98yALd+gbVuexx3eUWj0Pop5v4BUE=', 'Dan Wekesa',        '+254700000015', 'hmac_sha256$8073c0f870fcde6f893e4a1268c97648a72795d4d8772b9f649d3c1a7f9e5bb5')
+ON CONFLICT (id) DO NOTHING;
+
+-- Interim legacy roles: staff read as 'admin' until memberships arrive (U3).
+INSERT INTO public.app_user_roles (user_id, role) VALUES
+  ('a0000000-0000-0000-0000-000000000011', 'admin'),
+  ('a0000000-0000-0000-0000-000000000012', 'admin'),
+  ('a0000000-0000-0000-0000-000000000013', 'admin'),
+  ('a0000000-0000-0000-0000-000000000015', 'driver')
+ON CONFLICT (user_id) DO NOTHING;
+
+INSERT INTO public.live_buses (id, name, plate_number, driver_id, driver_name, driver_phone, capacity, status)
+VALUES ('146a0000-0000-0000-0000-00000000000b', 'IT Bus B', 'KDB 002B', 'a0000000-0000-0000-0000-000000000015', 'Dan Wekesa', '+254700000015', 30, 'idle')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.live_routes (id, name, type, bus_id, school_id)
+VALUES ('40000000-0000-0000-0000-00000000000b', 'IT B — Morning', 'morning', '146a0000-0000-0000-0000-00000000000b', '5cae0000-0000-0000-0000-000000000002')
+ON CONFLICT (id) DO NOTHING;
+
+-- Ben Barasa: school B student whose parent email is Amina's — the seeded
+-- cross-school parent case (accepted link; pending flows are created in-test).
+INSERT INTO public.live_students (id, name, grade, parent_name, parent_phone, parent_email, home_address, home_lat, home_lng, pickup_time, status, bus_id, school_id)
+VALUES ('50000000-0000-0000-0000-00000000000b', 'Ben Barasa', 'Grade 2', 'Amina Achieng', '+254700000002', 'and7005@gmail.com', 'Langata, Nairobi', -1.361900, 36.744300, '06:50', 'at-school', '146a0000-0000-0000-0000-00000000000b', '5cae0000-0000-0000-0000-000000000002')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.live_parent_students (id, parent_id, student_id)
+VALUES ('52000000-0000-0000-0000-00000000000b', 'a0000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-00000000000b')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.live_student_routes (student_id, route_id)
+VALUES ('50000000-0000-0000-0000-00000000000b', '40000000-0000-0000-0000-00000000000b')
+ON CONFLICT (student_id, route_id) DO NOTHING;
+
+INSERT INTO public.live_route_stops (id, route_id, name, stop_order, scheduled_time, lat, lng, is_school_gate, student_id) VALUES
+  ('30f00000-0000-0000-0000-00000000010b', '40000000-0000-0000-0000-00000000000b', 'Langata, Nairobi', 1, '06:50', -1.361900, 36.744300, false, '50000000-0000-0000-0000-00000000000b'),
+  ('30f00000-0000-0000-0000-00000000020b', '40000000-0000-0000-0000-00000000000b', 'IT Second School', 2, NULL, -1.351200, 36.752800, true, NULL)
+ON CONFLICT (id) DO NOTHING;
