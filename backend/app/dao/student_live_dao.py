@@ -28,9 +28,15 @@ class _ConnParentLinks:
         self._conn = conn
 
     def parent_account_id(self, email: str) -> Any | None:
+        # An ELIGIBLE parent account only (U8): provider identities and
+        # disabled accounts must never be auto-linked as parents, whatever
+        # email a student's slot carries.
         row = self._conn.execute(
             "select u.id from app_users u join app_user_roles r on r.user_id = u.id "
-            "where lower(u.email) = lower(%s) and r.role = 'parent'",
+            "where lower(u.email) = lower(%s) and r.role = 'parent' "
+            "and u.disabled_at is null "
+            "and not exists (select 1 from provider_accounts p "
+            "                where p.user_id = u.id and p.removed_at is null)",
             (email,),
         ).fetchone()
         return row["id"] if row else None

@@ -285,6 +285,19 @@ class AccountDao:
         catch an email claimed by the wrong person before it matters.
         """
         with get_connection() as conn:
+            eligible = conn.execute(
+                """
+                select 1 from app_users u
+                where u.id = %s and u.disabled_at is null
+                  and not exists (select 1 from provider_accounts p
+                                  where p.user_id = u.id and p.removed_at is null)
+                """,
+                (parent_id,),
+            ).fetchone()
+            if not eligible:
+                # U8 hygiene: a provider or disabled identity is never linked
+                # as a parent, even if its email lands in a student slot.
+                return 0
             created = link_account_to_matching_students(_ConnParentLinks(conn), parent_id, email)
             if created:
                 names = [

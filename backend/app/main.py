@@ -15,6 +15,7 @@ from app.api import (
     parent_portal,
     push,
     runs_live,
+    staff,
     students_live,
 )
 from app.core.config import get_settings
@@ -95,6 +96,7 @@ def create_app() -> FastAPI:
     app.include_router(runs_live.router)
     app.include_router(incidents.router)
     app.include_router(accounts.router)
+    app.include_router(staff.router)
     app.include_router(parent_portal.router)
     app.include_router(push.router)
 

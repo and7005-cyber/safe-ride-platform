@@ -8,11 +8,14 @@ from app.core.auth import get_current_user
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, SafeRideError, to_http_exception
 from app.core.rate_limit import SlidingWindowLimiter, client_ip
+from app.dao.membership_dao import MembershipDao
 from app.schemas.auth import (
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MembershipOut,
     MeResponse,
+    OfferOut,
     PinLoginRequest,
     ProviderStateOut,
     ResetPasswordRequest,
@@ -22,6 +25,7 @@ from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 service = AuthService()
+memberships_dao = MembershipDao()
 T = TypeVar("T")
 
 # Last reset link, exposed only in local dev for the email-less flow.
@@ -46,6 +50,10 @@ signup_ip_limiter = SlidingWindowLimiter(
 forgot_ip_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=60)
 forgot_account_limiter = SlidingWindowLimiter(max_attempts=3, window_seconds=900)
 reset_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
+# Change-password is authenticated, so the budget keys on the account itself
+# (U8): 5 attempts / 15 min stops an attacker holding a stolen session from
+# brute-forcing the current password, while never troubling a real user.
+change_password_account_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=900)
 
 _LOGIN_LIMIT_MESSAGE = "Too many login attempts. Try again shortly."
 _RESET_LIMIT_MESSAGE = "Too many password reset attempts. Try again shortly."
@@ -130,11 +138,14 @@ def me(user: dict = Depends(get_current_user)):
             if m["state"] == "active"
         ],
         pendingOffers=[
-            MembershipOut(
+            OfferOut(
+                id=m.get("id"),
                 schoolId=m["school_id"],
                 schoolName=m.get("school_name"),
                 schoolCode=m.get("school_code"),
                 role=m["role"],
+                offeredBy=m.get("offered_by_name"),
+                offeredAt=m.get("created_at"),
             )
             for m in memberships
             if m["state"] == "offered"
@@ -147,6 +158,37 @@ def me(user: dict = Depends(get_current_user)):
         ),
         mustChangePassword=user.get("must_change_password", False),
     )
+
+
+@router.post("/change-password")
+def change_password(request: ChangePasswordRequest, user: dict = Depends(get_current_user)):
+    """Any authenticated role; on the must-change allowlist (R30), and even
+    then the CURRENT password is required. Keeps the calling session, revokes
+    every other one."""
+    change_password_account_limiter.check(
+        str(user["id"]), "Too many password change attempts. Try again shortly."
+    )
+    safe_call(
+        lambda: service.change_password(
+            user, request.current_password, request.new_password
+        )
+    )
+    return {"ok": True}
+
+
+# Role offers (U8/AE15): auth-surface — the offer belongs to the CALLING
+# account, no school header involved; anyone else's offer does not exist.
+
+@router.post("/offers/{offer_id}/accept")
+def accept_offer(offer_id: str, user: dict = Depends(get_current_user)):
+    safe_call(lambda: memberships_dao.accept_offer(offer_id, actor=user))
+    return {"ok": True}
+
+
+@router.post("/offers/{offer_id}/decline")
+def decline_offer(offer_id: str, user: dict = Depends(get_current_user)):
+    safe_call(lambda: memberships_dao.decline_offer(offer_id, actor=user))
+    return {"ok": True}
 
 
 @router.post("/forgot-password")

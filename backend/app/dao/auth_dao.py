@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection, get_global_connection
+from app.dao.audit_dao import masked_display_sql
 
 
 class AuthDao:
@@ -9,7 +10,8 @@ class AuthDao:
             row = conn.execute(
                 """
                 select u.id, u.email, u.password_hash, u.full_name, u.phone,
-                       u.pin_hash, u.must_change_password, u.disabled_at, r.role
+                       u.pin_hash, u.must_change_password,
+                       u.temporary_password_expires_at, u.disabled_at, r.role
                 from app_users u
                 left join app_user_roles r on r.user_id = u.id
                 where lower(u.email) = lower(%s)
@@ -83,14 +85,22 @@ class AuthDao:
         """
         with get_connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 select s.id as session_id, s.last_school_id, s.totp_verified_at,
                        u.id, u.email, u.full_name, u.phone, u.must_change_password,
                        r.role,
                        (select coalesce(jsonb_agg(jsonb_build_object(
+                                'id', m.id::text,
                                 'school_id', m.school_id::text, 'role', m.role,
                                 'state', m.state, 'school_name', sc.name,
-                                'school_code', sc.code)
+                                'school_code', sc.code,
+                                'created_at', m.created_at,
+                                'offered_by_name',
+                                    (select {masked_display_sql("ob", "op")}
+                                     from app_users ob
+                                     left join provider_accounts op
+                                        on op.user_id = ob.id and op.removed_at is null
+                                     where ob.id = m.offered_by))
                                 order by m.created_at), '[]'::jsonb)
                         from school_memberships m
                         join live_schools sc on sc.id = m.school_id
@@ -108,7 +118,7 @@ class AuthDao:
                           and ss.ended_at is null
                           and ss.started_at > now() - interval '4 hours'
                        ) as support_session,
-                       (select coalesce(array_agg(distinct st.school_id::text), '{}')
+                       (select coalesce(array_agg(distinct st.school_id::text), '{{}}')
                         from live_parent_students ps
                         join live_students st on st.id = ps.student_id
                         where ps.parent_id = u.id and ps.status = 'accepted'
@@ -169,24 +179,93 @@ class AuthDao:
             )
 
     def consume_reset_token(self, token_hash: str) -> dict[str, Any] | None:
-        """Single-use: mark used and return the user_id if valid and unused."""
+        """Single-use: mark used and return the user_id if valid and unused.
+        A disabled account's tokens are dead on arrival (R13: `disable_user`
+        voids them, and this join refuses any that slip through a race)."""
         with get_connection() as conn:
             row = conn.execute(
                 """
-                update password_reset_tokens
+                update password_reset_tokens t
                 set used_at = now()
-                where token_hash = %s
-                    and used_at is null
-                    and expires_at > now()
-                returning user_id
+                from app_users u
+                where u.id = t.user_id
+                    and t.token_hash = %s
+                    and t.used_at is null
+                    and t.expires_at > now()
+                    and u.disabled_at is null
+                returning t.user_id
                 """,
                 (token_hash,),
             ).fetchone()
         return dict(row) if row else None
 
-    def update_password(self, user_id: str, password_hash: str) -> None:
-        with get_connection() as conn:
+    def get_user_credentials(self, user_id: str) -> dict[str, Any] | None:
+        """id + password hash for the change-password current-password check.
+        User-table read reachable from any authenticated surface → global."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                "select id, email, password_hash from app_users where id = %s",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_user_password(self, user_id: str, password_hash: str) -> None:
+        """THE user-set-a-password write (U8): new hash, ``password_changed_at``
+        stamped, the temporary-password flag and expiry cleared, and every
+        outstanding reset and pre-auth token voided — one transaction. Used by
+        both change-password and the forgot-password reset; session handling
+        stays with the caller (change keeps its own session, reset keeps none).
+        """
+        with get_global_connection() as conn:
             conn.execute(
-                "update app_users set password_hash = %s where id = %s",
+                """
+                update app_users
+                set password_hash = %s, password_changed_at = now(),
+                    must_change_password = false,
+                    temporary_password_expires_at = null
+                where id = %s
+                """,
                 (password_hash, user_id),
+            )
+            conn.execute(
+                "update password_reset_tokens set used_at = now() "
+                "where user_id = %s and used_at is null",
+                (user_id,),
+            )
+            conn.execute(
+                "delete from auth_preauth_tokens where user_id = %s", (user_id,)
+            )
+
+    def revoke_other_sessions(self, user_id: str, keep_session_id: str) -> None:
+        """End every session but the calling one (change-password, R29)."""
+        with get_global_connection() as conn:
+            conn.execute(
+                "update auth_sessions set revoked_at = now() "
+                "where user_id = %s and id <> %s and revoked_at is null",
+                (user_id, keep_session_id),
+            )
+
+    def disable_user(self, user_id: str) -> None:
+        """THE single disable path (R13), one transaction: the account stops
+        resolving (login, PIN list, session lookup and push recipients all
+        carry ``disabled_at is null``), every live session is revoked, and
+        every outstanding reset and pre-auth token is voided."""
+        with get_global_connection() as conn:
+            conn.execute(
+                "update app_users set disabled_at = now() "
+                "where id = %s and disabled_at is null",
+                (user_id,),
+            )
+            conn.execute(
+                "update auth_sessions set revoked_at = now() "
+                "where user_id = %s and revoked_at is null",
+                (user_id,),
+            )
+            conn.execute(
+                "update password_reset_tokens set used_at = now() "
+                "where user_id = %s and used_at is null",
+                (user_id,),
+            )
+            conn.execute(
+                "delete from auth_preauth_tokens where user_id = %s", (user_id,)
             )
