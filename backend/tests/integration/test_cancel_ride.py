@@ -122,6 +122,18 @@ def signup_parent(client, marker: str, tag: str) -> dict:
     }
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 def _create_driver(client, admin_headers, marker: str) -> dict:
     """A throwaway driver with a known PIN (retry rare PIN collisions)."""
     for _ in range(5):
@@ -187,6 +199,10 @@ def fleet(client, admin_headers, sandbox):
 
         s1 = make_student(1, -1.28, "06:30", p1["email"], email2=p2["email"])
         s2 = make_student(2, -1.29, "06:45", p3["email"])
+        # These accounts predate their students, so the staff-side links above
+        # are pending (U11) — each linked parent accepts to unlock the portal.
+        for parent in (p1, p2, p3):
+            accept_pending(client, parent["headers"])
 
         yield {
             "marker": marker,

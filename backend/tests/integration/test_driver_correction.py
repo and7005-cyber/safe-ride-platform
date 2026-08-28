@@ -87,6 +87,18 @@ def absence_today(student_id: str) -> dict | None:
         ).fetchone()
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 @pytest.fixture(scope="module")
 def fleet(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
@@ -122,7 +134,7 @@ def fleet(client, admin_headers, sandbox):
     created["students"] = []
     created["parent_ids"] = []
     for n, (lat, lng) in enumerate([(-1.30, 36.79), (-1.31, 36.78)], start=1):
-        parent_id, parent_email, _ = signup_parent(client, marker, f"rv-p{n}")
+        parent_id, parent_email, parent_headers = signup_parent(client, marker, f"rv-p{n}")
         created["parent_ids"].append(parent_id)
         created["students"].append(client.post(
             "/api/students",
@@ -134,6 +146,9 @@ def fleet(client, admin_headers, sandbox):
                   "route_ids": [created["morning"]["id"], created["afternoon"]["id"]]},
             headers=admin_headers,
         ).json())
+        # The account predates the student, so the staff-side link above is
+        # pending (U11) — the parent accepts to become a recipient.
+        accept_pending(client, parent_headers)
 
     try:
         yield created

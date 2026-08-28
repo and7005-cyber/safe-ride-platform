@@ -164,6 +164,18 @@ def signup_parent(client, marker: str, tag: str) -> dict:
     }
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 def _make_school(client, headers, marker: str) -> dict:
     # Post-U6 there is ONE school per module — the sandbox (see apply suite).
     assert _SANDBOX, "sandbox fixture not active"
@@ -370,6 +382,10 @@ def test_ae2_enrolment_proposal_text_accept_and_notifications(client, admin_head
             _make_student(client, admin_headers, marker, 3, school["id"], H_NEAR,
                           email=parents["near"]["email"]),
         ]
+        # The accounts predate their students, so the staff-side links above
+        # are pending (U11) — each parent accepts to become a recipient.
+        for tag in ("far1", "far2", "mid", "near"):
+            accept_pending(client, parents[tag]["headers"])
         _apply_fresh_plan(client, admin_headers, school["id"], [bus["id"]])
         for tag in ("far1", "far2", "mid", "near"):
             assert len(_plan_feed(client, parents[tag]["headers"])) == 1  # first apply
@@ -377,6 +393,8 @@ def test_ae2_enrolment_proposal_text_accept_and_notifications(client, admin_head
         # The trigger: a plannable enrolment lacking both legs.
         new_kid = _make_student(client, admin_headers, marker, 9, school["id"],
                                 NEW_HOME, email=parents["new"]["email"])
+        # Same U11 offer for the new child's pre-existing account.
+        accept_pending(client, parents["new"]["headers"])
         body = _wait_for_records(client, admin_headers, school["id"], new_kid["id"])
         assert body["unplaceable"] == []
         assert len(body["proposals"]) == 1

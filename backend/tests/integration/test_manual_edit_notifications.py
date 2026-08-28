@@ -118,6 +118,18 @@ def signup_parent(client, marker: str, tag: str) -> dict:
     }
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 def _make_school(client, headers, marker: str) -> dict:
     # Post-U6 there is ONE school per module — the sandbox (see apply suite).
     assert _SANDBOX, "sandbox fixture not active"
@@ -288,6 +300,10 @@ def _build_world(client, admin_headers, marker: str) -> dict:
     route = _make_route(client, admin_headers, marker, school["id"])
     kid_a = _make_student(client, admin_headers, marker, "A", "06:30", HOME_A, pa, [route["id"]])
     kid_b = _make_student(client, admin_headers, marker, "B", "06:40", HOME_B, pb, [route["id"]])
+    # The accounts predate their students, so the staff-side links above are
+    # pending (U11) — each parent accepts to become a notification recipient.
+    accept_pending(client, pa["headers"])
+    accept_pending(client, pb["headers"])
 
     assert _wait_until(
         lambda: _baseline(kid_a["id"]) is not None and _baseline(kid_b["id"]) is not None
