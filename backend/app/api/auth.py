@@ -11,7 +11,10 @@ from app.core.rate_limit import SlidingWindowLimiter, client_ip
 from app.schemas.auth import (
     ForgotPasswordRequest,
     LoginRequest,
+    MembershipOut,
+    MeResponse,
     PinLoginRequest,
+    ProviderStateOut,
     ResetPasswordRequest,
     SignupRequest,
 )
@@ -107,14 +110,43 @@ def logout(authorization: str | None = Header(default=None)):
     return {"ok": True}
 
 
-@router.get("/me")
+@router.get("/me", response_model=MeResponse, response_model_by_alias=True)
 def me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "fullName": user.get("full_name"),
-        "role": user.get("role"),
-    }
+    memberships = user.get("memberships") or []
+    provider = user.get("provider")
+    return MeResponse(
+        id=user["id"],
+        email=user["email"],
+        fullName=user.get("full_name"),
+        role=user.get("role"),
+        memberships=[
+            MembershipOut(
+                schoolId=m["school_id"],
+                schoolName=m.get("school_name"),
+                schoolCode=m.get("school_code"),
+                role=m["role"],
+            )
+            for m in memberships
+            if m["state"] == "active"
+        ],
+        pendingOffers=[
+            MembershipOut(
+                schoolId=m["school_id"],
+                schoolName=m.get("school_name"),
+                schoolCode=m.get("school_code"),
+                role=m["role"],
+            )
+            for m in memberships
+            if m["state"] == "offered"
+        ],
+        activeSchoolId=user.get("last_school_id"),
+        provider=(
+            ProviderStateOut(totpEnrolled=bool(provider.get("totp_enrolled")))
+            if provider
+            else None
+        ),
+        mustChangePassword=user.get("must_change_password", False),
+    )
 
 
 @router.post("/forgot-password")

@@ -94,3 +94,23 @@ def provider_headers() -> dict[str, str]:
     # Until U10 lands, the provider signs in with password only; afterwards the
     # fixture completes the second-factor step too.
     return login(PROVIDER)
+
+
+@pytest.fixture(scope="session")
+def in_process_db():
+    """Point the app's process-global connection pool at the suite's DSN.
+
+    backend/.env carries the compose-internal host (``db``), which does not
+    resolve from the host machine; in-process tests that exercise real app
+    code (TestClient, the seam) need the pool on the host-mapped port.
+    """
+    from app.core import db as app_db
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.database_url
+    app_db.close_pool()
+    settings.database_url = DSN
+    yield
+    app_db.close_pool()
+    settings.database_url = original

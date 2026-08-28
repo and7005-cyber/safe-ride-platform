@@ -32,6 +32,9 @@ class AuthService:
                 "email": user["email"],
                 "fullName": user.get("full_name"),
                 "role": user.get("role"),
+                # The client must know right away whether it may leave the
+                # change-password screen (R30); everything else comes from /me.
+                "mustChangePassword": bool(user.get("must_change_password")),
             },
         }
 
@@ -59,6 +62,9 @@ class AuthService:
     def login(self, email: str, password: str) -> dict:
         user = self.dao.get_user_by_email(email)
         if not user or not verify_password(password, user["password_hash"]):
+            raise UnauthorizedError("Invalid email or password")
+        if user.get("disabled_at") is not None:
+            # Indistinguishable from a bad password: no account enumeration.
             raise UnauthorizedError("Invalid email or password")
         return self._issue_session(user)
 

@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         alias="DEMO_SCHOOL_ID",
     )
     trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    # Tenancy compatibility window (U5): while False, a school-scoped request
+    # without an X-School-Id header falls back to the caller's only (or last
+    # used) school; flipping to True makes the header mandatory (400).
+    scope_header_required: bool = Field(default=False, alias="SCOPE_HEADER_REQUIRED")
     # Minimum turnaround between a bus's back-to-back trips in one period (U6/R20):
     # stands in for the unmodeled gate<->wave deadhead. Global for this pass.
     turnaround_buffer_min: int = Field(default=15, alias="TURNAROUND_BUFFER_MIN")

@@ -1,8 +1,9 @@
 """Bearer-session auth dependencies for the live-model API surface."""
 from collections.abc import Callable
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 
+from app.core.scope import is_password_change_exempt
 from app.services.auth_service import AuthService
 
 _service = AuthService()
@@ -12,7 +13,9 @@ def _unauthorized() -> HTTPException:
     return HTTPException(status_code=401, detail="Authentication required")
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> dict:
+def get_current_user(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict:
     if not authorization:
         raise _unauthorized()
     scheme, _, token = authorization.partition(" ")
@@ -21,12 +24,34 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict:
     user = _service.resolve_session(token.strip())
     if not user:
         raise _unauthorized()
+    if user.get("must_change_password") and not is_password_change_exempt(
+        request.url.path
+    ):
+        # A temporary password opens nothing but the change screen (R30).
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "password-change-required",
+                "message": "You must change your temporary password first",
+            },
+        )
     return {
         "id": str(user["id"]),
         "email": user["email"],
         "full_name": user.get("full_name"),
         "phone": user.get("phone"),
         "role": user.get("role"),
+        # Tenancy enrichment (U5): consumed by app.core.permissions.
+        "session_id": str(user["session_id"]),
+        "must_change_password": bool(user.get("must_change_password")),
+        "memberships": user.get("memberships") or [],
+        "provider": user.get("provider"),
+        "support_session": user.get("support_session"),
+        "parent_school_ids": user.get("parent_school_ids") or [],
+        "last_school_id": (
+            str(user["last_school_id"]) if user.get("last_school_id") else None
+        ),
+        "totp_verified_at": user.get("totp_verified_at"),
     }
 
 

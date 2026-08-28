@@ -9,7 +9,7 @@ class AuthDao:
             row = conn.execute(
                 """
                 select u.id, u.email, u.password_hash, u.full_name, u.phone,
-                       u.pin_hash, r.role
+                       u.pin_hash, u.must_change_password, u.disabled_at, r.role
                 from app_users u
                 left join app_user_roles r on r.user_id = u.id
                 where lower(u.email) = lower(%s)
@@ -39,6 +39,7 @@ class AuthDao:
                 from app_users u
                 join app_user_roles r on r.user_id = u.id
                 where r.role = 'driver' and u.pin_hash is not null
+                    and u.disabled_at is null
                 """
             ).fetchall()
         return [dict(row) for row in rows]
@@ -72,17 +73,54 @@ class AuthDao:
             )
 
     def get_session_user(self, token_hash: str) -> dict[str, Any] | None:
-        """Resolve a live session to its user+role; slide expiry forward."""
+        """Resolve a live session to its enriched user; slide expiry forward.
+
+        Carries everything scope resolution needs (U5): active+offered
+        memberships (removed rows excluded), provider state, the live step-in
+        session (unexpired, ≤4h), the parent's accepted-link school set,
+        ``must_change_password`` and ``last_school_id``. A disabled identity
+        resolves to no session at all (R13: removal ends access at once).
+        """
         with get_connection() as conn:
             row = conn.execute(
                 """
-                select s.id as session_id, u.id, u.email, u.full_name, u.phone, r.role
+                select s.id as session_id, s.last_school_id, s.totp_verified_at,
+                       u.id, u.email, u.full_name, u.phone, u.must_change_password,
+                       r.role,
+                       (select coalesce(jsonb_agg(jsonb_build_object(
+                                'school_id', m.school_id::text, 'role', m.role,
+                                'state', m.state, 'school_name', sc.name,
+                                'school_code', sc.code)
+                                order by m.created_at), '[]'::jsonb)
+                        from school_memberships m
+                        join live_schools sc on sc.id = m.school_id
+                        where m.user_id = u.id and m.removed_at is null
+                       ) as memberships,
+                       (select jsonb_build_object(
+                                'totp_enrolled', p.totp_enrolled_at is not null)
+                        from provider_accounts p
+                        where p.user_id = u.id and p.removed_at is null
+                       ) as provider,
+                       (select jsonb_build_object(
+                                'id', ss.id::text, 'school_id', ss.school_id::text)
+                        from provider_support_sessions ss
+                        where ss.id = s.support_session_id
+                          and ss.ended_at is null
+                          and ss.started_at > now() - interval '4 hours'
+                       ) as support_session,
+                       (select coalesce(array_agg(distinct st.school_id::text), '{}')
+                        from live_parent_students ps
+                        join live_students st on st.id = ps.student_id
+                        where ps.parent_id = u.id and ps.status = 'accepted'
+                          and st.school_id is not null
+                       ) as parent_school_ids
                 from auth_sessions s
                 join app_users u on u.id = s.user_id
                 left join app_user_roles r on r.user_id = u.id
                 where s.token_hash = %s
                     and s.revoked_at is null
                     and s.expires_at > now()
+                    and u.disabled_at is null
                 """,
                 (token_hash,),
             ).fetchone()
@@ -93,6 +131,14 @@ class AuthDao:
                 (row["session_id"],),
             )
         return dict(row)
+
+    def set_session_school(self, session_id: str, school_id: str) -> None:
+        """Remember the session's active school for header fallback (R16)."""
+        with get_connection() as conn:
+            conn.execute(
+                "update auth_sessions set last_school_id = %s where id = %s",
+                (school_id, session_id),
+            )
 
     def revoke_session(self, token_hash: str) -> None:
         with get_connection() as conn:
