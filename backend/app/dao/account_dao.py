@@ -183,7 +183,13 @@ class AccountDao:
                 """
                 select u.id, u.full_name, u.email, u.phone, u.created_at,
                        coalesce(array_agg(s.name order by s.name)
-                                filter (where s.name is not null), '{}') as students
+                                filter (where s.name is not null), '{}') as students,
+                       exists (
+                           select 1 from live_parent_students po
+                           join live_students so on so.id = po.student_id
+                           where po.parent_id = u.id
+                             and so.school_id is distinct from %s
+                       ) as shared
                 from app_users u
                 join app_user_roles r on r.user_id = u.id and r.role = 'parent'
                 join live_parent_students ps on ps.parent_id = u.id
@@ -191,8 +197,11 @@ class AccountDao:
                 group by u.id
                 order by u.full_name asc
                 """,
-                (scope.school_id,),
+                (scope.school_id, scope.school_id),
             ).fetchall()
+            # `shared` (AE18's UI half): a link — any status — to a child of
+            # another school freezes this parent here; the page disables Edit
+            # up front instead of leaving the server 409 as the only signal.
             result = [
                 {**dict(r), "status": "registered", "students": list(r["students"])}
                 for r in registered
@@ -232,6 +241,7 @@ class AccountDao:
                     "status": "pending",
                     "students": list(p["students"]),
                     "created_at": None,
+                    "shared": False,
                 })
         return result
 

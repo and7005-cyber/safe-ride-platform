@@ -561,6 +561,18 @@ def test_shared_parent_is_frozen_for_both_schools(client):
     detail = edited.json()["detail"]
     assert "shared with another school" in detail
     assert SCHOOL_B_NAME not in detail  # neutral: no other school named
+    # AE18's UI half: the list marks the frozen parent up front so the page
+    # can disable Edit before the 409 (single-school parents stay unmarked).
+    listed = client.get(
+        "/api/accounts/parents", headers=hdr(client, DIRECTOR_A, SCHOOL_A_ID)
+    ).json()
+    by_id = {p["id"]: p for p in listed if p["id"]}
+    assert by_id[PARENT_AMINA_ID]["shared"] is True
+    assert all(
+        p["shared"] is False
+        for p in listed
+        if p["id"] and p["id"] != PARENT_AMINA_ID
+    )
     deleted = client.delete(
         f"/api/accounts/parents/{PARENT_AMINA_ID}",
         headers=hdr(client, DIRECTOR_A, SCHOOL_A_ID),
