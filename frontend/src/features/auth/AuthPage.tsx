@@ -24,9 +24,12 @@ import { api } from "@/lib/apiClient";
 import { useAuth, type Role } from "@/lib/auth";
 
 function homeFor(role: Role | null): string {
-  if (role === "admin") return "/";
+  // Staff access now comes from memberships, which the login response does
+  // not carry — so email logins land on "/" and ProtectedRoute bounces
+  // non-staff to their own surface once /me answers (staff-first for people
+  // who are both staff and parent). Driver PIN logins go straight to /driver.
   if (role === "driver") return "/driver";
-  return "/parent";
+  return "/";
 }
 
 export function AuthPage() {
@@ -46,7 +49,13 @@ export function AuthPage() {
 
   const finishAuth = (
     token: string,
-    user: { id: string; email: string; fullName?: string | null; role?: Role | null },
+    user: {
+      id: string;
+      email: string;
+      fullName?: string | null;
+      role?: Role | null;
+      mustChangePassword?: boolean;
+    },
   ) => {
     const resolved: Role | null = user.role ?? null;
     signIn(token, {
@@ -54,6 +63,9 @@ export function AuthPage() {
       email: user.email,
       fullName: user.fullName ?? null,
       role: resolved,
+      // Respected immediately (R30): the change screen renders off the login
+      // response, before /me — nothing else would answer anyway.
+      mustChangePassword: Boolean(user.mustChangePassword),
     });
     navigate(homeFor(resolved));
   };

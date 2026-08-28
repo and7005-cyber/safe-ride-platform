@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
+import { useSchoolKey } from "@/lib/queries";
 
 // U9 step 1 — fleet confirmation (F1 step 1), extracted from PlanReviewPage.
 // Mounted for the whole page life (render gated on `active`) so the seeded
@@ -13,17 +14,16 @@ import { api } from "@/lib/apiClient";
 export function PlanFleetStep({
   active,
   schoolId,
-  schools,
   buses,
   onConfirmed,
 }: {
   active: boolean;
   schoolId: string;
-  schools: any[];
   buses: any[];
   onConfirmed: () => void;
 }) {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
 
   const [fleetSel, setFleetSel] = useState<Set<string>>(new Set());
@@ -52,11 +52,10 @@ export function PlanFleetStep({
     setConfirmingFleet(true);
     try {
       const res = await api.post("/api/fleet-plans/confirm-fleet", {
-        school_id: schoolId,
         bus_ids: [...fleetSel],
       });
       setFleetNotices(res.notices ?? []);
-      await qc.invalidateQueries({ queryKey: ["buses"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("buses") });
       toast({
         title: `Fleet confirmed — ${res.buses.length} bus${res.buses.length === 1 ? "" : "es"} claimed`,
       });
@@ -69,12 +68,11 @@ export function PlanFleetStep({
   };
 
   const busList = buses as any[];
+  // U12: the buses list is scoped to the active school, so a foreign claim
+  // can only appear transiently; there is no cross-school name to show.
   const claimableRow = (b: any) => {
-    const foreign = b.school_id && b.school_id !== schoolId;
-    const claimingSchool = foreign
-      ? ((schools as any[]).find((s) => s.id === b.school_id)?.name ?? "another school")
-      : null;
-    return { foreign, claimingSchool };
+    const foreign = Boolean(b.school_id && b.school_id !== schoolId);
+    return { foreign, claimingSchool: foreign ? "another school" : null };
   };
 
   if (!active) return null;

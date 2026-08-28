@@ -24,6 +24,7 @@ import { PlanDiffPanel } from "@/features/admin/components/PlanDiffPanel";
 import { PlanDraftMap, type PlanMapBus } from "@/features/admin/components/PlanDraftMap";
 import { PlanUnplaceablePanel } from "@/features/admin/components/PlanUnplaceablePanel";
 import { api } from "@/lib/apiClient";
+import { useSchoolKey } from "@/lib/queries";
 import {
   PLAN_LEGS,
   RESOLVE_CONFIRM_MESSAGE,
@@ -62,6 +63,7 @@ export function PlanReviewStep({
   onContinueToApply: () => void;
 }) {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
   const confirm = useConfirm();
 
@@ -80,8 +82,8 @@ export function PlanReviewStep({
     try {
       await fn();
       if (generation !== requestGeneration.current) return true;
-      await qc.invalidateQueries({ queryKey: ["fleet-plan-review"] });
-      await qc.invalidateQueries({ queryKey: ["fleet-plans"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plan-review") });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plans") });
       return true;
     } catch (err) {
       if (generation !== requestGeneration.current) return false;

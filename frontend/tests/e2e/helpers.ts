@@ -95,9 +95,13 @@ export async function signInAs(
   // Any app-origin document, so localStorage is writable before the app boots.
   await page.goto("/auth");
   await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
-  // Tenancy (U1/U12): the active school is per-tab, in sessionStorage.
+  // Tenancy (U1/U12): the active school is per-tab, in sessionStorage. With
+  // no school given, clear any value a previous sign-in left in this tab so
+  // each signInAs starts the account's own first-landing flow.
   if (schoolId) {
     await page.evaluate((s) => sessionStorage.setItem("saferide-school", s), schoolId);
+  } else {
+    await page.evaluate(() => sessionStorage.removeItem("saferide-school"));
   }
   await page.goto("/");
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
@@ -108,6 +112,9 @@ export async function signInAsDriver(page: Page): Promise<void> {
   const token = await cachedDriverToken(page.request);
   await page.goto("/auth");
   await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  // Driver routes 403 the school header by design (U12): make sure no staff
+  // test's per-tab school survives into this driver session.
+  await page.evaluate(() => sessionStorage.removeItem("saferide-school"));
   await page.goto("/driver");
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }
@@ -166,6 +173,13 @@ export function authHeaders(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
+/** Staff-surface API calls carry the school scope explicitly (U12): with more
+ * than one membership the server refuses to guess, so fixture/setup requests
+ * name their school the same way the app does. */
+export function schoolHeaders(token: string, schoolId: string) {
+  return { Authorization: `Bearer ${token}`, "X-School-Id": schoolId };
+}
+
 /** End the demo driver's active run if one exists (idempotent cleanup). */
 /**
  * Delete a run out-of-band. **Teardown only** — never inside an assertion.
@@ -205,6 +219,78 @@ function psql(sql: string): void {
     ],
     { stdio: "ignore", cwd: REPO_ROOT },
   );
+}
+
+/** Like psql() but returns rows (tuples-only, unaligned; one row per line). */
+function psqlQuery(sql: string): string {
+  return execFileSync(
+    "docker",
+    [
+      "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
+      "psql", "-U", "saferide", "-d", "saferide", "-tA", "-c", sql,
+    ],
+    { encoding: "utf8", cwd: REPO_ROOT },
+  ).trim();
+}
+
+// Fixture schools in SQL (U12): the app can no longer create or delete a
+// school (creation moved to the provider console, deletion is out of scope),
+// so suites that need a disposable school — admin-plan.spec.ts applies whole
+// fleet plans and must never rewrite the seeded schools' routes — provision
+// one directly in the database, with a director membership for the acting
+// account, and drop it the same way. This mirrors purgeRun/backdateRun: the
+// tests must not get a product-level backdoor around a real product rule.
+
+/** Create a school row plus an active director membership for `email`. */
+export function sqlCreateSchool(name: string, email: string): { id: string; code: string } {
+  const id = crypto.randomUUID();
+  const code = `E2P-${id.slice(0, 8)}`;
+  psql(
+    `insert into live_schools (id, name, address, phone, lat, lng, morning_bell, afternoon_bell, code) ` +
+      `values ('${id}', '${name.replace(/'/g, "''")}', '1 Plan Lane, Nairobi', '+254700000001', ` +
+      `-1.3005, 36.8102, '07:30', '15:30', '${code}')`,
+  );
+  psql(
+    `insert into school_memberships (user_id, school_id, role, state, accepted_at) ` +
+      `select id, '${id}', 'director', 'active', now() from app_users ` +
+      `where lower(email) = lower('${email.replace(/'/g, "''")}')`,
+  );
+  return { id, code };
+}
+
+/** Drop a fixture school and every school-stamped row it still owns. */
+export function sqlDropSchool(schoolId: string): void {
+  const tables = [
+    "live_notifications",
+    "live_communicated_stops",
+    "live_incidents",
+    "live_student_absences",
+    "live_parent_students",
+    "live_student_routes",
+    "live_route_stops",
+    "run_stops",
+    "run_absences",
+    "run_participation",
+    "live_runs",
+    "live_routes",
+    "live_students",
+    "live_buses",
+    "school_memberships",
+    "provider_support_sessions",
+  ];
+  for (const table of tables) {
+    psql(`delete from ${table} where school_id = '${schoolId}'`);
+  }
+  // Fleet-plan documents cascade with the school row (011).
+  psql(`delete from live_schools where id = '${schoolId}'`);
+}
+
+/** Ids of fixture schools left behind by aborted runs (sweep support). */
+export function sqlListSchoolIdsByName(prefix: string): string[] {
+  const out = psqlQuery(
+    `select id from live_schools where name like '${prefix.replace(/'/g, "''")}%'`,
+  );
+  return out ? out.split("\n").map((line) => line.trim()).filter(Boolean) : [];
 }
 
 export async function endActiveRun(request: APIRequestContext): Promise<void> {

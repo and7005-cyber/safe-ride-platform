@@ -37,13 +37,15 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { RouteMapPreview } from "@/components/map/RouteMapPreview";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
-import { useBuses, useRoutes, useSchools } from "@/lib/queries";
+import { useIsDirector } from "@/lib/auth";
+import { useBuses, useRoutes, useSchoolKey } from "@/lib/queries";
 
 const EMPTY = {
   name: "",
   type: "morning",
   bus_id: "none",
-  school_id: "none",
+  // U12: no school field — a route belongs to the tab's active school and the
+  // server stamps the request scope.
   // Ordinal of this trip within the bus's period (R19): 1 = first wave. A bus
   // may hold several trips per period, each a distinct (bus, type, trip_index).
   trip_index: 1,
@@ -160,9 +162,10 @@ export function RoutesPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const confirm = useConfirm();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const { data: routes = [] } = useRoutes();
   const { data: buses = [] } = useBuses();
-  const { data: schools = [] } = useSchools();
   const [open, setOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
@@ -200,7 +203,6 @@ export function RoutesPage() {
       name: r.name,
       type: r.type,
       bus_id: r.bus_id ?? "none",
-      school_id: r.school_id ?? "none",
       // Prefill both from the saved route (deferred from U10, which only did the
       // create planner) — a bare PUT would otherwise reset trip_index to 1 and
       // wipe the gate anchor server-side (both default when omitted).
@@ -216,7 +218,6 @@ export function RoutesPage() {
         name: form.name,
         type: form.type,
         bus_id: form.bus_id === "none" ? null : form.bus_id,
-        school_id: form.school_id === "none" ? null : form.school_id,
         // A blank/NaN trip number falls back to 1 (single-trip). Same (bus,
         // type, trip_index) 409s; the catch below surfaces the API detail.
         trip_index: Number(form.trip_index) || 1,
@@ -225,7 +226,7 @@ export function RoutesPage() {
       const res = editId
         ? await api.put(`/api/fleet/routes/${editId}`, payload)
         : await api.post("/api/fleet/routes", payload);
-      await qc.invalidateQueries({ queryKey: ["routes"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
       setOpen(false);
       notifyIfDegraded(res);
     } catch (err) {
@@ -240,7 +241,7 @@ export function RoutesPage() {
       confirmLabel: "Delete route",
     }))) return;
     await api.del(`/api/fleet/routes/${id}`);
-    await qc.invalidateQueries({ queryKey: ["routes"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("routes") });
   };
 
   // Collapse per-student stop rows into one entry per stop_order.
@@ -272,7 +273,7 @@ export function RoutesPage() {
       await api.put(`/api/fleet/routes/${routeId}/stop-order`, { order });
       // Await the refetch so the arrows stay disabled until the display order
       // (the next payload's source) is fresh.
-      await qc.invalidateQueries({ queryKey: ["routes"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
     } catch (err) {
       // 400 "refresh and try again" (stale order) and the planner 409 verbatim.
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -300,7 +301,7 @@ export function RoutesPage() {
     setBusyRouteId(route.id);
     try {
       const res = await api.post(`/api/fleet/routes/${route.id}/recalculate`);
-      await qc.invalidateQueries({ queryKey: ["routes"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
       notifyIfDegraded(res);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -347,8 +348,8 @@ export function RoutesPage() {
       for (const sid of g.studentIds) {
         responses.push(await api.del(`/api/fleet/routes/${routeId}/stops/${sid}`));
       }
-      await qc.invalidateQueries({ queryKey: ["routes"] });
-      await qc.invalidateQueries({ queryKey: ["students"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
+      await qc.invalidateQueries({ queryKey: schoolKey("students") });
       notifyIfDegraded(...responses);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -369,7 +370,7 @@ export function RoutesPage() {
           }),
         );
       }
-      await qc.invalidateQueries({ queryKey: ["routes"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
       setStopEdit(null);
       notifyIfDegraded(...responses);
     } catch (err) {
@@ -428,7 +429,10 @@ export function RoutesPage() {
                     <Megaphone className="h-4 w-4" />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => startEdit(route)}><Pencil className="h-4 w-4" /></Button>
-                  <Button variant="ghost" size="icon" onClick={() => remove(route.id)}><Trash2 className="h-4 w-4" /></Button>
+                  {/* Director-only (U12/R8): the server 403s the backstop. */}
+                  {isDirector && (
+                    <Button variant="ghost" size="icon" title="Delete route" onClick={() => remove(route.id)}><Trash2 className="h-4 w-4" /></Button>
+                  )}
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
@@ -582,16 +586,6 @@ export function RoutesPage() {
                   onChange={(e) => setForm({ ...form, trip_index: Number(e.target.value) })}
                 />
               </div>
-            </div>
-            <div className="space-y-2">
-              <Label>School</Label>
-              <Select value={form.school_id} onValueChange={(v) => setForm({ ...form, school_id: v })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">— None —</SelectItem>
-                  {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
             </div>
             {/* Gate anchor (R3): the bell time the schedule solves backwards
                 from — morning = arrival, afternoon = departure. Prefilled from

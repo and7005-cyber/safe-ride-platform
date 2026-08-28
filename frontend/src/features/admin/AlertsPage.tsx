@@ -7,7 +7,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/apiClient";
-import { useIncidents } from "@/lib/queries";
+import { useIsDirector } from "@/lib/auth";
+import { useIncidents, useSchoolKey } from "@/lib/queries";
 import { ADMIN_INCIDENT_LABEL, labelFor } from "@/lib/statusVocabulary";
 
 // Labels come from the shared vocabulary (U17). Admin wording is operational
@@ -15,14 +16,16 @@ import { ADMIN_INCIDENT_LABEL, labelFor } from "@/lib/statusVocabulary";
 
 export function AlertsPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const confirm = useConfirm();
   const { data: incidents = [] } = useIncidents();
   const unacked = incidents.filter((i: any) => !i.acknowledged).length;
 
   const acknowledge = async (id: string) => {
     await api.post(`/api/incidents/${id}/acknowledge`);
-    await qc.invalidateQueries({ queryKey: ["incidents"] });
-    await qc.invalidateQueries({ queryKey: ["unread-alerts"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("incidents") });
+    await qc.invalidateQueries({ queryKey: schoolKey("unread-alerts") });
   };
 
   const remove = async (id: string) => {
@@ -32,8 +35,8 @@ export function AlertsPage() {
       confirmLabel: "Delete alert",
     }))) return;
     await api.del(`/api/incidents/${id}`);
-    await qc.invalidateQueries({ queryKey: ["incidents"] });
-    await qc.invalidateQueries({ queryKey: ["unread-alerts"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("incidents") });
+    await qc.invalidateQueries({ queryKey: schoolKey("unread-alerts") });
   };
 
   return (
@@ -76,7 +79,10 @@ export function AlertsPage() {
                       <Check className="h-4 w-4" /> Ack
                     </Button>
                   )}
-                  <Button variant="ghost" size="icon" onClick={() => remove(incident.id)}><Trash2 className="h-4 w-4" /></Button>
+                  {/* Director-only (U12/R8): the server 403s the backstop. */}
+                  {isDirector && (
+                    <Button variant="ghost" size="icon" title="Delete alert" onClick={() => remove(incident.id)}><Trash2 className="h-4 w-4" /></Button>
+                  )}
                 </div>
               </CardContent>
             </Card>

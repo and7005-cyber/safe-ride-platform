@@ -3,17 +3,21 @@ import { NavLink, useNavigate } from "react-router-dom";
 import {
   Bell,
   Bus,
+  Check,
+  ChevronsUpDown,
   ClipboardList,
   Clock,
   GraduationCap,
+  Heart,
   LayoutDashboard,
   LogOut,
   Map,
   Menu,
   Route as RouteIcon,
-  School,
+  Settings,
   ShieldCheck,
   UserCog,
+  UserPlus,
   Users,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -27,8 +31,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/lib/auth";
-import { useUnreadAlerts } from "@/lib/queries";
+import { membershipAt, staffMemberships, useAuth, useIsDirector } from "@/lib/auth";
+import { useActiveSchoolId } from "@/lib/school";
+import { useSwitchSchool, useUnreadAlerts } from "@/lib/queries";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -38,7 +43,6 @@ const NAV = [
   { to: "/fleet-plan", label: "Fleet Plan", icon: ClipboardList },
   { to: "/students", label: "Students", icon: GraduationCap },
   { to: "/runs", label: "Run History", icon: Clock },
-  { to: "/schools", label: "Schools", icon: School },
   { to: "/parents", label: "Parents", icon: Users },
   { to: "/drivers", label: "Drivers", icon: UserCog },
   { to: "/alerts", label: "Alerts", icon: Bell },
@@ -51,10 +55,37 @@ export function AdminLayout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const unreadCount = unread?.count ?? 0;
 
+  const activeSchoolId = useActiveSchoolId();
+  const memberships = staffMemberships(user);
+  const active = membershipAt(user, activeSchoolId);
+  const isDirector = useIsDirector();
+  const switchSchool = useSwitchSchool();
+
+  // Staff (director-only) and Settings join the nav; the Schools page and
+  // every school picker are gone — the console works inside the active school.
+  const nav = [
+    ...NAV,
+    ...(isDirector ? [{ to: "/staff", label: "Staff", icon: UserPlus }] : []),
+    { to: "/settings", label: "Settings", icon: Settings },
+    // Staff who are ALSO a parent get a shortcut to their own parent view.
+    // /me exposes no parent-link signal for staff, so the legacy role is the
+    // only available cue (a limitation noted in U12).
+    ...(user?.role === "parent" ? [{ to: "/parent", label: "Parent view", icon: Heart }] : []),
+  ];
+
   const handleSignOut = async () => {
     await signOut();
     navigate("/auth");
   };
+
+  const schoolCard = (
+    <div className="mb-3 rounded-lg bg-sidebar-accent/40 px-3 py-2" data-testid="active-school-card">
+      <p className="text-sm font-medium">{active?.schoolName ?? "—"}</p>
+      <p className="text-xs text-sidebar-foreground/70">
+        Code: {active?.schoolCode ?? "—"}
+      </p>
+    </div>
+  );
 
   const sidebar = (
     <aside className="flex h-full w-64 flex-col bg-sidebar text-sidebar-foreground">
@@ -71,13 +102,13 @@ export function AdminLayout({ children }: { children: ReactNode }) {
         Management
       </p>
       <nav className="flex-1 space-y-1 px-3 py-2">
-        {NAV.map((item) => {
+        {nav.map((item) => {
           const Icon = item.icon;
           return (
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.end}
+              end={(item as { end?: boolean }).end}
               onClick={() => setOpen(false)}
               className={({ isActive }) =>
                 cn(
@@ -100,10 +131,52 @@ export function AdminLayout({ children }: { children: ReactNode }) {
         })}
       </nav>
       <div className="border-t border-sidebar-border px-4 py-4">
-        <div className="mb-3 rounded-lg bg-sidebar-accent/40 px-3 py-2">
-          <p className="text-sm font-medium">Greenfield Academy</p>
-          <p className="text-xs text-sidebar-foreground/70">Beta Programme</p>
-        </div>
+        {/* The active school (name + code). With several memberships the card
+            becomes the switcher (U12/R4): switching drops the old school's
+            cache and lands on the dashboard — never a mixed screen. */}
+        {memberships.length > 1 ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="w-full text-left"
+                data-testid="school-switcher"
+                aria-label="Switch school"
+              >
+                <div className="mb-3 flex items-center justify-between gap-2 rounded-lg bg-sidebar-accent/40 px-3 py-2 hover:bg-sidebar-accent/60">
+                  <div data-testid="active-school-card">
+                    <p className="text-sm font-medium">{active?.schoolName ?? "—"}</p>
+                    <p className="text-xs text-sidebar-foreground/70">
+                      Code: {active?.schoolCode ?? "—"}
+                    </p>
+                  </div>
+                  <ChevronsUpDown className="h-4 w-4 shrink-0 text-sidebar-foreground/60" />
+                </div>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-56">
+              <DropdownMenuLabel>Your schools</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {memberships.map((m) => (
+                <DropdownMenuItem
+                  key={m.schoolId}
+                  data-testid={`switch-school-${m.schoolId}`}
+                  onClick={() => void switchSchool(m.schoolId)}
+                >
+                  <span className="flex-1">
+                    <span className="block text-sm">{m.schoolName ?? "School"}</span>
+                    <span className="block text-xs text-muted-foreground">
+                      {m.schoolCode ?? "—"}
+                    </span>
+                  </span>
+                  {m.schoolId === activeSchoolId && <Check className="h-4 w-4" />}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : (
+          schoolCard
+        )}
         <Button
           variant="ghost"
           className="w-full justify-start gap-2 text-sidebar-foreground/80 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"

@@ -37,8 +37,9 @@ import { PageHeader } from "@/features/admin/components/PageHeader";
 import { PlacePicker, type Provenance } from "@/features/admin/components/PlacePicker";
 import { StudentsPinMap } from "@/features/admin/components/StudentsPinMap";
 import { api } from "@/lib/apiClient";
+import { useIsDirector } from "@/lib/auth";
 import { emailError, parentContactErrors, phoneError } from "@/lib/validation";
-import { useAbsences, useRoutes, useSchools, useStudents } from "@/lib/queries";
+import { useAbsences, useRoutes, useSchoolKey, useStudents } from "@/lib/queries";
 
 // --- Pure status pieces (unit-tested in tests/unit/studentStatus.test.ts) ---
 
@@ -106,18 +107,20 @@ const EMPTY = {
   // picked yet); editing an existing row seeds "legacy" (rows predate tracking).
   provenance: "typed" as Provenance,
   pickup_time: "",
-  school_id: "none",
+  // U12: the student's school IS the tab's active school — the server stamps
+  // the request scope, so the form no longer carries a school picker.
   morning_route: "none",
   afternoon_route: "none",
 };
 
 export function StudentsPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
   const confirm = useConfirm();
+  const isDirector = useIsDirector();
   const { data: students = [] } = useStudents();
   const { data: routes = [] } = useRoutes();
-  const { data: schools = [] } = useSchools();
   // The badge and the escalate/remove dialog act on TODAY's absence row, so
   // the query is scoped to the Nairobi day the server keys absences on —
   // an unscoped list would let a past/future-dated row wear today's badge.
@@ -140,13 +143,10 @@ export function StudentsPage() {
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
-  const [schoolFilter, setSchoolFilter] = useState("all");
 
   const morningRoutes = useMemo(() => routes.filter((r: any) => r.type === "morning"), [routes]);
   const afternoonRoutes = useMemo(() => routes.filter((r: any) => r.type === "afternoon"), [routes]);
   const routeName = (id: string) => (routes as any[]).find((r) => r.id === id)?.name;
-  const schoolName = (id: string | null) =>
-    (schools as any[]).find((s) => s.id === id)?.name ?? "—";
 
   // The whole absence row per student — scope drives the badge text, source
   // gates the toggle (parent-sourced rows get the escalate/remove dialog).
@@ -156,28 +156,19 @@ export function StudentsPage() {
     return m;
   }, [absences]);
 
-  const schoolFilters = useMemo(
-    () => [
-      { value: "all", label: "All schools" },
-      ...(schools as any[]).map((s) => ({ value: s.id, label: s.name })),
-    ],
-    [schools],
-  );
-
   const filtered = useMemo(
     () =>
       (students as any[]).filter((s) => {
         const matchesStatus = studentMatchesFilter(s, statusFilter);
-        const matchesSchool = schoolFilter === "all" || s.school_id === schoolFilter;
         const q = search.toLowerCase();
         const matchesSearch =
           !q ||
           [s.name, s.parent_name, s.parent_phone].some((v: string) =>
             (v ?? "").toLowerCase().includes(q),
           );
-        return matchesStatus && matchesSchool && matchesSearch;
+        return matchesStatus && matchesSearch;
       }),
-    [students, search, statusFilter, schoolFilter],
+    [students, search, statusFilter],
   );
 
   const startCreate = () => {
@@ -193,7 +184,6 @@ export function StudentsPage() {
       parent2_email: s.parent2_email ?? "", home_address: s.home_address ?? "",
       home_lat: s.home_lat, home_lng: s.home_lng, provenance: "legacy",
       pickup_time: s.pickup_time ?? "",
-      school_id: s.school_id ?? "none",
       morning_route: morningRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
       afternoon_route: afternoonRoutes.find((r: any) => ids.includes(r.id))?.id ?? "none",
     });
@@ -227,12 +217,13 @@ export function StudentsPage() {
         parent2_email: form.parent2_email || null, home_address: form.home_address || null,
         home_lat: form.home_lat, home_lng: form.home_lng, provenance: form.provenance,
         pickup_time: form.pickup_time || null,
-        school_id: form.school_id === "none" ? null : form.school_id, route_ids,
+        // U12: no school_id — the server stamps the request's school scope.
+        route_ids,
       };
       if (editId) await api.put(`/api/students/${editId}`, payload);
       else await api.post("/api/students", payload);
-      await qc.invalidateQueries({ queryKey: ["students"] });
-      await qc.invalidateQueries({ queryKey: ["routes"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("students") });
+      await qc.invalidateQueries({ queryKey: schoolKey("routes") });
       setOpen(false);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -248,15 +239,15 @@ export function StudentsPage() {
       confirmLabel: "Delete student",
     }))) return;
     await api.del(`/api/students/${s.id}`);
-    await qc.invalidateQueries({ queryKey: ["students"] });
-    await qc.invalidateQueries({ queryKey: ["routes"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("students") });
+    await qc.invalidateQueries({ queryKey: schoolKey("routes") });
   };
 
   // display_status derives from the absence rows (day scope → absent), so the
   // Status column refreshes together with the badge after any absence change.
   const refreshAfterAbsenceChange = async () => {
-    await qc.invalidateQueries({ queryKey: ["absences"] });
-    await qc.invalidateQueries({ queryKey: ["students"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("absences") });
+    await qc.invalidateQueries({ queryKey: schoolKey("students") });
   };
 
   const toggleAbsence = async (s: any) => {
@@ -312,7 +303,6 @@ export function StudentsPage() {
         placeholder="Search students, parents…"
         filters={[
           { value: statusFilter, onChange: setStatusFilter, options: STUDENT_STATUS_FILTERS },
-          { value: schoolFilter, onChange: setSchoolFilter, options: schoolFilters },
         ]}
         actions={
           <>
@@ -333,7 +323,6 @@ export function StudentsPage() {
             <TableRow>
               <TableHead>Student</TableHead>
               <TableHead>Grade</TableHead>
-              <TableHead>School</TableHead>
               <TableHead>Routes</TableHead>
               <TableHead>Home Address</TableHead>
               <TableHead>Pickup</TableHead>
@@ -344,7 +333,7 @@ export function StudentsPage() {
           </TableHeader>
           <TableBody>
             {filtered.length === 0 ? (
-              <TableRow><TableCell colSpan={9} className="text-center text-muted-foreground">No students match your filters.</TableCell></TableRow>
+              <TableRow><TableCell colSpan={8} className="text-center text-muted-foreground">No students match your filters.</TableCell></TableRow>
             ) : (
               filtered.map((s: any) => {
                 const names = (s.route_ids ?? []).map(routeName).filter(Boolean);
@@ -365,7 +354,6 @@ export function StudentsPage() {
                       </div>
                     </TableCell>
                     <TableCell>{s.grade ?? "—"}</TableCell>
-                    <TableCell className="text-muted-foreground">{schoolName(s.school_id)}</TableCell>
                     <TableCell className="text-muted-foreground">{names.length ? names.join(", ") : "—"}</TableCell>
                     <TableCell className="text-muted-foreground">{s.home_address ?? "—"}</TableCell>
                     <TableCell>{s.pickup_time ?? "—"}</TableCell>
@@ -399,7 +387,10 @@ export function StudentsPage() {
                         {absence ? <UserCheck className="h-4 w-4 text-success" /> : <UserX className="h-4 w-4" />}
                       </Button>
                       <Button variant="ghost" size="icon" onClick={() => startEdit(s)}><Pencil className="h-4 w-4" /></Button>
-                      <Button variant="ghost" size="icon" onClick={() => remove(s)}><Trash2 className="h-4 w-4" /></Button>
+                      {/* Director-only (U12/R8): the server 403s the backstop. */}
+                      {isDirector && (
+                        <Button variant="ghost" size="icon" title="Delete student" onClick={() => remove(s)}><Trash2 className="h-4 w-4" /></Button>
+                      )}
                     </TableCell>
                   </TableRow>
                 );
@@ -496,16 +487,6 @@ export function StudentsPage() {
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2"><Label>Pickup time</Label><Input placeholder="06:45" value={form.pickup_time} onChange={(e) => setForm({ ...form, pickup_time: e.target.value })} /></div>
             </div>
-            <div className="space-y-2">
-              <Label>School</Label>
-              <Select value={form.school_id} onValueChange={(v) => setForm({ ...form, school_id: v })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">— None —</SelectItem>
-                  {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2">
                 <Label>Morning route</Label>
@@ -577,14 +558,13 @@ export function StudentsPage() {
       <BulkUploadDialog open={bulkOpen} onOpenChange={setBulkOpen} />
 
       {/* Aggregate pin map (U11/R19): the dialog's data comes ONLY from the
-          audited /pin-map endpoint. The deep-link back out reads the normal
-          single-student row and opens the regular editor (PlacePicker) — the
-          usual flow for one child, not client-side aggregation. */}
+          audited /pin-map endpoint, scoped to the tab's active school. The
+          deep-link back out reads the normal single-student row and opens the
+          regular editor (PlacePicker) — the usual flow for one child, not
+          client-side aggregation. */}
       <StudentsPinMap
         open={pinMapOpen}
         onOpenChange={setPinMapOpen}
-        schools={schools as any[]}
-        initialSchoolId={schoolFilter === "all" ? null : schoolFilter}
         onEditStudent={(id) => {
           const s = (students as any[]).find((x) => String(x.id) === String(id));
           if (!s) return;

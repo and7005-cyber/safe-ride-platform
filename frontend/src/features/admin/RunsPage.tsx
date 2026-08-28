@@ -34,7 +34,8 @@ import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { RunFlagBadges } from "@/features/admin/components/RunFlagBadges";
 import { api } from "@/lib/apiClient";
-import { useBuses, useRoutes, useRuns } from "@/lib/queries";
+import { useIsDirector } from "@/lib/auth";
+import { useBuses, useRoutes, useRuns, useSchoolKey } from "@/lib/queries";
 import {
   RUN_STATUS_FILTERS,
   RUN_STATUS_LABEL,
@@ -65,6 +66,8 @@ function ReportField({ label, value }: { label: string; value: string | number |
 
 export function RunsPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const { toast } = useToast();
   const confirm = useConfirm();
   const { data: runs = [] } = useRuns();
@@ -80,8 +83,8 @@ export function RunsPage() {
 
   // Post-run audit report (R14): fetched fresh each time a row's dialog opens.
   const { data: report } = useQuery({
-    queryKey: ["run-report", reportId],
-    queryFn: () => api.get(`/api/runs/${reportId}/report`),
+    queryKey: schoolKey("run-report", reportId),
+    queryFn: ({ signal }) => api.get(`/api/runs/${reportId}/report`, undefined, { signal }),
     enabled: Boolean(reportId),
   });
 
@@ -117,7 +120,7 @@ export function RunsPage() {
       };
       if (editId) await api.put(`/api/runs/${editId}`, payload);
       else await api.post("/api/runs", payload);
-      await qc.invalidateQueries({ queryKey: ["runs"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("runs") });
       setOpen(false);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -147,7 +150,7 @@ export function RunsPage() {
     }))) return;
     try {
       await api.post(`/api/runs/${run.id}/force-close`, {});
-      await qc.invalidateQueries({ queryKey: ["runs"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("runs") });
       // Open the run's report so the call list is in front of whoever did this.
       setReportId(run.id);
     } catch (err) {
@@ -159,8 +162,8 @@ export function RunsPage() {
     try {
       await api.post(`/api/runs/${runId}/contacted`, { student_id: studentId });
       await Promise.all([
-        qc.invalidateQueries({ queryKey: ["run-report", runId] }),
-        qc.invalidateQueries({ queryKey: ["runs"] }),
+        qc.invalidateQueries({ queryKey: schoolKey("run-report", runId) }),
+        qc.invalidateQueries({ queryKey: schoolKey("runs") }),
       ]);
     } catch (err) {
       toast({ title: "Cannot record", description: (err as Error).message, variant: "destructive" });
@@ -174,7 +177,7 @@ export function RunsPage() {
       confirmLabel: "Delete run",
     }))) return;
     await api.del(`/api/runs/${id}`);
-    await qc.invalidateQueries({ queryKey: ["runs"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("runs") });
   };
 
   return (
@@ -238,7 +241,12 @@ export function RunsPage() {
                       </Button>
                     )}
                     <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); startEdit(r); }}><Pencil className="h-4 w-4" /></Button>
-                    <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); remove(r.id); }}><Trash2 className="h-4 w-4" /></Button>
+                    {/* AE27 (U12): a coordinator may delete only a NON-completed
+                        run (open-run cleanup); a completed run's record is
+                        director territory. The server enforces the same rule. */}
+                    {(isDirector || r.status !== "completed") && (
+                      <Button variant="ghost" size="icon" title="Delete run" onClick={(e) => { e.stopPropagation(); remove(r.id); }}><Trash2 className="h-4 w-4" /></Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))

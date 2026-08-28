@@ -9,7 +9,8 @@ import { FleetMapPage } from "@/features/admin/FleetMapPage";
 import { BusesPage } from "@/features/admin/BusesPage";
 import { RoutesPage } from "@/features/admin/RoutesPage";
 import { PlanReviewPage } from "@/features/admin/PlanReviewPage";
-import { SchoolsPage } from "@/features/admin/SchoolsPage";
+import { SchoolSettingsPage } from "@/features/admin/SchoolSettingsPage";
+import { StaffPage } from "@/features/admin/StaffPage";
 import { StudentsPage } from "@/features/admin/StudentsPage";
 import { RunsPage } from "@/features/admin/RunsPage";
 import { ParentsPage } from "@/features/admin/ParentsPage";
@@ -52,7 +53,13 @@ export const router = createBrowserRouter([
   { path: "/fleet-plan", element: admin(<PlanReviewPage />) },
   { path: "/students", element: admin(<StudentsPage />) },
   { path: "/runs", element: admin(<RunsPage />) },
-  { path: "/schools", element: admin(<SchoolsPage />) },
+  // School Settings replaces the Schools page (U12/R23): the console works
+  // inside ONE active school — no create/delete, no list. Old bookmarks land
+  // on the settings of whatever school the tab is in.
+  { path: "/settings", element: admin(<SchoolSettingsPage />) },
+  { path: "/schools", element: <Navigate to="/settings" replace /> },
+  // Staff management (U12/R5-R10) — the page itself bounces non-directors.
+  { path: "/staff", element: admin(<StaffPage />) },
   // Parent assignment now happens in the student form (R12); the old page is gone.
   { path: "/parent-assignments", element: <Navigate to="/students" replace /> },
   { path: "/parents", element: admin(<ParentsPage />) },

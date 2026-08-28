@@ -33,8 +33,9 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { useIsDirector } from "@/lib/auth";
 import { phoneError } from "@/lib/validation";
-import { useBuses, useDrivers } from "@/lib/queries";
+import { useBuses, useDrivers, useSchoolKey } from "@/lib/queries";
 import {
   BUS_STATUS_FILTERS,
   BUS_STATUS_LABEL,
@@ -60,6 +61,8 @@ const EMPTY = {
 
 export function BusesPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const { toast } = useToast();
   const confirm = useConfirm();
   const { data: buses = [], isLoading } = useBuses();
@@ -131,7 +134,7 @@ export function BusesPage() {
       };
       if (editId) await api.put(`/api/fleet/buses/${editId}`, payload);
       else await api.post("/api/fleet/buses", payload);
-      await qc.invalidateQueries({ queryKey: ["buses"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("buses") });
       setOpen(false);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -148,7 +151,7 @@ export function BusesPage() {
     }))) return;
     try {
       await api.del(`/api/fleet/buses/${id}`);
-      await qc.invalidateQueries({ queryKey: ["buses"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("buses") });
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     }
@@ -214,7 +217,10 @@ export function BusesPage() {
                   </TableCell>
                   <TableCell className="text-right">
                     <Button variant="ghost" size="icon" onClick={() => startEdit(bus)}><Pencil className="h-4 w-4" /></Button>
-                    <Button variant="ghost" size="icon" onClick={() => remove(bus.id)}><Trash2 className="h-4 w-4" /></Button>
+                    {/* Director-only (U12/R8): the server 403s the backstop. */}
+                    {isDirector && (
+                      <Button variant="ghost" size="icon" title="Delete bus" onClick={() => remove(bus.id)}><Trash2 className="h-4 w-4" /></Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))

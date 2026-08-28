@@ -25,13 +25,16 @@ import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { useIsDirector } from "@/lib/auth";
 import { emailError, phoneError } from "@/lib/validation";
-import { useDrivers } from "@/lib/queries";
+import { useDrivers, useSchoolKey } from "@/lib/queries";
 
 const EMPTY = { full_name: "", email: "", password: "", phone: "", pin: "" };
 
 export function DriversPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const { toast } = useToast();
   const confirm = useConfirm();
   const { data: drivers = [] } = useDrivers();
@@ -80,8 +83,8 @@ export function DriversPage() {
           phone: form.phone || null, pin: form.pin || null,
         });
       }
-      await qc.invalidateQueries({ queryKey: ["accounts-drivers"] });
-      await qc.invalidateQueries({ queryKey: ["buses"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("accounts-drivers") });
+      await qc.invalidateQueries({ queryKey: schoolKey("buses") });
       const newPin = form.pin;
       const driverName = form.full_name;
       setOpen(false);
@@ -101,8 +104,8 @@ export function DriversPage() {
       confirmLabel: "Delete driver",
     }))) return;
     await api.del(`/api/accounts/drivers/${id}`);
-    await qc.invalidateQueries({ queryKey: ["accounts-drivers"] });
-    await qc.invalidateQueries({ queryKey: ["buses"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("accounts-drivers") });
+    await qc.invalidateQueries({ queryKey: schoolKey("buses") });
   };
 
   const emailErr = emailError(form.email, true);
@@ -141,7 +144,10 @@ export function DriversPage() {
                   <TableCell>{d.assigned_bus ?? "—"}</TableCell>
                   <TableCell className="text-right">
                     <Button variant="ghost" size="icon" onClick={() => startEdit(d)}><Pencil className="h-4 w-4" /></Button>
-                    <Button variant="ghost" size="icon" onClick={() => remove(d.id)}><Trash2 className="h-4 w-4" /></Button>
+                    {/* Director-only (U12/R8): the server 403s the backstop. */}
+                    {isDirector && (
+                      <Button variant="ghost" size="icon" title="Delete driver" onClick={() => remove(d.id)}><Trash2 className="h-4 w-4" /></Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))

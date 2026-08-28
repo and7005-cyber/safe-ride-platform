@@ -11,18 +11,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
 import { PlacePicker, type ResolvedPlace } from "@/features/admin/components/PlacePicker";
 import { api } from "@/lib/apiClient";
-import { useSchools } from "@/lib/queries";
+import { useSchoolKey } from "@/lib/queries";
 import { bulkStudentRowError } from "@/lib/validation";
 
 // `parent_phone2` is Parent 2's phone (pre-existing header, reused column).
@@ -86,14 +78,12 @@ const EMPTY_PLACE: ResolvedPlace = { address: "", lat: null, lng: null, provenan
 
 export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
-  const { data: schools = [] } = useSchools();
 
-  // The upload is scoped to one school (U10): the payload carries school_id and
-  // every committed row is stamped with it — a school-less student would be
-  // invisible to the school-scoped fleet-plan draft basis and the pin map.
-  const [schoolId, setSchoolId] = useState("");
+  // U12: the upload is scoped to the tab's ACTIVE school — the request scope
+  // (X-School-Id) stamps every committed row, so the picker is gone.
   const [rows, setRows] = useState<BulkRowPayload[]>([]);
   const [clientErrors, setClientErrors] = useState<string[]>([]);
   const [triage, setTriage] = useState<TriageRow[] | null>(null);
@@ -158,7 +148,6 @@ export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpen
       setRows(valid);
       if (valid.length) {
         const res = await api.post("/api/students/bulk/validate", {
-          school_id: schoolId,
           students: valid,
         });
         setTriage(res.rows as TriageRow[]);
@@ -237,12 +226,11 @@ export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpen
         return out;
       });
       const res: CommitResult = await api.post("/api/students/bulk", {
-        school_id: schoolId,
         students,
       });
       setResult(res);
       setTriage(null);
-      await qc.invalidateQueries({ queryKey: ["students"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("students") });
     } catch (err) {
       toast({ title: "Import failed", description: (err as Error).message, variant: "destructive" });
     } finally {
@@ -282,31 +270,9 @@ export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpen
             Upload a CSV or Excel file. Each row needs a name, grade, and parent name, plus at
             least one parent phone and one parent email across the two parents
             (parent_phone/parent_phone2, parent_email/parent2_email). Routes are not part of
-            the upload — they come from the fleet plan.
+            the upload — they come from the fleet plan. Every imported student is enrolled at
+            this school.
           </p>
-          <div className="space-y-2">
-            <Label>School</Label>
-            <Select
-              value={schoolId}
-              onValueChange={(v) => {
-                setSchoolId(v);
-                resetFlow();
-              }}
-            >
-              <SelectTrigger data-testid="bulk-school">
-                <SelectValue placeholder="Select the school these students attend" />
-              </SelectTrigger>
-              <SelectContent>
-                {schools.map((s: { id: string; name: string }) => (
-                  <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              Every imported student is enrolled at this school — the fleet-plan drafts and the
-              pin map only see a school's own students.
-            </p>
-          </div>
           <div className="flex gap-2">
             <Button variant="outline" onClick={downloadTemplate}>Download template</Button>
             <input
@@ -316,7 +282,7 @@ export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpen
               className="hidden"
               onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
             />
-            <Button onClick={() => fileRef.current?.click()} disabled={busy || !schoolId}>
+            <Button onClick={() => fileRef.current?.click()} disabled={busy}>
               <Upload className="h-4 w-4" /> {busy && !triage ? "Checking…" : "Choose file"}
             </Button>
           </div>
