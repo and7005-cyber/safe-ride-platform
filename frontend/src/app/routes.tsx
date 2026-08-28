@@ -24,6 +24,10 @@ import { ParentHomePage } from "@/features/parent/ParentHomePage";
 import { ParentTrackPage } from "@/features/parent/ParentTrackPage";
 import { ParentAlertsPage } from "@/features/parent/ParentAlertsPage";
 import { ParentProfilePage } from "@/features/parent/ParentProfilePage";
+import { ProviderLayout } from "@/features/provider/ProviderLayout";
+import { SchoolsListPage } from "@/features/provider/SchoolsListPage";
+import { ProviderAccountsPage } from "@/features/provider/ProviderAccountsPage";
+import { ProviderAuditPage } from "@/features/provider/ProviderAuditPage";
 import { NotFoundPage } from "@/features/shared/NotFoundPage";
 
 function admin(node: ReactNode) {
@@ -40,6 +44,17 @@ function driver(node: ReactNode) {
 
 function parent(node: ReactNode) {
   return <ProtectedRoute allowedRoles={["parent"]}>{node}</ProtectedRoute>;
+}
+
+// The provider console (U13): provider-only — staff, drivers and parents are
+// bounced to their own homes; a provider WITHOUT a live step-in never
+// reaches the admin surface (ProtectedRoute's admin gate).
+function provider(node: ReactNode) {
+  return (
+    <ProtectedRoute allowedRoles={["provider"]}>
+      <ProviderLayout>{node}</ProviderLayout>
+    </ProtectedRoute>
+  );
 }
 
 export const router = createBrowserRouter([
@@ -65,6 +80,11 @@ export const router = createBrowserRouter([
   { path: "/parents", element: admin(<ParentsPage />) },
   { path: "/drivers", element: admin(<DriversPage />) },
   { path: "/alerts", element: admin(<AlertsPage />) },
+
+  // The provider console (U13): the schools health list is the home.
+  { path: "/provider", element: provider(<SchoolsListPage />) },
+  { path: "/provider/accounts", element: provider(<ProviderAccountsPage />) },
+  { path: "/provider/audit", element: provider(<ProviderAuditPage />) },
 
   { path: "/driver", element: driver(<DriverHomePage />) },
   { path: "/driver/run", element: driver(<DriverRunPage />) },

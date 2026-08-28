@@ -69,6 +69,18 @@ test("a new parent can sign up and reaches the parent home", async ({ page }) =>
   ).toBeVisible({ timeout: 10_000 });
 });
 
+test("sign-up offers parent only: the role choice is gone (U13)", async ({ page }) => {
+  // Staff join through their school's offers and drivers are set up by the
+  // school office — the form has no role select and no driver option at all.
+  await page.goto("/auth");
+  await page.getByRole("button", { name: "Sign up", exact: true }).click();
+
+  await expect(page.getByText(/This creates a parent account/)).toBeVisible();
+  await expect(page.getByText("I am a")).toHaveCount(0);
+  await expect(page.locator("#role")).toHaveCount(0);
+  await expect(page.getByText("Driver", { exact: true })).toHaveCount(0);
+});
+
 test("forgot password issues a usable reset link", async ({ page, request }) => {
   // Use a throwaway account so the seeded parent password stays canonical.
   const email = `e2e-reset-${Date.now()}@test.local`;

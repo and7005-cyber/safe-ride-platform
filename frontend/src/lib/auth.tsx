@@ -9,7 +9,18 @@ import {
   type ReactNode,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { api, getToken, onSchoolScoped404, onUnauthorized, setToken } from "@/lib/apiClient";
+// The module-level toast fn (not the useToast hook): AuthProvider is the app
+// root and must not re-render on every toast state change.
+import { toast } from "@/components/ui/use-toast";
+import {
+  api,
+  getToken,
+  onSchoolScoped403,
+  onSchoolScoped404,
+  onTotpEnrolmentRequired,
+  onUnauthorized,
+  setToken,
+} from "@/lib/apiClient";
 import {
   clearActiveSchoolId,
   getActiveSchoolId,
@@ -38,6 +49,21 @@ export interface PendingOffer extends SchoolMembership {
 export interface ProviderState {
   isProvider: boolean;
   totpEnrolled: boolean;
+  /** When the CALLING session last verified an authenticator code (ISO), or
+   * null. Step-up dialogs show the code input up front once this is stale
+   * (older than 15 minutes) — see stepUpCodeNeeded (U13). */
+  totpVerifiedAt: string | null;
+}
+
+/** The calling session's live provider step-in from /me (U13/AE29): feeds
+ * the persistent support banner and the school-store rule. */
+export interface SupportSession {
+  id: string;
+  schoolId: string;
+  schoolName: string | null;
+  schoolCode: string | null;
+  reason: string | null;
+  startedAt: string | null;
 }
 
 export interface AuthUser {
@@ -52,6 +78,8 @@ export interface AuthUser {
   /** The session's last-used school (server hint; the tab store is the truth). */
   activeSchoolId: string | null;
   provider: ProviderState | null;
+  /** The session's live step-in (providers only, U13); null otherwise. */
+  supportSession: SupportSession | null;
   mustChangePassword: boolean;
   /** False until the first /me answered — a fresh login knows only the login
    * response's fields, and ProtectedRoute must not judge memberships yet. */
@@ -71,6 +99,20 @@ export function staffMemberships(user: AuthUser | null): SchoolMembership[] {
  * staff signal (the legacy 'admin' role row alone no longer opens it). */
 export function isStaff(user: AuthUser | null): boolean {
   return staffMemberships(user).length > 0;
+}
+
+/** Whether this session is a provider with a LIVE step-in (U13). */
+export function isSteppedIn(user: AuthUser | null): boolean {
+  return Boolean(user?.provider && user.supportSession);
+}
+
+/** Whether the session may work in `schoolId`'s console: a staff membership
+ * there, OR a provider's live step-in at exactly that school (U13). A
+ * provider without a step-in has NO school — the console is closed. */
+export function canWorkAtSchool(user: AuthUser | null, schoolId: string | null): boolean {
+  if (!user || !schoolId) return false;
+  if (user.provider) return user.supportSession?.schoolId === schoolId;
+  return Boolean(membershipAt(user, schoolId));
 }
 
 /** The membership granting access to `schoolId`, best role first. */
@@ -109,6 +151,17 @@ function mapMe(me: any): AuthUser {
       ? {
           isProvider: Boolean(me.provider.isProvider ?? true),
           totpEnrolled: Boolean(me.provider.totpEnrolled),
+          totpVerifiedAt: me.provider.totpVerifiedAt ?? null,
+        }
+      : null,
+    supportSession: me.supportSession
+      ? {
+          id: me.supportSession.id,
+          schoolId: me.supportSession.schoolId,
+          schoolName: me.supportSession.schoolName ?? null,
+          schoolCode: me.supportSession.schoolCode ?? null,
+          reason: me.supportSession.reason ?? null,
+          startedAt: me.supportSession.startedAt ?? null,
         }
       : null,
     mustChangePassword: Boolean(me.mustChangePassword),
@@ -116,10 +169,19 @@ function mapMe(me: any): AuthUser {
   };
 }
 
-/** Reconcile the per-tab school store with the fresh /me answer (U12): the
- * store is only ever populated for staff sessions, a stale school (revoked
- * membership) is dropped, and a single membership self-selects. */
-function reconcileSchoolStore(user: AuthUser): void {
+/** Reconcile the per-tab school store with the fresh /me answer (U12, widened
+ * by U13): the store is populated for staff memberships OR an active provider
+ * step-in; a stale school (revoked membership, ended step-in) is dropped, and
+ * a single membership self-selects. Exported for unit tests. */
+export function reconcileSchoolStore(user: AuthUser): void {
+  if (user.provider) {
+    // Providers (U13): the tab's school mirrors the LIVE step-in exactly. A
+    // support session names the one school this session may work in; without
+    // one the store must be empty — a provider never idles inside a school.
+    if (user.supportSession) setActiveSchoolId(user.supportSession.schoolId);
+    else clearActiveSchoolId();
+    return;
+  }
   const staff = staffMemberships(user);
   const current = getActiveSchoolId();
   if (staff.length === 0) {
@@ -196,6 +258,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         pendingOffers: [],
         activeSchoolId: null,
         provider: null,
+        supportSession: null,
         mustChangePassword: Boolean(nextUser.mustChangePassword),
         hydrated: false,
       });
@@ -251,13 +314,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const me = await api.get("/api/auth/me");
           const mapped = mapMe(me);
           const staff = staffMemberships(mapped);
-          const stillMember = staff.some((m) => m.schoolId === schoolId);
-          if (!stillMember) {
+          // Access to the school survives via a membership OR (U13) a live
+          // provider step-in at that very school.
+          const stillAllowed =
+            staff.some((m) => m.schoolId === schoolId) ||
+            Boolean(mapped.provider && mapped.supportSession?.schoolId === schoolId);
+          if (!stillAllowed) {
             if (getActiveSchoolId() === schoolId) clearActiveSchoolId();
             await queryClient.cancelQueries({ queryKey: ["school", schoolId] });
             queryClient.removeQueries({ queryKey: ["school", schoolId] });
-            if (staff.length === 0 && mapped.role !== "parent" && mapped.role !== "driver") {
+            if (
+              staff.length === 0 &&
+              !mapped.provider &&
+              mapped.role !== "parent" &&
+              mapped.role !== "driver"
+            ) {
               // Nothing left to show this account: end the session cleanly.
+              // (A provider always keeps the console — never signed out here.)
               await signOutRef.current();
               return;
             }
@@ -270,8 +343,62 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       })();
     });
+    onSchoolScoped403((schoolId: string) => {
+      // The stepped-in provider's mirror of the staff re-choose rule (U13):
+      // school-scoped calls answer 403 the moment the support session ends
+      // (Exit elsewhere, the four-hour janitor, a supersede, logout). One /me
+      // re-check decides; ProtectedRoute then re-routes declaratively to the
+      // provider console — never a toast per failed query.
+      if (recheckInFlight.current) return;
+      recheckInFlight.current = true;
+      void (async () => {
+        try {
+          const me = await api.get("/api/auth/me");
+          const mapped = mapMe(me);
+          if (
+            mapped.provider &&
+            getActiveSchoolId() === schoolId &&
+            mapped.supportSession?.schoolId !== schoolId
+          ) {
+            clearActiveSchoolId();
+            await queryClient.cancelQueries({ queryKey: ["school", schoolId] });
+            queryClient.removeQueries({ queryKey: ["school", schoolId] });
+            toast({
+              title: "Step-in ended",
+              description:
+                "Your support session at this school is no longer active. Back to the school list.",
+            });
+          }
+          setUser(mapped);
+        } catch {
+          // /me failing lands in the normal 401/refresh paths.
+        } finally {
+          recheckInFlight.current = false;
+        }
+      })();
+    });
+    onTotpEnrolmentRequired(() => {
+      // A peer reset this provider's second factor (U13): /me now says
+      // unenrolled and ProtectedRoute swaps in the enrolment screen.
+      if (recheckInFlight.current) return;
+      recheckInFlight.current = true;
+      void (async () => {
+        try {
+          const me = await api.get("/api/auth/me");
+          setUser(mapMe(me));
+        } catch {
+          // /me failing lands in the normal 401/refresh paths.
+        } finally {
+          recheckInFlight.current = false;
+        }
+      })();
+    });
     void refresh();
-    return () => onSchoolScoped404(null);
+    return () => {
+      onSchoolScoped404(null);
+      onSchoolScoped403(null);
+      onTotpEnrolmentRequired(null);
+    };
   }, [refresh, queryClient]);
 
   const value = useMemo<AuthContextValue>(
@@ -289,12 +416,15 @@ export function useAuth(): AuthContextValue {
 }
 
 /** The caller's role at the ACTIVE school: 'director' | 'coordinator' | null.
- * A provider on this surface is stepped in, which the server resolves as
- * director — the capability checks mirror that (U12). */
+ * A provider holds a school role ONLY through a live step-in at that very
+ * school, which the server resolves as director — the capability checks
+ * mirror that (U12/U13). A provider without a step-in has no role anywhere. */
 export function useActiveSchoolRole(): MembershipRole | null {
   const { user } = useAuth();
   const schoolId = useActiveSchoolId();
-  if (user?.provider) return "director";
+  if (user?.provider) {
+    return schoolId && user.supportSession?.schoolId === schoolId ? "director" : null;
+  }
   return membershipAt(user, schoolId)?.role ?? null;
 }
 

@@ -1,5 +1,6 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -383,6 +384,104 @@ export async function clearCancellationState(
 
 export function uniqueName(prefix: string): string {
   return `${prefix} ${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`;
+}
+
+// TOTP for the provider suite (U13) ------------------------------------------
+//
+// RFC 6238 over the base32 key captured at the enrolment screen: 30-second
+// steps, HMAC-SHA1, 6 digits — exactly backend/app/core/totp.py. The server
+// accepts the current step ±1 and REFUSES any step at or below the last
+// accepted one (replay guard), so a burst of code-verified actions inside one
+// 30-second window would fail with "Invalid code". TotpMinter tracks the
+// last minted step and, when the next unconsumed step is still outside the
+// server's window, waits for the clock — tests must mint every code through
+// one shared minter instance.
+
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+export const TOTP_STEP_SECONDS = 30;
+
+export function base32Decode(input: string): Buffer {
+  const clean = input.toUpperCase().replace(/=+$/, "").replace(/\s+/g, "");
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const ch of clean) {
+    const index = BASE32_ALPHABET.indexOf(ch);
+    if (index === -1) throw new Error(`Invalid base32 character: ${ch}`);
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+/** The RFC 6238/4226 code for one step counter (SHA-1, 6 digits). */
+export function totpCodeAtStep(secretB32: string, step: number): string {
+  const message = Buffer.alloc(8);
+  message.writeBigUInt64BE(BigInt(step));
+  const digest = createHmac("sha1", base32Decode(secretB32)).update(message).digest();
+  const offset = digest[digest.length - 1]! & 0x0f;
+  const binary =
+    ((digest[offset]! & 0x7f) << 24) |
+    (digest[offset + 1]! << 16) |
+    (digest[offset + 2]! << 8) |
+    digest[offset + 3]!;
+  return String(binary % 1_000_000).padStart(6, "0");
+}
+
+export function currentTotpStep(atMs: number = Date.now()): number {
+  return Math.floor(atMs / 1000 / TOTP_STEP_SECONDS);
+}
+
+export class TotpMinter {
+  private lastStep = -1;
+
+  constructor(private readonly secretB32: string) {}
+
+  /** The next acceptable code: never re-mints a consumed step; waits out the
+   * clock when the next unconsumed step is still ahead of the ±1 window. */
+  async next(): Promise<string> {
+    for (;;) {
+      const now = currentTotpStep();
+      const target = Math.max(now, this.lastStep + 1);
+      if (target <= now + 1) {
+        this.lastStep = target;
+        return totpCodeAtStep(this.secretB32, target);
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+    }
+  }
+}
+
+// Provider seed-state restoration (U13). The seeded provider
+// (provider@kuumbai.test) ships UNENROLLED with a fixed salt; the provider
+// suite enrols it. The product path back is the reset-totp peer action —
+// provider.spec.ts ends by exercising exactly that — and these SQL helpers
+// are the crash-proof backstop (a run that dies mid-suite must not leave the
+// account enrolled under a secret nobody knows), the same philosophy as
+// purgeRun: idempotent restoration of seeded state, not a backdoor around a
+// product rule.
+
+const PROVIDER_USER_ID = "a0000000-0000-0000-0000-000000000014";
+
+/** Restore the seeded provider to its unenrolled seed state (fixed salt). */
+export function sqlResetProviderTotp(): void {
+  psql(
+    `update provider_accounts set totp_enrolled_at = null, totp_last_step = null, ` +
+      `totp_salt = '5eedab1e5a17c0ffee00000000000001', totp_pepper_key = null ` +
+      `where user_id = '${PROVIDER_USER_ID}'`,
+  );
+}
+
+/** Close any support session a crashed run left open for the seeded provider. */
+export function sqlEndProviderSupportSessions(): void {
+  psql(
+    `update provider_support_sessions set ended_at = now(), end_cause = 'revoked' ` +
+      `where provider_user_id = '${PROVIDER_USER_ID}' and ended_at is null`,
+  );
 }
 
 // Admin dialog forms render <Label>Text</Label><Input/> without htmlFor, so

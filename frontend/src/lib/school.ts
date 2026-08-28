@@ -6,11 +6,13 @@ import { useSyncExternalStore } from "react";
 // original's school (sessionStorage copy semantics), which is the intended
 // "carry the school with the tab" behaviour.
 //
-// The store is only ever populated on the staff surface: ProtectedRoute
-// auto-selects or the person chooses/switches, and AuthProvider clears it for
-// non-staff sessions and on sign-out. That single rule is what keeps the
-// driver surface from ever sending X-School-Id (driver routes 403 the header
-// by design) — see apiClient.ts, which reads this store on every request.
+// The store is only ever populated for a session with school-console access
+// (U12, widened by U13): a staff membership — ProtectedRoute auto-selects or
+// the person chooses/switches — OR a provider's live step-in, where the store
+// mirrors the support session exactly. AuthProvider clears it for every other
+// session and on sign-out. That single rule is what keeps the driver surface
+// from ever sending X-School-Id (driver routes 403 the header by design) —
+// see apiClient.ts, which reads this store on every request.
 
 const SCHOOL_KEY = "saferide-school";
 
