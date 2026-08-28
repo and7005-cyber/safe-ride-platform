@@ -1,10 +1,21 @@
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection, get_global_connection
 from app.dao.status_sql import display_status_case
+
+# Every parent-recipient query below filters to ACCEPTED links on ENABLED
+# accounts (U7/R31/R13): a pending cross-school link is not consent to be
+# messaged, and a disabled account must go silent everywhere at once. The
+# predicates live in one string so no recipient query can drift.
+_RECIPIENT_PREDICATES = "ps.status = 'accepted' and u.disabled_at is null"
 
 
 class PushDao:
+    # Push tokens and the notification feed are user-owned, not school-owned
+    # (the U5 seam's "non-school tables"): their methods use the deliberately
+    # scope-free global connection, so a scoped request's background task can
+    # deliver to a cross-school parent without borrowing any school GUC.
+
     def subscribe(self, user_id: str, endpoint: str, p256dh: str | None, auth: str | None, user_agent: str | None) -> None:
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 """
                 insert into live_push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
@@ -17,14 +28,14 @@ class PushDao:
             )
 
     def unsubscribe(self, user_id: str, endpoint: str) -> None:
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 "delete from live_push_subscriptions where endpoint = %s and user_id = %s",
                 (endpoint, user_id),
             )
 
     def register_fcm_token(self, user_id: str, token: str, user_agent: str | None) -> None:
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 """
                 insert into live_fcm_tokens (user_id, token, user_agent)
@@ -36,7 +47,7 @@ class PushDao:
             )
 
     def unregister_fcm_token(self, user_id: str, token: str) -> None:
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 "delete from live_fcm_tokens where token = %s and user_id = %s",
                 (token, user_id),
@@ -44,13 +55,13 @@ class PushDao:
 
     def delete_fcm_token(self, token: str) -> None:
         """Drop a token FCM reported as dead, whoever owns it."""
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute("delete from live_fcm_tokens where token = %s", (token,))
 
     def fcm_tokens_for_users(self, user_ids: list[str]) -> list[dict]:
         if not user_ids:
             return []
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             rows = conn.execute(
                 "select user_id, token from live_fcm_tokens where user_id = any(%s)",
                 (user_ids,),
@@ -60,7 +71,7 @@ class PushDao:
     def web_push_subscriptions_for_users(self, user_ids: list[str]) -> list[dict]:
         if not user_ids:
             return []
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             rows = conn.execute(
                 """
                 select user_id, endpoint, p256dh, auth
@@ -73,76 +84,88 @@ class PushDao:
 
     def delete_web_push_subscription(self, endpoint: str) -> None:
         """Drop a subscription the push service reported as gone (404/410)."""
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 "delete from live_push_subscriptions where endpoint = %s", (endpoint,)
             )
 
-    def active_run_for_driver(self, driver_id: str) -> dict | None:
-        """Today's active run for the driver's bus, if any.
+    # School-owned reads (U7): every method below takes an explicit scope and
+    # opens its connection through it. The UNSET default keeps unconverted
+    # callers on the context-var fallback, where the strict flag turns a
+    # missed thread inside a SchoolScope request into a loud error.
+
+    def active_run_for_driver(self, scope) -> dict | None:
+        """Today's active run for the calling driver's bus, if any.
 
         Mirrors RunDao.find_active_run_today: anything not completed counts
         (an admin marking a run 'delayed' must not mute its notifications).
-        """
-        with get_connection() as conn:
+        The bus resolves through the driver's OWN school (U7): the scope IS
+        the driver — user and school together."""
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
                 select r.* from live_runs r
                 join live_buses b on b.id = r.bus_id
-                where b.driver_id = %s
+                where b.driver_id = %s and b.school_id = %s
                   and r.date = (now() at time zone 'Africa/Nairobi')::date
                   and r.status <> 'completed'
                 order by r.created_at desc
                 limit 1
                 """,
-                (driver_id,),
+                (scope.user_id, scope.school_id),
             ).fetchone()
         return dict(row) if row else None
 
-    def bus_name(self, bus_id: str) -> str | None:
-        with get_connection() as conn:
+    def bus_name(self, bus_id: str, scope: object = UNSET) -> str | None:
+        with get_connection(scope) as conn:
             row = conn.execute("select name from live_buses where id = %s", (bus_id,)).fetchone()
         return row["name"] if row else None
 
-    def parents_of_students(self, student_ids: list[str]) -> list[dict]:
-        """Resolve (parent_id, student_id, student_name) pairs for students."""
+    def parents_of_students(self, student_ids: list[str], scope: object = UNSET) -> list[dict]:
+        """Resolve (parent_id, student_id, student_name) pairs for students —
+        accepted links on enabled accounts only (U7)."""
         if not student_ids:
             return []
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
-                """
+                f"""
                 select ps.parent_id, ps.student_id, s.name as student_name
                 from live_parent_students ps
                 join live_students s on s.id = ps.student_id
-                where ps.student_id = any(%s)
+                join app_users u on u.id = ps.parent_id
+                where ps.student_id = any(%s) and {_RECIPIENT_PREDICATES}
                 """,
                 (student_ids,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def parents_of_bus(self, bus_id: str) -> list[dict]:
-        """Resolve (parent_id, student_id, student_name) pairs for a bus."""
-        with get_connection() as conn:
+    def parents_of_bus(self, bus_id: str, scope: object = UNSET) -> list[dict]:
+        """Resolve (parent_id, student_id, student_name) pairs for a bus —
+        accepted links on enabled accounts only (U7)."""
+        with get_connection(scope) as conn:
             rows = conn.execute(
-                """
+                f"""
                 select ps.parent_id, ps.student_id, s.name as student_name
                 from live_parent_students ps
                 join live_students s on s.id = ps.student_id
-                where s.bus_id = %s
+                join app_users u on u.id = ps.parent_id
+                where s.bus_id = %s and {_RECIPIENT_PREDICATES}
                 """,
                 (bus_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def route_broadcast_context(self, route_id: str) -> dict | None:
+    def route_broadcast_context(self, scope, route_id: str) -> dict | None:
         """The route row plus its assigned-student count, for the broadcast
-        endpoint's guards (U8). None = unknown route (404); a zero count backs
-        the no-students 409 — a broadcast that can reach nobody must fail
-        loudly, never answer 200 with nothing sent."""
-        with get_connection() as conn:
+        endpoint's guards (U8). None = unknown route — which since U7 includes
+        another school's route (404); a zero count backs the no-students 409 —
+        a broadcast that can reach nobody must fail loudly, never answer 200
+        with nothing sent."""
+        with get_connection(scope) as conn:
             route = conn.execute(
-                "select id, name, type, bus_id from live_routes where id = %s",
-                (route_id,),
+                "select id, name, type, bus_id, school_id from live_routes "
+                "where id = %s and school_id = %s",
+                (route_id, scope.school_id),
             ).fetchone()
             if not route:
                 return None
@@ -152,9 +175,9 @@ class PushDao:
             ).fetchone()
         return {"route": dict(route), "student_count": int(count["n"])}
 
-    def parents_of_route(self, route_id: str) -> list[str]:
+    def parents_of_route(self, scope, route_id: str) -> list[str]:
         """DISTINCT parent account ids for the students ASSIGNED to a route
-        (U8, R20/R21).
+        (U8, R20/R21) — accepted links on enabled accounts only (U7).
 
         Assignment truth only: live_student_routes → live_parent_students.
         Never students.bus_id — bus membership drifts from route assignment
@@ -162,26 +185,27 @@ class PushDao:
         bus after reassignment), and R20 scopes the broadcast to the route's
         assigned students. Distinct at the SQL level: a parent with several
         children on the route is one recipient (AE5)."""
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
-                """
+                f"""
                 select distinct ps.parent_id
                 from live_student_routes sr
                 join live_parent_students ps on ps.student_id = sr.student_id
-                where sr.route_id = %s
+                join app_users u on u.id = ps.parent_id
+                where sr.route_id = %s and {_RECIPIENT_PREDICATES}
                 """,
                 (route_id,),
             ).fetchall()
         return [str(row["parent_id"]) for row in rows]
 
-    def routes_of_students(self, student_ids: list[str]) -> list[str]:
+    def routes_of_students(self, student_ids: list[str], scope: object = UNSET) -> list[str]:
         """DISTINCT route ids the given students are currently linked to — the
         pre-mutation capture for U13's manual-edit fan-out: a student update or
         delete rewrites/cascades the very links the post-commit fan-out would
         otherwise expand through, so the caller snapshots them first."""
         if not student_ids:
             return []
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 "select distinct route_id from live_student_routes "
                 "where student_id = any(%s::uuid[])",
@@ -189,13 +213,13 @@ class PushDao:
             ).fetchall()
         return sorted(str(row["route_id"]) for row in rows)
 
-    def students_of_routes(self, route_ids: list[str]) -> list[str]:
+    def students_of_routes(self, route_ids: list[str], scope: object = UNSET) -> list[str]:
         """DISTINCT student ids linked to the given routes — captured BEFORE a
         route deletion so U13's fan-out can still diff the members the cascade
         is about to unlink (their baselines then read as removed)."""
         if not route_ids:
             return []
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 "select distinct student_id from live_student_routes "
                 "where route_id = any(%s::uuid[])",
@@ -203,7 +227,7 @@ class PushDao:
             ).fetchall()
         return sorted(str(row["student_id"]) for row in rows)
 
-    def students_on_run(self, run_id: str, include_absent: bool = False) -> list[dict]:
+    def students_on_run(self, run_id: str, include_absent: bool = False, scope: object = UNSET) -> list[dict]:
         """Students with a seat on the run's stop roster.
 
         Recipients are filtered on the derived status (U3), not the raw column.
@@ -212,7 +236,7 @@ class PushDao:
         column-based filter kept sending them run notifications — contradicting
         the rule that their parents hear nothing until the office calls.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 f"""
                 select distinct s.id, s.name, {display_status_case("s")} as display_status
@@ -228,10 +252,10 @@ class PushDao:
         silent = {"absent", "unaccounted"}
         return [s for s in students if s["display_status"] not in silent]
 
-    def students_at_stop(self, run_id: str, stop_order: int) -> list[dict]:
+    def students_at_stop(self, run_id: str, stop_order: int, scope: object = UNSET) -> list[dict]:
         """Students whose stop sits at the given order on the run (coordinates
         not required — 'approaching' is stop-order based, not GPS based)."""
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 """
                 select rs.student_id, s.name as student_name,
@@ -245,9 +269,9 @@ class PushDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def remaining_student_stops(self, run_id: str, stops_completed: int) -> list[dict]:
+    def remaining_student_stops(self, run_id: str, stops_completed: int, scope: object = UNSET) -> list[dict]:
         """Upcoming (not yet reached) student stops for a run, with coordinates."""
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 """
                 select rs.stop_order, rs.lat, rs.lng, rs.student_id, s.name as student_name,
@@ -265,7 +289,7 @@ class PushDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def retract_notifications(self, run_id: str, student_id: str, types: list[str]) -> int:
+    def retract_notifications(self, run_id: str, student_id: str, types: list[str], scope: object = UNSET) -> int:
         """Remove notifications superseded by a driver correction (U5).
 
         The dedup index is unique on (user, run, student, type), which is what
@@ -278,7 +302,7 @@ class PushDao:
         delivered when it happens. The correction notification itself tells the
         family what changed, so nothing disappears unexplained.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 """
                 delete from live_notifications
@@ -299,22 +323,28 @@ class PushDao:
         run_id: str | None = None,
         bus_id: str | None = None,
         run_type: str | None = None,
+        school_id: str | None = None,
+        scope: object = UNSET,
     ) -> dict | None:
         """Insert a feed row. Returns None when the run-scoped dedup suppressed it.
 
         run_type persists the run's period ('morning'/'afternoon') on the row
         itself — run_id is ON DELETE SET NULL, so a join would silently lose
-        the period once an admin deletes the run.
+        the period once an admin deletes the run. school_id (U7) stamps the
+        originating school where the caller can derive one (run/route/plan
+        context); a purely account-level notice stays NULL.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
-                insert into live_notifications (user_id, student_id, run_id, bus_id, type, title, body, run_type)
-                values (%s, %s, %s, %s, %s, %s, %s, %s)
+                insert into live_notifications
+                    (user_id, student_id, run_id, bus_id, type, title, body, run_type, school_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 on conflict do nothing
-                returning id, user_id, student_id, run_id, bus_id, type, title, body, run_type, read, created_at
+                returning id, user_id, student_id, run_id, bus_id, type, title, body,
+                          run_type, school_id, read, created_at
                 """,
-                (user_id, student_id, run_id, bus_id, type, title, body, run_type),
+                (user_id, student_id, run_id, bus_id, type, title, body, run_type, school_id),
             ).fetchone()
         return dict(row) if row else None
 
@@ -330,6 +360,7 @@ class PushDao:
         bus_id: str | None,
         run_type: str | None,
         plan_audit_id: str | None,
+        school_id: str | None = None,
     ) -> dict | None:
         """Feed-row insert on the CALLER's connection (fleet-plan apply, U6).
 
@@ -343,18 +374,21 @@ class PushDao:
         row to the apply/restore act that produced it and drives the 011 plan
         dedup arbiter — ``on conflict do nothing`` returns None for a repeat
         (parent, student, type) within one act, mirroring the run-scoped
-        dedup's contract. Returns the inserted row, or None when suppressed.
+        dedup's contract. ``school_id`` (U7) stamps the plan's school.
+        Returns the inserted row, or None when suppressed.
         """
         row = conn.execute(
             """
             insert into live_notifications
-                (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id)
-            values (%s, %s, %s, %s, %s, %s, %s, %s)
+                (user_id, student_id, bus_id, type, title, body, run_type,
+                 plan_audit_id, school_id)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             on conflict do nothing
             returning id, user_id, student_id, bus_id, type, title, body, run_type,
-                      plan_audit_id, read, created_at
+                      plan_audit_id, school_id, read, created_at
             """,
-            (user_id, student_id, bus_id, type, title, body, run_type, plan_audit_id),
+            (user_id, student_id, bus_id, type, title, body, run_type,
+             plan_audit_id, school_id),
         ).fetchone()
         return dict(row) if row else None
 
@@ -365,7 +399,9 @@ class PushDao:
         window_hours: int | None = None,
         min_age_hours: int | None = None,
     ) -> list[dict]:
-        """The user's feed, newest first.
+        """The user's feed, newest first — user-scoped (U7: any role, no
+        school header), so it reads through the global connection like every
+        per-account surface.
 
         window_hours, when set, keeps only rows newer than that rolling
         window; min_age_hours keeps only rows at least that old. The parent
@@ -386,7 +422,7 @@ class PushDao:
             window_sql += " and created_at <= now() - (%s || ' hours')::interval"
             params.append(int(min_age_hours))
         params.append(limit)
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             rows = conn.execute(
                 f"""
                 select id, student_id, run_id, bus_id, type, run_type, title, body, read, created_at
@@ -402,14 +438,14 @@ class PushDao:
     def mark_notifications_read(self, user_id: str) -> None:
         # Intentionally global, never window-scoped (R35): opening the feed
         # clears the unread badge for every row, History-tab rows included.
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             conn.execute(
                 "update live_notifications set read = true where user_id = %s and read = false",
                 (user_id,),
             )
 
     def unread_count(self, user_id: str) -> int:
-        with get_connection() as conn:
+        with get_global_connection() as conn:
             row = conn.execute(
                 "select count(*) as count from live_notifications where user_id = %s and read = false",
                 (user_id,),

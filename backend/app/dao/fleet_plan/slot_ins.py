@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from app.core.db import get_connection
 from app.core.errors import ConflictError, NotFoundError
+from app.dao.audit_dao import record_audit
 from app.dao.fleet_dao import (
     _ROUTE_GEOMETRY_INPUTS_SQL,
     _depot_leg,
@@ -56,8 +57,8 @@ class SlotInOps:
             )
         return plan
 
-    def list_slot_ins(self, school_id: str) -> dict[str, Any]:
-        """The school's pending slot-in records, aged-out marked (never
+    def list_slot_ins(self, scope) -> dict[str, Any]:
+        """The ACTIVE school's pending slot-in records, aged-out marked (never
         auto-removed — the student stays visibly unassigned, R13/aging).
 
         Read-only display hygiene: a record whose student departed, or whose
@@ -65,7 +66,8 @@ class SlotInOps:
         filtered from the response without a write — accept re-validates
         against live truth anyway.
         """
-        with get_connection() as conn:
+        school_id = scope.school_id
+        with get_connection(scope) as conn:
             if conn.execute(
                 "select 1 from live_schools where id = %s", (school_id,)
             ).fetchone() is None:
@@ -107,7 +109,7 @@ class SlotInOps:
             "unplaceable": unplaceable,
         }
 
-    def accept_slot_in(self, school_id: str, proposal_id: str) -> dict[str, Any]:
+    def accept_slot_in(self, scope, proposal_id: str, actor: dict) -> dict[str, Any]:
         """Accept ONE proposal: apply just that insertion (AE2/AE7).
 
         One transaction, apply's lock order (plan row FIRST, then the
@@ -131,10 +133,11 @@ class SlotInOps:
         accepted at pilot scale. Notification is the ROUTER's post-commit
         dispatch of the U13 ``notify_route_changes`` pipeline over the
         returned route ids — only affected families hear (new child = first
-        communication; co-riders on the >= 5-minute rule), and no audit row
-        is written (the manual-edit path's contract).
+        communication; co-riders on the >= 5-minute rule). U7 adds the
+        slot-in-accepted audit row in the same transaction.
         """
-        with get_connection() as conn:
+        school_id = scope.school_id
+        with get_connection(scope) as conn:
             plan = self._applied_plan_slot_ins(conn, school_id, lock=True)
             document = dict(plan["document"] or {})
             records = list(document.get(slot_in_service.PROPOSALS_KEY) or [])
@@ -256,6 +259,12 @@ class SlotInOps:
             conn.execute(
                 "update live_fleet_plans set document = %s where id = %s",
                 (Jsonb(document), plan["id"]),
+            )
+            record_audit(
+                conn, action="slot-in-accepted", actor=actor, scope=scope,
+                resource_type="plan", resource_id=str(plan["id"]),
+                detail={"proposal_id": str(proposal_id), "student_id": sid,
+                        "legs": leg_names},
             )
         logger.info(
             "slot-in accept %s school %s: student=%s legs=%s degraded=%s",
@@ -440,13 +449,13 @@ class SlotInOps:
         return {"position": pos, "join": False,
                 "scheduled_time": new_time, "degraded": degraded}
 
-    def dismiss_slot_in(self, school_id: str, proposal_id: str) -> dict[str, Any]:
+    def dismiss_slot_in(self, scope, proposal_id: str, actor: dict) -> dict[str, Any]:
         """Dismiss one record (proposal or unplaceable notice): removed from
         the store, no live-table side effects — the student stays visibly
         unassigned (their display_status already reads 'unassigned' with no
         route links)."""
-        with get_connection() as conn:
-            plan = self._applied_plan_slot_ins(conn, school_id, lock=True)
+        with get_connection(scope) as conn:
+            plan = self._applied_plan_slot_ins(conn, scope.school_id, lock=True)
             document = dict(plan["document"] or {})
             records = list(document.get(slot_in_service.PROPOSALS_KEY) or [])
             record = next(
@@ -460,6 +469,13 @@ class SlotInOps:
             conn.execute(
                 "update live_fleet_plans set document = %s where id = %s",
                 (Jsonb(document), plan["id"]),
+            )
+            record_audit(
+                conn, action="slot-in-dismissed", actor=actor, scope=scope,
+                resource_type="plan", resource_id=str(plan["id"]),
+                detail={"proposal_id": str(proposal_id),
+                        "student_id": str(record.get("student_id")),
+                        "kind": record.get("kind")},
             )
         return {
             "ok": True,

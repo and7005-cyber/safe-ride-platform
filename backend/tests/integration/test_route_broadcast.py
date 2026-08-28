@@ -38,6 +38,8 @@ import httpx
 import psycopg
 import pytest
 
+from conftest import purge_accounts, school_sandbox
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -71,8 +73,17 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT RB School", lat=-1.30, lng=36.80) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 # Throwaway admin accounts (direct SQL) ------------------------------------------
@@ -87,10 +98,12 @@ def _password_hash(password: str) -> str:
     return f"pbkdf2_sha256$200000${salt}${base64.b64encode(digest).decode('ascii')}"
 
 
-def create_throwaway_admin(marker: str, tag: str) -> dict:
+def create_throwaway_admin(marker: str, tag: str, school_id: str | None = None) -> dict:
     """A fresh ADMIN account (fresh in-process limiter budget: the broadcast
     budget keys on the admin's user id). Signup cannot mint the admin role,
-    so the row goes straight into Postgres."""
+    so the row goes straight into Postgres. ``school_id`` (post-U6) grants an
+    active director membership there — the staff guard resolves the sender's
+    single membership by fallback, no header needed."""
     email = f"it-rb-{tag}-{marker}@test.local"
     with psycopg.connect(DB_URL) as conn:
         row = conn.execute(
@@ -102,6 +115,12 @@ def create_throwaway_admin(marker: str, tag: str) -> dict:
             "insert into app_user_roles (user_id, role) values (%s, 'admin')",
             (row[0],),
         )
+        if school_id:
+            conn.execute(
+                "insert into school_memberships (user_id, school_id, role, state, accepted_at) "
+                "values (%s, %s, 'director', 'active', now())",
+                (row[0], school_id),
+            )
     return {"id": str(row[0]), "email": email}
 
 
@@ -145,7 +164,7 @@ def _create_driver(client, admin_headers, marker: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     """Throwaway sender admin + driver + bus + school and four routes:
 
     - route_a (morning, on the bus): s1 linked to p1 AND p2, s2 linked to p1
@@ -165,7 +184,7 @@ def fleet(client, admin_headers):
     p1 = signup_parent(client, marker, "p1")
     p2 = signup_parent(client, marker, "p2")
     p3 = signup_parent(client, marker, "p3")
-    sender = create_throwaway_admin(marker, "sender")
+    sender = create_throwaway_admin(marker, "sender", sandbox["id"])
     driver = _create_driver(client, admin_headers, marker)
     bus = school = route_a = route_b = route_c = route_d = None
     s1 = s2 = s3 = s4 = None
@@ -176,11 +195,7 @@ def fleet(client, admin_headers):
             json={"name": f"IT RB Bus {marker}", "driver_id": driver["id"]},
             headers=admin_headers,
         ).json()
-        school = client.post(
-            "/api/fleet/schools",
-            json={"name": f"IT RB School {marker}", "lat": -1.30, "lng": 36.80},
-            headers=admin_headers,
-        ).json()
+        school = {"id": sandbox["id"], "name": sandbox["name"]}
 
         def make_route(name: str, type_: str, bus_id: str | None) -> dict:
             response = client.post(
@@ -233,13 +248,11 @@ def fleet(client, admin_headers):
         for route in (route_a, route_b, route_c, route_d):
             if route:
                 client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        if school:
-            client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
         if bus:
             client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
         for parent in (p1, p2, p3):
-            client.delete(f"/api/accounts/parents/{parent['id']}", headers=admin_headers)
+            purge_accounts(parent['id'])
         delete_throwaway_admin(sender["id"])
 
 
@@ -414,12 +427,12 @@ def test_parent_and_driver_tokens_403(client, fleet):
 
 # Per-admin limiter ------------------------------------------------------------------
 
-def test_rate_limited_after_12_sends_in_the_hour(client):
+def test_rate_limited_after_12_sends_in_the_hour(client, sandbox):
     """The 13th broadcast call inside the hour 429s. A dedicated fresh admin
     keeps this deterministic: the in-process budget keys on the admin's user
     id and this account makes exactly these calls (404s count — the limiter
     runs before any lookup, mirroring the cancel-ride order)."""
-    limited = create_throwaway_admin(uuid.uuid4().hex[:6], "rl")
+    limited = create_throwaway_admin(uuid.uuid4().hex[:6], "rl", sandbox["id"])
     try:
         headers = login(client, limited["email"], ADMIN_PASSWORD)
         ghost = str(uuid.uuid4())

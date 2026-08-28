@@ -7,19 +7,25 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from app.core.config import get_settings
-from app.core.scope import Scope, current_scope, guc_value
+from app.core.scope import Scope, SchoolScope, current_scope, guc_value
 
 _pool: ConnectionPool | None = None
 _pool_lock = Lock()
 
 # Sentinel: distinguishes "caller passed no scope" from an explicit None
-# (None means deliberately global — no school restriction).
+# (None means deliberately global — no school restriction). UNSET is the
+# public alias for signature-forwarding callers (PushDao/PushService thread
+# their own scope parameter straight through to get_connection).
 _UNSET = object()
+UNSET = _UNSET
 
-# Flipped to True once every school-owned DAO passes its scope explicitly
-# (U7); from then on, opening an implicitly-scoped connection inside a
-# school-scoped request is a programming error, not a fallback.
-STRICT_EXPLICIT_SCOPE = False
+# Flipped to True in U7: every school-owned DAO on the staff/driver/
+# provider surfaces passes its scope explicitly, so opening an
+# implicitly-scoped connection inside a SchoolScope request is a programming
+# error, not a fallback. ParentScope contexts stay on the context-var
+# fallback until U11 converts the parent portal — the strictness check below
+# deliberately fires for SchoolScope only.
+STRICT_EXPLICIT_SCOPE = True
 
 
 def get_pool() -> ConnectionPool:
@@ -60,7 +66,7 @@ def get_connection(scope: object = _UNSET) -> Iterator[Connection]:
     """
     if scope is _UNSET:
         effective = current_scope()
-        if effective is not None and STRICT_EXPLICIT_SCOPE:
+        if isinstance(effective, SchoolScope) and STRICT_EXPLICIT_SCOPE:
             raise RuntimeError(
                 "school-scoped request opened a connection without an explicit scope"
             )

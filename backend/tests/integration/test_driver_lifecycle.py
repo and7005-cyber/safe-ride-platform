@@ -41,7 +41,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run, school_sandbox
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -82,8 +82,17 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT DL School", lat=-1.3, lng=36.8) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -118,7 +127,7 @@ def _create_driver(client, admin_headers, marker: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     """Throwaway driver (known PIN) + bus + school + morning/afternoon routes
     + two students at distinct stops. Torn down completely afterwards."""
     marker = uuid.uuid4().hex[:6]
@@ -130,11 +139,7 @@ def fleet(client, admin_headers):
             json={"name": f"IT DL Bus {marker}", "driver_id": driver["id"]},
             headers=admin_headers,
         ).json()
-        school = client.post(
-            "/api/fleet/schools",
-            json={"name": f"IT DL School {marker}", "lat": -1.30, "lng": 36.80},
-            headers=admin_headers,
-        ).json()
+        school = {"id": sandbox["id"], "name": sandbox["name"]}
         morning = client.post(
             "/api/fleet/routes",
             json={"name": f"IT DL Morning {marker}", "type": "morning",
@@ -180,8 +185,6 @@ def fleet(client, admin_headers):
         for route in (morning, afternoon):
             if route:
                 client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        if school:
-            client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
         if bus:
             client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
@@ -1079,7 +1082,7 @@ def test_partial_scope_leaves_status_and_display_untouched_on_both_surfaces(
     finally:
         _clear_absences_for(client, admin_headers, student["id"])
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_driver_flag_and_clear_guard_follow_the_active_run_type(

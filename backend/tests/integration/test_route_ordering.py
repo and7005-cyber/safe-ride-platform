@@ -150,11 +150,10 @@ def patch_offline(monkeypatch, geo):
 # API fixture helpers -------------------------------------------------------------
 
 def _make_school(client, admin_headers, marker: str) -> dict:
-    response = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT RO School {marker}", "lat": -1.3000, "lng": 36.8200},
-        headers=admin_headers,
-    )
+    # Post-U6 the staff surface has ONE school — the active one (creation
+    # moved to the provider console); routes and students are marker-scoped
+    # so the shared school stays isolation-safe.
+    response = client.get("/api/fleet/school", headers=admin_headers)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -227,9 +226,9 @@ def _cleanup(client, admin_headers, *, students=(), routes=(), schools=(), buses
     for r in routes:
         if r:
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
-    for sc in schools:
-        if sc:
-            client.delete(f"/api/fleet/schools/{sc['id']}", headers=admin_headers)
+    # schools: accepted for call-site compatibility — the active school is
+    # seeded and never deleted (school deletion left the staff API in U6).
+    del schools
     for b in buses:
         if b:
             client.delete(f"/api/fleet/buses/{b['id']}", headers=admin_headers)
@@ -290,7 +289,7 @@ def test_degraded_mutations_signal_and_fall_back_to_pickup_order(client, admin_h
         assert listed["last_recalc_degraded"] is True
         stops = _stops(listed)
         assert [s["name"] for s in stops] == [
-            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}", f"IT RO School {marker}",
+            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}", school["name"],
         ]
         assert [s["scheduled_time"] for s in stops] == ["06:30", "06:50", None]
         assert stops[-1]["is_school_gate"] is True
@@ -410,7 +409,7 @@ def test_google_morning_writes_optimizer_order_and_anchored_times(
         assert [s["stop_order"] for s in stops] == [1, 2, 3, 4]
         assert [s["name"] for s in stops] == [
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
-            f"IT RO B Lane {marker}", f"IT RO School {marker}",
+            f"IT RO B Lane {marker}", school["name"],
         ]
         # Backward-solved from gate_anchor 07:45: departure 07:30, +5 min per
         # fake leg, gate arrival lands ON the anchor (U4).
@@ -554,13 +553,16 @@ def test_school_morning_bell_is_the_default_gate_anchor(
     """U4: with no route override, the school's morning_bell is the anchor (one
     authority: route override -> school bell -> system default)."""
     marker = uuid.uuid4().hex[:6]
-    resp = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT RO Bell {marker}", "lat": -1.30, "lng": 36.82, "morning_bell": "07:20"},
-        headers=admin_headers,
+    school = _make_school(client, admin_headers, marker)
+    # Stage the bell by SQL (no API fan-out: a settings PUT would regenerate
+    # every seeded route) and restore it in the finally below.
+    prior_bell = db.execute(
+        "select morning_bell from live_schools where id = %s", (school["id"],)
+    ).fetchone()["morning_bell"]
+    db.execute(
+        "update live_schools set morning_bell = '07:20' where id = %s", (school["id"],)
     )
-    assert resp.status_code == 200, resp.text
-    school = resp.json()
+    db.commit()
     route = _make_route(client, admin_headers, marker, "morning", school["id"])  # no override
     kids = []
     try:
@@ -574,6 +576,11 @@ def test_school_morning_bell_is_the_default_gate_anchor(
         # 1 stop -> 1 leg -> departure 07:15, gate 07:20 (the school bell).
         assert [s["scheduled_time"] for s in stops] == ["07:15", "07:20"]
     finally:
+        db.execute(
+            "update live_schools set morning_bell = %s where id = %s",
+            (prior_bell, school["id"]),
+        )
+        db.commit()
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
 
 
@@ -654,7 +661,7 @@ def test_single_location_route_computes_with_trivial_order(
         assert listed["last_recalc_degraded"] is False
         stops = _stops(listed)
         assert [s["name"] for s in stops] == [
-            f"IT RO A Lane {marker}", f"IT RO School {marker}",
+            f"IT RO A Lane {marker}", school["name"],
         ]
         # Backward-solved from the 07:00 default gate anchor (U4): one group,
         # one fake leg -> departure 06:55, gate arrival lands on 07:00.
@@ -846,7 +853,7 @@ def test_sibling_split_inherits_the_shared_record_exactly_once(
             f"IT RO A Lane {marker}": (1, "06:50"),   # kept the shared record
             f"IT RO B Lane {marker}": (2, "06:55"),   # preserved
             f"IT RO A2 Lane {marker}": (3, "06:35"),  # new group: own pickup time
-            f"IT RO School {marker}": (4, "07:00"),   # gate as-is
+            school["name"]: (4, "07:00"),   # gate as-is
         }
         # Exactly one inheritance: every group got a distinct order.
         orders = [s["stop_order"] for s in listed["route_stops"]]
@@ -1234,7 +1241,7 @@ def test_manual_reorder_persists_flips_flag_and_moves_sibling_groups_together(
             f"IT RO A Lane {marker}": (2, "06:30"),
             f"IT RO A2 Lane {marker}": (2, "06:35"),
             f"IT RO B Lane {marker}": (3, "06:40"),
-            f"IT RO School {marker}": (4, None),
+            school["name"]: (4, None),
         }
 
         # Reordering again while already manual just rewrites the order.
@@ -1246,7 +1253,7 @@ def test_manual_reorder_persists_flips_flag_and_moves_sibling_groups_together(
             f"IT RO A2 Lane {marker}": 1,
             f"IT RO B Lane {marker}": 2,
             f"IT RO C Lane {marker}": 3,
-            f"IT RO School {marker}": 4,
+            school["name"]: 4,
         }
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
@@ -1300,7 +1307,7 @@ def test_reorder_validation_rejects_bad_key_sets(client, admin_headers):
         listed = _get_route(client, admin_headers, route["id"])
         assert listed["manual_stop_order"] is False  # nothing flipped
         assert [s["name"] for s in _stops(listed)] == [
-            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}", f"IT RO School {marker}",
+            f"IT RO A Lane {marker}", f"IT RO B Lane {marker}", school["name"],
         ]
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route, other_route),
@@ -1405,7 +1412,7 @@ def test_manual_order_survives_assignment_and_unassignment(
             (f"IT RO B Lane {marker}", "06:55"),
             (f"IT RO C Lane {marker}", "06:45"),
             (f"IT RO A Lane {marker}", "06:50"),
-            (f"IT RO School {marker}", "07:00"),
+            (school["name"], "07:00"),
         ]
 
         # Assignment through the degraded container: appends before the gate,
@@ -1428,7 +1435,7 @@ def test_manual_order_survives_assignment_and_unassignment(
             (f"IT RO C Lane {marker}", "06:45"),
             (f"IT RO A Lane {marker}", "06:50"),
             (f"IT RO D Lane {marker}", "06:35"),  # appended, own pickup time
-            (f"IT RO School {marker}", "07:00"),  # gate untouched
+            (school["name"], "07:00"),  # gate untouched
         ]
 
         # Unassignment preserves the manual order and surviving times too.
@@ -1444,7 +1451,7 @@ def test_manual_order_survives_assignment_and_unassignment(
             (f"IT RO B Lane {marker}", "06:55"),
             (f"IT RO C Lane {marker}", "06:45"),
             (f"IT RO A Lane {marker}", "06:50"),
-            (f"IT RO School {marker}", "07:00"),
+            (school["name"], "07:00"),
         ]
     finally:
         _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,),
@@ -1492,7 +1499,7 @@ def test_recalculate_clears_manual_and_recomputes(
         assert listed["last_recalc_degraded"] is True
         assert [s["name"] for s in _stops(listed)] == [
             f"IT RO A Lane {marker}", f"IT RO B Lane {marker}",
-            f"IT RO C Lane {marker}", f"IT RO School {marker}",
+            f"IT RO C Lane {marker}", school["name"],
         ]
 
         # Back to manual, then recalculate at the DAO level with google up:
@@ -1511,7 +1518,7 @@ def test_recalculate_clears_manual_and_recomputes(
             (f"IT RO B Lane {marker}", "06:45"),
             (f"IT RO A Lane {marker}", "06:50"),
             (f"IT RO C Lane {marker}", "06:55"),
-            (f"IT RO School {marker}", "07:00"),
+            (school["name"], "07:00"),
         ]
     finally:
         _cleanup(client, admin_headers, students=kids, routes=(route,), schools=(school,))
@@ -1568,7 +1575,7 @@ def test_manual_pickup_time_edit_writes_through_to_that_stop_only(
             (f"IT RO C Lane {marker}", "06:55"),
             (f"IT RO A Lane {marker}", "05:50"),  # written through in place
             (f"IT RO B Lane {marker}", "06:50"),
-            (f"IT RO School {marker}", "07:00"),  # gate untouched
+            (school["name"], "07:00"),  # gate untouched
         ]
 
         students = client.get("/api/students", headers=admin_headers).json()
@@ -2146,7 +2153,7 @@ def test_plan_ordered_route_preserves_order_and_recomputes_times(
             (f"IT RO C Lane {marker}", "06:45"),
             (f"IT RO A Lane {marker}", "06:50"),
             (f"IT RO B Lane {marker}", "06:55"),
-            (f"IT RO School {marker}", "07:00"),
+            (school["name"], "07:00"),
         ]
         row = db.execute(
             "select total_duration_s from live_routes where id=%s", (route["id"],)
@@ -2175,7 +2182,7 @@ def test_plan_ordered_route_preserves_order_and_recomputes_times(
         assert [s["name"] for s in stops] == [
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
             f"IT RO B Lane {marker}", f"IT RO D Lane {marker}",
-            f"IT RO School {marker}",
+            school["name"],
         ]
         assert stops[-1]["scheduled_time"] == "07:00"  # gate = anchor, exactly
         times = [s["scheduled_time"] for s in stops]
@@ -2190,7 +2197,7 @@ def test_plan_ordered_route_preserves_order_and_recomputes_times(
         assert listed["plan_ordered"] is True
         assert [s["name"] for s in _stops(listed)] == [
             f"IT RO C Lane {marker}", f"IT RO A Lane {marker}",
-            f"IT RO B Lane {marker}", f"IT RO School {marker}",
+            f"IT RO B Lane {marker}", school["name"],
         ]
         assert _stops(listed)[-1]["scheduled_time"] == "07:00"
 
@@ -2207,7 +2214,7 @@ def test_plan_ordered_route_preserves_order_and_recomputes_times(
             (f"IT RO A Lane {marker}", "06:45"),
             (f"IT RO B Lane {marker}", "06:50"),
             (f"IT RO C Lane {marker}", "06:55"),
-            (f"IT RO School {marker}", "07:00"),
+            (school["name"], "07:00"),
         ]
     finally:
         _cleanup(client, admin_headers, students=[*kids, kid_d], routes=(route,),

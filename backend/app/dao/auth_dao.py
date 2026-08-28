@@ -1,6 +1,6 @@
 from typing import Any
 
-from app.core.db import get_connection
+from app.core.db import get_connection, get_global_connection
 
 
 class AuthDao:
@@ -133,8 +133,12 @@ class AuthDao:
         return dict(row)
 
     def set_session_school(self, session_id: str, school_id: str) -> None:
-        """Remember the session's active school for header fallback (R16)."""
-        with get_connection() as conn:
+        """Remember the session's active school for header fallback (R16).
+
+        Runs inside the staff guard BEFORE the scope is published (checked in
+        U7), and sessions are a non-school table either way — the global
+        connection keeps this safe under the strict seam by construction."""
+        with get_global_connection() as conn:
             conn.execute(
                 "update auth_sessions set last_school_id = %s where id = %s",
                 (school_id, session_id),

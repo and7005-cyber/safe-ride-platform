@@ -81,9 +81,10 @@ import os
 import uuid
 from typing import Any
 
+from psycopg import Rollback
 from psycopg.types.json import Jsonb
 
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection, scoped_transaction
 from app.services import geo_service
 from app.services.plan_solver import (
     CONSTRAINT_SEATS,
@@ -537,7 +538,7 @@ def _proposal_records(student: dict, needed_legs: list[str], routes: list[dict],
 # --- trigger entry point -------------------------------------------------------
 
 
-def propose_slot_ins(student_ids: list[str]) -> dict | None:
+def propose_slot_ins(student_ids: list[str], scope: object = UNSET) -> dict | None:
     """Generate (or refresh) slot-in records for the given students.
 
     Dispatched via BackgroundTasks beside the U13 notify wiring — BEST
@@ -547,13 +548,20 @@ def propose_slot_ins(student_ids: list[str]) -> dict | None:
     otherwise a silent no-op. Stored records for the triggered students are
     replaced wholesale (drop-then-append), so a student whose legs are all
     linked simply loses their stale records.
+
+    ``scope`` is the dispatching request's scope (U7): the connection opens
+    through it, and each phase's mid-connection commit runs through
+    ``scoped_transaction`` so the transaction-local GUC survives the commit
+    boundaries. An unthreaded dispatch inside a SchoolScope request fails
+    loudly under the strict seam (and is swallowed into the None return —
+    never a silent partial success).
     """
     try:
         summary: dict[str, int] = {"students": 0, "records": 0}
         sids = sorted({str(s) for s in (student_ids or [])})
         if not sids:
             return summary
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             students = conn.execute(
                 "select id, name, school_id, home_lat, home_lng, ridership_pattern "
                 "from live_students where id = any(%s::uuid[]) "
@@ -566,7 +574,9 @@ def propose_slot_ins(student_ids: list[str]) -> dict | None:
                     continue
                 by_school.setdefault(str(s["school_id"]), []).append(dict(s))
             for school_id in sorted(by_school):
-                counts = _generate_for_school(conn, school_id, by_school[school_id])
+                counts = _generate_for_school(
+                    conn, school_id, by_school[school_id], scope
+                )
                 if counts:
                     summary["students"] += counts["students"]
                     summary["records"] += counts["records"]
@@ -580,54 +590,67 @@ def propose_slot_ins(student_ids: list[str]) -> dict | None:
         return None
 
 
-def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | None:
+def _generate_for_school(
+    conn, school_id: str, students: list[dict], scope: object = UNSET
+) -> dict | None:
     """One school's generation pass — two phases, mirroring
     ``fleet_dao.regenerate_route_stops``: the slow provider work runs with no
-    transaction open, and the plan-row lock is held only for the short write.
+    LOCK held, and the plan-row lock is taken only for the short write.
 
     Phase 1 (reads only, NO locks): the applied plan's identity fingerprint
     (id + applied_at), the school, the candidate routes and the triggering
-    students' link state — then COMMIT, so nothing stays open across the
-    matrix fan-out. The duration matrix and the insertion scoring run
+    students' link state. The duration matrix and the insertion scoring run
     between the phases on plain in-memory data.
+
+    Both phases run inside ``scoped_transaction(conn, scope)`` (U7): the
+    plain ``conn.commit()`` boundaries this used to place here silently
+    dropped the transaction-local school GUC, so every statement after the
+    first commit ran unscoped — exactly the hazard the U5 seam test pins.
+    ``scoped_transaction`` re-arms the GUC on both sides of each block, so
+    the phase-2 write (and any follow-up statement) still carries the
+    school set. On a connection whose checkout armed the GUC the blocks
+    nest as savepoints and the pool release commits the lot; phase 1 takes
+    no locks, so the provider fan-out between the phases still extends no
+    lock (READ COMMITTED holds no cross-statement snapshot either).
 
     Size guard: the matrix point count is capped by
     ``SLOT_IN_MAX_MATRIX_POINTS`` (this is CRUD-triggered work — see the
     constant's comment). Over the cap the pass skips with one WARNING and
     writes nothing; the students stay visibly unassigned.
 
-    Phase 2 (short locked write): reopen a transaction, take the applied
-    plan row FOR UPDATE (the storage row — serializes concurrent generations
-    and the accept/dismiss writers, and matches apply's plan-row-first lock
-    order; no route locks are taken), and RE-VALIDATE the row against the
-    phase-1 fingerprint. Fingerprint-discard rule: if the applied plan
-    changed between the phases (a new apply displaced the row — different
-    id — or a restore re-applied over it — same id, new applied_at), the
-    computed proposals were scored against a plan that no longer governs the
-    live routes, so they are dropped silently with one log line — the
-    best-effort contract; the mutation stream that displaced the plan owns
-    any regeneration. On a match, the merge target is the LOCKED row's
-    freshly-read document, so accept/dismiss edits that landed between the
-    phases survive the wholesale per-student replace.
+    Phase 2 (short locked write): take the applied plan row FOR UPDATE (the
+    storage row — serializes concurrent generations and the accept/dismiss
+    writers, and matches apply's plan-row-first lock order; no route locks
+    are taken), and RE-VALIDATE the row against the phase-1 fingerprint.
+    Fingerprint-discard rule: if the applied plan changed between the
+    phases (a new apply displaced the row — different id — or a restore
+    re-applied over it — same id, new applied_at), the computed proposals
+    were scored against a plan that no longer governs the live routes, so
+    they are dropped (``Rollback`` inside the block) with one log line —
+    the best-effort contract; the mutation stream that displaced the plan
+    owns any regeneration. On a match, the merge target is the LOCKED
+    row's freshly-read document, so accept/dismiss edits that landed
+    between the phases survive the wholesale per-student replace.
     """
-    plan = conn.execute(
-        "select id, applied_at from live_fleet_plans "
-        "where school_id = %s and status = 'applied' "
-        "order by applied_at desc nulls last, created_at desc limit 1",
-        (school_id,),
-    ).fetchone()
-    school = conn.execute(
-        "select id, lat, lng from live_schools where id = %s", (school_id,)
-    ).fetchone()
-    routes = _load_routes(conn, school_id) if plan else []
-    linked: set[tuple[str, str]] = set()
-    for r in conn.execute(
-        "select sr.student_id, sr.route_type from live_student_routes sr "
-        "where sr.student_id = any(%s::uuid[])",
-        ([str(s["id"]) for s in students],),
-    ).fetchall():
-        linked.add((str(r["student_id"]), r["route_type"]))
-    conn.commit()  # phase 1 over — no transaction open across provider work
+    with scoped_transaction(conn, scope):
+        plan = conn.execute(
+            "select id, applied_at from live_fleet_plans "
+            "where school_id = %s and status = 'applied' "
+            "order by applied_at desc nulls last, created_at desc limit 1",
+            (school_id,),
+        ).fetchone()
+        school = conn.execute(
+            "select id, lat, lng from live_schools where id = %s", (school_id,)
+        ).fetchone()
+        routes = _load_routes(conn, school_id) if plan else []
+        linked: set[tuple[str, str]] = set()
+        for r in conn.execute(
+            "select sr.student_id, sr.route_type from live_student_routes sr "
+            "where sr.student_id = any(%s::uuid[])",
+            ([str(s["id"]) for s in students],),
+        ).fetchall():
+            linked.add((str(r["student_id"]), r["route_type"]))
+    # phase 1 over — no lock held across the provider fan-out below
 
     if not plan:
         return None  # no applied plan — the trigger condition fails silently
@@ -676,16 +699,31 @@ def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | N
                 _proposal_records(s, needed, routes, base_evals, school_pt, d)
             )
 
-    # Phase 2 — the short locked write, gated on the plan fingerprint.
-    locked = conn.execute(
-        "select id, applied_at, document from live_fleet_plans "
-        "where school_id = %s and status = 'applied' "
-        "order by applied_at desc nulls last, created_at desc limit 1 for update",
-        (school_id,),
-    ).fetchone()
-    if (locked is None or str(locked["id"]) != str(plan["id"])
-            or locked["applied_at"] != plan["applied_at"]):
-        conn.rollback()  # release the lock now — not at connection close
+    # Phase 2 — the short locked write, gated on the plan fingerprint. The
+    # scoped_transaction keeps the GUC armed through the write and re-arms
+    # after it, so the proposals land (and stay readable) under A's scope
+    # even after the block's boundary.
+    discarded = False
+    with scoped_transaction(conn, scope):
+        locked = conn.execute(
+            "select id, applied_at, document from live_fleet_plans "
+            "where school_id = %s and status = 'applied' "
+            "order by applied_at desc nulls last, created_at desc limit 1 for update",
+            (school_id,),
+        ).fetchone()
+        if (locked is None or str(locked["id"]) != str(plan["id"])
+                or locked["applied_at"] != plan["applied_at"]):
+            discarded = True
+            raise Rollback  # drop the block's work; nothing was merged
+        document = dict(locked["document"] or {})
+        kept = [r for r in (document.get(PROPOSALS_KEY) or [])
+                if str(r.get("student_id")) not in refreshed]
+        document[PROPOSALS_KEY] = kept + new_records
+        conn.execute(
+            "update live_fleet_plans set document = %s where id = %s",
+            (Jsonb(document), locked["id"]),
+        )
+    if discarded:
         logger.info(
             "slot-in generation discarded for school %s: the applied plan "
             "changed mid-compute (fingerprint drift) — proposals dropped, "
@@ -693,13 +731,4 @@ def _generate_for_school(conn, school_id: str, students: list[dict]) -> dict | N
             school_id,
         )
         return None
-    document = dict(locked["document"] or {})
-    kept = [r for r in (document.get(PROPOSALS_KEY) or [])
-            if str(r.get("student_id")) not in refreshed]
-    document[PROPOSALS_KEY] = kept + new_records
-    conn.execute(
-        "update live_fleet_plans set document = %s where id = %s",
-        (Jsonb(document), locked["id"]),
-    )
-    conn.commit()  # the lock is held only for the merge just above
     return {"students": len(refreshed), "records": len(new_records)}

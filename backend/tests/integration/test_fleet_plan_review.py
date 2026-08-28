@@ -32,7 +32,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import DSN
+from conftest import purge_accounts, DSN, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -67,9 +67,28 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+# Post-U6 world provisioning: one sandbox school per module (its own single-
+# membership admin); per-test worlds share it and purge their plan rows.
+_SANDBOX: dict = {}
+
+
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    with school_sandbox(
+        "IT ReviewSchool", lat=SCHOOL_LAT, lng=SCHOOL_LNG,
+        morning_bell="07:00", afternoon_bell="15:30",
+    ) as sb:
+        _SANDBOX.clear()
+        _SANDBOX.update(sb)
+        try:
+            yield sb
+        finally:
+            _SANDBOX.clear()
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -80,15 +99,9 @@ def parent_headers(client):
 # --- builders -----------------------------------------------------------------
 
 def _make_school(client, headers, marker: str, **overrides) -> dict:
-    payload = {
-        "name": f"IT ReviewSchool {marker}",
-        "lat": SCHOOL_LAT, "lng": SCHOOL_LNG,
-        "morning_bell": "07:00", "afternoon_bell": "15:30",
-    }
-    payload.update(overrides)
-    created = client.post("/api/fleet/schools", json=payload, headers=headers)
-    assert created.status_code == 200, created.text
-    return created.json()
+    # Post-U6 there is ONE school per module — the sandbox (see apply suite).
+    assert _SANDBOX, "sandbox fixture not active"
+    return {"id": _SANDBOX["id"], "name": _SANDBOX["name"]}
 
 
 def _make_bus(client, headers, name: str, *, capacity: int,
@@ -282,8 +295,16 @@ def _teardown(client, headers, fx: dict) -> None:
         client.delete(f"/api/students/{s['id']}", headers=headers)
     for b in fx.get("buses", []):
         client.delete(f"/api/fleet/buses/{b['id']}", headers=headers)
-    # Deleting the school cascades its plan rows (011 FK).
-    client.delete(f"/api/fleet/schools/{fx['school']['id']}", headers=headers)
+    # The school is the module sandbox: sweep its plan rows, routes, runs
+    # and audit rows by SQL (the retired school DELETE used to cascade them).
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        for table in (
+            "live_fleet_plans", "live_runs", "live_routes", "live_admin_audit",
+        ):
+            pg.execute(
+                f"delete from {table} where school_id = %s",  # noqa: S608
+                (fx["school"]["id"],),
+            )
 
 
 # --- review surface (R10) --------------------------------------------------------
@@ -664,7 +685,7 @@ def test_diff_bus_change_time_thresholds_baselines_and_family_count(
             client.delete(f"/api/fleet/buses/{bus_c['id']}", headers=admin_headers)
         _teardown(client, admin_headers, fx)
         for p in (p24, p5, p7):
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
+            purge_accounts(p['id'])
 
 
 def test_diff_newly_unplaceable_and_leg_removed(client, admin_headers):

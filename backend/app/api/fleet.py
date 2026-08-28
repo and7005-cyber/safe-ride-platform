@@ -18,7 +18,7 @@ def _validate_hhmm(v: str | None) -> str | None:
     return v.strip()
 
 from app.api._helpers import safe_call
-from app.core.auth import get_current_user, require_role
+from app.core.auth import get_current_user
 from app.core.errors import BadRequestError, ConflictError, NotFoundError
 from app.core.permissions import require_director, require_staff
 from app.core.rate_limit import SlidingWindowLimiter
@@ -33,7 +33,6 @@ router = APIRouter(prefix="/api/fleet", tags=["fleet"])
 dao = FleetDao()
 push_dao = PushDao()
 push_service = PushService()
-admin_only = require_role("admin")
 
 # Broadcast blast protection (U8): per-admin, in-process best-effort (per
 # Lambda container, auth.py pattern) — enough to stop a stuck retry loop from
@@ -189,45 +188,58 @@ def update_school(
     return safe_call(run)
 
 
-# Routes ---------------------------------------------------------------------
+# Routes (U7: school-scoped; delete stays director-only) ----------------------
 
 @router.get("/routes")
-def list_routes(user: dict = Depends(get_current_user)):
-    return safe_call(dao.list_routes)
+def list_routes(scope: SchoolScope = Depends(require_staff)):
+    return safe_call(lambda: dao.list_routes(scope))
 
 
 @router.post("/routes")
-def create_route(payload: RoutePayload, user: dict = Depends(admin_only)):
-    return safe_call(lambda: dao.create_route(payload.model_dump()))
+def create_route(
+    payload: RoutePayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    # The payload's school_id is ignored — the scope stamps the school (U7);
+    # a foreign bus_id answers 404 (AE25) inside the DAO.
+    return safe_call(lambda: dao.create_route(scope, payload.model_dump(), actor=user))
 
 
 @router.put("/routes/{route_id}")
 def update_route(
     route_id: str, payload: RoutePayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # U13 (origin R15): a route edit — a bus (re)assignment above all — can
     # change what every family on the route was told. Post-commit fan-out vs
     # the communicated baselines, via BackgroundTasks (the broadcast pattern).
     # create_route needs no fan-out: a brand-new route has no members yet.
-    result = safe_call(lambda: dao.update_route(route_id, payload.model_dump()))
+    result = safe_call(
+        lambda: dao.update_route(scope, route_id, payload.model_dump(), actor=user)
+    )
     if result is not None:
-        background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+        background_tasks.add_task(notify_route_changes, route_ids=[route_id], scope=scope)
     return result
 
 
 @router.delete("/routes/{route_id}")
 def delete_route(
-    route_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+    route_id: str, background_tasks: BackgroundTasks,
+    scope: SchoolScope = Depends(require_director),
+    user: dict = Depends(get_current_user),
 ):
     # U13: capture the members BEFORE the delete — the cascade severs the
     # links the fan-out would otherwise follow. Every member's baseline for
     # this route's leg then reads as removed: route-unassigned + baseline
     # delete.
-    members = safe_call(lambda: push_dao.students_of_routes([route_id]))
-    result = safe_call(lambda: (dao.delete_route(route_id), {"ok": True})[1])
+    members = safe_call(lambda: push_dao.students_of_routes([route_id], scope=scope))
+    result = safe_call(
+        lambda: (dao.delete_route(scope, route_id, actor=user), {"ok": True})[1]
+    )
     if members:
-        background_tasks.add_task(notify_route_changes, student_ids=members)
+        background_tasks.add_task(notify_route_changes, student_ids=members, scope=scope)
     return result
 
 
@@ -240,27 +252,32 @@ class StopTimePayload(BaseModel):
 @router.put("/routes/{route_id}/stops/{student_id}")
 def set_stop_time(
     route_id: str, student_id: str, payload: StopTimePayload,
-    background_tasks: BackgroundTasks, user: dict = Depends(admin_only),
+    background_tasks: BackgroundTasks,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # stops_recalculated: false = an affected auto route's rebuild fell back
     # instead of recomputing geometry (U6/R10) — the sibling cancel_stop shape.
     result = safe_call(
         lambda: {
             "ok": True,
-            "stops_recalculated": dao.set_student_pickup_time(student_id, payload.pickup_time),
+            "stops_recalculated": dao.set_student_pickup_time(
+                scope, route_id, student_id, payload.pickup_time, actor=user
+            ),
         }
     )
     # U13 (origin R15): a pickup-time edit regenerates EVERY route the student
     # rides — the fan-out expands from the student to those routes' members
     # and diffs each against the communicated baselines, post-commit.
-    background_tasks.add_task(notify_route_changes, student_ids=[student_id])
+    background_tasks.add_task(notify_route_changes, student_ids=[student_id], scope=scope)
     return result
 
 
 @router.delete("/routes/{route_id}/stops/{student_id}")
 def cancel_stop(
     route_id: str, student_id: str, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     # stops_recalculated: false = the rebuild fell back instead of recomputing
     # geometry; the durable last_recalc_degraded flag rides the route payload
@@ -268,7 +285,9 @@ def cancel_stop(
     result = safe_call(
         lambda: {
             "ok": True,
-            "stops_recalculated": dao.remove_student_from_route(route_id, student_id),
+            "stops_recalculated": dao.remove_student_from_route(
+                scope, route_id, student_id, actor=user
+            ),
         }
     )
     # U13: the student id travels explicitly — the link was just severed, so
@@ -276,7 +295,7 @@ def cancel_stop(
     # reads as removed: route-unassigned + baseline delete; the route's other
     # members are diffed for reshuffle drift.
     background_tasks.add_task(
-        notify_route_changes, route_ids=[route_id], student_ids=[student_id]
+        notify_route_changes, route_ids=[route_id], student_ids=[student_id], scope=scope
     )
     return result
 
@@ -293,7 +312,8 @@ class StopOrderPayload(BaseModel):
 @router.put("/routes/{route_id}/stop-order")
 def set_stop_order(
     route_id: str, payload: StopOrderPayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     """Persist the admin's manual stop order and flip the route to manual mode
     (R11). Set-equality validated server-side: missing, extra, duplicate or
@@ -303,18 +323,23 @@ def set_stop_order(
     a capacity or stop-cap violation (the caps apply to additions, which flow
     through the assignment paths' regeneration)."""
     result = safe_call(
-        lambda: (dao.set_route_stop_order(route_id, payload.order), {"ok": True})[1]
+        lambda: (
+            dao.set_route_stop_order(scope, route_id, payload.order, actor=user),
+            {"ok": True},
+        )[1]
     )
     # U13 (origin R15): a reorder keeps each stop's own time, but the members'
     # live truth may already have drifted from what was last communicated —
     # diff every member vs their baseline post-commit.
-    background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+    background_tasks.add_task(notify_route_changes, route_ids=[route_id], scope=scope)
     return result
 
 
 @router.post("/routes/{route_id}/recalculate")
 def recalculate_route(
-    route_id: str, background_tasks: BackgroundTasks, user: dict = Depends(admin_only)
+    route_id: str, background_tasks: BackgroundTasks,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     """Explicit return to automatic ordering (R11; fleet-plan U8): clears
     manual mode AND plan order — the one release action after which the
@@ -323,11 +348,14 @@ def recalculate_route(
     immediately. stops_recalculated: false = the rebuild fell back (degraded)
     instead of computing geometry. Custom routes → 409."""
     result = safe_call(
-        lambda: {"ok": True, "stops_recalculated": dao.recalculate_route(route_id)}
+        lambda: {
+            "ok": True,
+            "stops_recalculated": dao.recalculate_route(scope, route_id, actor=user),
+        }
     )
     # U13 (origin R15): the recompute may move every member's time — notify
     # only the >= 5-minute movers vs their communicated baselines.
-    background_tasks.add_task(notify_route_changes, route_ids=[route_id])
+    background_tasks.add_task(notify_route_changes, route_ids=[route_id], scope=scope)
     return result
 
 
@@ -364,10 +392,12 @@ def broadcast_to_route(
     route_id: str,
     payload: BroadcastPayload,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     """Free-text message to every parent with a child assigned to the route
-    (U8: R20, R21, R23; AE5).
+    (U8: R20, R21, R23; AE5). U7: another school's route answers 404, and the
+    recipient set is accepted links on enabled accounts only.
 
     Recipients come from assignments (live_student_routes →
     live_parent_students), never students.bus_id, distinct per parent
@@ -380,24 +410,29 @@ def broadcast_to_route(
 
     def run() -> tuple[dict, str, list[str]]:
         body = _clean_broadcast_body(payload.body)
-        context = push_dao.route_broadcast_context(route_id)
+        context = push_dao.route_broadcast_context(scope, route_id)
         if context is None:
             raise NotFoundError("Route not found")
         if context["student_count"] == 0:
             raise ConflictError(
                 "No students are assigned to this route — there is nobody to message."
             )
-        parent_ids = push_dao.parents_of_route(route_id)
+        parent_ids = push_dao.parents_of_route(scope, route_id)
         if not parent_ids:
             raise ConflictError(
                 "None of this route's students have a linked parent account — "
                 "the message would reach nobody. Link parent emails on the "
                 "students first."
             )
+        # The broadcast-sent audit rides the dispatch decision (U7): every
+        # guard passed and this exact recipient count is what goes out.
+        dao.record_broadcast(scope, route_id, user, len(parent_ids))
         return context["route"], body, parent_ids
 
     route, body, parent_ids = safe_call(run)
-    background_tasks.add_task(push_service.notify_admin_broadcast, route, body, parent_ids)
+    background_tasks.add_task(
+        push_service.notify_admin_broadcast, route, body, parent_ids, scope=scope
+    )
     return {"ok": True, "recipients": len(parent_ids)}
 
 
@@ -437,7 +472,7 @@ class RouteOptionsPayload(BaseModel):
 
 
 @router.post("/geocode")
-def geocode_address(payload: GeocodePayload, user: dict = Depends(admin_only)):
+def geocode_address(payload: GeocodePayload, scope: SchoolScope = Depends(require_staff)):
     hit = geo_service.geocode(payload.address, allow_fallback=True)
     if not hit:
         return {"found": False}
@@ -445,20 +480,22 @@ def geocode_address(payload: GeocodePayload, user: dict = Depends(admin_only)):
 
 
 @router.post("/reverse-geocode")
-def reverse_geocode_point(payload: ReverseGeocodePayload, user: dict = Depends(admin_only)):
+def reverse_geocode_point(
+    payload: ReverseGeocodePayload, scope: SchoolScope = Depends(require_staff)
+):
     """Resolve a picked map pin to an editable address string (R8). Best-effort:
     ``{"found": False}`` when there is no key, no result, or the lookup fails."""
     return geo_service.reverse_geocode(payload.lat, payload.lng)
 
 
 @router.get("/places/suggest")
-def places_suggest(q: str = "", user: dict = Depends(admin_only)):
+def places_suggest(q: str = "", scope: SchoolScope = Depends(require_staff)):
     """Nairobi-biased address autocomplete (Places API New, server-side)."""
     return {"suggestions": geo_service.places_autocomplete(q)}
 
 
 @router.get("/places/details")
-def places_details(place_id: str, user: dict = Depends(admin_only)):
+def places_details(place_id: str, scope: SchoolScope = Depends(require_staff)):
     """Resolve a Places place_id to coordinates for a selected suggestion."""
     hit = geo_service.place_details(place_id)
     if not hit:
@@ -467,10 +504,14 @@ def places_details(place_id: str, user: dict = Depends(admin_only)):
 
 
 @router.post("/route-options")
-def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)):
+def route_options(
+    payload: RouteOptionsPayload, scope: SchoolScope = Depends(require_staff)
+):
     """Geocode addresses + pickup times and return route options enriched with
     the real road polyline, total distance/time, and traffic-aware per-stop
-    ETAs (via the Google Routes API, with an offline straight-line fallback)."""
+    ETAs (via the Google Routes API, with an offline straight-line fallback).
+    U7: the preview's school is the ACTIVE school from the scope — the
+    payload's school_id is accepted and ignored (the stray-school-id rule)."""
 
     def run() -> dict:
         is_afternoon = payload.type == "afternoon"
@@ -478,12 +519,10 @@ def route_options(payload: RouteOptionsPayload, user: dict = Depends(admin_only)
 
         school = None
         school_bell = None
-        if payload.school_id:
-            row = next((s for s in dao.list_schools() if str(s["id"]) == payload.school_id), None)
-            if row:
-                school_bell = row.get("afternoon_bell") if is_afternoon else row.get("morning_bell")
-                if row.get("lat") is not None and row.get("lng") is not None:
-                    school = {"lat": row["lat"], "lng": row["lng"], "label": row["name"], "is_school": True}
+        row = dao.get_school(scope)
+        school_bell = row.get("afternoon_bell") if is_afternoon else row.get("morning_bell")
+        if row.get("lat") is not None and row.get("lng") is not None:
+            school = {"lat": row["lat"], "lng": row["lng"], "label": row["name"], "is_school": True}
         # One authority (U4): route override -> school bell -> system default.
         # The preview solves against this gate time exactly as the saved route.
         anchor_hhmm = payload.gate_anchor or school_bell or default_anchor

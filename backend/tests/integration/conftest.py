@@ -152,6 +152,107 @@ def temp_school(
             pg.execute("delete from live_schools where id = %s", (school_id,))
 
 
+def purge_accounts(*user_ids: str | None) -> None:
+    """Remove throwaway accounts out-of-band. **Teardown only** — the purge_run
+    precedent. Needed since U6 for parent accounts: account deletion became
+    school-scoped (a parent is deletable only while linked at the active
+    school), so a teardown that already removed the students has no product
+    path left to the account — sessions, roles, links and notifications all
+    cascade with the user row."""
+    ids = [str(u) for u in user_ids if u]
+    if not ids:
+        return
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        pg.execute("delete from app_users where id = any(%s::uuid[])", (ids,))
+
+
+SANDBOX_PASSWORD = "SandboxPass1!"
+
+
+def _password_hash(password: str) -> str:
+    """Mirror app.core.security.hash_password's stored format (pbkdf2_sha256,
+    200k iterations) so a direct-SQL account can log in through the real API."""
+    import base64
+    import hashlib
+    import uuid as _uuid
+
+    salt = _uuid.uuid4().hex
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000
+    )
+    return f"pbkdf2_sha256$200000${salt}${base64.b64encode(digest).decode('ascii')}"
+
+
+@contextmanager
+def school_sandbox(
+    name: str, *, lat: float | None = None, lng: float | None = None,
+    morning_bell: str | None = None, afternoon_bell: str | None = None,
+):
+    """A throwaway school PLUS a throwaway admin whose ONLY membership is that
+    school — the post-U6 replacement for the retired POST /api/fleet/schools
+    the legacy suites used to provision their isolated world.
+
+    The admin carries the legacy 'admin' role (so the pre-U7 container's
+    role guards accept it) AND an active director membership at the sandbox
+    school (so the U6/U7 staff guards resolve it too); being their single
+    membership, the header fallback lands there and no X-School-Id is
+    needed anywhere in the suite. Yields ``{"id", "name", "lat", "lng",
+    "email", "password"}``; the exit sweeps everything the suite may have
+    left inside the school, then the membership, school and admin account.
+    Seeded rows are never touched.
+    """
+    import uuid as _uuid
+
+    marker = _uuid.uuid4().hex[:8]
+    email = f"it-sandbox-admin-{marker}@test.local"
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        school_id = str(
+            pg.execute(
+                "insert into live_schools (name, lat, lng, morning_bell, afternoon_bell) "
+                "values (%s, %s, %s, %s, %s) returning id",
+                (name, lat, lng, morning_bell, afternoon_bell),
+            ).fetchone()[0]
+        )
+        admin_id = str(
+            pg.execute(
+                "insert into app_users (email, password_hash, full_name) "
+                "values (%s, %s, %s) returning id",
+                (email, _password_hash(SANDBOX_PASSWORD), f"IT Sandbox Admin {marker}"),
+            ).fetchone()[0]
+        )
+        pg.execute(
+            "insert into app_user_roles (user_id, role) values (%s, 'admin')",
+            (admin_id,),
+        )
+        pg.execute(
+            "insert into school_memberships (user_id, school_id, role, state, accepted_at) "
+            "values (%s, %s, 'director', 'active', now())",
+            (admin_id, school_id),
+        )
+    try:
+        yield {
+            "id": school_id, "name": name, "lat": lat, "lng": lng,
+            "email": email, "password": SANDBOX_PASSWORD, "admin_id": admin_id,
+        }
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as pg:
+            pg.execute(
+                "delete from live_student_absences where student_id in "
+                "(select id from live_students where school_id = %s)",
+                (school_id,),
+            )
+            for table in (
+                "live_runs", "live_students", "live_routes", "live_buses",
+                "live_fleet_plans", "live_incidents", "live_admin_audit",
+                "school_memberships",
+            ):
+                pg.execute(
+                    f"delete from {table} where school_id = %s", (school_id,)  # noqa: S608
+                )
+            pg.execute("delete from live_schools where id = %s", (school_id,))
+            pg.execute("delete from app_users where id = %s", (admin_id,))
+
+
 @pytest.fixture(scope="session")
 def in_process_db():
     """Point the app's process-global connection pool at the suite's DSN.

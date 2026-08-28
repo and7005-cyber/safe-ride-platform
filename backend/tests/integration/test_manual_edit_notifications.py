@@ -42,7 +42,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN
+from conftest import purge_accounts, DSN, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -80,9 +80,25 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+# Post-U6 world provisioning: one sandbox school per module (its own single-
+# membership admin, header fallback landing there).
+_SANDBOX: dict = {}
+
+
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    with school_sandbox("IT MEN School", lat=-1.3000, lng=36.8200) as sb:
+        _SANDBOX.clear()
+        _SANDBOX.update(sb)
+        try:
+            yield sb
+        finally:
+            _SANDBOX.clear()
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 # --- builders -----------------------------------------------------------------
@@ -103,13 +119,9 @@ def signup_parent(client, marker: str, tag: str) -> dict:
 
 
 def _make_school(client, headers, marker: str) -> dict:
-    created = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT MEN School {marker}", "lat": -1.3000, "lng": 36.8200},
-        headers=headers,
-    )
-    assert created.status_code == 200, created.text
-    return created.json()
+    # Post-U6 there is ONE school per module — the sandbox (see apply suite).
+    assert _SANDBOX, "sandbox fixture not active"
+    return {"id": _SANDBOX["id"], "name": _SANDBOX["name"]}
 
 
 def _make_route(client, headers, marker: str, school_id: str) -> dict:
@@ -152,10 +164,20 @@ def _cleanup(client, headers, *, students=(), routes=(), schools=(), parents=())
             client.delete(f"/api/fleet/routes/{r['id']}", headers=headers)
     for sc in schools:
         if sc:
-            client.delete(f"/api/fleet/schools/{sc['id']}", headers=headers)
+            # The school is the module sandbox: sweep its plan/route/run and
+            # audit rows by SQL (the retired school DELETE used to cascade).
+            with psycopg.connect(DSN, autocommit=True) as pg:
+                for table in (
+                    "live_fleet_plans", "live_runs", "live_routes",
+                    "live_admin_audit",
+                ):
+                    pg.execute(
+                        f"delete from {table} where school_id = %s",  # noqa: S608
+                        (sc["id"],),
+                    )
     for p in parents:
         if p:
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=headers)
+            purge_accounts(p['id'])
 
 
 # --- readers / sanctioned psycopg -----------------------------------------------

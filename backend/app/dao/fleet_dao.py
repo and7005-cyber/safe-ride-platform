@@ -1187,14 +1187,6 @@ class FleetDao:
 
     # --- schools -----------------------------------------------------------
 
-    def list_schools(self) -> list[dict[str, Any]]:
-        # Catalog read (live_schools carries no row policy). The router no
-        # longer exposes it wholesale; route_options still resolves a school's
-        # bells/coordinates through it until the route family converts (U7).
-        with get_connection() as conn:
-            rows = conn.execute("select * from live_schools order by name asc").fetchall()
-        return [dict(r) for r in rows]
-
     def get_school(self, scope: SchoolScope) -> dict[str, Any]:
         """The active school's settings row (R4): the scope IS the id."""
         with get_connection(scope) as conn:
@@ -1242,9 +1234,36 @@ class FleetDao:
 
     # --- routes ------------------------------------------------------------
 
-    def list_routes(self) -> list[dict[str, Any]]:
-        with get_connection() as conn:
-            routes = conn.execute("select * from live_routes order by name asc").fetchall()
+    @staticmethod
+    def _route_in_scope(conn, scope: SchoolScope, route_id: str) -> None:
+        """Another school's route does not exist for this caller (U7/R3)."""
+        row = conn.execute(
+            "select 1 from live_routes where id = %s and school_id = %s",
+            (route_id, scope.school_id),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("Route not found")
+
+    @staticmethod
+    def _check_bus_in_scope(conn, scope: SchoolScope, bus_id: str | None) -> None:
+        """A route payload's bus must belong to the scope school (U7/AE25):
+        a foreign bus "does not exist" for this caller — 404, never a wording
+        that implies another school holds it."""
+        if not bus_id:
+            return
+        row = conn.execute(
+            "select 1 from live_buses where id = %s and school_id = %s",
+            (bus_id, scope.school_id),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("Bus not found")
+
+    def list_routes(self, scope: SchoolScope) -> list[dict[str, Any]]:
+        with get_connection(scope) as conn:
+            routes = conn.execute(
+                "select * from live_routes where school_id = %s order by name asc",
+                (scope.school_id,),
+            ).fetchall()
             result = []
             for route in routes:
                 stops = conn.execute(
@@ -1282,8 +1301,11 @@ class FleetDao:
                 result.append(item)
         return result
 
-    def create_route(self, data: dict) -> dict[str, Any]:
-        with get_connection() as conn:
+    def create_route(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:
+        with get_connection(scope) as conn:
+            # school_id comes from the scope, never the client (U7); the
+            # payload's bus must be one of this school's own (AE25 — 404).
+            self._check_bus_in_scope(conn, scope, data.get("bus_id"))
             _check_route_bus_conflict(
                 conn, data.get("bus_id"), data.get("type") or "morning", data.get("trip_index") or 1
             )
@@ -1299,6 +1321,7 @@ class FleetDao:
                 "%(total_distance_m)s, %(total_duration_s)s) returning *",
                 {
                     **data,
+                    "school_id": scope.school_id,
                     "custom_stops": custom,
                     "polyline": data.get("polyline") if custom else None,
                     "total_distance_m": data.get("total_distance_m") if custom else None,
@@ -1313,19 +1336,30 @@ class FleetDao:
             # Turnaround feasibility across this bus's period chain (U6/R20) —
             # after regeneration, which clears the flag on a converged solve.
             _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
+            record_audit(
+                conn, action="route-created", actor=actor, scope=scope,
+                resource_type="route", resource_id=row["id"], detail={},
+            )
         # Observable degradation (U6/R10): false when the rebuild fell back —
         # same signal shape as update_route.
         return {**dict(row), "stops_recalculated": stops_recalculated}
 
-    def update_route(self, route_id: str, data: dict) -> dict[str, Any] | None:
+    def update_route(
+        self, scope: SchoolScope, route_id: str, data: dict, actor: dict
+    ) -> dict[str, Any] | None:
         from app.dao.student_live_dao import _derive_student_bus
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             current = conn.execute(
-                "select bus_id, type from live_routes where id = %s", (route_id,)
+                "select bus_id, type from live_routes where id = %s and school_id = %s",
+                (route_id, scope.school_id),
             ).fetchone()
             if not current:
-                return None
+                # Another school's route does not exist here (U7/R3) — and a
+                # genuinely unknown id answers the same 404, not a 200 null.
+                raise NotFoundError("Route not found")
+            # AE25: a foreign bus in the payload is 404 — nothing is written.
+            self._check_bus_in_scope(conn, scope, data.get("bus_id"))
             _check_route_bus_conflict(
                 conn, data.get("bus_id"), data.get("type") or "morning",
                 data.get("trip_index") or 1, exclude_route_id=route_id,
@@ -1340,14 +1374,17 @@ class FleetDao:
                 # mechanism) and last_recalc_degraded (custom routes never
                 # regenerate, so a stale degradation badge could otherwise
                 # never clear).
+                # The payload's school_id is IGNORED (U7): the route's school
+                # is pinned by the scope and never client-writable.
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
+                    "bus_id=%(bus_id)s, gate_anchor=%(gate_anchor)s, "
                     "trip_index=coalesce(%(trip_index)s, 1), "
                     "custom_stops=true, manual_stop_order=false, last_recalc_degraded=false, "
                     "polyline=%(polyline)s, total_distance_m=%(total_distance_m)s, "
-                    "total_duration_s=%(total_duration_s)s where id=%(id)s returning *",
-                    {**data, "id": route_id},
+                    "total_duration_s=%(total_duration_s)s "
+                    "where id=%(id)s and school_id=%(scope_school)s returning *",
+                    {**data, "id": route_id, "scope_school": scope.school_id},
                 ).fetchone()
                 if row:
                     _write_custom_stops(conn, route_id, data["stops"])
@@ -1357,9 +1394,10 @@ class FleetDao:
                 # for it); normal routes rebuild from students as before.
                 row = conn.execute(
                     "update live_routes set name=%(name)s, type=coalesce(%(type)s,'morning'), "
-                    "bus_id=%(bus_id)s, school_id=%(school_id)s, gate_anchor=%(gate_anchor)s, "
-                    "trip_index=coalesce(%(trip_index)s, 1) where id=%(id)s returning *",
-                    {**data, "id": route_id},
+                    "bus_id=%(bus_id)s, gate_anchor=%(gate_anchor)s, "
+                    "trip_index=coalesce(%(trip_index)s, 1) "
+                    "where id=%(id)s and school_id=%(scope_school)s returning *",
+                    {**data, "id": route_id, "scope_school": scope.school_id},
                 ).fetchone()
                 if row:
                     stops_recalculated = regenerate_route_stops(conn, route_id)
@@ -1380,32 +1418,56 @@ class FleetDao:
                 _check_turnaround_feasibility(conn, row["bus_id"], row["type"])
                 if current["bus_id"] != row["bus_id"] or current["type"] != row["type"]:
                     _check_turnaround_feasibility(conn, current["bus_id"], current["type"])
+                record_audit(
+                    conn, action="route-updated", actor=actor, scope=scope,
+                    resource_type="route", resource_id=route_id, detail={},
+                )
         if not row:
             return None
         # Observable degradation (U6/R10): false when the rebuild fell back.
         return {**dict(row), "stops_recalculated": stops_recalculated}
 
-    def delete_route(self, route_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_routes where id = %s", (route_id,))
+    def delete_route(self, scope: SchoolScope, route_id: str, actor: dict) -> None:
+        with get_connection(scope) as conn:
+            row = conn.execute(
+                "delete from live_routes where id = %s and school_id = %s returning id",
+                (route_id, scope.school_id),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Route not found")
+            record_audit(
+                conn, action="route-deleted", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id, detail={},
+            )
 
     # --- stop-level edits (#1) --------------------------------------------
 
-    def remove_student_from_route(self, route_id: str, student_id: str) -> bool:
+    def remove_student_from_route(
+        self, scope: SchoolScope, route_id: str, student_id: str, actor: dict
+    ) -> bool:
         """Cancel a stop by removing its student from the route, then rebuild.
         Returns the regeneration's ``stops_recalculated`` signal (U6/R10)."""
         from app.dao.student_live_dao import _derive_student_bus
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
+            self._route_in_scope(conn, scope, route_id)
             conn.execute(
                 "delete from live_student_routes where route_id = %s and student_id = %s",
                 (route_id, student_id),
             )
             stops_recalculated = regenerate_route_stops(conn, route_id)
             _derive_student_bus(conn, student_id)
+            record_audit(
+                conn, action="route-updated", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id,
+                detail={"edit": "stop-cancelled"},
+            )
         return stops_recalculated
 
-    def set_student_pickup_time(self, student_id: str, pickup_time: str | None) -> bool:
+    def set_student_pickup_time(
+        self, scope: SchoolScope, route_id: str, student_id: str,
+        pickup_time: str | None, actor: dict,
+    ) -> bool:
         """Edit a stop's pickup time (a student attribute). The effect depends
         on each affected route's ordering mode, decided under the same
         route-row lock every stop rewrite takes (U6):
@@ -1421,11 +1483,17 @@ class FleetDao:
         - custom: nothing to touch — planner stops are not student-linked.
 
         Returns False when any auto regeneration degraded."""
-        with get_connection() as conn:
-            conn.execute(
-                "update live_students set pickup_time = %s where id = %s",
-                (pickup_time, student_id),
-            )
+        with get_connection(scope) as conn:
+            # The path route pins the audit and answers 404 for a foreign
+            # route before anything is written (U7).
+            self._route_in_scope(conn, scope, route_id)
+            updated = conn.execute(
+                "update live_students set pickup_time = %s "
+                "where id = %s and school_id = %s returning id",
+                (pickup_time, student_id, scope.school_id),
+            ).fetchone()
+            if not updated:
+                raise NotFoundError("Student not found")
             # order by r.id: a student can sit on several routes — take their
             # row locks in a stable order so two concurrent edits cannot
             # deadlock across routes.
@@ -1447,14 +1515,48 @@ class FleetDao:
                     )
                 else:
                     ok = regenerate_route_stops(conn, route["id"]) and ok
+            record_audit(
+                conn, action="route-updated", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id,
+                detail={"edit": "stop-time"},
+            )
         return ok
 
     # --- manual ordering (U7) -----------------------------------------------
 
-    def set_route_stop_order(self, route_id: str, ordered_keys: list[str]) -> None:
-        with get_connection() as conn:
+    def set_route_stop_order(
+        self, scope: SchoolScope, route_id: str, ordered_keys: list[str], actor: dict
+    ) -> None:
+        with get_connection(scope) as conn:
+            self._route_in_scope(conn, scope, route_id)
             reorder_route_stops(conn, route_id, ordered_keys)
+            record_audit(
+                conn, action="route-updated", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id,
+                detail={"edit": "stop-order"},
+            )
 
-    def recalculate_route(self, route_id: str) -> bool:
-        with get_connection() as conn:
-            return recalculate_route_stops(conn, route_id)
+    def recalculate_route(self, scope: SchoolScope, route_id: str, actor: dict) -> bool:
+        with get_connection(scope) as conn:
+            self._route_in_scope(conn, scope, route_id)
+            result = recalculate_route_stops(conn, route_id)
+            record_audit(
+                conn, action="route-updated", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id,
+                detail={"edit": "recalculate"},
+            )
+            return result
+
+    def record_broadcast(
+        self, scope: SchoolScope, route_id: str, actor: dict, recipient_count: int
+    ) -> None:
+        """The broadcast-sent audit row (U7). The fan-out itself runs in
+        BackgroundTasks, so the act is recorded here at dispatch time — after
+        the recipient set resolved and every guard passed — with the count
+        the response reports (ids and counts only, per the detail rule)."""
+        with get_connection(scope) as conn:
+            record_audit(
+                conn, action="broadcast-sent", actor=actor, scope=scope,
+                resource_type="route", resource_id=route_id,
+                detail={"recipients": recipient_count},
+            )

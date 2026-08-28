@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.core.scope import SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
 from app.dao import participation_dao
@@ -10,10 +11,12 @@ from app.dao.status_sql import display_status_case, no_progress_case, scope_cove
 class RunDao:
     # --- admin runs --------------------------------------------------------
 
-    def list_runs(self, active: bool = False) -> list[dict[str, Any]]:
-        """All runs, newest first. active=True narrows to non-completed runs up
-        to and including today (Africa/Nairobi) — the dashboard's Active Runs
-        card (R5).
+    def list_runs(self, scope: SchoolScope, active: bool = False) -> list[dict[str, Any]]:
+        """The ACTIVE school's runs, newest first (U7). active=True narrows to
+        non-completed runs up to and including today (Africa/Nairobi) — the
+        dashboard's Active Runs card (R5). A driver-role scope narrows
+        further to their own bus's runs: the list must never hand a driver
+        the school-wide operational picture.
 
         Deliberately *not* the same predicate as find_active_run_today, which
         stays pinned to today so a stale run is invisible to every driver write
@@ -27,13 +30,18 @@ class RunDao:
         surface here flagged `stale`, which is where the office force-closes
         them.
         """
-        where = (
-            "where r.status <> 'completed' "
-            "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
-            if active
-            else ""
-        )
-        with get_connection() as conn:
+        where = "where r.school_id = %(school_id)s"
+        if active:
+            where += (
+                " and r.status <> 'completed' "
+                "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
+            )
+        if scope.role == "driver":
+            where += (
+                " and r.bus_id in (select id from live_buses "
+                "where driver_id = %(driver_id)s and school_id = %(school_id)s)"
+            )
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 f"""
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
@@ -57,7 +65,8 @@ class RunDao:
                 left join live_routes rt on rt.id = r.route_id
                 {where}
                 order by r.date desc, r.created_at desc
-                """
+                """,
+                {"school_id": scope.school_id, "driver_id": scope.user_id},
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -87,8 +96,30 @@ class RunDao:
         if existing:
             raise ConflictError("This bus already has an active run on that date")
 
-    def create_run(self, data: dict) -> dict[str, Any]:
-        with get_connection() as conn:
+    @staticmethod
+    def _assert_run_refs_in_scope(conn, scope: SchoolScope, data: dict) -> None:
+        """A run payload's bus and route must belong to the scope school
+        (U7/AE25's run-side twin): a foreign id "does not exist" — 404."""
+        from app.core.errors import NotFoundError
+
+        if data.get("bus_id"):
+            if not conn.execute(
+                "select 1 from live_buses where id = %s and school_id = %s",
+                (data["bus_id"], scope.school_id),
+            ).fetchone():
+                raise NotFoundError("Bus not found")
+        if data.get("route_id"):
+            if not conn.execute(
+                "select 1 from live_routes where id = %s and school_id = %s",
+                (data["route_id"], scope.school_id),
+            ).fetchone():
+                raise NotFoundError("Route not found")
+
+    def create_run(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:
+        with get_connection(scope) as conn:
+            # school_id comes from the scope, never the client (U7); the
+            # payload's bus AND route must be this school's own (404 foreign).
+            self._assert_run_refs_in_scope(conn, scope, data)
             # No two non-completed runs for the same bus on the same date (#12).
             if data.get("bus_id") and (data.get("status") or "in-progress") != "completed":
                 self._assert_no_active_run_conflict(conn, data["bus_id"], data.get("date"))
@@ -105,11 +136,17 @@ class RunDao:
                      coalesce(%(total_students)s,0), coalesce(%(students_boarded)s,0), coalesce(%(incidents)s,0))
                 returning *
                 """,
-                data,
+                {**data, "school_id": scope.school_id},
             ).fetchone()
+            record_audit(
+                conn, action="run-created", actor=actor, scope=scope,
+                resource_type="run", resource_id=row["id"], detail={},
+            )
         return dict(row)
 
-    def update_run(self, run_id: str, data: dict) -> dict[str, Any] | None:
+    def update_run(
+        self, scope: SchoolScope, run_id: str, data: dict, actor: dict
+    ) -> dict[str, Any] | None:
         """Edit a run's plan. Cannot complete one (R16).
 
         Completion is a claim about children, not a field: it means every child
@@ -119,14 +156,19 @@ class RunDao:
         recording the unresolved children as unaccounted. Setting the column
         here would produce a completed run with neither guarantee behind it.
         """
-        from app.core.errors import ConflictError
+        from app.core.errors import ConflictError, NotFoundError
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             current = conn.execute(
-                "select date, status from live_runs where id = %s", (run_id,)
+                "select date, status from live_runs where id = %s and school_id = %s",
+                (run_id, scope.school_id),
             ).fetchone()
             if not current:
-                return None
+                # Another school's run does not exist here (U7/R3) — and a
+                # genuinely unknown id answers the same 404, not a 200 null.
+                raise NotFoundError("Run not found")
+            # A foreign bus or route in the edit is 404 too (AE25's twin).
+            self._assert_run_refs_in_scope(conn, scope, data)
             if data.get("status") == "completed" and current["status"] != "completed":
                 raise ConflictError(
                     "A run cannot be marked finished here. The driver ends it once "
@@ -168,15 +210,23 @@ class RunDao:
                     stops_completed=coalesce(%(stops_completed)s,0),
                     total_students=coalesce(%(total_students)s,0),
                     students_boarded=coalesce(%(students_boarded)s,0), incidents=coalesce(%(incidents)s,0)
-                where id=%(id)s returning *
+                where id=%(id)s and school_id=%(scope_school)s returning *
                 """,
-                {**data, "id": run_id},
+                {**data, "id": run_id, "scope_school": scope.school_id},
             ).fetchone()
+            if row:
+                record_audit(
+                    conn, action="run-updated", actor=actor, scope=scope,
+                    resource_type="run", resource_id=run_id, detail={},
+                )
         return dict(row) if row else None
 
-    def delete_run(self, run_id: str) -> None:
+    def delete_run(self, scope: SchoolScope, run_id: str, actor: dict) -> None:
         """Delete a run — the admin's recovery path for a run started in error
-        (R16).
+        (R16). U7/AE27: a coordinator may delete a run only while it is NOT
+        completed (open-run cleanup — a driver's wrong-route start); deleting
+        a COMPLETED run is a director-only act, and the completed-today-with-
+        evidence refusal below stands for directors too.
 
         Deleting a non-completed run no longer writes any child a status. It
         used to bulk-set the roster's 'on-bus' children to 'at-school', which
@@ -204,9 +254,9 @@ class RunDao:
         keep their participation as history and delete normally — their day is
         over, so nothing on a live surface moves.
         """
-        from app.core.errors import ConflictError
+        from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             run = conn.execute(
                 """
                 select r.status, r.driver_id, r.date,
@@ -215,17 +265,23 @@ class RunDao:
                            select 1 from run_participation p
                            where p.run_id = r.id and p.student_id is not null
                        ) as has_evidence
-                from live_runs r where r.id = %s
+                from live_runs r where r.id = %s and r.school_id = %s
                 """,
-                (run_id,),
+                (run_id, scope.school_id),
             ).fetchone()
-            if run and run["status"] == "completed" and run["is_today"] and run["has_evidence"]:
+            if not run:
+                raise NotFoundError("Run not found")
+            if run["status"] == "completed" and scope.role != "director":
+                # AE27: the coordinator's delete covers open-run cleanup only;
+                # a finished run's record is director territory (R8).
+                raise ForbiddenError("Only a director can delete a completed run")
+            if run["status"] == "completed" and run["is_today"] and run["has_evidence"]:
                 raise ConflictError(
                     "This run is finished, and its record is the only evidence of "
                     "who was on the bus today. Deleting it would show those children "
                     "as never having travelled. Edit the run instead."
                 )
-            if run and run["status"] != "completed" and run["driver_id"]:
+            if run["status"] != "completed" and run["driver_id"]:
                 # Scoped to this run's own roster: a driver runs a morning and an
                 # afternoon route on the same date, and undoing one must not
                 # revoke the absences they marked on the other.
@@ -244,8 +300,13 @@ class RunDao:
                 )
             # run_participation and run_stops cascade on the run's own delete.
             conn.execute("delete from live_runs where id = %s", (run_id,))
+            record_audit(
+                conn, action="run-deleted", actor=actor, scope=scope,
+                resource_type="run", resource_id=run_id,
+                detail={"status": run["status"]},
+            )
 
-    def run_report(self, run_id: str) -> dict[str, Any]:
+    def run_report(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
         """Post-run report (R14-R16): the run row + bus/route/driver names +
         the absence snapshot taken at start_run. Legacy runs that predate the
         snapshot (a route but no run_absences rows and no run_stops — e.g.
@@ -254,7 +315,7 @@ class RunDao:
         Runs with no route report an empty list, approximate=False."""
         from app.core.errors import NotFoundError
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             run = conn.execute(
                 """
                 select r.*, b.name as bus_name, b.plate_number, rt.name as route_name,
@@ -269,9 +330,9 @@ class RunDao:
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
                 left join app_users u on u.id = r.driver_id
-                where r.id = %s
+                where r.id = %s and r.school_id = %s
                 """,
-                (run_id,),
+                (run_id, scope.school_id),
             ).fetchone()
             if not run:
                 raise NotFoundError("Run was not found")
@@ -320,11 +381,17 @@ class RunDao:
         return report
 
     # --- driver context ----------------------------------------------------
+    # Every driver-surface method takes the driver's SchoolScope (U7): the
+    # driver id is scope.user_id and the bus resolves through the driver's
+    # own school, so a driver can only ever act on their school's rows.
 
-    def get_driver_context(self, driver_id: str) -> dict[str, Any]:
-        with get_connection() as conn:
+    def get_driver_context(self, scope: SchoolScope) -> dict[str, Any]:
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
             bus = conn.execute(
-                "select * from live_buses where driver_id = %s order by name asc limit 1", (driver_id,)
+                "select * from live_buses where driver_id = %s and school_id = %s "
+                "order by name asc limit 1",
+                (driver_id, scope.school_id),
             ).fetchone()
             if not bus:
                 return {
@@ -505,13 +572,15 @@ class RunDao:
         ).fetchone()
         return dict(row) if row else None
 
-    def start_run(self, driver_id: str, route_id: str) -> dict[str, Any]:
+    def start_run(self, scope: SchoolScope, route_id: str) -> dict[str, Any]:
         """Atomic: validate, snapshot stops, create the in-progress run."""
         from app.core.errors import ConflictError, ForbiddenError
 
-        with get_connection() as conn:
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
             bus = conn.execute(
-                "select * from live_buses where driver_id = %s limit 1", (driver_id,)
+                "select * from live_buses where driver_id = %s and school_id = %s limit 1",
+                (driver_id, scope.school_id),
             ).fetchone()
             if not bus:
                 raise ForbiddenError("No bus is assigned to this driver")
@@ -703,11 +772,15 @@ class RunDao:
                 )
         return dict(run)
 
-    def arrive_next_stop(self, driver_id: str, run_id: str) -> dict[str, Any]:
+    def arrive_next_stop(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
         from app.core.errors import ConflictError, ForbiddenError
 
-        with get_connection() as conn:
-            run = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            run = conn.execute(
+                "select * from live_runs where id = %s and school_id = %s",
+                (run_id, scope.school_id),
+            ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
             if run["status"] == "completed":
@@ -756,16 +829,20 @@ class RunDao:
                     bus = conn.execute(
                         "select * from live_buses where id = %s", (run["bus_id"],)
                     ).fetchone()
+                    # Stamped with the run's school (U7): incidents are
+                    # school-owned rows from here on.
                     inc = conn.execute(
                         """
                         insert into live_incidents
-                            (run_id, driver_id, driver_name, bus_id, bus_name, type, description)
-                        values (%s, %s, %s, %s, %s, 'arrival', %s)
+                            (run_id, driver_id, driver_name, bus_id, bus_name, type,
+                             description, school_id)
+                        values (%s, %s, %s, %s, %s, 'arrival', %s, %s)
                         returning *
                         """,
                         (run_id, driver_id, bus["driver_name"] if bus else None, run["bus_id"],
                          bus["name"] if bus else None,
-                         f"{bus['name'] if bus else 'Bus'} has arrived at {gate['name']}."),
+                         f"{bus['name'] if bus else 'Bus'} has arrived at {gate['name']}.",
+                         run["school_id"]),
                     ).fetchone()
                     conn.execute(
                         "update live_runs set incidents = incidents + 1 where id = %s", (run_id,)
@@ -774,7 +851,7 @@ class RunDao:
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
         return {"run": dict(updated), "arrival_incident": arrival_incident}
 
-    def end_run(self, driver_id: str, run_id: str) -> dict[str, Any]:
+    def end_run(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
         """Complete a run — refused while any roster child is unaccounted (U4).
 
         The end-of-run sweep is gone. It used to write a terminal status to
@@ -790,9 +867,11 @@ class RunDao:
         """
         from app.core.errors import ClosureRefusedError, ConflictError, ForbiddenError
 
-        with get_connection() as conn:
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
             run = conn.execute(
-                "select * from live_runs where id = %s for update", (run_id,)
+                "select * from live_runs where id = %s and school_id = %s for update",
+                (run_id, scope.school_id),
             ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
@@ -863,7 +942,9 @@ class RunDao:
         result["boarded_student_ids"] = boarded_ids
         return result
 
-    def force_close_run(self, actor: dict[str, Any], run_id: str) -> dict[str, Any]:
+    def force_close_run(
+        self, scope: SchoolScope, run_id: str, actor: dict[str, Any]
+    ) -> dict[str, Any]:
         """Close a run no driver can resolve (U6/R12-R14).
 
         A driver whose phone dies, whose shift ends, or who simply forgets leaves
@@ -882,9 +963,10 @@ class RunDao:
         """
         from app.core.errors import ConflictError, NotFoundError
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             run = conn.execute(
-                "select * from live_runs where id = %s for update", (run_id,)
+                "select * from live_runs where id = %s and school_id = %s for update",
+                (run_id, scope.school_id),
             ).fetchone()
             if not run:
                 raise NotFoundError("Run not found")
@@ -928,7 +1010,7 @@ class RunDao:
                 conn,
                 action="run-force-closed",
                 actor=actor,
-                school_id=str(run["school_id"]) if run.get("school_id") else None,
+                scope=scope,
                 resource_type="run",
                 resource_id=str(run_id),
                 detail={"unaccounted_count": len(outstanding)},
@@ -942,25 +1024,36 @@ class RunDao:
         result["boarded_student_ids"] = boarded_ids
         result["gate_arrival_recorded"] = gate_reached
         result["unaccounted"] = outstanding
-        result["force_closed_by_display"] = actor_display(actor)
+        result["force_closed_by_display"] = actor_display(actor, scope)
         return result
 
-    def record_parent_contact(self, admin_id: str, run_id: str, student_id: str) -> dict[str, Any]:
+    def record_parent_contact(
+        self, scope: SchoolScope, run_id: str, student_id: str
+    ) -> dict[str, Any]:
         """Record that the office phoned an unaccounted child's parents (R14)."""
         from app.core.errors import NotFoundError
 
-        with get_connection() as conn:
-            if not participation_dao.record_contact(conn, str(run_id), student_id, admin_id):
+        with get_connection(scope) as conn:
+            run = conn.execute(
+                "select 1 from live_runs where id = %s and school_id = %s",
+                (run_id, scope.school_id),
+            ).fetchone()
+            if not run:
+                raise NotFoundError("Run not found")
+            if not participation_dao.record_contact(
+                conn, str(run_id), student_id, scope.user_id
+            ):
                 raise NotFoundError("No unaccounted child on this run to record contact for")
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
         return {"run_id": str(run_id), "unaccounted": outstanding}
 
-    def write_position(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
+    def write_position(self, scope: SchoolScope, lat: float, lng: float) -> dict[str, Any]:
         """Record the bus position; returns the active run snapshot."""
         from app.core.errors import ForbiddenError
 
-        with get_connection() as conn:
-            run = self.find_active_run_today(conn, self._bus_id_for_driver(conn, driver_id))
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            run = self.find_active_run_today(conn, self._bus_id_for_driver(conn, scope))
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
             conn.execute(
@@ -970,7 +1063,7 @@ class RunDao:
         return dict(run)
 
     def toggle_boarding(
-        self, driver_id: str, student_id: str, on_bus: bool
+        self, scope: SchoolScope, student_id: str, on_bus: bool
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Board a student on a morning run; returns (student, run snapshot).
 
@@ -981,8 +1074,9 @@ class RunDao:
         """
         from app.core.errors import ConflictError, ForbiddenError
 
-        with get_connection() as conn:
-            bus_id = self._bus_id_for_driver(conn, driver_id)
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            bus_id = self._bus_id_for_driver(conn, scope)
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
@@ -1023,7 +1117,7 @@ class RunDao:
         return dict(row), dict(run)
 
     def dropoff_student(
-        self, driver_id: str, student_id: str
+        self, scope: SchoolScope, student_id: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Confirm a drop-off at a reached stop on the driver's active
         afternoon run; returns (student, run snapshot).
@@ -1036,8 +1130,9 @@ class RunDao:
         """
         from app.core.errors import ConflictError, ForbiddenError
 
-        with get_connection() as conn:
-            bus_id = self._bus_id_for_driver(conn, driver_id)
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            bus_id = self._bus_id_for_driver(conn, scope)
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
@@ -1075,7 +1170,7 @@ class RunDao:
         return dict(row), dict(run)
 
     def record_handover(
-        self, driver_id: str, student_id: str, note: str
+        self, scope: SchoolScope, student_id: str, note: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Record a hand-over away from the child's own stop (U4/R12).
 
@@ -1095,8 +1190,9 @@ class RunDao:
         if not note:
             raise BadRequestError("A note is required — say where the child was handed over.")
 
-        with get_connection() as conn:
-            bus_id = self._bus_id_for_driver(conn, driver_id)
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            bus_id = self._bus_id_for_driver(conn, scope)
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
@@ -1126,7 +1222,7 @@ class RunDao:
         return dict(row), dict(run)
 
     def reverse_own_action(
-        self, driver_id: str, student_id: str
+        self, scope: SchoolScope, student_id: str
     ) -> tuple[dict[str, Any], dict[str, Any], str]:
         """Undo this driver's own drop-off, hand-over or absence mark while the
         run is still open (U5/R10). Returns (student, run, what_was_reversed).
@@ -1149,8 +1245,9 @@ class RunDao:
         """
         from app.core.errors import ConflictError, ForbiddenError
 
-        with get_connection() as conn:
-            bus_id = self._bus_id_for_driver(conn, driver_id)
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            bus_id = self._bus_id_for_driver(conn, scope)
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
@@ -1207,7 +1304,7 @@ class RunDao:
         return dict(student), dict(run), reversed_what
 
     def mark_student_absent(
-        self, driver_id: str, student_id: str, *, whole_day: bool = False
+        self, scope: SchoolScope, student_id: str, *, whole_day: bool = False
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Driver marks a roster student absent mid-run (U8/R17-R20); returns
         (student, run snapshot enriched with route_name/bus_name for the
@@ -1246,8 +1343,9 @@ class RunDao:
         from app.core.errors import ForbiddenError
 
         reason = "Marked absent by driver at stop"
-        with get_connection() as conn:
-            bus_id = self._bus_id_for_driver(conn, driver_id)
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
+            bus_id = self._bus_id_for_driver(conn, scope)
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
@@ -1258,13 +1356,17 @@ class RunDao:
             if not stop:
                 raise ForbiddenError("Student is not on this run")
             period = "day" if whole_day else run["type"]
+            # school_id stamped from the driver's scope (U7) — the roster
+            # check above proved the student rides this school's run.
             conn.execute(
                 """
                 insert into live_student_absences as a
-                    (student_id, absence_date, reason, marked_by, scope, source, marked_period)
+                    (student_id, absence_date, reason, marked_by, scope, source,
+                     marked_period, school_id)
                 values (
                     %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
-                    %(reason)s, %(driver)s, %(period)s, 'driver', %(period)s
+                    %(reason)s, %(driver)s, %(period)s, 'driver', %(period)s,
+                    %(school_id)s
                 )
                 on conflict (student_id, absence_date) do update set
                     reason = excluded.reason,
@@ -1289,13 +1391,16 @@ class RunDao:
                         when a.marked_period is null then excluded.marked_period
                         when a.marked_period = excluded.marked_period then a.marked_period
                         else 'day'
-                    end
+                    end,
+                    -- Heal a NULL left by a pre-U7 writer; never re-stamp.
+                    school_id = coalesce(a.school_id, excluded.school_id)
                 """,
                 {
                     "student_id": student_id,
                     "reason": reason,
                     "driver": driver_id,
                     "period": period,
+                    "school_id": scope.school_id,
                 },
             )
             student = conn.execute(
@@ -1349,8 +1454,11 @@ class RunDao:
     # participation. Counting a status column that no longer tracks boarding
     # would have frozen students_boarded at whatever the last sweep left.
 
-    def _bus_id_for_driver(self, conn, driver_id: str) -> str | None:
+    def _bus_id_for_driver(self, conn, scope: SchoolScope) -> str | None:
+        # The driver's bus at the driver's OWN school (U7): a same-named
+        # assignment at another school can never resolve here.
         row = conn.execute(
-            "select id from live_buses where driver_id = %s limit 1", (driver_id,)
+            "select id from live_buses where driver_id = %s and school_id = %s limit 1",
+            (scope.user_id, scope.school_id),
         ).fetchone()
         return row["id"] if row else None

@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from app.core.db import get_connection
 from app.core.errors import ConflictError, NotFoundError
+from app.dao.audit_dao import record_audit
 from app.dao.fleet_plan._shared import (
     UNRESOLVED_ADDRESS_CONSTRAINT,
     _META_COLUMNS,
@@ -98,12 +99,14 @@ class DraftOps:
     # --- draft generation (F1 step 2 / F4) ---------------------------------
 
     def create_draft(
-        self, school_id: str, *, seed: int | None, supersede: bool, created_by: str | None
+        self, scope, *, seed: int | None, supersede: bool, actor: dict
     ) -> dict[str, Any]:
         """Snapshot the basis, fetch the matrix, run the solver, persist the
-        draft. One open draft per school: an existing draft 409s unless
-        ``supersede``, which flips it to superseded AND scrubs its
-        document/basis payloads (metadata kept — the retention rule).
+        draft — for the ACTIVE school (U7: the scope decides; any payload
+        school is ignored by the router). One open draft per school: an
+        existing draft 409s unless ``supersede``, which flips it to
+        superseded AND scrubs its document/basis payloads (metadata kept —
+        the retention rule).
 
         Read-only against live routes by construction: nothing here writes
         ``live_routes`` / ``live_route_stops`` / ``live_student_routes`` (R8).
@@ -115,7 +118,8 @@ class DraftOps:
         short provider hold is an accepted simplification at pilot scale.
         """
         seed_val = int(seed) if seed is not None else 0
-        with get_connection() as conn:
+        school_id = scope.school_id
+        with get_connection(scope) as conn:
             school = conn.execute(
                 "select id, name, lat, lng from live_schools where id = %s", (school_id,)
             ).fetchone()
@@ -265,8 +269,15 @@ class DraftOps:
                 "insert into live_fleet_plans "
                 "(school_id, status, document, basis, solver_seed, degraded, created_by) "
                 "values (%s, 'draft', %s, %s, %s, %s, %s) returning *",
-                (school_id, Jsonb(document), Jsonb(basis), seed_val, degraded, created_by),
+                (school_id, Jsonb(document), Jsonb(basis), seed_val, degraded,
+                 actor.get("id")),
             ).fetchone()
+            record_audit(
+                conn, action="plan-drafted", actor=actor, scope=scope,
+                resource_type="plan", resource_id=row["id"],
+                detail={"seed": seed_val, "degraded": degraded,
+                        "superseded": bool(existing)},
+            )
         logger.info(
             "fleet plan draft %s for school %s: seed=%s degraded=%s students=%d "
             "plannable=%d buses=%d excluded=%d",
@@ -277,7 +288,7 @@ class DraftOps:
 
     # --- reads --------------------------------------------------------------
 
-    def current_plans(self, school_id: str) -> dict[str, Any]:
+    def current_plans(self, scope) -> dict[str, Any]:
         """The school's open draft (full row) plus applied/previous metadata
         WITHOUT their document/basis payloads. Full review computation is
         U5's job — the draft's stored document is returned as-is.
@@ -288,7 +299,8 @@ class DraftOps:
         restore's semantics), so a caller can assemble the restore
         confirmations without a blind POST. The capture document itself
         stays unexposed (aggregate PII)."""
-        with get_connection() as conn:
+        school_id = scope.school_id
+        with get_connection(scope) as conn:
             school = conn.execute(
                 "select id from live_schools where id = %s", (school_id,)
             ).fetchone()
@@ -338,14 +350,16 @@ class DraftOps:
 
     # --- discard ------------------------------------------------------------
 
-    def discard_draft(self, plan_id: str) -> dict[str, Any]:
+    def discard_draft(self, scope, plan_id: str, actor: dict) -> dict[str, Any]:
         """Discard an open draft: status -> discarded, document/basis scrubbed
         to NULL (metadata kept) — the retention rule, mechanized. Draft only:
-        any other status 409s by name."""
-        with get_connection() as conn:
+        any other status 409s by name; another school's plan id answers 404
+        (U7)."""
+        with get_connection(scope) as conn:
             row = conn.execute(
-                "select id, status from live_fleet_plans where id = %s for update",
-                (plan_id,),
+                "select id, status from live_fleet_plans "
+                "where id = %s and school_id = %s for update",
+                (plan_id, scope.school_id),
             ).fetchone()
             if not row:
                 raise NotFoundError("Plan not found")
@@ -358,5 +372,9 @@ class DraftOps:
                 f"document = null, basis = null where id = %s returning {_META_COLUMNS}",
                 (plan_id,),
             ).fetchone()
+            record_audit(
+                conn, action="plan-discarded", actor=actor, scope=scope,
+                resource_type="plan", resource_id=plan_id, detail={},
+            )
         return {"ok": True, **dict(updated)}
 

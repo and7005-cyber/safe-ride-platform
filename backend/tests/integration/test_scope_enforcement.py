@@ -53,9 +53,11 @@ def client(in_process_db):
 
     app = create_app()
 
-    def observed_guc() -> str | None:
-        # Implicit checkout: proves the context-var fallback feeds the seam.
-        with get_connection() as conn:
+    def observed_guc(scope=None) -> str | None:
+        # U7: school-surface routes thread their scope explicitly (the strict
+        # seam refuses an implicit checkout there); the parent route still
+        # exercises the context-var fallback, which ParentScope keeps.
+        with (get_connection(scope) if scope is not None else get_connection()) as conn:
             return conn.execute(
                 "select current_setting('saferide.school_ids', true) as v"
             ).fetchone()["v"]
@@ -66,8 +68,18 @@ def client(in_process_db):
             "school": scope.school_id,
             "role": scope.role,
             "actor": scope.actor_kind,
-            "guc": observed_guc(),
+            "guc": observed_guc(scope),
         }
+
+    @app.get("/t/staff-implicit")
+    def staff_implicit_route(scope: SchoolScope = Depends(require_staff)):
+        # The strict default (U7): an implicitly-scoped checkout inside a
+        # SchoolScope request is a programming error, not a fallback.
+        try:
+            observed_guc()
+        except RuntimeError as error:
+            return {"raised": str(error)}
+        return {"raised": None}
 
     @app.delete("/t/record")
     def delete_route(scope: SchoolScope = Depends(require_director)):
@@ -75,7 +87,11 @@ def client(in_process_db):
 
     @app.get("/t/driver")
     def driver_route(scope: SchoolScope = Depends(require_driver_scope)):
-        return {"school": scope.school_id, "actor": scope.actor_kind, "guc": observed_guc()}
+        return {
+            "school": scope.school_id,
+            "actor": scope.actor_kind,
+            "guc": observed_guc(scope),
+        }
 
     @app.get("/t/parent")
     def parent_route(scope: ParentScope = Depends(require_parent_scope)):
@@ -86,7 +102,9 @@ def client(in_process_db):
         background_tasks: BackgroundTasks,
         scope: SchoolScope = Depends(require_staff),
     ):
-        background_tasks.add_task(lambda: _bg_guc_seen.append(observed_guc()))
+        # U7: background work threads the request scope explicitly — the
+        # production dispatch pattern (notify_route_changes, notify_*).
+        background_tasks.add_task(lambda: _bg_guc_seen.append(observed_guc(scope)))
         return {"school": scope.school_id}
 
     return TestClient(app)
@@ -387,3 +405,13 @@ def test_background_tasks_see_the_request_guc(client):
     resp = client.get("/t/background", headers=hdr(token, SCHOOL_A_ID))
     assert resp.status_code == 200
     assert _bg_guc_seen == [SCHOOL_A_ID]
+
+
+def test_implicit_checkout_inside_a_school_request_is_refused(client):
+    """U7's strict default, proven through a real request: a school-scoped
+    endpoint that opens a connection without threading its scope raises —
+    the missed-conversion detector, not a fallback."""
+    token = tok(client, COORDINATOR_A)
+    body = client.get("/t/staff-implicit", headers=hdr(token, SCHOOL_A_ID)).json()
+    assert body["raised"] is not None
+    assert "without an explicit scope" in body["raised"]

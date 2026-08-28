@@ -11,14 +11,17 @@ Review-edit contract (R9): every edit re-checks the hard constraints and a
 violation answers 422 with the constraint NAMED ('capacity' or 'stop cap'),
 leaving the draft document unchanged.
 
-All admin-only: plan documents aggregate every enrolled child's name and home
-coordinates, the R19 rationale's aggregate PII target.
+All staff-scoped (tenancy U7): plan documents aggregate every enrolled
+child's name and home coordinates, the R19 rationale's aggregate PII target.
+Every school_id query/body parameter is accepted for the shipped frontend's
+payload shapes and IGNORED — the request scope decides; plan ids resolve
+against the active school, so a foreign plan answers 404.
 """
 from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
-from app.core.auth import require_role
+from app.core.auth import get_current_user
 from app.core.permissions import require_staff
 from app.core.scope import SchoolScope
 from app.dao.fleet_plan_dao import FleetPlanDao
@@ -26,7 +29,6 @@ from app.services.push_service import notify_route_changes
 
 router = APIRouter(prefix="/api/fleet-plans", tags=["fleet-plans"])
 dao = FleetPlanDao()
-admin_only = require_role("admin")
 
 
 class ConfirmFleetPayload(BaseModel):
@@ -40,7 +42,8 @@ class ConfirmFleetPayload(BaseModel):
 
 
 class DraftPayload(BaseModel):
-    school_id: str
+    # U7: accepted and IGNORED — the scope decides (the stray-school-id rule).
+    school_id: str | None = None
     # Deterministic solver seed (defaults to 0): the persisted solver_seed
     # regenerates a disputed draft bit-identically.
     seed: int | None = None
@@ -62,31 +65,35 @@ def confirm_fleet(
 
 
 @router.post("/draft")
-def create_draft(payload: DraftPayload, user: dict = Depends(admin_only)):
+def create_draft(
+    payload: DraftPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Generate and persist a draft plan (F1 step 2 / F4): basis snapshot,
     in-memory travel-time matrix, solver run. Read-only against live routes
     (R8). Returns the created plan row."""
     return safe_call(
         lambda: dao.create_draft(
-            payload.school_id,
-            seed=payload.seed,
-            supersede=payload.supersede,
-            created_by=user["id"],
+            scope, seed=payload.seed, supersede=payload.supersede, actor=user
         )
     )
 
 
 @router.get("/current")
-def current_plans(school_id: str, user: dict = Depends(admin_only)):
-    """The school's open draft (full document) plus applied/previous metadata
-    without payloads. Review computation is U5's job. The previous metadata
-    carries `drift` — the departed/enrolled rows restore's gate will demand
-    confirmations for, computed by the same helper as the gate itself."""
-    return safe_call(lambda: dao.current_plans(school_id))
+def current_plans(
+    school_id: str | None = None, scope: SchoolScope = Depends(require_staff)
+):
+    """The ACTIVE school's open draft (full document) plus applied/previous
+    metadata without payloads. Review computation is U5's job. The previous
+    metadata carries `drift` — the departed/enrolled rows restore's gate will
+    demand confirmations for, computed by the same helper as the gate itself.
+    The school_id query parameter is accepted and ignored (U7)."""
+    return safe_call(lambda: dao.current_plans(scope))
 
 
 @router.get("/review")
-def review(school_id: str, user: dict = Depends(admin_only)):
+def review(school_id: str | None = None, scope: SchoolScope = Depends(require_staff)):
     """The open draft's computed review surface (U5: R10/R24): document plus
     per-child ride times with wall-clock stop times (backward from the gate
     anchor for AM, forward for PM), per-bus capacity use, total driving,
@@ -94,8 +101,8 @@ def review(school_id: str, user: dict = Depends(admin_only)):
     count, and `basis_drift` — the exact enrolled/address-changed/departed
     rows apply's R22 gate computes, so the apply payload can be assembled
     without a blind POST. Provider-free: pure arithmetic over the stored
-    durations."""
-    return safe_call(lambda: dao.review(school_id))
+    durations. The school_id query parameter is accepted and ignored (U7)."""
+    return safe_call(lambda: dao.review(scope))
 
 
 # --- review edits (U5) ----------------------------------------------------
@@ -151,67 +158,95 @@ class AssignPayload(BaseModel):
 
 
 @router.post("/{plan_id}/move")
-def move_student(plan_id: str, payload: MovePayload, user: dict = Depends(admin_only)):
+def move_student(
+    plan_id: str, payload: MovePayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Move a placed child between buses — both legs by default; an explicit
     one-leg move flips the document pattern to split (stored pattern stays
     authoritative). Recomputes both affected routes' times."""
     return safe_call(
         lambda: dao.move_student(
-            plan_id, payload.student_id, payload.to_bus_id,
-            legs=payload.legs, position=payload.position,
+            scope, plan_id, payload.student_id, payload.to_bus_id,
+            legs=payload.legs, position=payload.position, actor=user,
         )
     )
 
 
 @router.post("/{plan_id}/reorder")
-def reorder_stops(plan_id: str, payload: ReorderPayload, user: dict = Depends(admin_only)):
+def reorder_stops(
+    plan_id: str, payload: ReorderPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Reorder one route's stops (explicit full-order echo of stop keys).
     Recomputes times along the new fixed sequence — never a re-ordering call."""
     return safe_call(
-        lambda: dao.reorder_stops(plan_id, payload.bus_id, payload.leg, payload.order)
+        lambda: dao.reorder_stops(
+            scope, plan_id, payload.bus_id, payload.leg, payload.order, actor=user
+        )
     )
 
 
 @router.post("/{plan_id}/pin")
-def set_pin(plan_id: str, payload: PinPayload, user: dict = Depends(admin_only)):
+def set_pin(
+    plan_id: str, payload: PinPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Pin/unpin a child: bus pin (per leg or both) and order pin, stored in
     the document so re-solve honours them."""
     return safe_call(
         lambda: dao.set_pin(
-            plan_id, payload.student_id,
-            bus=payload.bus, order=payload.order, unpin=payload.unpin,
+            scope, plan_id, payload.student_id,
+            bus=payload.bus, order=payload.order, unpin=payload.unpin, actor=user,
         )
     )
 
 
 @router.post("/{plan_id}/pattern")
-def set_pattern(plan_id: str, payload: PatternPayload, user: dict = Depends(admin_only)):
+def set_pattern(
+    plan_id: str, payload: PatternPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Change a child's ridership pattern in the draft only (never
     live_students). Removing a leg drops the child's stop from that leg and
     updates times."""
     return safe_call(
-        lambda: dao.set_pattern(plan_id, payload.student_id, payload.pattern)
+        lambda: dao.set_pattern(
+            scope, plan_id, payload.student_id, payload.pattern, actor=user
+        )
     )
 
 
 @router.post("/{plan_id}/assign")
-def assign_student(plan_id: str, payload: AssignPayload, user: dict = Depends(admin_only)):
+def assign_student(
+    plan_id: str, payload: AssignPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Place a currently-unplaceable child onto a bus at an explicit position,
     per pattern legs — the manual placement path until slot-ins ship."""
     return safe_call(
         lambda: dao.assign_student(
-            plan_id, payload.student_id, payload.bus_id,
-            position=payload.position, legs=payload.legs,
+            scope, plan_id, payload.student_id, payload.bus_id,
+            position=payload.position, legs=payload.legs, actor=user,
         )
     )
 
 
 @router.post("/{plan_id}/resolve")
-def resolve_draft(plan_id: str, user: dict = Depends(admin_only)):
+def resolve_draft(
+    plan_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Re-run the solver on the draft's basis with the document's pins and
     pattern edits as inputs (fresh in-memory matrix). Unpinned manual
     arrangements are discarded — the response says so explicitly."""
-    return safe_call(lambda: dao.resolve_draft(plan_id))
+    return safe_call(lambda: dao.resolve_draft(scope, plan_id, actor=user))
 
 
 class ApplyConfirmation(BaseModel):
@@ -237,7 +272,11 @@ class ApplyPayload(BaseModel):
 
 
 @router.post("/{plan_id}/apply")
-def apply_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_only)):
+def apply_plan(
+    plan_id: str, payload: ApplyPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Apply the draft (U6): ONE provider-free transaction — gates re-checked
     against the locked snapshot, displaced live state preserved as 'previous'
     (one-level history), routes reconciled in place, links and stops
@@ -247,6 +286,7 @@ def apply_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_o
     effects)."""
     return safe_call(
         lambda: dao.apply_plan(
+            scope,
             plan_id,
             confirmations=[c.model_dump() for c in payload.confirmations],
             acknowledgments=[a.model_dump() for a in payload.acknowledgments],
@@ -256,7 +296,11 @@ def apply_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_o
 
 
 @router.post("/{plan_id}/restore")
-def restore_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin_only)):
+def restore_plan(
+    plan_id: str, payload: ApplyPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Restore the preserved 'previous' plan (U7): an apply whose source is
     the as-evolved capture, addressed by the PRESERVED plan's id (from
     GET /current) so a gateway-timeout retry hits the now-applied row and
@@ -270,6 +314,7 @@ def restore_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin
     plan is a 200 no-op."""
     return safe_call(
         lambda: dao.restore_plan(
+            scope,
             plan_id,
             confirmations=[c.model_dump() for c in payload.confirmations],
             acknowledgments=[a.model_dump() for a in payload.acknowledgments],
@@ -279,58 +324,71 @@ def restore_plan(plan_id: str, payload: ApplyPayload, user: dict = Depends(admin
 
 
 @router.post("/{plan_id}/discard")
-def discard_draft(plan_id: str, user: dict = Depends(admin_only)):
+def discard_draft(
+    plan_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Discard an open draft: status flips to discarded and its
     document/basis payloads are scrubbed (metadata kept)."""
-    return safe_call(lambda: dao.discard_draft(plan_id))
+    return safe_call(lambda: dao.discard_draft(scope, plan_id, actor=user))
 
 
 # --- slot-in proposals (U12) -----------------------------------------------
 # Generated in BackgroundTasks by the students_live triggers (beside the U13
 # wiring), stored on the school's APPLIED plan row (slot_in_service documents
-# the decision), and acted on here. All admin-only like every plan surface.
+# the decision), and acted on here. All staff-scoped like every plan surface.
 
 
 class SlotInActionPayload(BaseModel):
-    school_id: str
+    # U7: accepted and IGNORED — the scope decides.
+    school_id: str | None = None
     # The stored record's id (from GET /slot-ins).
     proposal_id: str
 
 
 @router.get("/slot-ins")
-def list_slot_ins(school_id: str, user: dict = Depends(admin_only)):
-    """The school's pending slot-in proposals and unplaceable notices, each
-    stated as position + effect (AE2), with aged-out records marked (never
-    auto-applied, never auto-removed — the student stays visibly
-    unassigned). 404 when the school has no applied plan."""
-    return safe_call(lambda: dao.list_slot_ins(school_id))
+def list_slot_ins(
+    school_id: str | None = None, scope: SchoolScope = Depends(require_staff)
+):
+    """The ACTIVE school's pending slot-in proposals and unplaceable notices,
+    each stated as position + effect (AE2), with aged-out records marked
+    (never auto-applied, never auto-removed — the student stays visibly
+    unassigned). 404 when the school has no applied plan. The school_id
+    query parameter is accepted and ignored (U7)."""
+    return safe_call(lambda: dao.list_slot_ins(scope))
 
 
 @router.post("/slot-ins/accept")
 def accept_slot_in(
     payload: SlotInActionPayload, background_tasks: BackgroundTasks,
-    user: dict = Depends(admin_only),
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
 ):
     """Accept one proposal (U12): applies JUST that insertion — the stop
     materialized at the stated position along the fixed order (a frozen
     route keeps its manual order, AE7), times recomputed along the sequence,
     the student linked — then notifies ONLY the affected families through
     the shipped U13 diff/baseline pipeline post-commit (the new child as a
-    first communication, co-riders on the >= 5-minute rule; no audit row —
-    the manual-edit path's contract)."""
+    first communication, co-riders on the >= 5-minute rule)."""
     result = safe_call(
-        lambda: dao.accept_slot_in(payload.school_id, payload.proposal_id)
+        lambda: dao.accept_slot_in(scope, payload.proposal_id, actor=user)
     )
     background_tasks.add_task(
         notify_route_changes,
         route_ids=result["route_ids"],
         student_ids=[result["student_id"]],
+        scope=scope,
     )
     return result
 
 
 @router.post("/slot-ins/dismiss")
-def dismiss_slot_in(payload: SlotInActionPayload, user: dict = Depends(admin_only)):
+def dismiss_slot_in(
+    payload: SlotInActionPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
     """Dismiss one record: removed from the store with zero live-table side
     effects — the student stays visibly unassigned."""
-    return safe_call(lambda: dao.dismiss_slot_in(payload.school_id, payload.proposal_id))
+    return safe_call(lambda: dao.dismiss_slot_in(scope, payload.proposal_id, actor=user))

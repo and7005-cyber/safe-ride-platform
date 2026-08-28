@@ -1,6 +1,6 @@
 from typing import Any
 
-from app.core.db import get_connection
+from app.core.db import get_connection, get_global_connection
 from app.core.errors import ConflictError, NotFoundError
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import record_audit
@@ -265,7 +265,10 @@ class AccountDao:
     # --- unscoped account plumbing (signup path) ----------------------------
 
     def email_exists(self, email: str) -> bool:
-        with get_connection() as conn:
+        # Platform-wide user-table read (an email in use ANYWHERE refuses):
+        # called inside staff-scoped requests too, so it takes the global
+        # connection — the U7 rule for auth/user-table access.
+        with get_global_connection() as conn:
             row = conn.execute(
                 "select 1 from app_users where lower(email) = lower(%s)", (email,)
             ).fetchone()

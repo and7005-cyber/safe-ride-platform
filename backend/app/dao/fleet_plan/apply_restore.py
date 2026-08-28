@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 from app.dao.audit_dao import record_audit
 
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection
 from app.core.errors import ConflictError, NotFoundError
 from app.dao.fleet_dao import _depot_leg, _stop_label
 from app.dao.fleet_plan._shared import (
@@ -42,7 +42,7 @@ class ApplyRestoreOps:
     # --- apply (U6) -----------------------------------------------------------
 
     def apply_plan(
-        self, plan_id: str, *, confirmations: list[dict],
+        self, scope, plan_id: str, *, confirmations: list[dict],
         acknowledgments: list[dict], actor: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Apply the draft: ONE provider-free transaction, then compensable
@@ -101,11 +101,15 @@ class ApplyRestoreOps:
             for a in acknowledgments
         }
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             # (1) Plan row FIRST: this serializes a double-submit even for a
             # school with zero live routes (route locks alone could not).
+            # U7: pinned to the ACTIVE school — a foreign plan id answers the
+            # not-found contract.
             plan = conn.execute(
-                "select * from live_fleet_plans where id = %s for update", (plan_id,)
+                "select * from live_fleet_plans where id = %s and school_id = %s "
+                "for update",
+                (plan_id, scope.school_id),
             ).fetchone()
             if not plan:
                 raise NotFoundError("Plan not found")
@@ -529,7 +533,7 @@ class ApplyRestoreOps:
                 conn,
                 action="plan-applied",
                 actor=actor,
-                school_id=school_id,
+                scope=scope,
                 resource_type="plan",
                 resource_id=str(plan["id"]),
                 detail=detail,
@@ -546,7 +550,9 @@ class ApplyRestoreOps:
                 for sid in {r["student_id"] for r in diff_rows}
                 if sid in current_by_id
             }
-            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id, stop_labels)
+            feed_rows = self._write_plan_feed_rows(
+                conn, diff_rows, audit_id, stop_labels, school_id=school_id
+            )
 
             # Baselines upsert for every notified PLACED (student, leg) — R15
             # updates the baseline only on send (upserts, then stale deletes
@@ -586,7 +592,7 @@ class ApplyRestoreOps:
         # what keeps the atomic core provider-free.
         t0 = time.monotonic()
         refreshed, degraded_routes = self._refresh_routes(
-            "apply", plan_id, [route_ids[key] for key in pairs]
+            "apply", plan_id, [route_ids[key] for key in pairs], scope=scope
         )
         t_refresh_ms = int((time.monotonic() - t0) * 1000)
 
@@ -628,6 +634,7 @@ class ApplyRestoreOps:
     def _write_plan_feed_rows(
         self, conn, diff_rows: list[dict], audit_id: str,
         stop_labels: Mapping[str, str] | None = None,
+        school_id: str | None = None,
     ) -> list[dict]:
         """Feed rows for one apply/restore act, inserted ON THE CALLER'S
         transaction connection so a rollback takes them too
@@ -672,6 +679,7 @@ class ApplyRestoreOps:
                         bus_id=g["placed"][0]["current"]["bus_id"],
                         run_type=next(iter(legs)) if len(legs) == 1 else None,
                         plan_audit_id=audit_id,
+                        school_id=school_id,
                     )
                     if inserted:
                         feed_rows.append(inserted)
@@ -694,6 +702,7 @@ class ApplyRestoreOps:
                         student_id=sid, bus_id=None,
                         run_type=next(iter(legs)) if len(legs) == 1 else None,
                         plan_audit_id=audit_id,
+                        school_id=school_id,
                     )
                     if inserted:
                         feed_rows.append(inserted)
@@ -746,7 +755,9 @@ class ApplyRestoreOps:
                     (row["student_id"], row["leg"]),
                 )
 
-    def _refresh_routes(self, act: str, plan_id: str, route_ids: list[str]) -> tuple[list[str], list[str]]:
+    def _refresh_routes(
+        self, act: str, plan_id: str, route_ids: list[str], scope: object = UNSET
+    ) -> tuple[list[str], list[str]]:
         """Post-commit geometry-only refresh, one route per transaction along
         the given fixed order (the fleet_dao.update_school precedent — shared
         by apply and restore). Returns (refreshed, degraded_routes)."""
@@ -754,7 +765,7 @@ class ApplyRestoreOps:
         degraded_routes: list[str] = []
         for rid in route_ids:
             try:
-                ok = self._refresh_route_geometry(rid)
+                ok = self._refresh_route_geometry(rid, scope=scope)
             except Exception:
                 # A failed refresh leaves the route flagged (the marker was
                 # set in-transaction) — degraded per route, never plan-wide.
@@ -769,7 +780,7 @@ class ApplyRestoreOps:
     # --- restore (U7) ---------------------------------------------------------
 
     def restore_plan(
-        self, plan_id: str, *, confirmations: list[dict],
+        self, scope, plan_id: str, *, confirmations: list[dict],
         acknowledgments: list[dict], actor: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Restore the preserved 'previous' plan (R21/R22/R23): an APPLY whose
@@ -825,11 +836,14 @@ class ApplyRestoreOps:
             for a in acknowledgments
         }
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             # (1) Plan row FIRST (serializes a double-submit), then the
             # school's routes in sorted-id order — apply's lock order.
+            # U7: pinned to the ACTIVE school (foreign plan → 404).
             plan = conn.execute(
-                "select * from live_fleet_plans where id = %s for update", (plan_id,)
+                "select * from live_fleet_plans where id = %s and school_id = %s "
+                "for update",
+                (plan_id, scope.school_id),
             ).fetchone()
             if not plan:
                 raise NotFoundError(
@@ -1231,7 +1245,7 @@ class ApplyRestoreOps:
                 conn,
                 action="plan-restored",
                 actor=actor,
-                school_id=school_id,
+                scope=scope,
                 resource_type="plan",
                 resource_id=str(plan["id"]),
                 detail=detail,
@@ -1246,7 +1260,9 @@ class ApplyRestoreOps:
                 for sid in {r["student_id"] for r in diff_rows}
                 if sid in current_by_id
             }
-            feed_rows = self._write_plan_feed_rows(conn, diff_rows, audit_id, stop_labels)
+            feed_rows = self._write_plan_feed_rows(
+                conn, diff_rows, audit_id, stop_labels, school_id=school_id
+            )
             self._write_baselines(conn, diff_rows, stop_labels)
 
             # (11) FINAL gate, deliberately the transaction's LAST act (the
@@ -1269,7 +1285,7 @@ class ApplyRestoreOps:
         # phases as apply, along the capture's fixed route order.
         t0 = time.monotonic()
         refreshed, degraded_routes = self._refresh_routes(
-            "restore", plan_id, restored_route_ids
+            "restore", plan_id, restored_route_ids, scope=scope
         )
         t_refresh_ms = int((time.monotonic() - t0) * 1000)
 
@@ -1366,7 +1382,7 @@ class ApplyRestoreOps:
             "unplaceable": [],
         }
 
-    def _refresh_route_geometry(self, route_id: str) -> bool:
+    def _refresh_route_geometry(self, route_id: str, scope: object = UNSET) -> bool:
         """Post-commit geometry refresh for ONE materialized route in its own
         transaction (U6). GEOMETRY ONLY: polyline / total_distance_m /
         total_duration_s along the materialized stop order via
@@ -1377,8 +1393,12 @@ class ApplyRestoreOps:
         refresh-pending marker the apply transaction set) only on
         Google-quality geometry; a failed or offline refresh writes its
         best-effort totals but leaves the route visibly flagged. Returns True
-        exactly on Google-quality success."""
-        with get_connection() as conn:
+        exactly on Google-quality success.
+
+        ``scope`` (U7): the act's request scope, threaded explicitly — an
+        unthreaded call inside a SchoolScope request raises under the strict
+        seam instead of silently borrowing the context."""
+        with get_connection(scope) as conn:
             route = conn.execute(
                 "select r.id, r.type, r.bus_id, r.trip_index, "
                 "b.depot_lat, b.depot_lng "

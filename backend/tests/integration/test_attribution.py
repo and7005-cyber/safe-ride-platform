@@ -79,9 +79,13 @@ def purge_audit(resource_id: str) -> None:
 
 
 def test_force_close_records_the_actor_and_reports_the_display(staff_actor):
+    from app.core.scope import SchoolScope
     from app.dao.run_dao import RunDao
 
     dao = RunDao()
+    scope = SchoolScope(
+        user_id=staff_actor["id"], school_id=SCHOOL_A_ID, role="director"
+    )
     with db() as conn:
         run_id = str(
             conn.execute(
@@ -91,7 +95,7 @@ def test_force_close_records_the_actor_and_reports_the_display(staff_actor):
             ).fetchone()[0]
         )
     try:
-        result = dao.force_close_run(staff_actor, run_id)
+        result = dao.force_close_run(scope, run_id, actor=staff_actor)
         assert result["status"] == "completed"
         assert result["force_closed_by_display"] == staff_actor["full_name"]
 
@@ -104,7 +108,7 @@ def test_force_close_records_the_actor_and_reports_the_display(staff_actor):
         assert row["resource_type"] == "run"
         assert row["support_session_id"] is None
 
-        report = dao.run_report(run_id)
+        report = dao.run_report(scope, run_id)
         assert report["force_closed_by_display"] == staff_actor["full_name"]
     finally:
         purge_audit(run_id)
@@ -113,6 +117,7 @@ def test_force_close_records_the_actor_and_reports_the_display(staff_actor):
 
 
 def test_provider_force_close_masks_the_display_but_keeps_the_name(provider_actor):
+    from app.core.scope import SchoolScope
     from app.dao.run_dao import RunDao
 
     dao = RunDao()
@@ -133,11 +138,15 @@ def test_provider_force_close_masks_the_display_but_keeps_the_name(provider_acto
             ).fetchone()[0]
         )
     actor = {**provider_actor, "support_session": {"id": support_id, "school_id": SCHOOL_A_ID}}
+    scope = SchoolScope(
+        user_id=provider_actor["id"], school_id=SCHOOL_A_ID, role="director",
+        actor_kind="provider", support_session_id=support_id,
+    )
     try:
-        result = dao.force_close_run(actor, run_id)
+        result = dao.force_close_run(scope, run_id, actor=actor)
         # School-facing display masks the provider…
         assert result["force_closed_by_display"] == "SafeRide"
-        assert dao.run_report(run_id)["force_closed_by_display"] == "SafeRide"
+        assert dao.run_report(scope, run_id)["force_closed_by_display"] == "SafeRide"
         # …while the audit row keeps who it really was, and the step-in.
         row = audit_rows("run-force-closed", run_id)[0]
         assert row["actor_kind"] == "provider"
@@ -158,9 +167,17 @@ def test_provider_force_close_masks_the_display_but_keeps_the_name(provider_acto
 def test_acknowledge_writes_one_audit_row_and_masked_list_display(
     staff_actor, provider_actor
 ):
+    from app.core.scope import SchoolScope
     from app.dao.incident_dao import IncidentDao
 
     dao = IncidentDao()
+    staff_scope = SchoolScope(
+        user_id=staff_actor["id"], school_id=SCHOOL_A_ID, role="director"
+    )
+    provider_scope = SchoolScope(
+        user_id=provider_actor["id"], school_id=SCHOOL_A_ID, role="director",
+        actor_kind="provider",
+    )
     ids = []
     with db() as conn:
         for _ in range(2):
@@ -174,9 +191,9 @@ def test_acknowledge_writes_one_audit_row_and_masked_list_display(
                 )
             )
     try:
-        by_staff = dao.acknowledge(ids[0], staff_actor)
+        by_staff = dao.acknowledge(staff_scope, ids[0], staff_actor)
         assert by_staff["acknowledged_by_display"] == staff_actor["full_name"]
-        by_provider = dao.acknowledge(ids[1], provider_actor)
+        by_provider = dao.acknowledge(provider_scope, ids[1], provider_actor)
         assert by_provider["acknowledged_by_display"] == "SafeRide"
 
         for incident_id, kind in ((ids[0], "staff"), (ids[1], "provider")):
@@ -185,7 +202,7 @@ def test_acknowledge_writes_one_audit_row_and_masked_list_display(
             assert rows[0]["actor_kind"] == kind
             assert str(rows[0]["school_id"]) == SCHOOL_A_ID
 
-        listed = {i["id"]: i for i in map(dict, dao.list_incidents())}
+        listed = {i["id"]: i for i in map(dict, dao.list_incidents(staff_scope))}
         assert listed[uuid.UUID(ids[0])]["acknowledged_by_display"] == (
             staff_actor["full_name"]
         )

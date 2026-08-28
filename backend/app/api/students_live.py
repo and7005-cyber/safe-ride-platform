@@ -201,12 +201,13 @@ def create_student(
     # U13: seed the new child's (and the touched routes' co-riders') missing
     # baselines silently — see the module-level roster-wiring note.
     background_tasks.add_task(
-        notify_route_changes, student_ids=[str(result["id"])], seed_only=True
+        notify_route_changes, student_ids=[str(result["id"])], seed_only=True,
+        scope=scope,
     )
     # U12: a plannable enrolment with no route for a required leg, at a school
     # with applied plan routes, gets a slot-in proposal. Best-effort in the
     # background — a failed generation never fails the enrolment.
-    background_tasks.add_task(propose_slot_ins, [str(result["id"])])
+    background_tasks.add_task(propose_slot_ins, [str(result["id"])], scope=scope)
     return result
 
 
@@ -221,7 +222,9 @@ def update_student(
     route_ids = data.pop("route_ids")
     # U13: capture the routes the student may be about to LEAVE — the update
     # rewrites the links this expansion would otherwise follow.
-    prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
+    prior_route_ids = safe_call(
+        lambda: push_dao.routes_of_students([student_id], scope=scope)
+    )
     # U12 stability rule: an ambiguous/failed re-geocode keeps the placed pin.
     result = safe_call(
         lambda: dao.update_student(
@@ -233,11 +236,11 @@ def update_student(
     if result is not None:
         background_tasks.add_task(
             notify_route_changes, route_ids=prior_route_ids,
-            student_ids=[student_id], seed_only=True,
+            student_ids=[student_id], seed_only=True, scope=scope,
         )
         # U12: a confidently re-resolved address change (or any edit that
         # leaves a required leg routeless) refreshes the slot-in proposals.
-        background_tasks.add_task(propose_slot_ins, [student_id])
+        background_tasks.add_task(propose_slot_ins, [student_id], scope=scope)
     return result
 
 
@@ -250,13 +253,16 @@ def delete_student(
     # U13: pre-capture the routes the cascade is about to unlink; the deleted
     # child's own baselines cascade away with the student row, so only the
     # co-riders' missing baselines are seeded (silently).
-    prior_route_ids = safe_call(lambda: push_dao.routes_of_students([student_id]))
+    prior_route_ids = safe_call(
+        lambda: push_dao.routes_of_students([student_id], scope=scope)
+    )
     result = safe_call(
         lambda: (dao.delete_student(scope, student_id, actor=user), {"ok": True})[1]
     )
     if prior_route_ids:
         background_tasks.add_task(
-            notify_route_changes, route_ids=prior_route_ids, seed_only=True
+            notify_route_changes, route_ids=prior_route_ids, seed_only=True,
+            scope=scope,
         )
     return result
 
@@ -435,11 +441,14 @@ def bulk_upload(
             route_ids=sorted(set(touched_routes)),
             student_ids=sorted(set(touched_students)),
             seed_only=True,
+            scope=scope,
         )
         # U12: one slot-in generation pass for the whole upload (burst-guard
         # shape) — plannable rows lacking a required leg at a school with an
         # applied plan get proposals; everything else no-ops.
-        background_tasks.add_task(propose_slot_ins, sorted(set(touched_students)))
+        background_tasks.add_task(
+            propose_slot_ins, sorted(set(touched_students)), scope=scope
+        )
     return result
 
 

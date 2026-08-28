@@ -19,7 +19,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -193,11 +193,9 @@ def test_bus_crud(client, admin_headers):
 
 def test_school_route_and_student_crud(client, admin_headers):
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT School {marker}", "address": "Test Rd", "phone": "+254700000000", "lat": -1.30, "lng": 36.80},
-        headers=admin_headers,
-    ).json()
+    # Post-U6 the staff surface has ONE school — the active one; creation
+    # moved to the provider console. The CRUD chain runs against it.
+    school = client.get("/api/fleet/school", headers=admin_headers).json()
     student = client.post(
         "/api/students",
         json={"name": f"IT Student {marker}", "grade": "G1", "home_lat": -1.29, "home_lng": 36.81,
@@ -212,7 +210,7 @@ def test_school_route_and_student_crud(client, admin_headers):
     ).json()
 
     try:
-        assert school["name"] == f"IT School {marker}"
+        assert school["id"]
         assert student["name"] == f"IT Student {marker}"
         assert route["type"] == "morning"
 
@@ -228,7 +226,6 @@ def test_school_route_and_student_crud(client, admin_headers):
     finally:
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_driver_account_crud_and_parent_link(client, admin_headers):
@@ -279,20 +276,23 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
         )
         assert updated.status_code == 200, updated.text
         parents = client.get("/api/accounts/parents", headers=admin_headers).json()
-        parent_row = next(p for p in parents if p.get("id") == parent_id)
-        assert f"IT LinkKid {marker}" not in parent_row["students"]
+        # U6: the Parents page lists parents OF THIS SCHOOL'S STUDENTS — with
+        # the link pruned the row may drop off the list entirely.
+        parent_row = next((p for p in parents if p.get("id") == parent_id), None)
+        assert parent_row is None or f"IT LinkKid {marker}" not in parent_row["students"]
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver_id}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 # Validation, stops, absences, run uniqueness (June 2026 buglist) -------------
 
 def test_phone_validation_rejects_bad_numbers(client, admin_headers):
-    bad_school = client.post(
-        "/api/fleet/schools",
-        json={"name": "Bad Phone School", "phone": "12345"},
+    school = client.get("/api/fleet/school", headers=admin_headers).json()
+    bad_school = client.put(
+        f"/api/fleet/schools/{school['id']}",
+        json={"name": school["name"], "phone": "12345"},
         headers=admin_headers,
     )
     assert bad_school.status_code == 400
@@ -307,11 +307,7 @@ def test_phone_validation_rejects_bad_numbers(client, admin_headers):
 
 def test_route_stops_named_by_address_and_directional(client, admin_headers):
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"Dir School {marker}", "lat": -1.30, "lng": 36.82},
-        headers=admin_headers,
-    ).json()
+    school = client.get("/api/fleet/school", headers=admin_headers).json()
     morning = client.post(
         "/api/fleet/routes",
         json={"name": f"Dir AM {marker}", "type": "morning", "school_id": school["id"]},
@@ -369,7 +365,6 @@ def test_route_stops_named_by_address_and_directional(client, admin_headers):
         client.delete(f"/api/students/{late['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{morning['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{afternoon['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
@@ -377,11 +372,7 @@ def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
     named by that address — never collapsed into a generic 'School Pickup' (#4)."""
     marker = uuid.uuid4().hex[:6]
     address = f"Pickup Point {marker}, Nairobi"
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"Addr School {marker}", "lat": -1.30, "lng": 36.82},
-        headers=admin_headers,
-    ).json()
+    school = client.get("/api/fleet/school", headers=admin_headers).json()
     route = client.post(
         "/api/fleet/routes",
         json={"name": f"Addr Route {marker}", "type": "morning", "school_id": school["id"]},
@@ -404,7 +395,6 @@ def test_coordinateless_student_gets_address_named_stop(client, admin_headers):
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_route_options_orders_stops(client, admin_headers):
@@ -431,10 +421,7 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
     keys, so editing a student deleted the route that was already saved.
     """
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools", json={"name": f"Both School {marker}", "lat": -1.30, "lng": 36.82},
-        headers=admin_headers,
-    ).json()
+    school = client.get("/api/fleet/school", headers=admin_headers).json()
     morning = client.post(
         "/api/fleet/routes",
         json={"name": f"Both AM {marker}", "type": "morning", "school_id": school["id"]},
@@ -494,7 +481,6 @@ def test_student_keeps_both_routes_on_update(client, admin_headers):
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{morning['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{afternoon['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_admin_cannot_create_duplicate_active_run(client, admin_headers):
