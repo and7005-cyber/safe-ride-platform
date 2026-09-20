@@ -4,8 +4,8 @@
 # initial passwords). Prints SSM parameter NAMES only, never secrets; each
 # initial password is stored as its own SecureString for the operator to
 # retrieve out-of-band:
-#   aws ssm get-parameter --name /saferide/provider-initial-password/<email> \
-#     --with-decryption --query Parameter.Value --output text
+#   aws ssm get-parameter --name /saferide/provider-initial-password/<email-slug> \
+#     --region af-south-1 --with-decryption --query Parameter.Value --output text
 #
 # Usage: scripts/provider-bootstrap.sh <email1> "<Full Name 1>" <email2> "<Full Name 2>"
 set -euo pipefail
@@ -61,10 +61,13 @@ print(hash_password('$password'))
   # so the email is slugged for the NAME only; the bootstrap JSON keeps the
   # real address. The exact name is printed — copy it from here.
   email_slug="$(printf '%s' "$email" | sed 's/[^A-Za-z0-9._-]/-/g')"
+  # Pinned to BACKEND_REGION like every /saferide/* runtime parameter, so the
+  # operator's retrieval command never depends on their CLI default region.
   aws ssm put-parameter --name "/saferide/provider-initial-password/$email_slug" \
+    --region "$BACKEND_REGION" \
     --type SecureString --value "$password" --overwrite >/dev/null
   payload="$payload{\"email\": \"$email\", \"full_name\": \"$name\", \"password_hash\": \"$hash\"},"
-  echo "==> Initial password stored at SSM /saferide/provider-initial-password/$email_slug"
+  echo "==> Initial password stored at SSM /saferide/provider-initial-password/$email_slug ($BACKEND_REGION)"
 done
 
 json="{\"version\": $version, \"providers\": [${payload%,}]}"

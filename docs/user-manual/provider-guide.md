@@ -92,7 +92,7 @@ Provider accounts are never created through the app's sign-up. The first account
 1. Run `scripts/provider-bootstrap.sh <email1> "<Full Name 1>" <email2> "<Full Name 2>"` — **before** `infra/scripts/deploy-backend.sh`. It creates two SSM SecureString parameters:
    - `/saferide/totp-pepper` — created once, then left alone (see the warning below);
    - `/saferide/provider-bootstrap` — the versioned two-account payload the migrate step reads;
-   and stores each account's server-generated initial password at `/saferide/provider-initial-password/<email-slug>` (the email with SSM-illegal characters like `@`/`+` replaced by `-`; the script prints the exact name) for the operator to retrieve out-of-band. The script prints parameter **names only** — no secrets appear on screen or in this repo.
+   and stores each account's server-generated initial password at `/saferide/provider-initial-password/<email-slug>` in **af-south-1** (the email with SSM-illegal characters like `@`/`+` replaced by `-`; the script prints the exact name) for the operator to retrieve out-of-band. The script prints parameter **names only** — no secrets appear on screen or in this repo.
 2. Deploy. The migrate step creates (or re-keys) the two provider accounts. Each person signs in with the initial password from SSM and follows [Your first sign-in](#your-first-sign-in).
 
 The deploy **fails fast** if `/saferide/totp-pepper` or `/saferide/provider-bootstrap` is missing — they are never minted silently (see `infra/README.md`).
