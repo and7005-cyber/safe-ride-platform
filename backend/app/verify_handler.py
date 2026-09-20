@@ -258,8 +258,11 @@ _CHECK_SETS["tenancy-post-move"] = [
     ("null-scope-counts", """select 'live_buses' as tbl, count(*) as null_scope from live_buses where school_id is null union all select 'live_routes' as tbl, count(*) as null_scope from live_routes where school_id is null union all select 'live_students' as tbl, count(*) as null_scope from live_students where school_id is null union all select 'live_runs' as tbl, count(*) as null_scope from live_runs where school_id is null union all select 'live_fleet_plans' as tbl, count(*) as null_scope from live_fleet_plans where school_id is null union all select 'live_incidents' as tbl, count(*) as null_scope from live_incidents where school_id is null union all select 'live_student_absences' as tbl, count(*) as null_scope from live_student_absences where school_id is null union all select 'live_communicated_stops' as tbl, count(*) as null_scope from live_communicated_stops where school_id is null union all select 'live_student_routes' as tbl, count(*) as null_scope from live_student_routes where school_id is null union all select 'live_route_stops' as tbl, count(*) as null_scope from live_route_stops where school_id is null union all select 'run_stops' as tbl, count(*) as null_scope from run_stops where school_id is null union all select 'run_absences' as tbl, count(*) as null_scope from run_absences where school_id is null union all select 'run_participation' as tbl, count(*) as null_scope from run_participation where school_id is null""", False),
     ("school-rows", "select id, name, code from live_schools order by name", False),
     (
+        # By NAME (production's Greenfield id differs from the local seed's).
+        # Production post-move must show 0; a LOCAL stack shows 1 by design
+        # (the demo school keeps the name and is never deleted there).
         "greenfield-row",
-        "select count(*) as greenfield_rows from live_schools where id = '5cae0000-0000-0000-0000-000000000001'",
+        "select count(*) as greenfield_rows from live_schools where name = 'Greenfield Academy'",
         False,
     ),
     (
