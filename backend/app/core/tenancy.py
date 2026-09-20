@@ -47,4 +47,7 @@ SEED_DEMO_EMAILS: tuple[str, ...] = (
 )
 
 # The empty demo school row production still holds beside the pilot's data.
+# The LOCAL seed's Greenfield id only. Production's Greenfield row carries a
+# different id, so migration 014 and the verify checks resolve the demo school
+# BY NAME — never through this constant.
 GREENFIELD_SCHOOL_ID = "5cae0000-0000-0000-0000-000000000001"
