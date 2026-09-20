@@ -30,10 +30,24 @@ Covers R1–R3, R5, R7, R8, R11, R12, R33, R36 and AE2 of the origin document:
 - the `gps` verify set reports the trail and fix coverage of a run started
   here.
 
+The custody check and the boarding undo (U9: R13, R14, R19, R20, R23, R35;
+F2, F5; AE3, AE4, AE9, AE17) live in the second half of the file: a far
+Board raises one per-stop custody exception with a per-tap prompt and the
+panel's "bus seen at stop"; a near one raises nothing; a coarse fix is
+unverified/too-coarse with no prompt; several children at one stop answer
+independently; the undo clears the outcome, retracts `student-boarded` and
+sends `boarding-corrected`; a resolution tap is exempt; a forced
+classification error flags the trail row and blocks nothing; a hand-over is
+never checked; a coordinate-less stop and a GPS-denied run each yield one
+unverified row; un-boarding stays refused; an afternoon drop-off behaves
+like Board.
+
 Isolation: an own throwaway school (school_sandbox) with two drivers, two
-buses, a morning and an afternoon route on bus 1, a morning route on bus 2
-and three students at their own stops. Every run a test starts is purged in
-a finally block; the second sandbox the purge test opens sweeps itself.
+buses, a morning and an afternoon route on bus 1, a morning route on bus 2,
+three students at their own stops (A's parent is a real signed-up account
+with an accepted link, for the notification assertions) and five students
+sharing one stop. Every run a test starts is purged in a finally block; the
+second sandbox the purge test opens sweeps itself.
 """
 
 import os
@@ -48,7 +62,8 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, purge_run, school_sandbox
+from conftest import DSN, purge_accounts, purge_run, school_sandbox
+from test_students_parents import signup_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -114,12 +129,22 @@ def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
     pytest.fail(f"could not create throwaway driver: {response.text}")
 
 
+def _accept_pending(client, parent_headers) -> None:
+    """A staff-side link to a registered account is OFFERED (U11); the parent
+    accepts the school's pending card to gain access."""
+    for card in client.get("/api/parent-portal/pending", headers=parent_headers).json():
+        response = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept", headers=parent_headers
+        )
+        assert response.status_code == 200, response.text
+
+
 @pytest.fixture(scope="module")
 def fleet(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
     driver1 = _create_driver(client, admin_headers, marker, 1)
     driver2 = _create_driver(client, admin_headers, marker, 2)
-    created: dict = {"buses": [], "routes": [], "students": []}
+    created: dict = {"buses": [], "routes": [], "students": [], "parent_id": None}
     try:
         bus1 = client.post(
             "/api/fleet/buses",
@@ -148,27 +173,36 @@ def fleet(client, admin_headers, sandbox):
         morning2 = make_route("Morning2", "morning", bus2["id"])
         created["routes"] = [morning["id"], afternoon["id"], morning2["id"]]
 
-        def make_student(tag: str, lat: float, pickup: str, routes: list[str]) -> dict:
-            response = client.post(
-                "/api/students",
-                json={
-                    "name": f"IT GPS Kid{tag} {marker}", "parent_name": f"IT GPS Parent{tag}",
-                    "parent_phone": f"+2547120003{random.randint(10, 99)}",
-                    "parent_email": f"it-gps-p{tag.lower()}-{marker}@test.local",
-                    "home_lat": lat, "home_lng": 36.79, "pickup_time": pickup,
-                    "route_ids": routes,
-                },
-                headers=admin_headers,
-            )
+        # A's parent is a real account (the undo's notifications are asserted
+        # on their feed); the link is offered by the student create and
+        # accepted below.
+        parent_id, parent_email, parent_headers = signup_parent(client, marker, "gps-parent")
+        created["parent_id"] = parent_id
+
+        def make_student(tag: str, lat: float, pickup: str, routes: list[str], **extra) -> dict:
+            payload = {
+                "name": f"IT GPS Kid{tag} {marker}", "parent_name": f"IT GPS Parent{tag}",
+                "parent_phone": f"+2547120003{random.randint(10, 99)}",
+                "parent_email": f"it-gps-p{tag.lower()}-{marker}@test.local",
+                "home_lat": lat, "home_lng": 36.79, "pickup_time": pickup,
+                "route_ids": routes,
+            }
+            payload.update(extra)
+            response = client.post("/api/students", json=payload, headers=admin_headers)
             assert response.status_code == 200, response.text
             student = response.json()
             created["students"].append(student["id"])
             return student
 
-        a = make_student("A", -1.26, "06:20", [morning["id"], afternoon["id"]])
-        b = make_student("B", -1.27, "06:30", [morning["id"], afternoon["id"]])
-        c = make_student("C", -1.28, "06:40", [morning["id"], afternoon["id"]])
+        both = [morning["id"], afternoon["id"]]
+        a = make_student("A", -1.26, "06:20", both, parent_email=parent_email)
+        b = make_student("B", -1.27, "06:30", both)
+        c = make_student("C", -1.28, "06:40", both)
+        # Five children at one stop (identical home coordinates collapse into
+        # one run stop), after C on the route.
+        five = [make_student(f"F{n}", -1.285, "06:45", both) for n in range(1, 6)]
         z = make_student("Z", -1.25, "06:10", [morning2["id"]])
+        _accept_pending(client, parent_headers)
 
         yield {
             "marker": marker, "school_id": sandbox["id"],
@@ -177,7 +211,8 @@ def fleet(client, admin_headers, sandbox):
             "driver2_headers": pin_login(client, driver2["pin"]),
             "bus1": bus1, "bus2": bus2,
             "morning": morning, "afternoon": afternoon, "morning2": morning2,
-            "a": a, "b": b, "c": c, "z": z,
+            "a": a, "b": b, "c": c, "z": z, "five": five,
+            "parent_id": parent_id, "parent_headers": parent_headers,
         }
     finally:
         for run in client.get("/api/runs", headers=admin_headers).json():
@@ -194,6 +229,7 @@ def fleet(client, admin_headers, sandbox):
             client.delete(f"/api/fleet/buses/{bid}", headers=admin_headers)
         for driver in (driver1, driver2):
             client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
+        purge_accounts(created["parent_id"])
 
 
 # Helpers ----------------------------------------------------------------------
@@ -776,7 +812,7 @@ def _incident_count(run_id: str) -> int:
 
 # Capture time and validity (R2, R40) -------------------------------------------
 
-def test_skewed_invalid_naive_and_old_capture_times(client, fleet):
+def test_skewed_invalid_naive_and_old_capture_times(client, admin_headers, fleet):
     h = fleet["driver_headers"]
     bus_id = fleet["bus1"]["id"]
     run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
@@ -836,6 +872,9 @@ def test_skewed_invalid_naive_and_old_capture_times(client, fleet):
         assert_action_position(bus_position(bus_id), coarse)
     finally:
         purge_run(run_id)
+        # The naive-fix absent above marked C for the day; left in place it
+        # drops C from every later morning snapshot in this module.
+        _clear_absences(client, admin_headers, fleet["c"]["id"])
 
 
 # Purge (R12) ----------------------------------------------------------------------
@@ -1118,7 +1157,15 @@ def test_no_log_line_incident_or_audit_detail_carries_a_coordinate(
     try:
         arrive(client, fleet["driver_headers"], run_id, expected=1)
         with caplog.at_level(logging.INFO):
-            runs_live._purge_after_start(scope)
+            # The API container's own post-Start-Run pass may still hold the
+            # school's advisory lock (it runs after the run-started fan-out);
+            # the try-never-wait lock answers "skipped" until it commits, so
+            # take the in-process pass once that has happened.
+            for _ in range(40):
+                runs_live._purge_after_start(scope)
+                if any("gps purge pass (school=" in r.getMessage() for r in caplog.records):
+                    break
+                time.sleep(0.25)
 
             def cancelled(_scope):
                 raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
@@ -1214,5 +1261,619 @@ def test_the_gps_verify_set_reports_this_runs_trail_and_fix_coverage(
         assert coverage["with_fix"] >= 2
         assert coverage["action_rows"] >= coverage["with_fix"]
         assert by_label["trail-rows-classification-failed"]["rows"][0]["flagged"] >= 0
+    finally:
+        purge_run(run_id)
+
+
+# ==============================================================================
+# The custody check and the boarding undo (U9)
+# ==============================================================================
+
+METRE = 1 / 111_195.0  # one metre of latitude, in degrees
+CUSTODY_AWAY = "custody-away"
+UNVERIFIED = "unverified"
+
+
+def near_stop(coords: tuple, *, north_m: float = 0.0, accuracy: float = 12.0) -> dict:
+    """A fix ``north_m`` metres due north of a stop's coordinates."""
+    return fix(lat=coords[0] + north_m * METRE, lng=coords[1], accuracy=accuracy)
+
+
+def board(client, headers, student_id: str, fix_body, *, event_id=None, on_bus=True):
+    body = {"student_id": student_id, "on_bus": on_bus}
+    if event_id:
+        body["event_id"] = event_id
+    return action(client, headers, "/api/runs/driver/boarding", body, fix_body=fix_body)
+
+
+def dropoff(client, headers, student_id: str, fix_body, *, event_id=None):
+    body = {"student_id": student_id}
+    if event_id:
+        body["event_id"] = event_id
+    return action(client, headers, "/api/runs/driver/dropoff", body, fix_body=fix_body)
+
+
+def reverse(client, headers, student_id: str, *, event_id=None) -> httpx.Response:
+    body = {"student_id": student_id}
+    if event_id:
+        body["event_id"] = event_id
+    return client.post("/api/runs/driver/reverse", json=body, headers=headers)
+
+
+def respond(client, headers, event_id: str, answer: str) -> httpx.Response:
+    return client.post(
+        f"/api/runs/driver/prompts/{event_id}/respond", json={"answer": answer}, headers=headers
+    )
+
+
+def context(client, headers) -> dict:
+    response = client.get("/api/runs/driver/context", headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def pending(client, headers) -> list[dict]:
+    return context(client, headers)["pending_prompts"]
+
+
+def roster_row(client, headers, student_id: str) -> dict:
+    return next(s for s in context(client, headers)["students"] if s["id"] == student_id)
+
+
+def exceptions(client, admin_headers, run_id: str, kind: str | None = None) -> list[dict]:
+    response = client.get(f"/api/runs/{run_id}/exceptions", headers=admin_headers)
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    return [x for x in rows if kind is None or x["kind"] == kind]
+
+
+def ledger(exception_id: str) -> list[dict]:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_exception_events where exception_id = %s order by created_at, id",
+            (exception_id,),
+        ).fetchall()
+
+
+def participation(run_id: str, student_id: str) -> dict | None:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_participation where run_id = %s and student_id = %s",
+            (run_id, student_id),
+        ).fetchone()
+
+
+def notification_types(parent_id: str, run_id: str, student_id: str) -> list[str]:
+    with db() as conn:
+        rows = conn.execute(
+            "select type from live_notifications "
+            "where user_id = %s and run_id = %s and student_id = %s order by created_at, id",
+            (parent_id, run_id, student_id),
+        ).fetchall()
+    return [r["type"] for r in rows]
+
+
+def incidents(client, admin_headers, run_id: str, kind: str) -> list[dict]:
+    rows = client.get("/api/incidents", headers=admin_headers).json()
+    return [i for i in rows if i.get("run_id") == run_id and i.get("type") == kind]
+
+
+def arrive_at_stop(client, headers, run_id: str, stop_order: int, coords: tuple) -> None:
+    """Arrive with default (far) fixes up to the stop before, then at the stop
+    with the phone at the stop — the fix "bus seen at stop" reads."""
+    arrive_until(client, headers, run_id, stop_order - 1)
+    if progress(run_id) < stop_order:
+        response = arrive(
+            client, headers, run_id, expected=stop_order,
+            fix_body=near_stop(coords, north_m=30, accuracy=20),
+        )
+        assert response.status_code == 200, response.text
+
+
+def inject_exception_insert_failure() -> None:
+    with db() as conn:
+        conn.execute(
+            "create or replace function it_gps_inject_failure() returns trigger "
+            "language plpgsql as $$ begin "
+            "raise exception 'injected: run_exceptions insert refused'; end $$"
+        )
+        conn.execute("drop trigger if exists it_gps_inject_failure on run_exceptions")
+        conn.execute(
+            "create trigger it_gps_inject_failure before insert on run_exceptions "
+            "for each row execute function it_gps_inject_failure()"
+        )
+
+
+def clear_injected_failure() -> None:
+    with db() as conn:
+        conn.execute("drop trigger if exists it_gps_inject_failure on run_exceptions")
+        conn.execute("drop function if exists it_gps_inject_failure()")
+
+
+def test_ae3_ae4_a_far_board_raises_one_custody_exception_with_a_prompt_and_a_near_one_nothing(
+    client, admin_headers, fleet,
+):
+    """AE3: Board 1.8 km from the stop after an Arrive at the stop — one
+    custody exception, one pending prompt naming the child with the distance,
+    Confirm recorded, and the panel's "bus seen at stop" reads yes from the
+    Arrive fix. AE4: Board 60 m away raises nothing. Un-boarding stays
+    refused outside the undo path."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+
+        far = near_stop(a_stop, north_m=1800)
+        boarded = board(client, h, a_id, far)
+        assert boarded.status_code == 200, boarded.text
+        assert boarded.json()["id"] == a_id
+        assert participation(run_id, a_id)["boarded_at"] is not None
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+
+        prompts = pending(client, h)
+        assert len(prompts) == 1, prompts
+        prompt = prompts[0]
+        assert prompt["kind"] == CUSTODY_AWAY
+        assert prompt["student_id"] == a_id
+        assert [s["id"] for s in prompt["students"]] == [a_id]
+        assert prompt["students"][0]["name"] == fleet["a"]["name"]
+        assert prompt["answers"] == ["confirmed"]
+        assert prompt["stop_order"] == a_order and prompt["stop_name"]
+        assert prompt["distance_m"] == pytest.approx(1800, abs=5)
+
+        rows = exceptions(client, admin_headers, run_id)
+        assert [x["kind"] for x in rows] == [CUSTODY_AWAY]
+        row = rows[0]
+        assert row["id"] == prompt["exception_id"]
+        assert row["stop_order"] == a_order and row["status"] == "open"
+        assert row["seen_at_stop"] is True, "the Arrive fix was within the vicinity"
+        assert row["distance_m"] == pytest.approx(1800, abs=5)
+        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (far["lat"], far["lng"], 12.0)
+        assert [s["id"] for s in row["students"]] == [a_id]
+        assert len(row["events"]) == 1
+        event = row["events"][0]
+        assert event["id"] == prompt["event_id"]
+        assert event["prompt_state"] == "pending" and event["response"] is None
+        assert event["student_id"] == a_id
+        assert event["distance_m"] == pytest.approx(1800, abs=5)
+        assert str(ledger(row["id"])[0]["action_key"]) == key_of(boarded)
+
+        # The custody prompt takes `confirmed` only; dismiss is not an answer.
+        assert respond(client, h, prompt["event_id"], "dismissed").status_code == 400
+        confirmed = respond(client, h, prompt["event_id"], "confirmed")
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["prompt_state"] == "answered"
+        assert confirmed.json()["response"] == "confirmed"
+        assert respond(client, h, prompt["event_id"], "confirmed").status_code == 200
+        assert pending(client, h) == []
+        after = exceptions(client, admin_headers, run_id)[0]
+        assert after["status"] == "confirmed"
+        assert after["events"][0]["response"] == "confirmed"
+        assert after["seen_at_stop"] is True
+
+        # AE4: 60 m from the stop — inside the threshold, nothing raised.
+        b_order = plan["by_student"][b_id]
+        b_stop = plan["coords"][b_order]
+        arrive_at_stop(client, h, run_id, b_order, b_stop)
+        near = board(client, h, b_id, near_stop(b_stop, north_m=60))
+        assert near.status_code == 200, near.text
+        assert pending(client, h) == []
+        assert [x["kind"] for x in exceptions(client, admin_headers, run_id)] == [CUSTODY_AWAY]
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+
+        # Un-boarding through the toggle stays refused (the stale-client guard).
+        refused = board(client, h, b_id, near_stop(b_stop), on_bus=False)
+        assert refused.status_code == 409, refused.text
+        assert "Un-boarding is disabled" in refused.json()["detail"]
+        assert participation(run_id, b_id)["boarded_at"] is not None
+    finally:
+        purge_run(run_id)
+
+
+def test_ae17_a_coarse_fix_is_one_unverified_row_per_reason_with_an_event_per_tap_and_no_prompt(
+    client, admin_headers, fleet,
+):
+    """AE17: accuracy 900 m at 800 m from the stop — the cap runs first, so
+    this is unverified/too-coarse, never "within"; no prompt. A second coarse
+    tap on the run attaches to the same (run, reason) row."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        arrive_until(client, h, run_id, a_order)
+        coarse = board(client, h, a_id, near_stop(plan["coords"][a_order], north_m=800, accuracy=900))
+        assert coarse.status_code == 200, coarse.text
+        assert trail(run_id)[-1]["fix_reason"] == "coarse"
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+        assert pending(client, h) == []
+
+        rows = exceptions(client, admin_headers, run_id)
+        assert [(x["kind"], x["reason"]) for x in rows] == [(UNVERIFIED, "too-coarse")]
+        row = rows[0]
+        assert row["stop_order"] is None and row["student_id"] is None
+        assert row["status"] is None
+        assert [s["id"] for s in row["students"]] == [a_id]
+        assert row["fix_accuracy_m"] == 900
+        assert row["distance_m"] == pytest.approx(800, abs=5)
+        assert len(row["events"]) == 1
+        assert row["events"][0]["prompt_state"] is None and row["events"][0]["response"] is None
+        assert row["events"][0]["student_id"] == a_id
+        assert row["events"][0]["distance_m"] == pytest.approx(800, abs=5)
+
+        b_order = plan["by_student"][b_id]
+        arrive_until(client, h, run_id, b_order)
+        again = board(client, h, b_id, near_stop(plan["coords"][b_order], north_m=3000, accuracy=1200))
+        assert again.status_code == 200, again.text
+        rows = exceptions(client, admin_headers, run_id)
+        assert len(rows) == 1 and rows[0]["id"] == row["id"], "one unverified row per (run, reason)"
+        assert [s["id"] for s in rows[0]["students"]] == [a_id, b_id]
+        assert [e["student_id"] for e in rows[0]["events"]] == [a_id, b_id]
+        assert pending(client, h) == []
+    finally:
+        purge_run(run_id)
+
+
+def test_five_children_boarded_far_from_one_stop_share_one_exception_answered_independently(
+    client, admin_headers, fleet,
+):
+    """Five taps at one stop: one custody row with five pending prompt events;
+    each is confirmed or undone on its own; the status reads open while any
+    is pending, then confirmed because some were."""
+    h = fleet["driver_headers"]
+    five = [kid["id"] for kid in fleet["five"]]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        orders = {plan["by_student"][sid] for sid in five}
+        assert len(orders) == 1, "identical home coordinates collapse into one stop"
+        order = orders.pop()
+        arrive_until(client, h, run_id, order)
+        far = near_stop(plan["coords"][order], north_m=2000)
+        for sid in five:
+            assert board(client, h, sid, far).status_code == 200
+
+        rows = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)
+        assert len(rows) == 1 and rows[0]["stop_order"] == order
+        row = rows[0]
+        assert row["status"] == "open"
+        assert [s["id"] for s in row["students"]] == five
+        assert [e["prompt_state"] for e in row["events"]] == ["pending"] * 5
+        assert [e["student_id"] for e in row["events"]] == five
+
+        # Driving straight to this stop passed A, B and C unrecorded, so their
+        # bypassed-stop prompts (safety priority) sit ahead of the custody
+        # confirms in the queue; this test reads the custody ones.
+        def custody_prompts() -> list[dict]:
+            return [p for p in pending(client, h) if p["kind"] == CUSTODY_AWAY]
+
+        prompts = custody_prompts()
+        assert [p["student_id"] for p in prompts] == five, "creation order, one per tap"
+        assert {p["exception_id"] for p in prompts} == {row["id"]}
+        assert pending(client, h)[0]["kind"] == "stop-bypassed", "safety prompts first"
+        by_student = {p["student_id"]: p for p in prompts}
+
+        # One at a time: confirm, undo, confirm, confirm, undo.
+        assert respond(client, h, by_student[five[0]]["event_id"], "confirmed").status_code == 200
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["status"] == "open"
+        assert reverse(client, h, five[1], event_id=by_student[five[1]]["event_id"]).status_code == 200
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["status"] == "open"
+        assert [p["student_id"] for p in custody_prompts()] == five[2:]
+        assert respond(client, h, by_student[five[2]]["event_id"], "confirmed").status_code == 200
+        assert respond(client, h, by_student[five[3]]["event_id"], "confirmed").status_code == 200
+        assert reverse(client, h, five[4]).status_code == 200  # from the board page: no hint
+        assert custody_prompts() == []
+
+        final = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]
+        assert final["status"] == "confirmed"
+        assert [(e["prompt_state"], e["response"]) for e in final["events"]] == [
+            ("answered", "confirmed"), ("answered", "retracted"), ("answered", "confirmed"),
+            ("answered", "confirmed"), ("answered", "retracted"),
+        ]
+        assert participation(run_id, five[1]) is None and participation(run_id, five[4]) is None
+        assert all(participation(run_id, sid)["boarded_at"] for sid in (five[0], five[2], five[3]))
+        assert run_row(run_id)["students_boarded"] == 3
+    finally:
+        purge_run(run_id)
+
+
+def test_undo_of_a_far_board_clears_the_outcome_retracts_student_boarded_and_sends_boarding_corrected(
+    client, admin_headers, fleet,
+):
+    """R35 (boarding half): the undo — from the card with the event id, or
+    from the board page without — returns the child to no outcome, records
+    the custody prompt `retracted`, retracts `student-boarded` and sends one
+    neutral `boarding-corrected`; the exception reads retracted when it was
+    the only tap, open while another is pending, confirmed if any confirmed."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+        far = near_stop(a_stop, north_m=1800)
+
+        assert board(client, h, a_id, far).status_code == 200
+        assert _wait_for(lambda: "student-boarded" in notification_types(parent_id, run_id, a_id))
+        assert roster_row(client, h, a_id)["display_status"] == "on-bus"
+        assert roster_row(client, h, a_id)["can_undo"] is True, "the board page offers Undo"
+        first = pending(client, h)[0]
+
+        # Undo from the card (the event id travels as a hint).
+        undone = reverse(client, h, a_id, event_id=first["event_id"])
+        assert undone.status_code == 200, undone.text
+        assert undone.json()["id"] == a_id
+        assert participation(run_id, a_id) is None, "no outcome at all"
+        assert run_row(run_id)["students_boarded"] == 0
+        row = roster_row(client, h, a_id)
+        assert row["display_status"] == "at-home" and row["can_undo"] is False
+        assert pending(client, h) == []
+        rows = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)
+        assert len(rows) == 1 and rows[0]["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"]) for e in rows[0]["events"]] == [
+            ("answered", "retracted"),
+        ]
+        late = respond(client, h, first["event_id"], "confirmed")
+        assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-already-answered"
+        assert late.json()["detail"]["response"] == "retracted"
+
+        # The family: the boarded notice is gone, one neutral correction.
+        assert _wait_for(lambda: "boarding-corrected" in notification_types(parent_id, run_id, a_id))
+        types = notification_types(parent_id, run_id, a_id)
+        assert "student-boarded" not in types
+        assert types.count("boarding-corrected") == 1
+        with db() as conn:
+            body = conn.execute(
+                "select title, body from live_notifications where user_id = %s and run_id = %s "
+                "and student_id = %s and type = 'boarding-corrected'",
+                (parent_id, run_id, a_id),
+            ).fetchone()
+        assert body["title"] == "Correction: boarding withdrawn"
+        assert "withdrawn" in body["body"] and "record what happens at the stop" in body["body"]
+        assert "on the bus" not in body["body"].lower()
+        # The office: the lifecycle alert names the boarding mark.
+        assert _wait_for(lambda: incidents(client, admin_headers, run_id, "action-reversed"))
+        assert any(
+            "boarding mark was retracted" in (i.get("description") or "")
+            for i in incidents(client, admin_headers, run_id, "action-reversed")
+        )
+
+        # Board again, far: a new pending tap on the same row → open.
+        assert board(client, h, a_id, far).status_code == 200
+        second = pending(client, h)[0]
+        assert second["event_id"] != first["event_id"]
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["status"] == "open"
+        # Confirm it → confirmed; then undo from the board page (no hint):
+        # the confirmation stays on the record and a `retracted` row is
+        # appended after it; the child's latest event decides → retracted.
+        assert respond(client, h, second["event_id"], "confirmed").status_code == 200
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["status"] == "confirmed"
+        assert reverse(client, h, a_id).status_code == 200
+        final = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]
+        assert final["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"], e["student_id"]) for e in final["events"]] == [
+            ("answered", "retracted", a_id),
+            ("answered", "confirmed", a_id),
+            (None, "retracted", a_id),
+        ]
+        assert final["events"][1]["id"] == second["event_id"]
+        appended = final["events"][2]
+        assert appended["fix_lat"] is None and appended["distance_m"] is None
+        assert participation(run_id, a_id) is None
+        assert "student-boarded" not in notification_types(parent_id, run_id, a_id)
+
+        # A board at the stop, then undone: nothing to retract (the child's
+        # latest event is already a retraction), the undo still lands.
+        assert board(client, h, a_id, near_stop(a_stop, north_m=20)).status_code == 200
+        assert len(exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["events"]) == 3
+        assert reverse(client, h, a_id).status_code == 200
+        assert participation(run_id, a_id) is None
+        assert len(exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["events"]) == 3
+        # Nothing left of this driver's to undo.
+        nothing = reverse(client, h, a_id)
+        assert nothing.status_code == 409, nothing.text
+    finally:
+        purge_run(run_id)
+
+
+def test_a_resolution_tap_is_exempt_from_the_custody_check_and_an_unlisted_child_is_checked(
+    client, admin_headers, fleet,
+):
+    """R14: a Board for a child listed on the open bypassed-stop exception of
+    this run is its resolution and skips the custody check, however far the
+    fix; a child that exception does not list is checked normally."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        b_order = plan["by_student"][b_id]
+        assert b_order == a_order + 1
+        arrive_until(client, h, run_id, a_order)
+        passing = arrive(client, h, run_id, expected=b_order)
+        assert passing.status_code == 200, passing.text
+        bypassed = passing.json()["prompts"]
+        assert len(bypassed) == 1 and bypassed[0]["kind"] == "stop-bypassed"
+
+        # The catch-up board through the card, 5 km from A's stop: exempt.
+        far_a = near_stop(plan["coords"][a_order], north_m=5000)
+        assert board(client, h, a_id, far_a, event_id=bypassed[0]["event_id"]).status_code == 200
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY) == []
+        stop = exceptions(client, admin_headers, run_id, "stop-bypassed")[0]
+        assert stop["status"] == "resolved"
+        assert [e["response"] for e in stop["events"]] == ["resolution", "resolution"]
+        assert pending(client, h) == []
+
+        # B, at the reached stop and on no bypassed exception: checked.
+        far_b = near_stop(plan["coords"][b_order], north_m=5000)
+        assert board(client, h, b_id, far_b).status_code == 200
+        custody = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)
+        assert len(custody) == 1 and custody[0]["stop_order"] == b_order
+        assert [s["id"] for s in custody[0]["students"]] == [b_id]
+        prompts = pending(client, h)
+        assert [p["kind"] for p in prompts] == [CUSTODY_AWAY] and prompts[0]["student_id"] == b_id
+    finally:
+        purge_run(run_id)
+
+
+def test_a_forced_classification_error_leaves_the_boarding_committed_and_flags_the_trail_row(
+    client, admin_headers, fleet,
+):
+    """R23/R40: with every run_exceptions insert made to fail, a far Board
+    still commits — participation written, trail row flagged
+    `classification-failed` — with no exception row and no prompt."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    inject_exception_insert_failure()
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        arrive_until(client, h, run_id, a_order)
+        boarded = board(client, h, a_id, near_stop(plan["coords"][a_order], north_m=1800))
+        assert boarded.status_code == 200, boarded.text
+        assert participation(run_id, a_id)["boarded_at"] is not None
+        assert run_row(run_id)["students_boarded"] == 1
+        last = trail(run_id)[-1]
+        assert last["action_kind"] == "board"
+        assert tuple(last["flags"]) == ("classification-failed",)
+        assert exceptions(client, admin_headers, run_id) == []
+        assert pending(client, h) == []
+    finally:
+        clear_injected_failure()
+        purge_run(run_id)
+
+
+def test_ae9_a_handover_500_m_from_the_stop_raises_nothing(client, admin_headers, fleet):
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    run_id = start(client, h, fleet["afternoon"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        arrive_until(client, h, run_id, a_order)
+        handed = action(
+            client, h, "/api/runs/driver/handover",
+            {"student_id": a_id, "note": "Collected by grandmother at the junction"},
+            fix_body=near_stop(plan["coords"][a_order], north_m=500),
+        )
+        assert handed.status_code == 200, handed.text
+        # Driving to A's stop on the afternoon route passed other children's
+        # stops unrecorded (bypassed-stop rows, U2's kind); the hand-over
+        # itself is never checked: no custody row, no unverified row, no
+        # custody prompt.
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY) == []
+        assert exceptions(client, admin_headers, run_id, UNVERIFIED) == []
+        assert [p for p in pending(client, h) if p["kind"] == CUSTODY_AWAY] == []
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+    finally:
+        purge_run(run_id)
+
+
+def test_a_coordinateless_stop_is_listed_once_per_run_and_a_gps_denied_run_yields_one_no_fix_row(
+    client, admin_headers, fleet,
+):
+    """R20/F5: a stop without coordinates → one `stop-unverified` row per
+    (run, stop) with an event per tap and no prompt; taps with a browser
+    reason or no fix key at all → one `no-fix` row per run with an event per
+    tap. No custody row anywhere."""
+    h = fleet["driver_headers"]
+    a_id, b_id, c_id = fleet["a"]["id"], fleet["b"]["id"], fleet["c"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        assert {a_id, b_id, c_id} <= set(plan["by_student"]), plan
+        a_order = plan["by_student"][a_id]
+        with db() as conn:
+            conn.execute(
+                "update run_stops set lat = null, lng = null where run_id = %s and stop_order = %s",
+                (run_id, a_order),
+            )
+        arrive_until(client, h, run_id, a_order)
+        assert board(client, h, a_id, near_stop(plan["coords"][a_order], north_m=1800)).status_code == 200
+        assert board(client, h, a_id, near_stop(plan["coords"][a_order], north_m=1800)).status_code == 200
+        rows = exceptions(client, admin_headers, run_id)
+        assert [(x["kind"], x["reason"], x["stop_order"]) for x in rows] == [
+            (UNVERIFIED, "stop-unverified", a_order),
+        ]
+        assert len(rows[0]["events"]) == 2 and all(e["prompt_state"] is None for e in rows[0]["events"])
+        assert [s["id"] for s in rows[0]["students"]] == [a_id]
+        assert pending(client, h) == []
+
+        # GPS denied for B, no fix key at all for C: one no-fix row, two events.
+        b_order, c_order = plan["by_student"][b_id], plan["by_student"][c_id]
+        arrive_until(client, h, run_id, b_order)
+        assert board(client, h, b_id, {"reason": "denied"}).status_code == 200
+        arrive_until(client, h, run_id, c_order)
+        assert board(client, h, c_id, None).status_code == 200
+        assert [r["fix_reason"] for r in trail(run_id) if r["action_kind"] == "board"][-2:] == ["denied", "none"]
+        rows = exceptions(client, admin_headers, run_id)
+        assert sorted((x["kind"], x["reason"]) for x in rows) == [
+            (UNVERIFIED, "no-fix"), (UNVERIFIED, "stop-unverified"),
+        ]
+        no_fix = next(x for x in rows if x["reason"] == "no-fix")
+        assert no_fix["stop_order"] is None
+        assert no_fix["fix_lat"] is None and no_fix["distance_m"] is None
+        assert [e["student_id"] for e in no_fix["events"]] == [b_id, c_id]
+        assert all(e["prompt_state"] is None and e["fix_lat"] is None for e in no_fix["events"])
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY) == []
+        assert pending(client, h) == []
+    finally:
+        purge_run(run_id)
+
+
+def test_an_afternoon_dropoff_far_from_the_stop_behaves_like_board_and_its_undo_retracts(
+    client, admin_headers, fleet,
+):
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["afternoon"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+        dropped = dropoff(client, h, a_id, near_stop(a_stop, north_m=1800))
+        assert dropped.status_code == 200, dropped.text
+
+        # The afternoon route visits A's stop late, so the drive there passed
+        # other stops unrecorded (bypassed-stop prompts); read the custody one.
+        def custody_prompts() -> list[dict]:
+            return [p for p in pending(client, h) if p["kind"] == CUSTODY_AWAY]
+
+        prompts = custody_prompts()
+        assert len(prompts) == 1
+        assert prompts[0]["student_id"] == a_id
+        assert prompts[0]["distance_m"] == pytest.approx(1800, abs=5)
+        row = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]
+        assert row["status"] == "open" and row["seen_at_stop"] is True
+        assert _wait_for(lambda: "dropped-off" in notification_types(parent_id, run_id, a_id))
+
+        # The card's Undo: the drop-off arm, and the prompt answers retracted.
+        assert reverse(client, h, a_id, event_id=prompts[0]["event_id"]).status_code == 200
+        record = participation(run_id, a_id)
+        assert record["dropped_off_at"] is None and record["boarded_at"] is not None
+        assert custody_prompts() == []
+        row = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]
+        assert row["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"]) for e in row["events"]] == [("answered", "retracted")]
+        assert _wait_for(lambda: "dropoff-corrected" in notification_types(parent_id, run_id, a_id))
+        assert "dropped-off" not in notification_types(parent_id, run_id, a_id)
+
+        # Dropped off at the stop this time: no new event, the row stays retracted.
+        assert dropoff(client, h, a_id, near_stop(a_stop, north_m=20)).status_code == 200
+        row = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]
+        assert row["status"] == "retracted" and len(row["events"]) == 1
+        assert custody_prompts() == []
     finally:
         purge_run(run_id)

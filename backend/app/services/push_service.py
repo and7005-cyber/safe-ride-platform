@@ -29,6 +29,8 @@ Notification types:
                    changed the child's stop/time/bus
   route-unassigned a fleet-plan apply (U6) or a manual live-route edit (U13)
                    left the child without a route for a leg
+  boarding-corrected the driver withdrew a boarding mark (GPS plan U9); retracts
+                   student-boarded and claims nothing about where the child is
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -222,15 +224,26 @@ class PushService:
             # unique on (user, run, student, type), so leaving it would suppress
             # the driver's genuine second confirmation as a duplicate — the
             # family would keep the false message and never get the true one.
-            superseded = (
-                ["student-absent"] if reversed_what == "absence" else ["dropped-off"]
-            )
+            superseded = {
+                "absence": ["student-absent"],
+                "boarding": ["student-boarded"],
+            }.get(reversed_what, ["dropped-off"])
             self.dao.retract_notifications(str(run["id"]), student_id, superseded, scope=scope)
 
             if reversed_what == "absence":
                 type_ = "absence-corrected"
                 title = "Correction: not absent"
                 tail = "was marked absent by mistake. They are on the bus."
+            elif reversed_what == "boarding":
+                # Neutral by design (GPS plan U9/R35): the mark is withdrawn
+                # and the driver will record what happens; the message claims
+                # nothing about where the child is.
+                type_ = "boarding-corrected"
+                title = "Correction: boarding withdrawn"
+                tail = (
+                    "was marked as boarded by mistake; that mark has been withdrawn. "
+                    "The driver will record what happens at the stop."
+                )
             else:
                 type_ = "dropoff-corrected"
                 title = "Correction: not dropped off"

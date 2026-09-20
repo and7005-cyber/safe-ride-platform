@@ -31,10 +31,14 @@ import {
 // to end a run while anyone is unaccounted for, so the driver has to be able to
 // account for every case from the phone.
 //
-// Un-boarding is still not one of them. The boarding toggle's rejection of
-// on_bus=false is a stale-client concurrency guard with its own justification;
-// the undo below is a separate path that retracts a recorded outcome and tells
-// the family, rather than a relaxation of that guard.
+// Un-boarding through the toggle is still not one of them. The boarding
+// toggle's rejection of on_bus=false is a stale-client concurrency guard with
+// its own justification; the undo below is a separate path that retracts a
+// recorded outcome and tells the family, rather than a relaxation of that
+// guard. Since the GPS work (U9) that path covers a boarding too: a child this
+// login boarded on the open morning run, with no later drop-off or hand-over,
+// offers Undo here exactly as the custody card does, and both call the same
+// reverse route.
 
 export function DriverBoardingPage() {
   const qc = useQueryClient();

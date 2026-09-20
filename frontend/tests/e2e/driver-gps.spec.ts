@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Page, type Request } from "@playwright/test";
+import { expect, test, type APIRequestContext, type BrowserContext, type Page, type Request } from "@playwright/test";
 import {
   ADMIN,
   API_URL,
@@ -426,4 +426,189 @@ test("approximate location: a coarse fix keeps its coordinates with the reason; 
 
   await context.setGeolocation(NAIROBI);
   await expect(page.getByTestId("location-banner")).toHaveCount(0);
+});
+
+// --- the custody check (GPS plan U9: R14, R35; F2; AE3, AE4) -----------------------
+//
+// Seeded morning route "Express 1 — Morning": stop 1 Kilimani (Faith), stop 2
+// Lavington (Happiness). The emulated position is moved between the Arrive and
+// the Board the way a driver pulls away before tapping.
+
+const KILIMANI = { latitude: -1.2902, longitude: 36.7823, accuracy: 20 };
+const LAVINGTON = { latitude: -1.2789, longitude: 36.7685, accuracy: 20 };
+
+/** `metres` due north of a point (one degree of latitude is ~111.2 km). */
+function northOf(point: typeof KILIMANI, metres: number): typeof KILIMANI {
+  return { ...point, latitude: point.latitude + metres / 111_195 };
+}
+
+/** Records every position the live watch delivered to the app, so a test can
+ * wait for an emulated move to land before tapping. */
+const FIX_LOG = `
+  window.__fixes = [];
+  const geo = navigator.geolocation;
+  const watch = geo.watchPosition.bind(geo);
+  geo.watchPosition = (ok, err, opts) => watch((pos) => {
+    window.__fixes.push({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    ok(pos);
+  }, err, opts);
+`;
+
+/** The attention cue spies (as in driver-nudges.spec): the custody card must
+ * neither sound nor vibrate. */
+const CUE_SPY = `
+  window.__cues = { plays: [], vibrations: [] };
+  HTMLMediaElement.prototype.play = function () {
+    window.__cues.plays.push({ muted: this.muted });
+    return Promise.resolve();
+  };
+  Object.defineProperty(navigator, "vibrate", {
+    configurable: true,
+    value: (pattern) => { window.__cues.vibrations.push(pattern); return true; },
+  });
+`;
+
+async function moveTo(page: Page, context: BrowserContext, point: typeof KILIMANI) {
+  await context.setGeolocation(point);
+  await expect
+    .poll(
+      async () => {
+        const fixes: { lat: number; lng: number }[] = await page.evaluate(
+          () => (window as any).__fixes ?? [],
+        );
+        const last = fixes[fixes.length - 1];
+        return last != null
+          && Math.abs(last.lat - point.latitude) < 1e-6
+          && Math.abs(last.lng - point.longitude) < 1e-6;
+      },
+      { timeout: 10_000, message: "the emulated move should reach the live watch" },
+    )
+    .toBe(true);
+}
+
+async function driverContext(request: APIRequestContext) {
+  const token = await apiDriverToken(request);
+  const response = await request.get(`${API_URL}/api/runs/driver/context`, {
+    headers: authHeaders(token),
+  });
+  expect(response.ok()).toBeTruthy();
+  return response.json();
+}
+
+async function adminExceptions(request: APIRequestContext, runId: string) {
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const response = await request.get(`${API_URL}/api/runs/${runId}/exceptions`, {
+    headers: authHeaders(token),
+  });
+  expect(response.ok()).toBeTruthy();
+  return response.json();
+}
+
+async function boardFromRow(page: Page, studentId: string): Promise<Captured> {
+  const row = page.getByTestId(`student-row-${studentId}`);
+  await expect(row.getByTestId(`board-${studentId}`)).toBeEnabled();
+  await row.getByTestId(`board-${studentId}`).click();
+  const captured = await captureAction(page, "/api/runs/driver/boarding", () =>
+    page.getByRole("dialog").getByRole("button", { name: "Board", exact: true }).click(),
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  return captured;
+}
+
+test("custody: a Board 1.8 km from the stop raises the silent confirm card with the distance; Confirm records it with the bus seen at the stop; Undo from the card and from the board page withdraws the boarding", async ({ page, context, request }) => {
+  await page.addInitScript(FIX_LOG);
+  await page.addInitScript(CUE_SPY);
+  await context.setGeolocation(KILIMANI);
+  await signInAsDriver(page);
+  await startMorningRun(page);
+  const ctx = await driverContext(request);
+  const runId: string = ctx.active_run.id;
+  const faith = ctx.students.find((s: any) => s.name === SEED.parentChild);
+  const happiness = ctx.students.find((s: any) => s.name === SEED.afternoonRideMate);
+  expect(faith && happiness).toBeTruthy();
+
+  // Arrive at Kilimani with the phone at the stop — the fix "bus seen at
+  // stop" reads. Nothing to ask yet.
+  await moveTo(page, context, KILIMANI);
+  await page.getByRole("button", { name: "Arrive Next Stop" }).click();
+  await expect(page.getByText(/^1\/\d+ stops completed$/)).toBeVisible();
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+
+  // AE3: the driver pulls away before tapping Board.
+  await page.goto("/driver/boarding");
+  await moveTo(page, context, northOf(KILIMANI, 1800));
+  const boarding = await boardFromRow(page, faith.id);
+  expect(boarding.body.fix.lat).toBeCloseTo(northOf(KILIMANI, 1800).latitude, 5);
+
+  const card = page.getByTestId("nudge-card");
+  await expect(card).toBeVisible();
+  await expect(card).toHaveAttribute("data-kind", "custody-away");
+  await expect(card).toContainText("Kilimani");
+  await expect(card).toContainText(
+    `You marked ${SEED.parentChild} boarded about 1.8 km from their stop. Confirm, or undo?`,
+  );
+  await expect(card.getByTestId("nudge-dismiss")).toHaveCount(0);
+  // The tap completed regardless (R23): the row reads On bus and offers Undo.
+  const faithRow = page.getByTestId(`student-row-${faith.id}`);
+  await expect(faithRow.getByText("On bus")).toBeVisible();
+  await expect(faithRow.getByTestId(`undo-${faith.id}`)).toBeVisible();
+  // Silent (F2): no tone, no vibration for the routine confirm.
+  const cues = await page.evaluate(() => (window as any).__cues);
+  expect(cues.plays.filter((p: any) => !p.muted)).toHaveLength(0);
+  expect(cues.vibrations).toEqual([]);
+
+  await card.getByTestId("nudge-confirm").click();
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+  let rows = await adminExceptions(request, runId);
+  const custody = rows.filter((x: any) => x.kind === "custody-away");
+  expect(custody).toHaveLength(1);
+  expect(custody[0].stop_order).toBe(1);
+  expect(custody[0].status).toBe("confirmed");
+  expect(custody[0].seen_at_stop).toBe(true);
+  expect(custody[0].distance_m).toBeGreaterThan(1700);
+  expect(custody[0].distance_m).toBeLessThan(1900);
+  expect(custody[0].students.map((s: any) => s.id)).toEqual([faith.id]);
+  expect(custody[0].events.map((e: any) => [e.prompt_state, e.response, e.student_id])).toEqual([
+    ["answered", "confirmed", faith.id],
+  ]);
+  expect(custody[0].events[0].shown_at).not.toBeNull();
+  expect(rows.filter((x: any) => x.kind === "unverified")).toHaveLength(0);
+
+  // Undo from the card (R35): Lavington, the same pattern.
+  await page.goto("/driver/run");
+  await moveTo(page, context, LAVINGTON);
+  await page.getByRole("button", { name: "Arrive Next Stop" }).click();
+  await expect(page.getByText(/^2\/\d+ stops completed$/)).toBeVisible();
+  await page.goto("/driver/boarding");
+  await moveTo(page, context, northOf(LAVINGTON, 1800));
+  await boardFromRow(page, happiness.id);
+  await expect(card).toContainText(SEED.afternoonRideMate);
+  await card.getByTestId("nudge-undo").click();
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+  // No outcome: the Board control is back, the Undo gone.
+  const happinessRow = page.getByTestId(`student-row-${happiness.id}`);
+  await expect(happinessRow.getByTestId(`board-${happiness.id}`)).toBeEnabled();
+  await expect(happinessRow.getByTestId(`undo-${happiness.id}`)).toHaveCount(0);
+  rows = await adminExceptions(request, runId);
+  let lavington = rows.find((x: any) => x.kind === "custody-away" && x.stop_order === 2);
+  expect(lavington.status).toBe("retracted");
+  expect(lavington.events.map((e: any) => [e.prompt_state, e.response])).toEqual([
+    ["answered", "retracted"],
+  ]);
+
+  // Undo from the board page: the same reverse path, the same ledger answer.
+  await boardFromRow(page, happiness.id);
+  await expect(card).toContainText(SEED.afternoonRideMate);
+  await happinessRow.getByTestId(`undo-${happiness.id}`).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(`Undo your entry for ${SEED.afternoonRideMate}?`)).toBeVisible();
+  await dialog.getByRole("button", { name: "Undo" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+  await expect(happinessRow.getByTestId(`board-${happiness.id}`)).toBeEnabled();
+  rows = await adminExceptions(request, runId);
+  lavington = rows.find((x: any) => x.kind === "custody-away" && x.stop_order === 2);
+  expect(lavington.status).toBe("retracted");
+  expect(lavington.events.map((e: any) => e.response)).toEqual(["retracted", "retracted"]);
+  expect(rows.filter((x: any) => x.kind === "custody-away")).toHaveLength(2);
 });

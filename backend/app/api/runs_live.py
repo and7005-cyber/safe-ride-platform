@@ -471,22 +471,27 @@ def reverse_own_action(
     payload: StudentIdPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
 ):
-    """Undo this driver's own drop-off, hand-over or absence mark (U5/R10).
+    """Undo this driver's own drop-off, hand-over, boarding or absence mark
+    (U5/R10; GPS plan U9/R14, R35).
 
     Deliberately a separate endpoint from /driver/boarding: that one's rejection
     of un-boarding is a stale-client concurrency guard, and relaxing it would
-    regress that protection while appearing to change only UX.
+    regress that protection while appearing to change only UX. The boarding
+    undo is this path's own arm, reached from the custody card and from the
+    board page alike; `event_id` is the card's hint for the prompt ledger.
 
     The affected parents always get an explicit correction. Retracting a
     statement silently would be worse than the mis-tap.
     """
     student, run, reversed_what = safe_call(
-        lambda: dao.reverse_own_action(scope, payload.student_id)
+        lambda: dao.reverse_own_action(scope, payload.student_id, event_id=payload.event_id)
     )
     background_tasks.add_task(
         push_service.notify_correction, student, run, reversed_what, scope=scope
     )
-    retracted = "absence mark" if reversed_what == "absence" else "drop-off confirmation"
+    retracted = {"absence": "absence mark", "boarding": "boarding mark"}.get(
+        reversed_what, "drop-off confirmation"
+    )
     background_tasks.add_task(
         _record_lifecycle_alert, scope, str(run["id"]), "action-reversed",
         f"{student['name']} — the {retracted} was retracted.",

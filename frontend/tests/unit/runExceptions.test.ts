@@ -15,6 +15,7 @@ import {
   reasonLabel,
   responseLabel,
   seenAtStopLine,
+  statusBadge,
   unreviewedCount,
   type RunException,
   type RunExceptionEvent,
@@ -203,5 +204,47 @@ describe("the count the badge shows", () => {
       exception({ status: null }),
     ])).toBe(2);
     expect(unreviewedCount([])).toBe(0);
+  });
+});
+
+// --- the custody tap's derived status and children (GPS plan U9) ----------------
+
+describe("a custody tap's row", () => {
+  it("lists the tapped children plainly, not as 'still no outcome'", () => {
+    expect(childrenLine(exception({
+      kind: "custody-away", status: "open",
+      students: [{ id: "a", name: "Wanjiru" }, { id: "b", name: "Brian" }],
+    }))).toBe("Wanjiru, Brian");
+    expect(childrenLine(exception({
+      kind: "unverified", students: [{ id: "a", name: "Wanjiru" }],
+    }))).toBe("Wanjiru");
+  });
+
+  it("badges every derived status the server can send, and nothing for none", () => {
+    expect(statusBadge("open")).toEqual({ label: "Open", variant: "warning" });
+    expect(statusBadge("resolved")).toEqual({ label: "Resolved", variant: "success" });
+    expect(statusBadge("confirmed")).toEqual({ label: "Confirmed by driver", variant: "success" });
+    expect(statusBadge("retracted")).toEqual({ label: "Retracted", variant: "secondary" });
+    expect(statusBadge(null)).toBeNull();
+  });
+
+  it("wordings are sentence case with no raw slug", () => {
+    for (const status of ["open", "resolved", "confirmed", "retracted"] as const) {
+      const label = statusBadge(status)!.label;
+      expect(label[0]).toBe(label[0]!.toUpperCase());
+      expect(label).not.toMatch(/[a-z]-[a-z]/);
+    }
+  });
+});
+
+describe("the custody undo on the ledger (GPS plan U9)", () => {
+  it("reads a retraction as undone by the driver, answered or appended", () => {
+    expect(responseLabel("retracted")).toBe("undone by the driver");
+    expect(eventLine(event({ prompt_state: "answered", response: "retracted" }))).toContain(
+      "prompt answered: undone by the driver",
+    );
+    const appended = eventLine(event({ prompt_state: null, response: "retracted", student_id: "a" }));
+    expect(appended).toContain("undone by the driver");
+    expect(appended).not.toContain("prompt");
   });
 });

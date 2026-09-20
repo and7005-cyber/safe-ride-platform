@@ -1,10 +1,9 @@
-"""Position rules: fix validation now (GPS plan U7), geometry classification
-later (U9 adds the accuracy-cap → plausibility → distance-less-accuracy chain
-to this same module; U10 the absent arms).
+"""Position rules: fix validation (GPS plan U7) and the custody geometry (U9);
+U10 adds the absent arms, U12 fills the plausibility hook.
 
 Pure: no I/O and no clock of its own — ``normalise_fix`` takes ``now`` — so
 the whole boundary is unit-testable and the DAO calls it inside the action
-transaction with whatever cap the school resolves to (U11).
+transaction with whatever cap and threshold the school resolves to (U11).
 
 The boundary is lenient by design (R2, R40). A tap's ``fix`` is whatever the
 client sent: a usable fix, a coarse one with its coordinates attached, a
@@ -12,14 +11,25 @@ reason alone, something malformed, or nothing at all. None of those may fail
 the tap, so the outcome is always a value: the stored fix or None, one
 ``fix_reason`` from ``FIX_REASONS`` and zero or more ``flags`` — never an
 exception, never a 422.
+
+The custody check (``classify_custody``) is a value too: ``within``, ``away``
+or ``unverified`` with one reason. Its order is the plan's "check ordering
+and geometry" decision — the accuracy cap before any subtraction, so a 900 m
+fix can never fake "within"; plausibility before distance, so a flagged fix
+never clears a check (R32); and among the reasons a check cannot run for,
+the fixed precedence stop-unverified > implausible > no-fix > too-coarse
+(R20), so the office reads the cause it can act on first (a pin to fix).
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from app.services.geo_service import haversine_m
 
 # fix_reason vocabulary on the trail row (DAO-owned, no CHECK — see 016).
 FIX_REASON_NONE = "none"          # the body carried a usable fix, or no fix key at all
@@ -171,3 +181,131 @@ def normalise_fix(
         reason=reason,
         flags=flags,
     )
+
+
+# --- the custody check (U9: R14, R20; R32's hook) ------------------------------
+
+CUSTODY_WITHIN = "within"
+CUSTODY_AWAY = "away"
+CUSTODY_UNVERIFIED = "unverified"
+
+# The `reason` an `unverified` exception carries, in precedence order (R20):
+# when several apply to one tap, the first wins.
+REASON_STOP_UNVERIFIED = "stop-unverified"   # the stop has no usable coordinates
+REASON_IMPLAUSIBLE = "implausible"           # the fix carries a plausibility flag (U12)
+REASON_NO_FIX = "no-fix"                     # nothing stored: denied, unavailable, timeout, invalid, omitted
+REASON_TOO_COARSE = "too-coarse"             # accuracy above the cap
+UNVERIFIED_REASONS = (
+    REASON_STOP_UNVERIFIED, REASON_IMPLAUSIBLE, REASON_NO_FIX, REASON_TOO_COARSE,
+)
+
+
+@dataclass(frozen=True)
+class CustodyCheck:
+    """The verdict on one Board or Drop-off. ``distance_m`` is the great-circle
+    distance from the fix to the stop whenever both exist — reported even
+    when the verdict is ``unverified``, for the office; None otherwise."""
+
+    classification: str
+    reason: str | None
+    distance_m: float | None
+
+    @property
+    def away(self) -> bool:
+        return self.classification == CUSTODY_AWAY
+
+    @property
+    def unverified(self) -> bool:
+        return self.classification == CUSTODY_UNVERIFIED
+
+
+def _usable_point(point: tuple[Any, Any] | None) -> tuple[float, float] | None:
+    """A (lat, lng) pair with both finite and in range, else None. Stops are
+    geocoded, not surveyed: a missing or low-confidence pin degrades the
+    check to unverified rather than classifying against a wrong place."""
+    if point is None:
+        return None
+    lat = _finite_number(point[0])
+    lng = _finite_number(point[1])
+    if lat is None or lng is None:
+        return None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
+        return None
+    return lat, lng
+
+
+def plausibility_flags(fix: NormalisedFix | StoredFix | None, **context: Any) -> tuple[str, ...]:
+    """The plausibility safeguard's flags for this fix (R32) — U12's seam.
+
+    Returns no flags today: nothing is compared against the previous trail
+    row or the planned stops yet, and a clock-skewed capture time is not a
+    plausibility flag until U12 says so. ``context`` is where U12 passes the
+    previous fix and the run's stops without changing the callers.
+    """
+    return ()
+
+
+def classify_custody(
+    fix: StoredFix | None,
+    stop: tuple[Any, Any] | None,
+    *,
+    custody_threshold_m: float,
+    accuracy_cap_m: float,
+    flags: Iterable[str] = (),
+) -> CustodyCheck:
+    """Classify a Board or Drop-off tap against the child's stop (R14, R20).
+
+    In order:
+
+    - the stop has no usable coordinates → ``unverified`` / ``stop-unverified``,
+      whatever the fix (the pin is what the office must fix first);
+    - no stored fix → ``unverified`` / ``no-fix``;
+    - the fix carries a plausibility flag → ``unverified`` / ``implausible``,
+      even when it is also coarse: a flagged fix is not evidence either way;
+    - accuracy above the cap → ``unverified`` / ``too-coarse``. The cap runs
+      before any subtraction: 800 m away with a 900 m radius is not "within";
+    - otherwise ``distance − accuracy`` against the threshold: past it is
+      ``away``, at or inside it is ``within``.
+
+    The distance travels on the verdict whenever fix and stop both exist.
+    """
+    point = _usable_point(stop)
+    distance = haversine_m((fix.lat, fix.lng), point) if fix is not None and point else None
+    reasons: list[str] = []
+    if point is None:
+        reasons.append(REASON_STOP_UNVERIFIED)
+    if fix is None:
+        reasons.append(REASON_NO_FIX)
+    else:
+        if any(True for _ in flags):
+            reasons.append(REASON_IMPLAUSIBLE)
+        if fix.accuracy_m > accuracy_cap_m:
+            reasons.append(REASON_TOO_COARSE)
+    if reasons:
+        reason = next(r for r in UNVERIFIED_REASONS if r in reasons)
+        return CustodyCheck(
+            classification=CUSTODY_UNVERIFIED, reason=reason,
+            distance_m=distance if reason != REASON_STOP_UNVERIFIED else None,
+        )
+    assert fix is not None and distance is not None
+    if distance - fix.accuracy_m > custody_threshold_m:
+        return CustodyCheck(classification=CUSTODY_AWAY, reason=None, distance_m=distance)
+    return CustodyCheck(classification=CUSTODY_WITHIN, reason=None, distance_m=distance)
+
+
+def within_vicinity(
+    fix: StoredFix | None,
+    stop: tuple[Any, Any] | None,
+    *,
+    vicinity_m: float,
+    accuracy_cap_m: float,
+) -> bool:
+    """Did this fix place the phone at the stop? The same geometry as the
+    custody check — cap first, then ``distance − accuracy`` inside the
+    vicinity radius — so "bus seen at stop" (R13) and, later, U15's arrival
+    nudge read one rule. A coarse fix on the stop vouches for nothing; a stop
+    without coordinates is never seen."""
+    point = _usable_point(stop)
+    if fix is None or point is None or fix.accuracy_m > accuracy_cap_m:
+        return False
+    return haversine_m((fix.lat, fix.lng), point) - fix.accuracy_m <= vicinity_m

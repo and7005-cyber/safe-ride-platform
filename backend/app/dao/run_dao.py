@@ -523,13 +523,23 @@ class RunDao:
                 # The absence arm matches reverse_driver_absence's own guard
                 # (source 'driver', marked by this login), so a driver mark that
                 # U8's precedence left attributed to the office or a parent
-                # correctly offers no undo here.
+                # correctly offers no undo here. The boarding arm (GPS plan U9)
+                # matches reverse_own_action's: this login's own confirmed
+                # boarding on a morning run with no later drop-off or hand-over.
                 undo_sql = """, (
                         exists (
                             select 1 from run_participation p
                             where p.run_id = %(run_id)s and p.student_id = s.id
                               and (p.dropped_off_at is not null or p.handover_at is not null)
                               and p.acting_driver_id = %(driver_id)s
+                        )
+                        or exists (
+                            select 1 from run_participation p3
+                            where p3.run_id = %(run_id)s and p3.student_id = s.id
+                              and %(run_type)s = 'morning'
+                              and p3.boarded_at is not null and p3.boarded_presumed = false
+                              and p3.dropped_off_at is null and p3.handover_at is null
+                              and p3.acting_driver_id = %(driver_id)s
                         )
                         or exists (
                             select 1 from live_student_absences a2
@@ -1364,29 +1374,108 @@ class RunDao:
         result["auto_resolved"] = auto_resolved
         return result
 
+    @staticmethod
+    def _listed_on_open_bypass(
+        conn, run: dict[str, Any], stop_order: int | None, student_id: str
+    ) -> bool:
+        """Before the outcome is written: does an open bypassed-stop exception
+        of this run list this child (GPS plan U3/R15, U9/R14)? The answer is
+        what makes the tap a resolution and exempts it from the custody check;
+        it can only be read before the tap gives the child an outcome. Its own
+        savepoint: a fault reads as "not listed" — the tap is then checked
+        normally, never refused."""
+        try:
+            with conn.transaction():
+                return exception_dao.listed_on_open_bypassed(
+                    conn, dict(run), stop_order, str(student_id)
+                )
+        except Exception:
+            logger.exception(
+                "bypassed-stop membership unavailable; the tap is checked normally "
+                "(run=%s stop_order=%s)",
+                run["id"], stop_order,
+            )
+            return False
+
     def _attach_resolution_tap(
         self, conn, run: dict[str, Any], event_id: str | None, student_id: str, action: str,
-        *, tap: _Tap | None = None,
-    ) -> None:
-        """Record the outcome as a bypassed-stop resolution when the child sits
-        at the stop of a pending prompt of this run (GPS plan U3/R15).
+        *, tap: _Tap | None = None, listed_before: bool = False,
+    ) -> bool:
+        """Record the outcome as a bypassed-stop resolution when an open
+        bypassed-stop exception of this run listed the child before the tap
+        (GPS plan U3/R15, U9/R14; ``listed_before`` from
+        ``_listed_on_open_bypass``).
 
         Every Board, Drop-off and Absent comes through here: membership on
         the run's own stop snapshot is the key, so a catch-up sequence from the
-        board page answers the prompt exactly as the card's shortcuts do. The
-        card's event id is a hint the DAO may log and ignore. In a savepoint —
-        the tap has already been recorded above it and is never refused (R23);
-        a failure flags the tap's trail row (U7/R40).
+        board page answers the prompt exactly as the card's shortcuts do — and
+        a dismissed prompt takes nothing away. The card's event id is a hint
+        the DAO may log and ignore. In a savepoint — the tap has already been
+        recorded above it and is never refused (R23); a failure flags the
+        tap's trail row (U7/R40).
+
+        Returns True when the tap was attached as a resolution: Board and
+        Drop-off then skip the custody check (R14 — a catch-up sequence must
+        never turn late Boards into false custody prompts); a failure here
+        reads as "not attached", so the check still runs.
         """
         try:
             with conn.transaction():
-                exception_dao.record_resolution(conn, dict(run), student_id, event_id=event_id)
+                attached = exception_dao.record_resolution(
+                    conn, dict(run), student_id, event_id=event_id,
+                    listed_before=listed_before,
+                )
+            return attached is not None
         except Exception:
             logger.exception(
                 "resolution tap not attached; the %s still commits (run=%s event=%s)",
                 action, run["id"], event_id,
             )
             self._flag_classification_failed(conn, tap)
+            return False
+
+    def _check_custody(
+        self, conn, run: dict[str, Any], stop: dict[str, Any], student_id: str,
+        student_name: str, tap: _Tap, action: str,
+    ) -> dict[str, Any] | None:
+        """The custody check for a Board or Drop-off (GPS plan U9/R14, R20),
+        in its own savepoint after the outcome, the trail row and the served
+        position are written: a far tap raises the per-stop custody exception
+        and its per-tap prompt, an untestable one records an unverified row,
+        a tap at the stop writes nothing. A failure rolls back to the
+        savepoint, flags the trail row `classification-failed` and is logged
+        with the run and stop order only — never a coordinate — so the tap
+        still commits with no prompt (R23, R40).
+        """
+        try:
+            with conn.transaction():
+                return exception_dao.record_custody_check(
+                    conn, dict(run), stop=dict(stop), student_id=str(student_id),
+                    student_name=student_name, fix=tap.fix, action_key=tap.key,
+                )
+        except Exception:
+            logger.exception(
+                "custody check not recorded; the %s still commits (run=%s stop_order=%s)",
+                action, run["id"], stop["stop_order"],
+            )
+            self._flag_classification_failed(conn, tap)
+            return None
+
+    @staticmethod
+    def _retract_custody_prompts(
+        conn, run: dict[str, Any], student_id: str, event_id: str | None
+    ) -> None:
+        """The undo's answer on the child's custody prompts (GPS plan U9/R14):
+        in a savepoint so a ledger fault never blocks the correction itself."""
+        try:
+            with conn.transaction():
+                exception_dao.retract_custody_prompts(
+                    conn, dict(run), str(student_id), event_id=event_id
+                )
+        except Exception:
+            logger.exception(
+                "custody prompt retraction failed; the undo still commits (run=%s)", run["id"]
+            )
 
     def record_parent_contact(
         self, scope: SchoolScope, run_id: str, student_id: str
@@ -1451,6 +1540,9 @@ class RunDao:
                 )
             if stop["stop_order"] > run["stops_completed"]:
                 raise ConflictError("Stop has not been reached yet")
+            # Read before the outcome lands: is this child on an open
+            # bypassed-stop exception of this run (U3/R15, U9/R14)?
+            listed_before = self._listed_on_open_bypass(conn, run, stop["stop_order"], student_id)
             row = conn.execute(
                 "update live_students set status = 'on-bus' where id = %s returning *",
                 (student_id,),
@@ -1463,7 +1555,12 @@ class RunDao:
             )
             self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
             self._serve_position(conn, tap, str(run["bus_id"]))
-            self._attach_resolution_tap(conn, run, event_id, student_id, "boarding", tap=tap)
+            # A resolution tap is exempt from the custody check (U9/R14);
+            # every other Board is classified against the child's stop.
+            if not self._attach_resolution_tap(
+                conn, run, event_id, student_id, "boarding", tap=tap, listed_before=listed_before
+            ):
+                self._check_custody(conn, run, stop, student_id, row["name"], tap, "boarding")
             # Recount students_boarded from participation in the SAME
             # transaction — never increment/decrement, so repeated taps can't
             # drift the counter (R15), and it no longer reads a status column
@@ -1524,6 +1621,7 @@ class RunDao:
                 raise ConflictError("Student is not on the bus")
             if aboard["dropped_off_at"] is not None or aboard["handover_at"] is not None:
                 raise ConflictError("This drop-off is already confirmed")
+            listed_before = self._listed_on_open_bypass(conn, run, stop["stop_order"], student_id)
             row = conn.execute(
                 "update live_students set status = 'dropped-off' where id = %s returning *",
                 (student_id,),
@@ -1531,7 +1629,12 @@ class RunDao:
             participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
             self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
             self._serve_position(conn, tap, str(run["bus_id"]))
-            self._attach_resolution_tap(conn, run, event_id, student_id, "drop-off", tap=tap)
+            # Same rule as Board (U9/R14): a resolution tap is exempt, every
+            # other Drop-off is classified against the child's stop.
+            if not self._attach_resolution_tap(
+                conn, run, event_id, student_id, "drop-off", tap=tap, listed_before=listed_before
+            ):
+                self._check_custody(conn, run, stop, student_id, row["name"], tap, "drop-off")
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
@@ -1605,10 +1708,11 @@ class RunDao:
         return body, public_run(run)
 
     def reverse_own_action(
-        self, scope: SchoolScope, student_id: str
+        self, scope: SchoolScope, student_id: str, *, event_id: str | None = None
     ) -> tuple[dict[str, Any], dict[str, Any], str]:
-        """Undo this driver's own drop-off, hand-over or absence mark while the
-        run is still open (U5/R10). Returns (student, run, what_was_reversed).
+        """Undo this driver's own drop-off, hand-over, boarding or absence mark
+        while the run is still open (U5/R10; GPS plan U9/R14, R35). Returns
+        (student, run, what_was_reversed).
 
         The closure gate makes a mis-tap consequential. A drop-off confirmed on
         the wrong child sends that family a false assurance and cannot be taken
@@ -1621,6 +1725,14 @@ class RunDao:
         guard with a justification independent of the finality argument, and
         relaxing it would regress that protection while appearing to change only
         UX.
+
+        The boarding arm (U9) is the one path behind both the custody card's
+        Undo and the board page's: this login's own confirmed boarding on this
+        open morning run, with no later drop-off or hand-over, is cleared to no
+        outcome — the child is neither aboard nor absent, and the driver will
+        record what happens at the stop (R35). Undoing a boarding or a drop-off
+        also answers the child's custody prompts on this run `retracted`;
+        ``event_id`` is the card's hint for that ledger, never the key.
 
         Scope is deliberately narrow: this driver's account, this run, still
         open. The driver assistant shares the login, so "their own action" means
@@ -1643,6 +1755,7 @@ class RunDao:
 
             record = participation_dao.get_for_student(conn, str(run["id"]), student_id)
             reversed_what: str | None = None
+            retract_custody = False
 
             if record and (record["dropped_off_at"] or record["handover_at"]):
                 if str(record["acting_driver_id"] or "") != str(driver_id):
@@ -1655,6 +1768,29 @@ class RunDao:
                 conn.execute(
                     "update live_students set status = 'on-bus' where id = %s", (student_id,)
                 )
+                # A far drop-off raised a custody prompt; its undo answers it.
+                retract_custody = reversed_what == "dropoff"
+            elif (
+                run["type"] == "morning"
+                and record
+                and record["boarded_at"] is not None
+                and not record["boarded_presumed"]
+            ):
+                # The boarding arm (U9): morning only — Board itself is
+                # morning-only, and an afternoon row is the auto-board's
+                # presumption, which Absent and Drop-off own.
+                if str(record["acting_driver_id"] or "") != str(driver_id):
+                    raise ForbiddenError("That was recorded by a different driver")
+                reversed_what = "boarding"
+                # No outcome at all: the row goes, the counter is recounted
+                # below, and the derived status falls back to at-home. The raw
+                # column (vestigial, CHECK-bound to four values) goes back to
+                # what a morning run's roster carries before a boarding.
+                participation_dao.clear_for_student(conn, str(run["id"]), student_id)
+                conn.execute(
+                    "update live_students set status = 'at-school' where id = %s", (student_id,)
+                )
+                retract_custody = True
             elif AbsenceDao().reverse_driver_absence(conn, student_id, str(driver_id)):
                 reversed_what = "absence"
                 # Back onto the run as boarded: the child was aboard, which is
@@ -1671,6 +1807,8 @@ class RunDao:
                 raise ConflictError(
                     "Nothing of yours to undo for this child on this run."
                 )
+            if retract_custody:
+                self._retract_custody_prompts(conn, run, student_id, event_id)
 
             counted = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))
@@ -1734,7 +1872,8 @@ class RunDao:
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
             stop = conn.execute(
-                "select 1 from run_stops where run_id = %s and student_id = %s limit 1",
+                "select stop_order from run_stops where run_id = %s and student_id = %s "
+                "order by stop_order asc limit 1",
                 (run["id"], student_id),
             ).fetchone()
             if not stop:
@@ -1743,6 +1882,9 @@ class RunDao:
                 conn, scope, envelope, action="absent", run_id=str(run["id"]),
                 identity={"student_id": str(student_id), "whole_day": bool(whole_day)},
             )
+            # Read before the absence lands (U3/R15): membership on an open
+            # bypassed-stop exception makes this mark its resolution.
+            listed_before = self._listed_on_open_bypass(conn, run, stop["stop_order"], student_id)
             period = "day" if whole_day else run["type"]
             # school_id stamped from the driver's scope (U7) — the roster
             # check above proved the student rides this school's run.
@@ -1812,7 +1954,10 @@ class RunDao:
             participation_dao.clear_for_student(conn, str(run["id"]), student_id)
             self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
             self._serve_position(conn, tap, str(run["bus_id"]))
-            self._attach_resolution_tap(conn, run, event_id, student_id, "absent mark", tap=tap)
+            self._attach_resolution_tap(
+                conn, run, event_id, student_id, "absent mark", tap=tap,
+                listed_before=listed_before,
+            )
             boarded_count = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))
                 if run["type"] == "afternoon"

@@ -159,8 +159,10 @@ test("morning run: explicit start, confirmed boarding, completed-today lock", as
   await expect(boardButton).toBeEnabled();
   await boardButton.click();
 
-  // Boarding asks for confirmation naming the student, and is final (R29):
-  // once confirmed the row shows a static badge — no Off/undo control.
+  // Boarding asks for confirmation naming the student (R29); once confirmed
+  // the row shows the badge and no "Off" toggle — un-boarding stays refused.
+  // (Since the GPS work the row offers Undo through the reverse path, the
+  // correction that tells the family; that is not a toggle.)
   const boardDialog = page.getByRole("dialog");
   await expect(boardDialog.getByText(/Board .+\?/)).toBeVisible();
   await boardDialog.getByRole("button", { name: "Board", exact: true }).click();

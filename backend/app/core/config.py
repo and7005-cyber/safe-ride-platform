@@ -20,6 +20,8 @@ GPS_KEY_LOCK_TIMEOUT_MS = 2000       # wait on an in-flight duplicate before 409
 GPS_FIX_ACCURACY_CAP_M = 200.0       # accuracy above this is `coarse`
 GPS_CLOCK_SKEW_TOLERANCE_S = 30      # capture time this far ahead of receipt is skew
 GPS_STALE_AFTER_S = 90               # a served position older than this reads stale (U8)
+GPS_CUSTODY_THRESHOLD_M = 150.0      # Board/Drop-off further than this (less accuracy) is `away` (U9)
+GPS_VICINITY_RADIUS_M = 100.0        # a fix this close (less accuracy) counts as "at the stop" (U9)
 
 
 def _maybe_b64_json(value: str) -> str:

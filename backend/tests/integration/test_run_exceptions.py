@@ -35,6 +35,7 @@ import os
 import random
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import psycopg
@@ -271,16 +272,44 @@ def _students_by_order(fleet, layout: dict) -> dict[int, list[dict]]:
     return out
 
 
-def _board(client, driver_headers, student_id: str) -> httpx.Response:
+def _stop_fix(student_id: str, *, north_m: float = 0.0, accuracy: float = 12.0) -> dict | None:
+    """A fix at (or ``north_m`` metres north of) the child's stop on the
+    driver's open run today. Since U9 a Board or Drop-off without a fix is
+    recorded as an unverified check and one 1.8 km away as a custody
+    exception; these tests are about the bypassed stop, so their outcome taps
+    carry a fix at the stop unless a test says otherwise."""
+    with db() as conn:
+        row = conn.execute(
+            """
+            select rs.lat, rs.lng from run_stops rs
+            join live_runs r on r.id = rs.run_id
+            where rs.student_id = %s and r.status <> 'completed'
+              and r.date = (now() at time zone 'Africa/Nairobi')::date
+            order by r.created_at desc limit 1
+            """,
+            (student_id,),
+        ).fetchone()
+    if not row or row["lat"] is None or row["lng"] is None:
+        return None
+    return {
+        "lat": row["lat"] + north_m / 111_195.0, "lng": row["lng"], "accuracy_m": accuracy,
+        "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+    }
+
+
+def _board(client, driver_headers, student_id: str, *, fix: dict | None = None) -> httpx.Response:
     return client.post(
-        "/api/runs/driver/boarding", json={"student_id": student_id, "on_bus": True},
+        "/api/runs/driver/boarding",
+        json={"student_id": student_id, "on_bus": True, "fix": fix or _stop_fix(student_id)},
         headers=driver_headers,
     )
 
 
-def _dropoff(client, driver_headers, student_id: str) -> httpx.Response:
+def _dropoff(client, driver_headers, student_id: str, *, fix: dict | None = None) -> httpx.Response:
     return client.post(
-        "/api/runs/driver/dropoff", json={"student_id": student_id}, headers=driver_headers
+        "/api/runs/driver/dropoff",
+        json={"student_id": student_id, "fix": fix or _stop_fix(student_id)},
+        headers=driver_headers,
     )
 
 
@@ -1134,7 +1163,7 @@ def test_parents_track_children_and_alerts_never_carry_exceptions_or_the_office_
 
 PROMPT_KEYS = {
     "event_id", "exception_id", "kind", "stop_order", "stop_name", "student_id",
-    "students", "answers", "created_at", "delivered_at", "shown_at",
+    "students", "answers", "distance_m", "created_at", "delivered_at", "shown_at",
 }
 
 
@@ -1174,10 +1203,13 @@ def _ledger(exception_id: str) -> list[dict]:
         ).fetchall()
 
 
-def _board_via(client, headers, student_id: str, event_id: str | None) -> httpx.Response:
+def _board_via(
+    client, headers, student_id: str, event_id: str | None, *, fix: dict | None = None
+) -> httpx.Response:
     return client.post(
         "/api/runs/driver/boarding",
-        json={"student_id": student_id, "on_bus": True, "event_id": event_id},
+        json={"student_id": student_id, "on_bus": True, "event_id": event_id,
+              "fix": fix or _stop_fix(student_id)},
         headers=headers,
     )
 
@@ -1373,7 +1405,9 @@ def test_resolution_taps_through_the_card_attach_to_the_prompt(client, admin_hea
     Boarding D through the card leaves the two-child prompt pending and
     shorter (E only) with D on the ledger as a resolution; marking E absent
     through it answers the prompt as `resolution` and resolves the exception.
-    Custody exemption for these taps is U9's assertion — placeholder here."""
+    The resolution tap is exempt from the custody check (U9/R14): D's board
+    through the card carries a fix 5 km from the stop and raises nothing,
+    while a child the exception does not list is checked normally."""
     run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
     run_id = run["id"]
     try:
@@ -1381,7 +1415,8 @@ def test_resolution_taps_through_the_card_attach_to_the_prompt(client, admin_hea
         prompt = drive["responses"][-1]["prompts"][0]
         event_id, exception_id = prompt["event_id"], prompt["exception_id"]
 
-        assert _board_via(client, fleet["driver_headers"], fleet["d"]["id"], event_id).status_code == 200
+        far = _stop_fix(fleet["d"]["id"], north_m=5000)
+        assert _board_via(client, fleet["driver_headers"], fleet["d"]["id"], event_id, fix=far).status_code == 200
         assert _event(event_id)["prompt_state"] == "pending"
         ledger = _ledger(exception_id)
         assert [e["response"] for e in ledger] == [None, "resolution"]
@@ -1399,15 +1434,29 @@ def test_resolution_taps_through_the_card_attach_to_the_prompt(client, admin_hea
         assert _pending(client, fleet["driver_headers"]) == []
         done = _bypassed(client, admin_headers, run_id)[0]
         assert done["status"] == "resolved"
-        # U9 placeholder: a resolution tap is exempt from the custody check.
-        # Nothing raises custody-away until U9 lands; the assertion is named
-        # here so U9 turns it into the real one.
+        # The exemption (U9/R14): D's far board was a resolution tap, so no
+        # custody exception exists on the run.
         assert all(x["kind"] != "custody-away" for x in _exceptions(client, admin_headers, run_id).json())
 
         # The prompt is answered: a spoken answer now is a conflict.
         late = _respond(client, fleet["driver_headers"], event_id, "dismissed")
         assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-already-answered"
         assert late.json()["detail"]["response"] == "resolution"
+
+        # A child the exception never listed: C (boarded at C's own stop on
+        # the way, no prompt there) re-boarded from 5 km away is checked
+        # normally — one custody exception at C's stop naming C.
+        c_far = _stop_fix(fleet["c"]["id"], north_m=5000)
+        assert _board_via(client, fleet["driver_headers"], fleet["c"]["id"], event_id, fix=c_far).status_code == 200
+        custody = [x for x in _exceptions(client, admin_headers, run_id).json() if x["kind"] == "custody-away"]
+        assert len(custody) == 1
+        assert custody[0]["stop_order"] == drive["layout"]["by_student"][fleet["c"]["id"]]
+        assert [s["id"] for s in custody[0]["students"]] == [fleet["c"]["id"]]
+        assert custody[0]["status"] == "open"
+        checked = _pending(client, fleet["driver_headers"])
+        assert [p["kind"] for p in checked] == ["custody-away"]
+        assert checked[0]["student_id"] == fleet["c"]["id"]
+        assert checked[0]["distance_m"] == pytest.approx(5000, abs=10)
     finally:
         purge_run(run_id)
         _clear_absences_for(client, admin_headers, fleet["e"]["id"])
@@ -1451,15 +1500,55 @@ def test_the_event_id_is_a_hint_and_membership_selects_the_prompt(client, admin_
         assert len(_ledger(c_prompt["exception_id"])) == 1
         assert _event(c_prompt["event_id"])["prompt_state"] == "pending"
 
-        # C's prompt dismissed, then C boarded naming it: the tap stands; with
-        # no pending prompt at C's stop nothing is attached, the dismissed
-        # answer stays.
+        # C's prompt dismissed, then C boarded naming it: the tap stands, and
+        # membership on the still-open exception records it as the resolution
+        # (U9/R14 — a dismissed prompt takes nothing away); the dismissed
+        # answer itself stays as it was, and the exception resolves on read.
         assert _respond(client, fleet["driver_headers"], c_prompt["event_id"], "dismissed").status_code == 200
         answered_id = _board_via(client, fleet["driver_headers"], fleet["c"]["id"], c_prompt["event_id"])
         assert answered_id.status_code == 200, answered_id.text
-        assert len(_ledger(c_prompt["exception_id"])) == 1
+        c_ledger = _ledger(c_prompt["exception_id"])
+        assert [(e["prompt_state"], e["response"]) for e in c_ledger] == [
+            ("answered", "dismissed"), (None, "resolution"),
+        ]
+        assert str(c_ledger[1]["student_id"]) == fleet["c"]["id"]
         assert _event(c_prompt["event_id"])["response"] == "dismissed"
         assert _at_stop(run_id, "morning", c_order) == []
+        c_row = next(x for x in _bypassed(client, admin_headers, run_id) if x["id"] == c_prompt["exception_id"])
+        assert c_row["status"] == "resolved"
+    finally:
+        purge_run(run_id)
+
+
+def test_a_dismissed_prompt_takes_nothing_from_the_custody_exemption(client, admin_headers, fleet):
+    """U9/R14 by membership: the bypassed-stop prompt for A's stop is
+    dismissed, then A is boarded 2 km from the stop. The board is still the
+    open exception's resolution — one ledger event, the exception resolves on
+    read — and raises no custody exception and no prompt. A second tap for A,
+    now accounted for and no longer listed, is checked normally."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        prompt = _raise_at_stop_of(client, fleet, run_id, fleet["a"])
+        assert _respond(client, fleet["driver_headers"], prompt["event_id"], "dismissed").status_code == 200
+        far = _stop_fix(fleet["a"]["id"], north_m=2000)
+        assert _board(client, fleet["driver_headers"], fleet["a"]["id"], fix=far).status_code == 200
+        ledger = _ledger(prompt["exception_id"])
+        assert [(e["prompt_state"], e["response"]) for e in ledger] == [
+            ("answered", "dismissed"), (None, "resolution"),
+        ]
+        assert str(ledger[1]["student_id"]) == fleet["a"]["id"]
+        rows = _exceptions(client, admin_headers, run_id).json()
+        assert [x["kind"] for x in rows] == [STOP_BYPASSED]
+        assert rows[0]["status"] == "resolved"
+        assert _pending(client, fleet["driver_headers"]) == []
+
+        assert _board(client, fleet["driver_headers"], fleet["a"]["id"], fix=far).status_code == 200
+        custody = [x for x in _exceptions(client, admin_headers, run_id).json() if x["kind"] == "custody-away"]
+        assert len(custody) == 1
+        assert [s["id"] for s in custody[0]["students"]] == [fleet["a"]["id"]]
+        assert len(_ledger(prompt["exception_id"])) == 2, "the second tap is no resolution"
+        assert [p["kind"] for p in _pending(client, fleet["driver_headers"])] == ["custody-away"]
     finally:
         purge_run(run_id)
 
@@ -1490,7 +1579,9 @@ def test_arrive_closes_only_shown_remote_absents_and_board_closes_nothing(client
         by_id = {p["event_id"]: p for p in _pending(client, fleet["driver_headers"])}
         assert by_id[shown["event_id"]]["student_id"] == fleet["c"]["id"]
         assert _names(by_id[shown["event_id"]]["students"]) == [fleet["c"]["name"]]
-        assert by_id[custody["event_id"]]["answers"] == []
+        # The custody confirm's one spoken answer (U9); undo goes through the
+        # reverse path and is recorded there.
+        assert by_id[custody["event_id"]]["answers"] == ["confirmed"]
 
         # A Board of a child at another stop (B's, not the bypassed A's) while
         # everything is pending closes nothing — no auto-resolution, and no

@@ -162,6 +162,7 @@ export type NotificationType =
   | "incident"
   | "admin-notice"
   | "ride-cancelled"
+  | "boarding-corrected"
   | "custom";
 
 export const NOTIFICATION_LABEL: Record<NotificationType, string> = {
@@ -175,6 +176,9 @@ export const NOTIFICATION_LABEL: Record<NotificationType, string> = {
   incident: "Bus incident",
   "admin-notice": "School notice",
   "ride-cancelled": "Ride cancelled",
+  // The driver withdrew a boarding mark (GPS plan U9/R35). Neutral on
+  // purpose: it says the mark is gone, not where the child is.
+  "boarding-corrected": "Boarding mark withdrawn",
   custom: "Notice",
 };
 
@@ -189,6 +193,7 @@ export const NOTIFICATION_VARIANT: Record<NotificationType, BadgeVariant> = {
   incident: "destructive",
   "admin-notice": "warning",
   "ride-cancelled": "secondary",
+  "boarding-corrected": "secondary",
   custom: "secondary",
 };
 

@@ -90,6 +90,9 @@ const RESPONSE_LABEL: Record<string, string> = {
   "told-me": "a parent or the office told the driver",
   "not-at-stop": "the driver was not at the stop",
   undo: "undone by the driver",
+  // The custody undo (GPS plan U9): a pending prompt answered this way, or
+  // the row appended after a confirmation the driver later withdrew.
+  retracted: "undone by the driver",
 };
 
 export interface RunExceptionEvent {
@@ -119,7 +122,10 @@ export interface RunException {
   fix_captured_at: string | null;
   distance_m: number | null;
   seen_at_stop: boolean | null;
-  status: "open" | "resolved" | null;
+  /** Derived by the server: open/resolved for a bypassed stop (current
+   * outcomes), open/confirmed/retracted for a custody tap (its prompt
+   * answers); null for the kinds that define none. */
+  status: "open" | "resolved" | "confirmed" | "retracted" | null;
   created_at: string;
   reviewed_at: string | null;
   reviewed_by_display: string | null;
@@ -189,15 +195,32 @@ export function seenAtStopLine(x: Pick<RunException, "seen_at_stop">): string | 
 }
 
 /** The children the row is about: the ones still without an outcome for a
- * stop-keyed kind, the named child for a student-keyed one. */
+ * bypassed stop, the children tapped for a custody or unverified row, the
+ * named child for a student-keyed one. */
 export function childrenLine(x: Pick<RunException, "kind" | "students" | "student_name" | "status">): string | null {
   if (x.students.length > 0) {
     const names = x.students.map((s) => s.name);
-    return `Still no outcome: ${names.join(", ")}`;
+    return x.kind === "stop-bypassed" ? `Still no outcome: ${names.join(", ")}` : names.join(", ");
   }
   if (x.student_name) return x.student_name;
   if (x.status === "resolved") return "Every child at this stop now has an outcome";
   return null;
+}
+
+/** The status badge's wording and tone, or null when the kind defines none. */
+export function statusBadge(status: RunException["status"]): { label: string; variant: "warning" | "success" | "secondary" } | null {
+  switch (status) {
+    case "open":
+      return { label: "Open", variant: "warning" };
+    case "resolved":
+      return { label: "Resolved", variant: "success" };
+    case "confirmed":
+      return { label: "Confirmed by driver", variant: "success" };
+    case "retracted":
+      return { label: "Retracted", variant: "secondary" };
+    default:
+      return null;
+  }
 }
 
 /** One ledger event in plain words, oldest first in the panel. */
@@ -290,6 +313,7 @@ export function RunExceptionsPanel({
             const reason = reasonLabel(x.reason);
             const children = childrenLine(x);
             const note = kindNote(x.kind);
+            const status = statusBadge(x.status);
             return (
               <li
                 key={x.id}
@@ -300,10 +324,10 @@ export function RunExceptionsPanel({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="font-medium">{kindLabel(x.kind)}</span>
                   {reason && <span className="text-muted-foreground">— {reason}</span>}
-                  {/* Derived by the server from current outcomes; only the
-                      kinds that define it carry it. */}
-                  {x.status === "open" && <Badge variant="warning">Open</Badge>}
-                  {x.status === "resolved" && <Badge variant="success">Resolved</Badge>}
+                  {/* Derived by the server — from current outcomes for a
+                      bypassed stop, from the prompt answers for a custody
+                      tap; only the kinds that define it carry it. */}
+                  {status && <Badge variant={status.variant}>{status.label}</Badge>}
                 </div>
                 {note && <p className="text-xs text-muted-foreground">{note}</p>}
                 <div className="grid gap-x-4 gap-y-1 sm:grid-cols-2">

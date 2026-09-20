@@ -112,6 +112,43 @@ def add_flag(conn, row_id: str, flag: str) -> None:
     )
 
 
+def run_fixes(
+    conn, run_id: str, *, default_retention_days: int = GPS_POSITION_RETENTION_DAYS
+) -> list[StoredFix]:
+    """Every phone fix on a run's trail inside the school's retention, oldest
+    first — the read behind "bus seen at stop" (U9, R13).
+
+    Phone fixes only: a checkpoint row is the planned stop coordinate stamped
+    by a fix-less Arrive, and counting it would make every stop "seen" by
+    construction — the fabricated corroboration the plan warns about. Rows
+    past retention are never served (R12), so a purge that has not run yet
+    is invisible here too.
+    """
+    rows = conn.execute(
+        """
+        select p.lat, p.lng, p.accuracy_m, p.captured_at
+        from run_positions p
+        join live_runs r on r.id = p.run_id
+        left join live_schools s on s.id = r.school_id
+        where p.run_id = %s
+          and p.source <> %s
+          and p.lat is not null and p.lng is not null
+          and p.accuracy_m is not null and p.captured_at is not null
+          and p.received_at >= now() - make_interval(
+                secs => coalesce(s.position_retention_days, %s) * 86400)
+        order by p.received_at asc, p.id asc
+        """,
+        (run_id, SOURCE_CHECKPOINT, default_retention_days),
+    ).fetchall()
+    return [
+        StoredFix(
+            lat=row["lat"], lng=row["lng"], accuracy_m=row["accuracy_m"],
+            captured_at=row["captured_at"],
+        )
+        for row in rows
+    ]
+
+
 # --- the served position (five columns, one statement) -------------------------
 
 
