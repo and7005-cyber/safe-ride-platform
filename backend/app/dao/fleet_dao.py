@@ -7,7 +7,12 @@ from app.core.db import get_connection
 from app.core.errors import BadRequestError, ConflictError, NotFoundError, SafeRideError
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import record_audit
-from app.dao.status_sql import bus_status_case
+from app.dao.status_sql import (
+    RAW_POSITION_COLUMNS,
+    bus_position_columns,
+    bus_status_case,
+    pop_position,
+)
 from app.services import geo_service
 # The ONE server-side stop-cap authority (U8): the solver's cap, shared with
 # the frontend's PLANNER_STOPS_CAP meaning. plan_solver is pure logic (stdlib +
@@ -1031,53 +1036,35 @@ class FleetDao:
     # --- buses -------------------------------------------------------------
 
     def list_buses(self, scope: SchoolScope) -> list[dict[str, Any]]:
+        """The school's buses, each with ``derived_status`` and ``position``.
+
+        derived_status (U9) replaces the hand-maintained status column as the
+        value every admin surface reads. The raw column still travels in the
+        payload (select *) but nothing should render it.
+
+        ``position`` (GPS plan U8) is the one served position with its
+        freshness — lat, lng, source, position_at, accuracy_m, age_s, stale,
+        gps_off, no_gps_for_run, label — or None while the bus has none. The
+        shared fragment in ``status_sql`` derives every field, and the five
+        write-side columns are detached from the row so a client cannot read
+        around it (the pre-U8 Python label loop is gone with them).
+        """
         with get_connection(scope) as conn:
-            # derived_status (U9) replaces the hand-maintained status column as
-            # the value every admin surface reads. The raw column still travels
-            # in the payload (select *) but nothing should render it.
             rows = conn.execute(
-                f"select b.*, {bus_status_case('b')} as derived_status "
-                "from live_buses b where b.school_id = %s order by b.name asc",
+                f"""
+                select b.*, {bus_status_case('b')} as derived_status,
+                       {bus_position_columns('b')}
+                from live_buses b where b.school_id = %s order by b.name asc
+                """,
                 (scope.school_id,),
             ).fetchall()
-            buses = [dict(r) for r in rows]
-            # Derive a live position status from the bus's active run (no GPS):
-            # at-school / at-stop / starting. Position itself lives in
-            # current_lat/lng, set on start (school) and each arrival (stop).
-            for b in buses:
-                b["position_state"] = "idle"
-                b["position_label"] = None
-                run = conn.execute(
-                    """
-                    select id, stops_completed, total_stops from live_runs
-                    where bus_id = %s and status <> 'completed'
-                      and date = (now() at time zone 'Africa/Nairobi')::date
-                    order by created_at desc limit 1
-                    """,
-                    (b["id"],),
-                ).fetchone()
-                if not run:
-                    continue
-                completed = run["stops_completed"] or 0
-                if completed <= 0:
-                    b["position_state"] = "starting"
-                    b["position_label"] = "Starting — at school"
-                    continue
-                stop = conn.execute(
-                    "select name, is_school_gate from run_stops "
-                    "where run_id = %s and stop_order = %s order by is_school_gate desc limit 1",
-                    (run["id"], completed),
-                ).fetchone()
-                if stop and stop["is_school_gate"]:
-                    b["position_state"] = "at-school"
-                    b["position_label"] = "At school"
-                elif stop:
-                    nxt = conn.execute(
-                        "select 1 from run_stops where run_id = %s and stop_order = %s limit 1",
-                        (run["id"], completed + 1),
-                    ).fetchone()
-                    b["position_state"] = "at-stop"
-                    b["position_label"] = f"At {stop['name']}" + (" · en route to next" if nxt else "")
+        buses = []
+        for r in rows:
+            bus = dict(r)
+            bus["position"] = pop_position(bus)
+            for column in RAW_POSITION_COLUMNS:
+                bus.pop(column, None)
+            buses.append(bus)
         return buses
 
     def create_bus(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:

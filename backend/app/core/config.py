@@ -19,6 +19,7 @@ GPS_ACTION_KEY_TTL_DAYS = 7          # idempotency keys purged after this
 GPS_KEY_LOCK_TIMEOUT_MS = 2000       # wait on an in-flight duplicate before 409
 GPS_FIX_ACCURACY_CAP_M = 200.0       # accuracy above this is `coarse`
 GPS_CLOCK_SKEW_TOLERANCE_S = 30      # capture time this far ahead of receipt is skew
+GPS_STALE_AFTER_S = 90               # a served position older than this reads stale (U8)
 
 
 def _maybe_b64_json(value: str) -> str:

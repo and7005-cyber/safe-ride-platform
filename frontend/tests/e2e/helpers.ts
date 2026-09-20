@@ -506,6 +506,31 @@ export function sqlUnreviewException(exceptionId: string): void {
   );
 }
 
+/**
+ * Age a bus's served position by `seconds` (GPS plan U8, R27/AE13). **Setup
+ * for staleness specs only**: nothing in the product can back-date a fix, and
+ * waiting out the staleness threshold is not a test. The backdate_run
+ * precedent.
+ */
+export function sqlAgeBusPosition(busId: string, seconds: number): void {
+  psql(
+    `update live_buses set position_at = now() - make_interval(secs => ${Math.floor(seconds)}) ` +
+      `where id = '${busId}'`,
+  );
+}
+
+/**
+ * Null a bus's served position. **Teardown only**: purgeRun deletes the run
+ * but not the five position columns End Run would have cleared, and a leftover
+ * pair reads as a live bus on the next spec's fleet map.
+ */
+export function sqlClearBusPosition(busId: string): void {
+  psql(
+    `update live_buses set current_lat = null, current_lng = null, position_source = null, ` +
+      `position_at = null, position_accuracy_m = null where id = '${busId}'`,
+  );
+}
+
 /** Close any support session a crashed run left open for the seeded provider. */
 export function sqlEndProviderSupportSessions(): void {
   psql(

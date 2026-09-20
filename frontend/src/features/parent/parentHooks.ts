@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Home, MapPin, Bell, User, type LucideIcon } from "lucide-react";
 import { api } from "@/lib/apiClient";
+import type { ParentBusPosition } from "@/lib/positionFreshness";
 import { POLL_LIVE } from "@/lib/queries";
 
 export const PARENT_NAV: { to: string; label: string; icon: LucideIcon; end?: boolean }[] = [
@@ -132,8 +133,20 @@ export function useParentProfile() {
   });
 }
 
+// Track (GPS plan U8, R37): the bus is resolved through today's run the child
+// is ON, never the home bus, and its position arrives as the parent allowlist
+// {lat, lng, position_at, stale} — no source, accuracy or exception state
+// (R22). `bus` and `bus_position` are null outside an in-progress run.
+export interface TrackResponse {
+  student: Record<string, any>;
+  stops: any[];
+  run: Record<string, any> | null;
+  bus: { id: string; name: string | null } | null;
+  bus_position: ParentBusPosition | null;
+}
+
 export function useTrack(studentId: string | null) {
-  return useQuery({
+  return useQuery<TrackResponse>({
     queryKey: ["parent-track", studentId],
     queryFn: () => api.get("/api/parent-portal/track", { student_id: studentId }),
     enabled: Boolean(studentId),
