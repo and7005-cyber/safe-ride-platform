@@ -50,6 +50,8 @@ const ADMIN_INCIDENT_VALUES = [
   // The closure events (U11): every one of them changes what a completed run
   // means, so each needs office wording rather than a raw slug.
   "closure-refused", "force-closed", "handover-recorded", "action-reversed",
+  // The two stop exceptions that also raise an office alert (GPS plan U4).
+  "stop-bypassed", "absent-remote",
 ] as const;
 const PARENT_INCIDENT_VALUES = [
   "breakdown", "accident", "student", "traffic", "other",
@@ -172,8 +174,20 @@ describe("cross-role agreement", () => {
     for (const officeOnly of [
       "arrival", "run-started", "run-completed", "cancellation",
       "closure-refused", "force-closed", "handover-recorded", "action-reversed",
+      "stop-bypassed", "absent-remote",
     ]) {
       expect(Object.keys(PARENT_INCIDENT_LABEL)).not.toContain(officeOnly);
+    }
+  });
+
+  it("keeps stop exceptions out of the parent vocabulary entirely (R22)", () => {
+    // Parents never see exceptions. The two exception kinds that also raise an
+    // office alert have admin wording and must never acquire parent wording;
+    // the panel's own kind labels live with the panel, not in a parent map.
+    for (const type of ["stop-bypassed", "absent-remote"] as const) {
+      expect(ADMIN_INCIDENT_LABEL[type]).toBeTruthy();
+      expect(PARENT_INCIDENT_LABEL).not.toHaveProperty(type);
+      expect(PARENT_INCIDENT_VARIANT).not.toHaveProperty(type);
     }
   });
 });

@@ -209,7 +209,9 @@ export type IncidentType =
   | "closure-refused"
   | "force-closed"
   | "handover-recorded"
-  | "action-reversed";
+  | "action-reversed"
+  | "stop-bypassed"
+  | "absent-remote";
 
 export const ADMIN_INCIDENT_LABEL: Record<IncidentType, string> = {
   breakdown: "Vehicle breakdown",
@@ -226,6 +228,11 @@ export const ADMIN_INCIDENT_LABEL: Record<IncidentType, string> = {
   "force-closed": "Route force-closed",
   "handover-recorded": "Left the bus off-route",
   "action-reversed": "Driver correction",
+  // The two stop exceptions loud enough to reach the office feed as well as
+  // the run's exceptions panel (GPS plan U4/R21). Office-only: each one names
+  // a child whose whereabouts the driver's taps did not establish.
+  "stop-bypassed": "Stop passed without outcomes",
+  "absent-remote": "Absent marked away from the stop",
 };
 
 export const ADMIN_INCIDENT_VARIANT: Record<IncidentType, BadgeVariant> = {
@@ -245,6 +252,10 @@ export const ADMIN_INCIDENT_VARIANT: Record<IncidentType, BadgeVariant> = {
   "force-closed": "warning",
   "handover-recorded": "warning",
   "action-reversed": "secondary",
+  // Safety-critical, not routine: a child may have been left at a stop or
+  // marked absent from kilometres away.
+  "stop-bypassed": "warning",
+  "absent-remote": "warning",
 };
 
 /** What a parent can actually receive — lifecycle and arrival rows are excluded

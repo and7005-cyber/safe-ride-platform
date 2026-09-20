@@ -133,6 +133,21 @@ export function useActiveRuns() {
   });
 }
 
+/**
+ * One run's post-run report (R14) — bus, driver, absences, the contact
+ * obligation and, since GPS plan U4, the run's stop exceptions. Fetched fresh
+ * each time a run's dialog opens; the exceptions panel invalidates this key
+ * after a review so the row re-reads with its stamp.
+ */
+export function useRunReport(runId: string | null) {
+  const schoolId = useActiveSchoolId();
+  return useQuery({
+    queryKey: schoolKeyFor(schoolId, "run-report", runId),
+    queryFn: ({ signal }) => api.get(`/api/runs/${runId}/report`, undefined, { signal }),
+    enabled: Boolean(schoolId) && Boolean(runId),
+  });
+}
+
 export function useIncidents() {
   const schoolId = useActiveSchoolId();
   return useQuery({

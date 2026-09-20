@@ -65,6 +65,9 @@ describe("the user manual keeps up with the shipped vocabulary", () => {
       "force-closed",
       "handover-recorded",
       "action-reversed",
+      // The two stop exceptions that reach the alerts feed (GPS plan U4).
+      "stop-bypassed",
+      "absent-remote",
     ] as const) {
       const label = ADMIN_INCIDENT_LABEL[type];
       expect(admin, `admin guide never mentions the "${label}" alert`).toContain(label);

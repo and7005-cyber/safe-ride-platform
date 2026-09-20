@@ -39,11 +39,26 @@ class RunDao:
                 " and r.status <> 'completed' "
                 "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
             )
+        # Stop exceptions still awaiting the office (GPS plan U4/R21): the
+        # stored reviewed_at alone, never the derived open/resolved status —
+        # deriving it would re-run the per-stop outcome predicate across every
+        # run in history on each poll of this list. The column is absent, not
+        # zero, for a driver: exceptions are office-facing (R22), and this
+        # list is the one read a driver shares with staff.
+        exception_count_sql = ""
         if scope.role == "driver":
             where += (
                 " and r.bus_id in (select id from live_buses "
                 "where driver_id = %(driver_id)s and school_id = %(school_id)s)"
             )
+        else:
+            exception_count_sql = """,
+                       (
+                           select count(*) from run_exceptions x
+                           where x.run_id = r.id
+                             and x.school_id = r.school_id
+                             and x.reviewed_at is null
+                       ) as exception_count"""
         with get_connection(scope) as conn:
             rows = conn.execute(
                 f"""
@@ -62,7 +77,7 @@ class RunDao:
                            where p.run_id = r.id
                              and p.unaccounted_at is not null
                              and p.contacted_at is null
-                       ) as contact_pending
+                       ) as contact_pending{exception_count_sql}
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id

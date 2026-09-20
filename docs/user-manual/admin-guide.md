@@ -241,15 +241,40 @@ If a draft carries the badge **"Schedule couldn't be fully optimised — times a
 
 ## Run History
 
-Every run — in progress or finished — is listed here with progress ("X/Y stops · A/B boarded") and status (**In progress / Delayed / Completed**), plus up to three flags that tell you a run needs you:
+Every run — in progress or finished — is listed here with progress ("X/Y stops · A/B boarded") and status (**In progress / Delayed / Completed**), plus up to four flags that tell you a run needs you:
 
 | Flag | What it means | What to do |
 | --- | --- | --- |
 | **No taps** | The bus has stopped recording arrivals for 15 minutes or more. Usually a dead or lost phone. Not the same as **Delayed**, which is *your* judgement about the schedule | Call the driver |
 | **Needs closing** | The run is still open and its day has passed. It has fallen out of every driver screen, so only you can end it | Force-close it |
 | **N to call** | That run left children unaccounted for and their families have not been phoned yet | Open the run and work through the list |
+| **N to review** | That run raised stop exceptions nobody in the office has looked at yet (see [Stop exceptions](#stop-exceptions)) | Open the run, read each one, mark it reviewed |
 
-**Click any run** to open its **Run Report**: bus, driver, date, start and end time, stops completed, students boarded (or dropped off, for afternoon runs), the list of absent students with reasons, and — if the run left anyone unaccounted for — the families you owe a call.
+The same flags appear on the Dashboard's **Active Runs** card for runs still open today, so the two screens always agree.
+
+**Click any run** to open its **Run Report**: bus, driver, date, start and end time, stops completed, students boarded (or dropped off, for afternoon runs), the list of absent students with reasons, the run's stop exceptions, and — if the run left anyone unaccounted for — the families you owe a call.
+
+### Stop exceptions
+
+A stop exception is the app noticing that a driver's taps and the bus's position do not agree, or that a stop was passed with nothing recorded. It is recorded on the run, shown to the driver as a prompt where a prompt is useful, and listed for you in the run's report. **A tap always completes** — an exception never blocks a boarding or an absent mark; it flags it. Parents never see exceptions.
+
+Each exception shows its kind, the stop, the children concerned, what the driver's phone reported, the driver's answer to the prompt, and who in the office has reviewed it.
+
+| Kind | What it means |
+| --- | --- |
+| **Stop passed without outcomes** | The driver tapped Arrive at a later stop while a child at this stop still had no outcome — not boarded, dropped off, absent or handed over. The driver is prompted with a tone to record them. The row stays **Open** until every listed child has an outcome and reads **Resolved** after; an undo reopens it. This one also arrives on the Alerts page |
+| **Absent marked away from the stop** | The driver marked a child absent from well outside the stop and did not say that a parent or the office had told them the child was not coming. The family received the standard absent notice **and** a call-now notice asking them to ring the school. This one also arrives on the Alerts page. Call the family if they have not called you |
+| **Absent attested by the driver** | The driver marked a child absent away from the stop and answered that a parent or the office had told them. Kept for history only; no alert and no call-now notice |
+| **Tap far from the stop** | A Board or Drop-off was tapped further from the child's stop than the school's threshold allows. The driver was asked to confirm or undo, and the answer is recorded. **Bus seen at stop: yes** means some fix on the run did place the bus at that stop — a driver who pulled away before tapping. **No** means nothing placed the bus there |
+| **Check not verified** | The location check for a tap could not be made, with the reason: no fix for this action, fix too coarse, or stop position unverified (the stop's pin needs fixing on the route). No prompt, no alert |
+| **Implausible movement** | A fix on the run moved further or faster than a bus can, or reported an accuracy that cannot be trusted. Listed once per run for you to look at |
+
+Two things to keep apart when you read one:
+
+- **Open / Resolved** is about the children: it says whether the situation still stands, and the app works it out from the run's current records. You cannot change it here.
+- **Reviewed** is about you: it means a director or coordinator has looked at the row. Click **Mark reviewed** once you have — the row stays in the report with your name and the time, and stops counting on the **N to review** flag. Reviewing an exception that is still **Open** is normal; it means you have seen it, not that it is settled.
+
+> **A phone's position corroborates; it does not prove.** "Phone reported within 20 m" is what the driver's phone claimed, with the accuracy it claimed. It is good evidence, not a verdict. Read the exception alongside the driver's answer and, when it matters, a phone call.
 
 ### Ending a run the driver cannot finish
 
@@ -296,6 +321,8 @@ The **Driver Alerts** page is the incident feed. Entries arrive from:
 | **Route force-closed** | You or a colleague closed a run the driver could not, naming the children now owed a phone call |
 | **Left the bus off-route** | A child left the bus away from their own stop, with the driver's note saying where and to whom |
 | **Driver correction** | A driver retracted something they had recorded by mistake. The family was told about the correction |
+| **Stop passed without outcomes** | The driver moved past a stop while a child there still had no record. One per stop per run. Open the run in Run History to see how it resolved — see [Stop exceptions](#stop-exceptions) |
+| **Absent marked away from the stop** | A child was marked absent from well outside their stop with no word from a parent or the office; the family was asked to call the school. See [Stop exceptions](#stop-exceptions) |
 
 Lifecycle alerts arrive pre-acknowledged and are **excluded from the incident counters** — there are several per bus per day, and counting them would turn the Dashboard's incidents tile red on a completely ordinary morning. They never reach parents: several of them name other people's children.
 

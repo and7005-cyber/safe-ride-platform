@@ -481,6 +481,31 @@ export function sqlResetProviderTotp(): void {
   );
 }
 
+/**
+ * Restore a seeded stop exception to its unreviewed seed state (GPS plan U4).
+ * The review route is idempotent and stamps once, so a spec that clicks
+ * Reviewed on a seeded row must put the stamp back or the next run of the
+ * suite finds nothing left to review. Same philosophy as purgeRun: restoring
+ * seeded state, not a backdoor.
+ *
+ * The exception-reviewed audit row goes too: the seed carries none, and a
+ * surviving one breaks the migration rehearsal in
+ * backend/tests/integration/test_tenancy_schema.py, which re-applies 013's
+ * audit CHECK (without that action) to the populated database before 016
+ * widens it again. The throwaway sandbox schools the integration suite
+ * reviews in take their audit rows with them; the seeded school does not.
+ */
+export function sqlUnreviewException(exceptionId: string): void {
+  psql(
+    `update run_exceptions set reviewed_at = null, reviewed_by = null ` +
+      `where id = '${exceptionId}'`,
+  );
+  psql(
+    `delete from live_admin_audit where action = 'exception-reviewed' ` +
+      `and resource_id = '${exceptionId}'`,
+  );
+}
+
 /** Close any support session a crashed run left open for the seeded provider. */
 export function sqlEndProviderSupportSessions(): void {
   psql(

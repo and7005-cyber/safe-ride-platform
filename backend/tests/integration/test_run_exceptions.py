@@ -980,6 +980,68 @@ def test_reviewing_twice_is_idempotent_and_writes_one_audit_row(client, admin_he
         purge_run(run_id)
 
 
+def _runs_row(client, headers, run_id: str, *, active: bool = False) -> dict | None:
+    params = {"active": "true"} if active else None
+    response = client.get("/api/runs", params=params, headers=headers)
+    assert response.status_code == 200, response.text
+    return next((r for r in response.json() if r["id"] == run_id), None)
+
+
+def test_exception_count_on_the_runs_list_reads_the_stored_review_stamp(
+    client, admin_headers, fleet
+):
+    """U4/R21: the staff runs list carries ``exception_count`` — the run's
+    exceptions with no ``reviewed_at`` — on both the full list and the
+    Dashboard's ``?active=true`` read, so the two surfaces agree. Reviewing
+    lowers the count without removing the row from the run's exceptions, and
+    the count is the stored stamp alone: a still-open exception that has been
+    reviewed no longer counts. A driver's read of the same list carries no
+    such key at all (R22)."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        before = _runs_row(client, admin_headers, run_id)
+        assert before is not None and before["exception_count"] == 0
+
+        rows = _raise_every_stop(client, fleet, run_id)
+        expected = len(rows)
+        assert expected >= 2
+
+        full = _runs_row(client, admin_headers, run_id)
+        active = _runs_row(client, admin_headers, run_id, active=True)
+        assert full["exception_count"] == expected
+        assert active is not None, "an in-progress run of today is on the active list"
+        assert active["exception_count"] == expected, "Dashboard and Runs disagree"
+
+        # Review one: still open (nobody boarded), but no longer counted.
+        target = str(rows[0]["id"])
+        reviewed = _review(client, admin_headers, run_id, target)
+        assert reviewed.status_code == 200, reviewed.text
+        assert reviewed.json()["status"] == "open"
+        assert _runs_row(client, admin_headers, run_id)["exception_count"] == expected - 1
+        assert _runs_row(client, admin_headers, run_id, active=True)["exception_count"] == expected - 1
+        # A repeat review moves nothing.
+        assert _review(client, admin_headers, run_id, target).status_code == 200
+        assert _runs_row(client, admin_headers, run_id)["exception_count"] == expected - 1
+
+        # Review the rest: zero, and every row is still listed with its stamp.
+        for row in rows[1:]:
+            assert _review(client, admin_headers, run_id, str(row["id"])).status_code == 200
+        assert _runs_row(client, admin_headers, run_id)["exception_count"] == 0
+        listed = _bypassed(client, admin_headers, run_id)
+        assert {x["id"] for x in listed} == {str(r["id"]) for r in rows}
+        assert all(x["reviewed_at"] and x["reviewed_by_display"] for x in listed)
+        assert all(x["status"] == "open" for x in listed), "review never resolves"
+
+        # The driver's own list of the same run: no exception_count key.
+        mine = _runs_row(client, fleet["driver_headers"], run_id)
+        assert mine is not None, "the driver sees their own bus's run"
+        assert "exception_count" not in mine
+        assert "contact_pending" in mine, "the other list flags still travel"
+    finally:
+        purge_run(run_id)
+
+
 def test_error_paths_and_empty_runs(client, admin_headers, fleet):
     """An unknown run: 404. A wrong exception id, or a real one under the wrong
     run: 404. A run with no stops, and a run of another day: an empty list."""

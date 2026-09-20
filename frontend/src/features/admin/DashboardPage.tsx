@@ -95,6 +95,15 @@ export function DashboardPage() {
                           <Link to="/runs" className="underline">close it in Run History</Link>
                         </p>
                       )}
+                      {/* The badge beside the status carries the count (GPS
+                          plan U4); the panel that explains each exception is
+                          the run's report, which only Run History opens. */}
+                      {Number(run.exception_count ?? 0) > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Stop exceptions waiting for the office ·{" "}
+                          <Link to="/runs" className="underline">open the run in Run History</Link>
+                        </p>
+                      )}
                     </div>
                     <div className="flex flex-wrap items-center justify-end gap-1.5">
                       <Badge variant={variantFor(RUN_STATUS_VARIANT, run.status)}>{labelFor(RUN_STATUS_LABEL, run.status)}</Badge>
