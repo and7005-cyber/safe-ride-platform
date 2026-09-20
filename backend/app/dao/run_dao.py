@@ -39,6 +39,12 @@ class _Tap:
     session_id: str | None
     thresholds: SchoolThresholds
     trail_row_id: str | None = None
+    # The fix's plausibility flags (U12), set by _check_plausibility once the
+    # trail row exists: `()` for a plausible fix or no fix, the flags for an
+    # implausible one, None when the assessment itself failed — then the
+    # custody and absent checks do not run, because an unjudged fix must
+    # never clear a check (R32).
+    plausibility: tuple[str, ...] | None = ()
 
 
 # Columns of a live_runs row that never leave the DAO layer (GPS plan U7): the
@@ -686,9 +692,12 @@ class RunDao:
     #                key row, so the key is never committed ahead of the
     #                action nor the response after it.
     #
-    # The savepoint tier (U2/U3 today, U9/U10 next) hangs off the same seam:
-    # a failure there rolls back to its savepoint, flags the trail row
-    # `classification-failed`, and the tap still commits (R23, R40).
+    # The savepoint tier (U2/U3, U9/U10, U12) hangs off the same seam: a
+    # failure there rolls back to its savepoint, flags the trail row
+    # `classification-failed`, and the tap still commits (R23, R40). Its
+    # first step is the plausibility safeguard (U12), run from _record_tap
+    # on every tap that stored a fix, so the custody and absent checks that
+    # follow read the fix's flags rather than computing them.
 
     @staticmethod
     def _open_tap(
@@ -731,11 +740,14 @@ class RunDao:
             )
         return tap
 
-    @staticmethod
-    def _record_tap(conn, tap: _Tap, *, run_id: str, bus_id: str) -> str:
+    def _record_tap(
+        self, conn, tap: _Tap, *, run_id: str, bus_id: str, student_id: str | None = None,
+    ) -> str:
         """The trail row for this tap, and the run bound to the session that
         tapped (R28: Start Run stamps it, any later tap from a new session
-        re-binds it)."""
+        re-binds it) — then, first thing in the savepoint tier, the
+        plausibility safeguard on the fix (U12). ``student_id`` is the child
+        the tap named, if any, for the office's review ledger."""
         tap.trail_row_id = position_dao.append_action_row(
             conn,
             school_id=tap.school_id,
@@ -753,7 +765,58 @@ class RunDao:
                 "where id = %s and started_session_id is distinct from %s",
                 (tap.session_id, run_id, tap.session_id),
             )
+        self._check_plausibility(conn, str(run_id), tap, student_id=student_id)
         return tap.trail_row_id
+
+    def _check_plausibility(
+        self, conn, run_id: str, tap: _Tap, *, student_id: str | None = None,
+    ) -> None:
+        """The plausibility safeguard (GPS plan U12/R32) on the tap's fix, in
+        two savepoints after the trail row is written.
+
+        The first judges the fix against the run's previous fix and planned
+        stops and merges the flags onto the trail row; its result is what the
+        custody and absent checks classify with (``tap.plausibility``). The
+        second lists a flagged fix on the run's ``implausible-movement``
+        exception for the office. Each failure rolls back its own savepoint,
+        flags the trail row ``classification-failed`` and is logged with the
+        run only — never a coordinate — and the tap still commits (R23, R40).
+        A failed assessment leaves ``tap.plausibility`` None, so the checks
+        that follow do not run: an unjudged fix must never clear a check.
+        """
+        if tap.fix.fix is None or not tap.trail_row_id:
+            tap.plausibility = ()
+            return
+        run = {"id": str(run_id), "school_id": tap.school_id}
+        try:
+            with conn.transaction():
+                verdict = exception_dao.assess_plausibility(
+                    conn, run, trail_row_id=tap.trail_row_id, fix=tap.fix,
+                    retention_days=tap.thresholds.position_retention_days,
+                )
+        except Exception:
+            logger.exception(
+                "plausibility not assessed; the %s still commits unchecked (run=%s)",
+                tap.action, run_id,
+            )
+            self._flag_classification_failed(conn, tap)
+            tap.plausibility = None
+            return
+        tap.plausibility = verdict.flags
+        if not verdict.flagged:
+            return
+        try:
+            with conn.transaction():
+                exception_dao.record_implausible_fix(
+                    conn, run, fix=tap.fix, verdict=verdict, action_key=tap.key,
+                    student_id=student_id,
+                )
+        except Exception:
+            logger.exception(
+                "implausible fix not listed for review; the %s still commits (run=%s flags=%s)",
+                tap.action, run_id, ",".join(verdict.flags),
+            )
+            self._flag_classification_failed(conn, tap)
 
     @staticmethod
     def _serve_position(
@@ -1459,8 +1522,17 @@ class RunDao:
         a tap at the stop writes nothing. A failure rolls back to the
         savepoint, flags the trail row `classification-failed` and is logged
         with the run and stop order only — never a coordinate — so the tap
-        still commits with no prompt (R23, R40).
+        still commits with no prompt (R23, R40). The fix's plausibility flags
+        (U12) travel in from the tap; when the assessment itself failed the
+        check is not run at all — the trail row already reads
+        `classification-failed`, and an unjudged fix must not clear it.
         """
+        if tap.plausibility is None:
+            logger.warning(
+                "custody check skipped: plausibility unknown (run=%s stop_order=%s)",
+                run["id"], stop["stop_order"],
+            )
+            return None
         try:
             with conn.transaction():
                 return exception_dao.record_custody_check(
@@ -1468,6 +1540,7 @@ class RunDao:
                     student_name=student_name, fix=tap.fix, action_key=tap.key,
                     custody_threshold_m=tap.thresholds.custody_threshold_m,
                     accuracy_cap_m=tap.thresholds.fix_accuracy_cap_m,
+                    flags=tap.plausibility,
                 )
         except Exception:
             logger.exception(
@@ -1523,8 +1596,16 @@ class RunDao:
         when the snapshot has none. A failure rolls back to the savepoint,
         flags the trail row `classification-failed` and is logged with the
         run and stop order only — never a coordinate — so the mark still
-        commits with no prompt (R23, R40).
+        commits with no prompt (R23, R40). As for the custody check, the
+        fix's plausibility flags (U12) travel in from the tap and a failed
+        assessment means no classification at all.
         """
+        if tap.plausibility is None:
+            logger.warning(
+                "absent classification skipped: plausibility unknown (run=%s stop_order=%s)",
+                run["id"], stop["stop_order"],
+            )
+            return None
         try:
             with conn.transaction():
                 gate = conn.execute(
@@ -1549,6 +1630,7 @@ class RunDao:
                     action_key=tap.key, prior_absence_covers=prior_absence_covers,
                     vicinity_m=tap.thresholds.vicinity_radius_m,
                     accuracy_cap_m=tap.thresholds.fix_accuracy_cap_m,
+                    flags=tap.plausibility,
                 )
         except Exception:
             logger.exception(
@@ -1635,7 +1717,10 @@ class RunDao:
             participation_dao.record_boarding(
                 conn, str(run["id"]), student_id, row["name"], str(driver_id), presumed=False
             )
-            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._record_tap(
+                conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]),
+                student_id=str(student_id),
+            )
             self._serve_position(conn, tap, str(run["bus_id"]))
             # A resolution tap is exempt from the custody check (U9/R14);
             # every other Board is classified against the child's stop.
@@ -1709,7 +1794,10 @@ class RunDao:
                 (student_id,),
             ).fetchone()
             participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
-            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._record_tap(
+                conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]),
+                student_id=str(student_id),
+            )
             self._serve_position(conn, tap, str(run["bus_id"]))
             # Same rule as Board (U9/R14): a resolution tap is exempt, every
             # other Drop-off is classified against the child's stop.
@@ -1777,8 +1865,12 @@ class RunDao:
                 (student_id,),
             ).fetchone()
             # Trail row and served position like every tap (U7); a hand-over
-            # is never a check (R19), so nothing classifies here.
-            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            # is never a check (R19), so nothing classifies here — the
+            # plausibility safeguard still judges its fix (U12).
+            self._record_tap(
+                conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]),
+                student_id=str(student_id),
+            )
             self._serve_position(conn, tap, str(run["bus_id"]))
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
@@ -2082,7 +2174,10 @@ class RunDao:
             # (U2). On an afternoon run this retracts the presumed board the
             # auto-board wrote — the correction that presumption exists to allow.
             participation_dao.clear_for_student(conn, str(run["id"]), student_id)
-            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._record_tap(
+                conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]),
+                student_id=str(student_id),
+            )
             self._serve_position(conn, tap, str(run["bus_id"]))
             self._attach_resolution_tap(
                 conn, run, event_id, student_id, "absent mark", tap=tap,

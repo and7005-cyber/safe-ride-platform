@@ -1,11 +1,13 @@
 """Fix validation at the action boundary (GPS plan U7: R2, R40), the
-custody geometry (U9: R14, R20, R32 hook) and the absent classification
-(U10: R16, R20). Pure tests over ``position_rules``: every shape a client can
-send becomes a value — stored fix or None, one reason, flags — and never an
-exception; every custody check is one of ``within``, ``away`` or
-``unverified`` with a reason, decided cap first, then plausibility, then
-distance less accuracy; every absent mark is ``unverified``, ``corroborated``
-(by an earlier absence, the stop or the school) or ``remote``."""
+custody geometry (U9: R14, R20), the absent classification (U10: R16, R20)
+and the plausibility safeguard (U12: R32). Pure tests over
+``position_rules``: every shape a client can send becomes a value — stored
+fix or None, one reason, flags — and never an exception; every custody check
+is one of ``within``, ``away`` or ``unverified`` with a reason, decided cap
+first, then plausibility, then distance less accuracy; every absent mark is
+``unverified``, ``corroborated`` (by an earlier absence, the stop or the
+school) or ``remote``; every fix is judged against the previous one and the
+planned stops, and a flagged fix clears nothing."""
 
 from datetime import datetime, timedelta, timezone
 
@@ -22,7 +24,18 @@ from app.services.position_rules import (
     CUSTODY_UNVERIFIED,
     CUSTODY_WITHIN,
     FIX_REASONS,
+    FLAG_ACCURACY_ZERO,
+    FLAG_AT_PLANNED_STOP,
+    FLAG_CLASSIFICATION_FAILED,
     FLAG_CLOCK_SKEW,
+    FLAG_JUMP,
+    FLAG_REPEAT_COORDINATES,
+    FLAG_SPEED,
+    JUMP_DISTANCE_M,
+    JUMP_WINDOW_S,
+    PLANNED_STOP_RADIUS_M,
+    PLAUSIBILITY_FLAGS,
+    PLAUSIBLE_MAX_SPEED_MPS,
     REASON_IMPLAUSIBLE,
     REASON_NO_FIX,
     REASON_STOP_UNVERIFIED,
@@ -34,6 +47,7 @@ from app.services.position_rules import (
     StoredFix,
     classify_absent,
     classify_custody,
+    jump_distance_m,
     normalise_fix,
     plausibility_flags,
     within_vicinity,
@@ -318,7 +332,7 @@ def test_no_fix_is_unverified_no_fix_with_no_distance():
 def test_a_stop_without_usable_coordinates_is_stop_unverified_whatever_the_fix(stop):
     # With a good fix, with no fix, with an implausible fix: the stop wins the
     # precedence (stop-unverified > implausible > no-fix > too-coarse).
-    for fix, flags in ((fix_at(60), ()), (None, ()), (fix_at(60), ("implausible-jump",)),
+    for fix, flags in ((fix_at(60), ()), (None, ()), (fix_at(60), (FLAG_JUMP,)),
                        (fix_at(60, accuracy=900), ())):
         result = custody(fix, stop, flags=flags)
         assert result.classification == CUSTODY_UNVERIFIED, (stop, fix, flags)
@@ -327,26 +341,15 @@ def test_a_stop_without_usable_coordinates_is_stop_unverified_whatever_the_fix(s
 
 
 def test_plausibility_flags_make_the_check_implausible_and_outrank_too_coarse():
-    flagged = custody(fix_at(60), flags=("implausible-jump",))
+    flagged = custody(fix_at(60), flags=(FLAG_JUMP,))
     assert flagged.classification == CUSTODY_UNVERIFIED
     assert flagged.reason == REASON_IMPLAUSIBLE
     # A flagged fix never clears the check, however close it reads (R32).
     assert flagged.distance_m == pytest.approx(60, abs=1)
     # Flagged and coarse: implausible is the reason the office sees.
-    assert custody(fix_at(60, accuracy=900), flags=("accuracy-zero",)).reason == REASON_IMPLAUSIBLE
+    assert custody(fix_at(60, accuracy=900), flags=(FLAG_ACCURACY_ZERO,)).reason == REASON_IMPLAUSIBLE
     # A flagged far fix is not "away" either — it is not evidence of anything.
-    assert custody(fix_at(1800), flags=("implausible-jump",)).reason == REASON_IMPLAUSIBLE
-
-
-def test_the_plausibility_hook_returns_no_flags_until_u12_fills_it():
-    stored = norm(usable())
-    assert plausibility_flags(stored) == ()
-    assert plausibility_flags(stored.fix) == ()
-    assert plausibility_flags(None) == ()
-    # A clock-skewed fix is not a plausibility flag today either (U12 decides).
-    skewed = norm(usable(captured_at=(NOW + timedelta(minutes=10)).isoformat()))
-    assert skewed.flags == (FLAG_CLOCK_SKEW,)
-    assert plausibility_flags(skewed) == ()
+    assert custody(fix_at(1800), flags=(FLAG_JUMP,)).reason == REASON_IMPLAUSIBLE
 
 
 def test_a_per_school_threshold_changes_the_verdict():
@@ -484,13 +487,13 @@ def test_ae16_an_afternoon_absent_at_the_school_for_a_stop_still_ahead_is_corrob
 def test_the_unverified_reasons_and_their_precedence_are_the_custody_checks():
     assert absent(None).reason == REASON_NO_FIX
     assert absent(fix_at(40, accuracy=900)).reason == REASON_TOO_COARSE
-    assert absent(fix_at(40), flags=("implausible-jump",)).reason == REASON_IMPLAUSIBLE
-    assert absent(fix_at(40, accuracy=900), flags=("accuracy-zero",)).reason == REASON_IMPLAUSIBLE
+    assert absent(fix_at(40), flags=(FLAG_JUMP,)).reason == REASON_IMPLAUSIBLE
+    assert absent(fix_at(40, accuracy=900), flags=(FLAG_ACCURACY_ZERO,)).reason == REASON_IMPLAUSIBLE
     # A coordinate-less stop wins over every other reason and over every
     # corroboration, the fix at the school included; no distance is reported.
     for fix, kwargs in (
         (fix_at(40), {}), (None, {}), (fix_at(40, accuracy=900), {}),
-        (fix_at(40), {"flags": ("implausible-jump",)}), (fix_at(40), {"prior": True}),
+        (fix_at(40), {"flags": (FLAG_JUMP,)}), (fix_at(40), {"prior": True}),
         (school_fix(), {"run_type": "afternoon", "stop_order": 6, "stops_completed": 1}),
     ):
         result = absent(fix, (None, None), **kwargs)
@@ -499,9 +502,9 @@ def test_the_unverified_reasons_and_their_precedence_are_the_custody_checks():
         assert result.distance_m is None
     # The other unverified verdicts keep the distance for the office.
     assert absent(fix_at(800, accuracy=900)).distance_m == pytest.approx(800, abs=1)
-    assert absent(fix_at(40), flags=("implausible-jump",)).distance_m == pytest.approx(40, abs=1)
+    assert absent(fix_at(40), flags=(FLAG_JUMP,)).distance_m == pytest.approx(40, abs=1)
     # A flagged fix never corroborates, however close (R32).
-    assert absent(fix_at(10), flags=("implausible-jump",)).unverified
+    assert absent(fix_at(10), flags=(FLAG_JUMP,)).unverified
 
 
 def test_per_school_vicinity_and_cap_change_the_absent_verdict():
@@ -510,3 +513,185 @@ def test_per_school_vicinity_and_cap_change_the_absent_verdict():
     assert absent(fix_at(150), vicinity=200).corroborated
     assert absent(fix_at(40, accuracy=250)).reason == REASON_TOO_COARSE
     assert absent(fix_at(40, accuracy=250), cap=300).corroborated
+
+
+# --- the plausibility safeguard (U12: R32; R20's implausible reason) --------------
+#
+# The previous fix is at the stop; the new fix is judged against it and the
+# run's planned stops. Capture times are built from CAPTURED so every
+# interval below is legible.
+
+STOPS = (STOP, (STOP[0] + 1000 * METRE, STOP[1]), SCHOOL)
+
+
+def later(seconds: float, *, metres_north: float = 0.0, accuracy: float = 12.0,
+          lng: float | None = None) -> StoredFix:
+    """A fix ``seconds`` after CAPTURED, ``metres_north`` of the stop."""
+    return StoredFix(
+        lat=STOP[0] + metres_north * METRE, lng=STOP[1] if lng is None else lng,
+        accuracy_m=accuracy, captured_at=CAPTURED + timedelta(seconds=seconds),
+    )
+
+
+def flags_of(fix, previous=None, stops=STOPS):
+    return plausibility_flags(fix, previous=previous, stops=stops)
+
+
+def test_the_flag_vocabulary_is_stable_and_ordered():
+    assert PLAUSIBILITY_FLAGS == (
+        "clock-skew", "jump", "speed", "accuracy-zero", "repeat-coordinates", "at-planned-stop",
+    )
+    assert (FLAG_CLOCK_SKEW, FLAG_JUMP, FLAG_SPEED, FLAG_ACCURACY_ZERO,
+            FLAG_REPEAT_COORDINATES, FLAG_AT_PLANNED_STOP) == PLAUSIBILITY_FLAGS
+    # Bookkeeping is not plausibility; and the plan's "identical accuracy"
+    # arm was left out on purpose (see the vocabulary's note).
+    assert FLAG_CLASSIFICATION_FAILED not in PLAUSIBILITY_FLAGS
+    assert "repeat-accuracy" not in PLAUSIBILITY_FLAGS
+    assert (PLAUSIBLE_MAX_SPEED_MPS, JUMP_DISTANCE_M, JUMP_WINDOW_S, PLANNED_STOP_RADIUS_M) == (
+        40.0, 1000.0, 30.0, 2.0,
+    )
+
+
+def test_nothing_stored_means_nothing_to_judge():
+    assert flags_of(None) == ()
+    assert flags_of(norm(None)) == ()
+    assert flags_of(norm({"reason": "denied"})) == ()
+    assert flags_of(norm("garbage"), previous=later(0)) == ()
+
+
+def test_two_fixes_five_km_apart_twenty_seconds_apart_flag_the_second_and_the_check_reads_implausible():
+    previous = later(0, metres_north=40)
+    far = later(20, metres_north=5040, accuracy=15)
+    flags = flags_of(far, previous)
+    assert flags == (FLAG_JUMP, FLAG_SPEED)
+    # The custody check on that tap: unverified / implausible — neither
+    # `away` (it is 5 km out) nor anything else (R32).
+    verdict = custody(far, flags=flags)
+    assert verdict == CustodyCheck(
+        classification=CUSTODY_UNVERIFIED, reason=REASON_IMPLAUSIBLE,
+        distance_m=pytest.approx(5040, abs=5),
+    )
+    # And the first of the two is judged on its own merits: nothing before it.
+    assert flags_of(previous) == ()
+    assert jump_distance_m(far, previous) == pytest.approx(5000, abs=5)
+    assert jump_distance_m(previous, None) is None
+
+
+def test_speed_is_distance_over_the_capture_interval_against_forty_metres_per_second():
+    # No planned stops here: the pairwise rules alone (the next stop's pin
+    # sits 1 km north and would add its own flag).
+    def flags_of(fix, previous):
+        return plausibility_flags(fix, previous=previous, stops=())
+
+    previous = later(0)
+    # 800 m in 20 s is exactly 40 m/s: not above the cap.
+    assert flags_of(later(20, metres_north=800, accuracy=13), previous) == ()
+    # 810 m in 20 s is above it — and under a kilometre, so speed alone.
+    assert flags_of(later(20, metres_north=810, accuracy=13), previous) == (FLAG_SPEED,)
+    # 1,001 m in 29 s is 34.5 m/s — a jump, not a speed.
+    assert flags_of(later(29, metres_north=1001, accuracy=13), previous) == (FLAG_JUMP,)
+    # 1,001 m in exactly 30 s is not "under 30 s"; 33 m/s is not a speed either.
+    assert flags_of(later(30, metres_north=1001, accuracy=13), previous) == ()
+    # 1,000 m in 10 s is not over a kilometre, but it is 100 m/s.
+    assert flags_of(later(10, metres_north=1000, accuracy=13), previous) == (FLAG_SPEED,)
+    # 5 km in a second: both, jump reported first.
+    assert flags_of(later(1, metres_north=5000, accuracy=13), previous) == (FLAG_JUMP, FLAG_SPEED)
+    # Along the longitude too.
+    east = StoredFix(lat=STOP[0], lng=STOP[1] + 5000 * METRE, accuracy_m=13.0,
+                     captured_at=CAPTURED + timedelta(seconds=10))
+    assert flags_of(east, previous) == (FLAG_JUMP, FLAG_SPEED)
+
+
+def test_a_zero_or_negative_capture_interval_yields_no_speed_or_jump_verdict():
+    previous = later(60)
+    # Captured before the previous fix (a cached fix behind a fresh one):
+    # the distance says nothing about speed.
+    assert flags_of(later(0, metres_north=5000, accuracy=13), previous) == ()
+    # Same instant, different place: no interval to divide by either.
+    assert flags_of(later(60, metres_north=5000, accuracy=13), previous) == ()
+
+
+def test_the_same_capture_re_read_from_the_cache_is_not_a_second_observation():
+    # Two Boards inside the client's cache window carry one fix (U6/U7):
+    # identical coordinates, accuracy and capture time — nothing to flag.
+    one = later(0, metres_north=40)
+    two = later(0, metres_north=40)
+    assert flags_of(two, one) == ()
+    # The moment the capture time differs, identical coordinates are a
+    # repeat (the fabricated-corroboration risk).
+    assert flags_of(later(5, metres_north=40), one) == (FLAG_REPEAT_COORDINATES,)
+
+
+def test_identical_consecutive_coordinates_flag_the_second_fix_and_distinct_ones_or_identical_accuracy_do_not():
+    previous = later(0, metres_north=40, accuracy=12)
+    # Same point, new accuracy: repeat-coordinates.
+    assert flags_of(later(30, metres_north=40, accuracy=13), previous) == (FLAG_REPEAT_COORDINATES,)
+    # Same point, same accuracy: still the one flag — a stuck feed repeats both.
+    assert flags_of(later(30, metres_north=40, accuracy=12), previous) == (FLAG_REPEAT_COORDINATES,)
+    # Moved 5 m with the same accuracy: nothing. Identical accuracy is not a
+    # rule — iPhones report quantised accuracies and repeat them routinely.
+    assert flags_of(later(30, metres_north=45, accuracy=12), previous) == ()
+    # Same latitude only, or a distinct accuracy and point: nothing.
+    assert flags_of(later(30, metres_north=40, accuracy=13, lng=STOP[1] + 5 * METRE), previous) == ()
+    assert flags_of(later(30, metres_north=45, accuracy=13), previous) == ()
+    # Repeats are judged against the previous fix only, not the whole trail.
+    assert flags_of(later(60, metres_north=40, accuracy=12), later(30, metres_north=45, accuracy=13)) == ()
+
+
+def test_accuracy_zero_flags_and_twenty_five_metres_does_not():
+    assert flags_of(later(0, metres_north=40, accuracy=0)) == (FLAG_ACCURACY_ZERO,)
+    assert flags_of(later(0, metres_north=40, accuracy=0.0)) == (FLAG_ACCURACY_ZERO,)
+    assert flags_of(later(0, metres_north=40, accuracy=25)) == ()
+    # A coarse fix is judged like any other — coarse is the cap's business.
+    assert flags_of(later(0, metres_north=40, accuracy=900)) == ()
+    # Anomalously good accuracy is the plausibility path, not "too coarse":
+    # implausible outranks the cap and the geometry.
+    assert custody(later(0, metres_north=40, accuracy=0), flags=(FLAG_ACCURACY_ZERO,)).reason == REASON_IMPLAUSIBLE
+
+
+def test_a_fix_on_a_planned_stop_pin_flags_and_thirty_metres_away_does_not():
+    assert flags_of(later(0, metres_north=0)) == (FLAG_AT_PLANNED_STOP,)
+    assert flags_of(later(0, metres_north=1.9)) == (FLAG_AT_PLANNED_STOP,)
+    assert flags_of(later(0, metres_north=2.1)) == ()
+    assert flags_of(later(0, metres_north=30)) == ()
+    # Any planned stop counts — the next one, the school gate — and a stop
+    # without usable coordinates is skipped, not matched.
+    assert flags_of(later(0, metres_north=1000)) == (FLAG_AT_PLANNED_STOP,)
+    assert flags_of(later(0, metres_north=3000)) == (FLAG_AT_PLANNED_STOP,)
+    assert flags_of(later(0, metres_north=0), stops=[None, (None, None), (float("nan"), 1.0)]) == ()
+    assert flags_of(later(0, metres_north=0), stops=()) == ()
+
+
+def test_clock_skew_is_folded_in_so_a_skewed_fix_classifies_as_implausible():
+    skewed = norm(usable(captured_at=(NOW + timedelta(minutes=10)).isoformat()))
+    assert skewed.flags == (FLAG_CLOCK_SKEW,)
+    assert flags_of(skewed, stops=()) == (FLAG_CLOCK_SKEW,)
+    assert custody(skewed.fix, flags=flags_of(skewed, stops=())).reason == REASON_IMPLAUSIBLE
+    # The bare stored fix carries no skew information; only the boundary's
+    # result does.
+    assert flags_of(skewed.fix, stops=()) == ()
+    # And a plausible, unskewed fix through the same door: nothing.
+    assert flags_of(norm(usable()), stops=()) == ()
+
+
+def test_flags_come_in_vocabulary_order_however_many_apply():
+    previous = later(0, metres_north=-40, accuracy=0)
+    # Zero accuracy, 1,040 m in a second, on the next stop's pin.
+    pile = later(1, metres_north=1000, accuracy=0)
+    assert flags_of(pile, previous) == (
+        FLAG_JUMP, FLAG_SPEED, FLAG_ACCURACY_ZERO, FLAG_AT_PLANNED_STOP,
+    )
+
+
+def test_a_flagged_fix_neither_corroborates_an_absent_nor_counts_as_seen_at_stop():
+    on_the_pin = later(0, metres_north=0)
+    flags = flags_of(on_the_pin)
+    assert flags == (FLAG_AT_PLANNED_STOP,)
+    # Inside the vicinity, and still not corroborated (R32, R16's order).
+    verdict = absent(on_the_pin, flags=flags)
+    assert verdict.classification == ABSENT_UNVERIFIED and verdict.reason == REASON_IMPLAUSIBLE
+    assert not verdict.corroborated
+    # The geometry alone would have said yes — which is exactly why the
+    # trail reader (position_dao.run_fixes) drops flagged fixes before
+    # `within_vicinity` ever sees them.
+    assert within_vicinity(on_the_pin, STOP, vicinity_m=VICINITY, accuracy_cap_m=CAP)

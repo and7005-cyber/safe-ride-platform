@@ -76,9 +76,29 @@ the row lock plus the sent stamp plus the notification dedup make it once.
 Unanswered at End Run or force-close is recorded without call-now. The undo
 answers the child's pending absent prompt ``undo`` (or appends an ``undo``
 row after an answer, history kept) and never touches the call-now stamps.
+
+The plausibility safeguard (U12, R32) is the fourth writer, and it runs on
+every tap that stores a fix — Start Run to End Run — before the custody and
+absent checks. ``assess_plausibility`` compares the fix with the run's
+previous fix-bearing trail row (by receipt, inside retention) and the run's
+planned stops, and merges the flags it finds onto the tap's trail row; the
+action DAO hands those flags to the two checks, so a flagged fix classifies
+``unverified`` / ``implausible`` and neither raises nor clears anything.
+``record_implausible_fix`` then lists the fix for the office on the run's one
+``implausible-movement`` row (016's per-run partial index): the first flagged
+fix creates the row with its fix columns and the distance it moved; every
+flagged fix — the first included — attaches as a silent ledger event carrying
+its fix columns, ``distance_m`` = how far it sits from the previous distinct
+capture (None for a run's first fix) and ``student_id`` when the tap named a
+child; the row's ``reason`` is the union of every flag seen on the run so
+far, comma-joined in vocabulary order, so the office reads the whole picture
+on one line. No prompt, no call-now, no incident: the office's second
+opinion, nothing the driver has to answer.
 """
 
 import logging
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from app.core.db import get_connection
@@ -94,11 +114,13 @@ from app.dao.audit_dao import masked_display_sql, record_audit
 from app.dao.school_thresholds import resolve_school_thresholds
 from app.services.position_rules import (
     CUSTODY_WITHIN,
+    PLAUSIBILITY_FLAGS,
     REASON_STOP_UNVERIFIED,
     NormalisedFix,
     StoredFix,
     classify_absent,
     classify_custody,
+    jump_distance_m,
     plausibility_flags,
     within_vicinity,
 )
@@ -110,6 +132,7 @@ ABSENT_REMOTE = "absent-remote"
 ABSENT_ATTESTED = "absent-attested"
 CUSTODY_AWAY = "custody-away"
 UNVERIFIED = "unverified"
+IMPLAUSIBLE_MOVEMENT = "implausible-movement"
 # The two absent kinds share 016's (run, student) partial index: one row per
 # child per run, whichever kind it currently reads.
 ABSENT_KINDS = (ABSENT_REMOTE, ABSENT_ATTESTED)
@@ -585,6 +608,7 @@ def record_custody_check(
     action_key: str | None,
     custody_threshold_m: float | None = None,
     accuracy_cap_m: float | None = None,
+    flags: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Classify one Board or Drop-off against the child's stop and record the
     verdict (R14, R20; AE3, AE4, AE17).
@@ -596,6 +620,8 @@ def record_custody_check(
     coordinates, never the live route's. The thresholds are the school's own
     (U11): the action DAO passes the ones it resolved for the tap; a caller
     that passes none has them resolved here from ``run["school_id"]``.
+    ``flags`` are the fix's plausibility flags from ``assess_plausibility``
+    (U12): any flag makes the verdict ``unverified`` / ``implausible``.
 
     - ``within``: nothing written.
     - ``away``: the per-stop ``custody-away`` row (created by the first far
@@ -618,7 +644,7 @@ def record_custody_check(
     verdict = classify_custody(
         fix.fix, (stop.get("lat"), stop.get("lng")),
         custody_threshold_m=custody_threshold_m, accuracy_cap_m=accuracy_cap_m,
-        flags=plausibility_flags(fix),
+        flags=tuple(flags),
     )
     outcome: dict[str, Any] = {
         "classification": verdict.classification,
@@ -728,9 +754,11 @@ def record_absent_check(
     prior_absence_covers: bool,
     vicinity_m: float | None = None,
     accuracy_cap_m: float | None = None,
+    flags: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Classify one Absent mark and record the verdict (R16, R17, R20; AE6,
-    AE7, AE8, AE16).
+    AE7, AE8, AE16). ``flags`` are the fix's plausibility flags (U12): a
+    flagged fix is ``unverified`` / ``implausible`` and corroborates nothing.
 
     Called by ``mark_student_absent`` inside its savepoint, after the absence,
     the snapshot and the trail row are written — the mark itself is never
@@ -767,7 +795,7 @@ def record_absent_check(
         stops_completed=int(run.get("stops_completed") or 0),
         prior_absence_covers=prior_absence_covers,
         vicinity_m=vicinity_m, accuracy_cap_m=accuracy_cap_m,
-        flags=plausibility_flags(fix),
+        flags=tuple(flags),
     )
     outcome: dict[str, Any] = {
         "classification": verdict.classification,
@@ -859,6 +887,129 @@ def record_absent_check(
         run_id, stop_order, exception_id, "pending" if not pending else "attached",
     )
     return outcome
+
+
+# --- the plausibility safeguard (U12: R32, R20's implausible reason) -------------
+
+
+@dataclass(frozen=True)
+class PlausibilityVerdict:
+    """What ``assess_plausibility`` found: the flags (``()`` for a plausible
+    fix or no fix at all), the previous distinct capture it was judged
+    against, and how far the fix sits from it (None without one)."""
+
+    flags: tuple[str, ...]
+    previous: StoredFix | None
+    jump_m: float | None
+
+    @property
+    def flagged(self) -> bool:
+        return bool(self.flags)
+
+
+def assess_plausibility(
+    conn, run: dict[str, Any], *, trail_row_id: str, fix: NormalisedFix, retention_days: int,
+) -> PlausibilityVerdict:
+    """Judge the tap's fix against the run's previous fix and planned stops
+    and merge the flags onto its trail row (U12, R32).
+
+    Called by every action DAO right after the trail row is written, in its
+    own savepoint, before the custody or absent check reads the result. The
+    previous fix is the run's newest fix-bearing trail row by receipt inside
+    the school's retention (``retention_days``, resolved by the tap), the
+    stops the run's own snapshot. A fix-less tap has nothing to judge.
+    Merges through ``position_dao.add_flags`` so ``clock-skew`` from the
+    boundary stays and nothing is written twice. Never logs a coordinate.
+    """
+    stored = fix.fix
+    if stored is None:
+        return PlausibilityVerdict(flags=(), previous=None, jump_m=None)
+    run_id = str(run["id"])
+    previous = position_dao.previous_fix(
+        conn, run_id, before_row_id=trail_row_id, retention_days=retention_days
+    )
+    stops = position_dao.planned_stops(conn, run_id)
+    flags = plausibility_flags(fix, previous=previous, stops=stops)
+    if flags:
+        position_dao.add_flags(conn, trail_row_id, flags)
+    return PlausibilityVerdict(
+        flags=flags, previous=previous, jump_m=jump_distance_m(stored, previous),
+    )
+
+
+def _merge_reason(existing: str | None, flags: Iterable[str]) -> str:
+    """The row's ``reason``: every flag seen on the run so far, comma-joined
+    in vocabulary order (an unknown stored token is kept, last)."""
+    seen = {token for token in (existing or "").split(",") if token}
+    seen.update(flags)
+    ordered = [flag for flag in PLAUSIBILITY_FLAGS if flag in seen]
+    ordered += sorted(token for token in seen if token not in PLAUSIBILITY_FLAGS)
+    return ",".join(ordered)
+
+
+def record_implausible_fix(
+    conn, run: dict[str, Any], *, fix: NormalisedFix, verdict: PlausibilityVerdict,
+    action_key: str | None, student_id: str | None,
+) -> str:
+    """List a flagged fix for the office on the run's ``implausible-movement``
+    row (U12, R32) — one row per run, 016's partial index.
+
+    The first flagged fix creates the row with its fix columns and ``jump_m``
+    as ``distance_m``; the row is locked when it already exists so two
+    flagged taps serialise their event inserts behind it, and its ``reason``
+    becomes the union of every flag seen so far. Every flagged fix — the
+    first included — attaches as one silent ledger event (``prompt_state``
+    NULL): the fix columns, ``distance_m`` = how far it moved from the
+    previous distinct capture, ``student_id`` when the tap named a child, the
+    action key. No prompt, no call-now, no incident. Returns the row id.
+    """
+    run_id = str(run["id"])
+    school_id = str(run["school_id"])
+    fix_columns = _fix_columns(fix)
+    reason = _merge_reason(None, verdict.flags)
+    inserted = conn.execute(
+        """
+        insert into run_exceptions
+            (school_id, run_id, kind, reason,
+             fix_lat, fix_lng, fix_accuracy_m, fix_captured_at, distance_m)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (run_id) where kind = 'implausible-movement' do nothing
+        returning id
+        """,
+        (school_id, run_id, IMPLAUSIBLE_MOVEMENT, reason, *fix_columns, verdict.jump_m),
+    ).fetchone()
+    if inserted:
+        exception_id = str(inserted["id"])
+    else:
+        existing = conn.execute(
+            """
+            select id, reason from run_exceptions
+            where run_id = %s and kind = %s
+            for update
+            """,
+            (run_id, IMPLAUSIBLE_MOVEMENT),
+        ).fetchone()
+        exception_id = str(existing["id"])
+        merged = _merge_reason(existing["reason"], verdict.flags)
+        if merged != (existing["reason"] or ""):
+            conn.execute(
+                "update run_exceptions set reason = %s where id = %s", (merged, exception_id)
+            )
+    conn.execute(
+        """
+        insert into run_exception_events
+            (exception_id, school_id, run_id, student_id, action_key,
+             fix_lat, fix_lng, fix_accuracy_m, fix_captured_at, distance_m)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (exception_id, school_id, run_id, str(student_id) if student_id else None, action_key,
+         *fix_columns, verdict.jump_m),
+    )
+    logger.info(
+        "implausible fix recorded (run=%s flags=%s exception=%s)",
+        run_id, ",".join(verdict.flags), exception_id,
+    )
+    return exception_id
 
 
 def stamp_call_now_due(conn, *, event_id: str, run_id: str, student_id: str) -> bool:

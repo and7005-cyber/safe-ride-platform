@@ -477,7 +477,10 @@ def test_a_position_older_than_the_threshold_reads_stale_and_a_new_fix_clears_it
     b_id = fleet["b"]["id"]
     run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
     try:
-        f1 = fix(lat=-1.2611, lng=36.7911, accuracy=8.0)
+        # Captured moments ago: the phone helper's own capture times sit in
+        # the past (conftest.Phone), and this test is about freshness.
+        f1 = fix(lat=-1.2611, lng=36.7911, accuracy=8.0,
+                 captured_at=iso(datetime.now(timezone.utc) - timedelta(seconds=5)))
         assert arrive(client, h, run_id, expected=1, fix_body=f1).status_code == 200
         assert staff_position(client, admin_headers, bus_id)["stale"] is False
 
@@ -499,7 +502,8 @@ def test_a_position_older_than_the_threshold_reads_stale_and_a_new_fix_clears_it
         # Past it again, then a new fix clears it — the tap, no other write.
         age_position(bus_id, 600)
         assert staff_position(client, admin_headers, bus_id)["stale"] is True
-        f2 = fix(lat=-1.2622, lng=36.7922, accuracy=10.0)
+        f2 = fix(lat=-1.2622, lng=36.7922, accuracy=10.0,
+                 captured_at=iso(datetime.now(timezone.utc) - timedelta(seconds=5)))
         assert arrive(client, h, run_id, expected=2, fix_body=f2).status_code == 200
         pos = staff_position(client, admin_headers, bus_id)
         assert pos["stale"] is False and pos["age_s"] < 60

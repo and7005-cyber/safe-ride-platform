@@ -35,7 +35,6 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timezone
 
 import httpx
 import psycopg
@@ -43,6 +42,7 @@ import pytest
 from psycopg.rows import dict_row
 
 from conftest import (
+    Phone,
     COORDINATOR_A,
     DIRECTOR_A,
     DSN,
@@ -226,7 +226,14 @@ def _clear_absences_for(client, admin_headers, student_id: str) -> None:
             client.delete(f"/api/students/absences/{a['id']}", headers=admin_headers)
 
 
+# The suite's fixes come from one moving phone (conftest.Phone, GPS plan
+# U12): the plausibility safeguard would flag taps posted milliseconds apart
+# from a kilometre away, and these tests are about the bypassed stop.
+PHONE = Phone(home=(-1.30, 36.80))
+
+
 def _start(client, driver_headers, route_id: str) -> dict:
+    PHONE.begin_run(None)
     response = client.post(
         "/api/runs/driver/start", json={"route_id": route_id}, headers=driver_headers
     )
@@ -272,12 +279,13 @@ def _students_by_order(fleet, layout: dict) -> dict[int, list[dict]]:
     return out
 
 
-def _stop_fix(student_id: str, *, north_m: float = 0.0, accuracy: float = 12.0) -> dict | None:
-    """A fix at (or ``north_m`` metres north of) the child's stop on the
-    driver's open run today. Since U9 a Board or Drop-off without a fix is
-    recorded as an unverified check and one 1.8 km away as a custody
-    exception; these tests are about the bypassed stop, so their outcome taps
-    carry a fix at the stop unless a test says otherwise."""
+def _stop_fix(student_id: str, *, north_m: float = 8.0, accuracy: float | None = None) -> dict | None:
+    """A fix ``north_m`` metres north of the child's stop on the driver's
+    open run today — a few metres off the pin by default, since a fix *on* a
+    planned stop's pin is flagged implausible (U12). Since U9 a Board or
+    Drop-off without a fix is recorded as an unverified check and one 1.8 km
+    away as a custody exception; these tests are about the bypassed stop, so
+    their outcome taps carry a fix at the stop unless a test says otherwise."""
     with db() as conn:
         row = conn.execute(
             """
@@ -291,10 +299,7 @@ def _stop_fix(student_id: str, *, north_m: float = 0.0, accuracy: float = 12.0) 
         ).fetchone()
     if not row or row["lat"] is None or row["lng"] is None:
         return None
-    return {
-        "lat": row["lat"] + north_m / 111_195.0, "lng": row["lng"], "accuracy_m": accuracy,
-        "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-    }
+    return PHONE.fix(row["lat"] + north_m / 111_195.0, row["lng"], accuracy)
 
 
 def _board(client, driver_headers, student_id: str, *, fix: dict | None = None) -> httpx.Response:

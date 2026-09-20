@@ -1,8 +1,9 @@
-"""Position rules: fix validation (GPS plan U7), the custody geometry (U9) and
-the absent classification (U10); U12 fills the plausibility hook.
+"""Position rules: fix validation (GPS plan U7), the custody geometry (U9),
+the absent classification (U10) and the plausibility safeguard (U12).
 
-Pure: no I/O and no clock of its own — ``normalise_fix`` takes ``now`` — so
-the whole boundary is unit-testable and the DAO calls it inside the action
+Pure: no I/O and no clock of its own — ``normalise_fix`` takes ``now``,
+``plausibility_flags`` takes the previous fix and the planned stops — so the
+whole boundary is unit-testable and the DAO calls it inside the action
 transaction with whatever cap and threshold the school resolves to (U11).
 
 The boundary is lenient by design (R2, R40). A tap's ``fix`` is whatever the
@@ -26,6 +27,15 @@ absence a parent or the office recorded before the tap, the phone at the
 child's stop, or — on an afternoon run — the phone at the school while the
 child's stop is still ahead. Anything else is ``remote``, and the driver's
 attestation decides it (R17).
+
+The plausibility safeguard (``plausibility_flags``, R32) is the second
+opinion on the fix itself: compared with the run's previous fix and the
+run's planned stops, does this fix look like something a phone on a bus
+would report? Its flags are stored on the trail row and make every check
+``unverified`` / ``implausible`` — a flagged fix neither raises nor clears a
+custody or vicinity check, corroborates nothing and is never "bus seen at
+stop" — while the office gets one ``implausible-movement`` exception per run
+listing the flagged fixes. Flags never block the tap.
 """
 
 from __future__ import annotations
@@ -45,11 +55,43 @@ FIX_REASON_INVALID = "invalid"    # malformed or out of range; nothing stored
 CLIENT_FIX_REASONS = frozenset({"denied", "unavailable", "timeout", "coarse"})
 FIX_REASONS = ("none", "denied", "unavailable", "timeout", "coarse", "invalid")
 
-# flags vocabulary on the trail row.
-FLAG_CLOCK_SKEW = "clock-skew"                    # capture time ahead of receipt
-FLAG_CLASSIFICATION_FAILED = "classification-failed"  # U9/U10's savepoint failed
+# flags vocabulary on the trail row (DAO-owned, no CHECK — see 016).
+#
+# The plausibility flags (U12, R32) — stable names, one per rule, in the
+# order they are reported. Any of these on a fix makes every check on it
+# `unverified` / `implausible`; the office reads them comma-joined as the
+# `implausible-movement` exception's reason, and the staff panel's REASON_LABEL
+# map (RunExceptionsPanel.tsx) must cover every name here.
+#
+# The plan's "identical accuracy across consecutive fixes" arm is deliberately
+# left out (decided during U12). iOS reports horizontal accuracy in quantised
+# steps (5, 10, 35, 65 m ...), so identical consecutive accuracies are the
+# normal case on an iPhone, and a flag on them would classify most iPhone
+# Boards and Absents `implausible` — switching the custody and absent checks
+# off for those drivers, which is worse than the fabrication it targets.
+# `repeat-coordinates` still catches a frozen or replayed feed: a genuinely
+# stuck feed repeats both.
+FLAG_CLOCK_SKEW = "clock-skew"                    # capture time ahead of receipt beyond tolerance (U7)
+FLAG_JUMP = "jump"                                # over 1 km from the previous fix in under 30 s
+FLAG_SPEED = "speed"                              # implied speed from the previous fix above 40 m/s
+FLAG_ACCURACY_ZERO = "accuracy-zero"              # accuracy reported as exactly zero
+FLAG_REPEAT_COORDINATES = "repeat-coordinates"    # the previous distinct capture had the same coordinates
+FLAG_AT_PLANNED_STOP = "at-planned-stop"          # within two metres of a planned stop's pin
+PLAUSIBILITY_FLAGS = (
+    FLAG_CLOCK_SKEW, FLAG_JUMP, FLAG_SPEED, FLAG_ACCURACY_ZERO,
+    FLAG_REPEAT_COORDINATES, FLAG_AT_PLANNED_STOP,
+)
+# Bookkeeping, not plausibility: the savepoint tier failed on this tap (R40).
+FLAG_CLASSIFICATION_FAILED = "classification-failed"
 
 DEFAULT_CLOCK_SKEW_TOLERANCE_S = 30
+
+# The plausibility thresholds (U12). System-wide, not per school: they
+# describe what a bus can do, not what a school prefers.
+PLAUSIBLE_MAX_SPEED_MPS = 40.0     # 144 km/h; above it the fix is `speed`
+JUMP_DISTANCE_M = 1000.0           # further than this ...
+JUMP_WINDOW_S = 30.0               # ... in less than this is `jump`
+PLANNED_STOP_RADIUS_M = 2.0        # a fix this close to a stop's pin is `at-planned-stop`
 
 
 @dataclass(frozen=True)
@@ -241,15 +283,81 @@ def _usable_point(point: tuple[Any, Any] | None) -> tuple[float, float] | None:
     return lat, lng
 
 
-def plausibility_flags(fix: NormalisedFix | StoredFix | None, **context: Any) -> tuple[str, ...]:
-    """The plausibility safeguard's flags for this fix (R32) — U12's seam.
+def plausibility_flags(
+    fix: NormalisedFix | StoredFix | None,
+    *,
+    previous: StoredFix | None = None,
+    stops: Iterable[tuple[Any, Any] | None] = (),
+    **context: Any,
+) -> tuple[str, ...]:
+    """The plausibility safeguard's flags for this fix (U12, R32), in
+    ``PLAUSIBILITY_FLAGS`` order; ``()`` when nothing is stored or nothing
+    looks wrong.
 
-    Returns no flags today: nothing is compared against the previous trail
-    row or the planned stops yet, and a clock-skewed capture time is not a
-    plausibility flag until U12 says so. ``context`` is where U12 passes the
-    previous fix and the run's stops without changing the callers.
+    ``previous`` is the run's previous fix-bearing trail row inside the
+    school's retention, by receipt order (the DAO chooses it; None for the
+    first fix of a run); ``stops`` the run's planned stop coordinates
+    (``run_stops`` for this run, gate included). The rules:
+
+    - ``clock-skew``: the boundary's own flag (U7) folded in, so a skewed fix
+      classifies as implausible too — only a ``NormalisedFix`` carries it;
+    - ``accuracy-zero``: accuracy of exactly 0 (non-finite is already
+      ``invalid`` at the boundary and never reaches here);
+    - ``at-planned-stop``: within ``PLANNED_STOP_RADIUS_M`` of any planned
+      stop's pin — a phone does not land on a geocoded pin by chance;
+    - against ``previous``, only when its capture time differs from this
+      one's — an identical capture time is the same fix re-read from the
+      client's cache (U6's 15 s window; two Boards legitimately share one),
+      not a second observation: ``repeat-coordinates`` (identical lat and
+      lng), and, when the capture interval is positive, ``speed`` (distance
+      ÷ interval above ``PLAUSIBLE_MAX_SPEED_MPS``) and ``jump`` (over
+      ``JUMP_DISTANCE_M`` in under ``JUMP_WINDOW_S``). A zero or negative
+      interval yields no speed or jump verdict: a cached fix may
+      legitimately predate the previous tap's fresh one.
+
+    Identical accuracy is not a rule (see the vocabulary's note). Coarse
+    fixes are judged like any other: a wide fix can still be a teleport.
+    ``context`` keeps the signature open for later inputs.
     """
-    return ()
+    inherited: tuple[str, ...] = ()
+    if isinstance(fix, NormalisedFix):
+        inherited = fix.flags
+        fix = fix.fix
+    if fix is None:
+        return ()
+
+    found: set[str] = set()
+    if FLAG_CLOCK_SKEW in inherited:
+        found.add(FLAG_CLOCK_SKEW)
+    if fix.accuracy_m == 0:
+        found.add(FLAG_ACCURACY_ZERO)
+    here = (fix.lat, fix.lng)
+    for stop in stops:
+        point = _usable_point(stop)
+        if point is not None and haversine_m(here, point) <= PLANNED_STOP_RADIUS_M:
+            found.add(FLAG_AT_PLANNED_STOP)
+            break
+    if previous is not None and previous.captured_at != fix.captured_at:
+        if previous.lat == fix.lat and previous.lng == fix.lng:
+            found.add(FLAG_REPEAT_COORDINATES)
+        interval = (fix.captured_at - previous.captured_at).total_seconds()
+        if interval > 0:
+            distance = haversine_m(here, (previous.lat, previous.lng))
+            if distance / interval > PLAUSIBLE_MAX_SPEED_MPS:
+                found.add(FLAG_SPEED)
+            if distance > JUMP_DISTANCE_M and interval < JUMP_WINDOW_S:
+                found.add(FLAG_JUMP)
+    return tuple(flag for flag in PLAUSIBILITY_FLAGS if flag in found)
+
+
+def jump_distance_m(fix: StoredFix | None, previous: StoredFix | None) -> float | None:
+    """How far this fix sits from the previous distinct capture — the
+    ``distance_m`` an ``implausible-movement`` ledger event carries ("moved
+    N m between fixes"). None without a previous fix, or when the two are
+    the same capture."""
+    if fix is None or previous is None or previous.captured_at == fix.captured_at:
+        return None
+    return haversine_m((fix.lat, fix.lng), (previous.lat, previous.lng))
 
 
 def classify_custody(

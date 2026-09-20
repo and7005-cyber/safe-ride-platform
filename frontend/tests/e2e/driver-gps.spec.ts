@@ -12,6 +12,7 @@ import {
   purgeRun,
   signInAs,
   signInAsDriver,
+  sqlAgeTrail,
 } from "./helpers";
 
 // The driver's GPS fix on every tap (GPS plan U6: R1–R5, R33 client half;
@@ -436,14 +437,31 @@ test("approximate location: a coarse fix keeps its coordinates with the reason; 
 // Seeded morning route "Express 1 — Morning": stop 1 Kilimani (Faith), stop 2
 // Lavington (Happiness). The emulated position is moved between the Arrive and
 // the Board the way a driver pulls away before tapping.
+//
+// The plausibility safeguard (GPS plan U12, R32) judges every fix against the
+// run's previous one, so the emulated phone has to behave like a phone: it
+// stops a few metres off a stop's pin (a fix exactly on the pin is flagged),
+// each point carries its own accuracy as a real phone's fixes would, and
+// before a long move the trail is aged (sqlAgeTrail) to stand in for the
+// minutes a driver takes to pull 1.8 km away — a teleport in seconds is
+// exactly what the safeguard flags, and it must not disqualify the Board.
 
 const KILIMANI = { latitude: -1.2902, longitude: 36.7823, accuracy: 20 };
 const LAVINGTON = { latitude: -1.2789, longitude: 36.7685, accuracy: 20 };
 
 /** `metres` due north of a point (one degree of latitude is ~111.2 km). */
-function northOf(point: typeof KILIMANI, metres: number): typeof KILIMANI {
-  return { ...point, latitude: point.latitude + metres / 111_195 };
+function northOf(point: typeof KILIMANI, metres: number, accuracy = point.accuracy): typeof KILIMANI {
+  return { ...point, latitude: point.latitude + metres / 111_195, accuracy };
 }
+
+/** The phone at the stop: 20 m off the pin, its own accuracy. */
+const AT_KILIMANI = northOf(KILIMANI, 20, 18);
+const AT_LAVINGTON = northOf(LAVINGTON, 20, 19);
+/** Where the run starts: 40 m off Kilimani's pin. */
+const START_POINT = northOf(KILIMANI, 40, 22);
+/** Seconds the earlier fixes are aged by before a long move: 3 km in 200 s
+ * is 15 m/s, a bus's pace. */
+const PULL_AWAY_S = 200;
 
 /** Records every position the live watch delivered to the app, so a test can
  * wait for an emulated move to land before tapping. */
@@ -521,7 +539,7 @@ async function boardFromRow(page: Page, studentId: string): Promise<Captured> {
 test("custody: a Board 1.8 km from the stop raises the silent confirm card with the distance; Confirm records it with the bus seen at the stop; Undo from the card and from the board page withdraws the boarding", async ({ page, context, request }) => {
   await page.addInitScript(FIX_LOG);
   await page.addInitScript(CUE_SPY);
-  await context.setGeolocation(KILIMANI);
+  await context.setGeolocation(START_POINT);
   await signInAsDriver(page);
   await startMorningRun(page);
   const ctx = await driverContext(request);
@@ -532,14 +550,15 @@ test("custody: a Board 1.8 km from the stop raises the silent confirm card with 
 
   // Arrive at Kilimani with the phone at the stop — the fix "bus seen at
   // stop" reads. Nothing to ask yet.
-  await moveTo(page, context, KILIMANI);
+  await moveTo(page, context, AT_KILIMANI);
   await page.getByRole("button", { name: "Arrive Next Stop" }).click();
   await expect(page.getByText(/^1\/\d+ stops completed$/)).toBeVisible();
   await expect(page.getByTestId("nudge-card")).toHaveCount(0);
 
-  // AE3: the driver pulls away before tapping Board.
+  // AE3: the driver pulls away (minutes, by the trail) before tapping Board.
   await page.goto("/driver/boarding");
-  await moveTo(page, context, northOf(KILIMANI, 1800));
+  sqlAgeTrail(runId, PULL_AWAY_S);
+  await moveTo(page, context, northOf(KILIMANI, 1800, 16));
   const boarding = await boardFromRow(page, faith.id);
   expect(boarding.body.fix.lat).toBeCloseTo(northOf(KILIMANI, 1800).latitude, 5);
 
@@ -576,14 +595,20 @@ test("custody: a Board 1.8 km from the stop raises the silent confirm card with 
   ]);
   expect(custody[0].events[0].shown_at).not.toBeNull();
   expect(rows.filter((x: any) => x.kind === "unverified")).toHaveLength(0);
+  // A plausible drive so far: nothing for the office to second-guess (U12).
+  expect(rows.filter((x: any) => x.kind === "implausible-movement")).toHaveLength(0);
 
-  // Undo from the card (R35): Lavington, the same pattern.
+  // Undo from the card (R35): Lavington, the same pattern. The emulated
+  // phone teleports 1.6 km to Lavington in seconds — the safeguard flags
+  // that Arrive's fix (asserted at the end); the Board after it, made once
+  // the trail is aged, is checked normally.
   await page.goto("/driver/run");
-  await moveTo(page, context, LAVINGTON);
+  await moveTo(page, context, AT_LAVINGTON);
   await page.getByRole("button", { name: "Arrive Next Stop" }).click();
   await expect(page.getByText(/^2\/\d+ stops completed$/)).toBeVisible();
   await page.goto("/driver/boarding");
-  await moveTo(page, context, northOf(LAVINGTON, 1800));
+  sqlAgeTrail(runId, PULL_AWAY_S);
+  await moveTo(page, context, northOf(LAVINGTON, 1800, 17));
   await boardFromRow(page, happiness.id);
   await expect(card).toContainText(SEED.afternoonRideMate);
   await card.getByTestId("nudge-undo").click();
@@ -600,6 +625,9 @@ test("custody: a Board 1.8 km from the stop raises the silent confirm card with 
   ]);
 
   // Undo from the board page: the same reverse path, the same ledger answer.
+  // The phone has crept 10 m on: a fresh fix at the same coordinates would
+  // read as a repeat, and the second tap must be checked like the first.
+  await moveTo(page, context, northOf(LAVINGTON, 1810, 21));
   await boardFromRow(page, happiness.id);
   await expect(card).toContainText(SEED.afternoonRideMate);
   await happinessRow.getByTestId(`undo-${happiness.id}`).click();
@@ -614,6 +642,17 @@ test("custody: a Board 1.8 km from the stop raises the silent confirm card with 
   expect(lavington.status).toBe("retracted");
   expect(lavington.events.map((e: any) => e.response)).toEqual(["retracted", "retracted"]);
   expect(rows.filter((x: any) => x.kind === "custody-away")).toHaveLength(2);
+  expect(rows.filter((x: any) => x.kind === "unverified")).toHaveLength(0);
+
+  // The office's second opinion (U12, R32): the one teleport in this run —
+  // the Arrive at Lavington, 1.6 km in seconds — is the run's single
+  // implausible-movement row, a jump, named no child, and nothing else on
+  // the run is listed there.
+  const implausible = rows.filter((x: any) => x.kind === "implausible-movement");
+  expect(implausible).toHaveLength(1);
+  expect(implausible[0].reason.split(",")).toEqual(["jump", "speed"]);
+  expect(implausible[0].distance_m).toBeGreaterThan(1000);
+  expect(implausible[0].events.map((e: any) => [e.student_id, e.prompt_state])).toEqual([[null, null]]);
 });
 
 // --- the remote absent (GPS plan U10: R16, R17, R18, R35; F4; AE6, AE7) -----------
@@ -645,7 +684,7 @@ async function adminIncidents(request: APIRequestContext, runId: string, type: s
 test("remote absent: an Absent 3 km from the stop raises the attestation card with tone and vibration; No — I wasn't at the stop sends call-now once and alerts the office; Yes — they told me attests the next one", async ({ page, context, request }) => {
   await page.addInitScript(FIX_LOG);
   await page.addInitScript(CUE_SPY);
-  await context.setGeolocation(KILIMANI);
+  await context.setGeolocation(START_POINT);
   await signInAsDriver(page);
   await startMorningRun(page);
   const ctx = await driverContext(request);
@@ -655,14 +694,16 @@ test("remote absent: an Absent 3 km from the stop raises the attestation card wi
   expect(faith && happiness).toBeTruthy();
   try {
     // Arrive at Kilimani with the phone at the stop; nothing to ask yet.
-    await moveTo(page, context, KILIMANI);
+    await moveTo(page, context, AT_KILIMANI);
     await page.getByRole("button", { name: "Arrive Next Stop" }).click();
     await expect(page.getByText(/^1\/\d+ stops completed$/)).toBeVisible();
     await expect(page.getByTestId("nudge-card")).toHaveCount(0);
 
-    // AE7: 3 km on, the driver marks Faith absent from the board page.
+    // AE7: 3 km on (minutes, by the trail), the driver marks Faith absent
+    // from the board page.
     await page.goto("/driver/boarding");
-    await moveTo(page, context, northOf(KILIMANI, 3000));
+    sqlAgeTrail(runId, PULL_AWAY_S);
+    await moveTo(page, context, northOf(KILIMANI, 3000, 16));
     const marked = await absentFromRow(page, faith.id);
     expect(marked.body.fix.lat).toBeCloseTo(northOf(KILIMANI, 3000).latitude, 5);
 
@@ -729,11 +770,12 @@ test("remote absent: an Absent 3 km from the stop raises the attestation card wi
     // "Yes — they told me": attested, no second alert.
     await signInAsDriver(page);
     await page.goto("/driver/run");
-    await moveTo(page, context, LAVINGTON);
+    await moveTo(page, context, AT_LAVINGTON);
     await page.getByRole("button", { name: "Arrive Next Stop" }).click();
     await expect(page.getByText(/^2\/\d+ stops completed$/)).toBeVisible();
     await page.goto("/driver/boarding");
-    await moveTo(page, context, northOf(LAVINGTON, 3000));
+    sqlAgeTrail(runId, PULL_AWAY_S);
+    await moveTo(page, context, northOf(LAVINGTON, 3000, 21));
     await absentFromRow(page, happiness.id);
     await expect(card).toHaveAttribute("data-kind", "absent-remote");
     await expect(card).toContainText(SEED.afternoonRideMate);

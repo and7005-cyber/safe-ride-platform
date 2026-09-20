@@ -520,6 +520,21 @@ export function sqlAgeBusPosition(busId: string, seconds: number): void {
 }
 
 /**
+ * Move every trail row of a run `seconds` into the past by capture time (GPS
+ * plan U12). **Setup for the custody and remote-absent specs only**: the
+ * plausibility safeguard flags a fix that moved further than a bus could
+ * since the run's previous fix, and an emulated phone teleports. Aging the
+ * earlier fixes stands in for the minutes a driver takes to pull away from a
+ * stop; nothing in the product can do this. The sqlAgeBusPosition precedent.
+ */
+export function sqlAgeTrail(runId: string, seconds: number): void {
+  psql(
+    `update run_positions set captured_at = captured_at - make_interval(secs => ${Math.floor(seconds)}) ` +
+      `where run_id = '${runId}'`,
+  );
+}
+
+/**
  * Null a bus's served position. **Teardown only**: purgeRun deletes the run
  * but not the five position columns End Run would have cleared, and a leftover
  * pair reads as a live bus on the next spec's fleet map.

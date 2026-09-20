@@ -4,7 +4,9 @@ Two shapes, like ``exception_dao``:
 
 - module functions on the caller's connection, used by the action DAOs
   inside the action transaction: append the tap's trail row, write the five
-  position columns as one statement, clear them, flag a row;
+  position columns as one statement, clear them, flag a row, and read the
+  previous fix and the planned stops the plausibility safeguard (U12)
+  compares a new fix against;
 - ``PositionDao`` for the one piece of work that opens its own scoped
   connection — the bounded purge after Start Run — so RLS confines it to the
   school like any request-path DAO.
@@ -27,6 +29,7 @@ only the copied coordinates are nulled. Nothing here logs a coordinate.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from psycopg import sql
@@ -40,7 +43,12 @@ from app.core.config import (
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
 from app.dao import idempotency_dao
-from app.services.position_rules import NormalisedFix, StoredFix
+from app.services.position_rules import (
+    FLAG_CLASSIFICATION_FAILED,
+    PLAUSIBILITY_FLAGS,
+    NormalisedFix,
+    StoredFix,
+)
 
 logger = logging.getLogger("saferide.positions")
 
@@ -103,53 +111,130 @@ def append_action_row(
 def add_flag(conn, row_id: str, flag: str) -> None:
     """Append a flag to a trail row once (idempotent). The seam U9/U10 use to
     mark ``classification-failed`` after their savepoint rolled back."""
+    add_flags(conn, row_id, (flag,))
+
+
+def add_flags(conn, row_id: str, flags: Iterable[str]) -> None:
+    """Merge flags onto a trail row in one statement — each once, in the
+    given order after whatever the row already carries (``clock-skew`` from
+    the boundary stays first). The plausibility step (U12) writes its flags
+    through here."""
+    new = list(flags)
+    if not new:
+        return
     conn.execute(
         """
-        update run_positions set flags = array_append(flags, %s)
-        where id = %s and not (%s = any(flags))
+        update run_positions
+        set flags = flags || array(
+            select f from unnest(%s::text[]) with ordinality as n(f, ord)
+            where not (f = any(flags))
+            order by ord
+        )
+        where id = %s
         """,
-        (flag, row_id, flag),
+        (new, row_id),
+    )
+
+
+# Every fix reader below keeps the same shape: phone fixes only (a checkpoint
+# row is the planned stop coordinate stamped by a fix-less Arrive, and counting
+# it would make every stop "seen" by construction), the four fix columns
+# present, and receipt inside the school's retention (R12) — a purge that has
+# not run yet is invisible here too.
+_FIX_ROW_SQL = """
+    p.source <> %(checkpoint)s
+    and p.lat is not null and p.lng is not null
+    and p.accuracy_m is not null and p.captured_at is not null
+"""
+_RETENTION_SQL = """
+    p.received_at >= now() - make_interval(secs => %(retention_days)s * 86400)
+"""
+
+
+def _stored(row) -> StoredFix:
+    return StoredFix(
+        lat=row["lat"], lng=row["lng"], accuracy_m=row["accuracy_m"],
+        captured_at=row["captured_at"],
     )
 
 
 def run_fixes(
     conn, run_id: str, *, default_retention_days: int | None = None
 ) -> list[StoredFix]:
-    """Every phone fix on a run's trail inside the school's retention, oldest
-    first — the read behind "bus seen at stop" (U9, R13).
+    """Every *plausible* phone fix on a run's trail inside the school's
+    retention, oldest first — the read behind "bus seen at stop" (U9, R13).
 
-    Phone fixes only: a checkpoint row is the planned stop coordinate stamped
-    by a fix-less Arrive, and counting it would make every stop "seen" by
-    construction — the fabricated corroboration the plan warns about. Rows
-    past retention are never served (R12), so a purge that has not run yet
-    is invisible here too. The school's own retention applies; the default
-    beneath it is Settings' (U11), read per call.
+    A fix carrying any plausibility flag (U12, R32) is left out: a flagged
+    fix vouches for nothing, so a fix posted at the planned stop's pin or
+    teleported onto it can never make "bus seen at stop" read yes — the
+    fabricated corroboration the plan warns about. A row flagged
+    ``classification-failed`` is left out too: its plausibility may never
+    have been judged, and an unjudged fix must not vouch for a stop either.
+    The school's own retention applies; the default beneath it is Settings'
+    (U11), read per call.
     """
     if default_retention_days is None:
         default_retention_days = int(get_settings().gps_position_retention_days)
     rows = conn.execute(
-        """
+        f"""
         select p.lat, p.lng, p.accuracy_m, p.captured_at
         from run_positions p
         join live_runs r on r.id = p.run_id
         left join live_schools s on s.id = r.school_id
-        where p.run_id = %s
-          and p.source <> %s
-          and p.lat is not null and p.lng is not null
-          and p.accuracy_m is not null and p.captured_at is not null
+        where p.run_id = %(run_id)s
+          and {_FIX_ROW_SQL}
+          and not (p.flags && %(excluded_flags)s::text[])
           and p.received_at >= now() - make_interval(
-                secs => coalesce(s.position_retention_days, %s) * 86400)
+                secs => coalesce(s.position_retention_days, %(retention_days)s) * 86400)
         order by p.received_at asc, p.id asc
         """,
-        (run_id, SOURCE_CHECKPOINT, default_retention_days),
+        {
+            "run_id": run_id, "checkpoint": SOURCE_CHECKPOINT,
+            "excluded_flags": [*PLAUSIBILITY_FLAGS, FLAG_CLASSIFICATION_FAILED],
+            "retention_days": default_retention_days,
+        },
     ).fetchall()
-    return [
-        StoredFix(
-            lat=row["lat"], lng=row["lng"], accuracy_m=row["accuracy_m"],
-            captured_at=row["captured_at"],
-        )
-        for row in rows
-    ]
+    return [_stored(row) for row in rows]
+
+
+def previous_fix(
+    conn, run_id: str, *, before_row_id: str, retention_days: int
+) -> StoredFix | None:
+    """The run's previous fix-bearing trail row — by receipt order, inside
+    the school's retention (the resolved days, U11), excluding the tap's own
+    row — for the plausibility safeguard (U12) to compare the new fix
+    against. Flagged or not: a fix after an implausible one is judged against
+    what the phone last claimed. None for the first fix of a run, or when
+    every earlier fix is past retention (a row the purge will delete is not
+    evidence either)."""
+    row = conn.execute(
+        f"""
+        select p.lat, p.lng, p.accuracy_m, p.captured_at
+        from run_positions p
+        where p.run_id = %(run_id)s
+          and p.id <> %(before_row_id)s
+          and {_FIX_ROW_SQL}
+          and {_RETENTION_SQL}
+        order by p.received_at desc, p.id desc
+        limit 1
+        """,
+        {
+            "run_id": run_id, "before_row_id": before_row_id,
+            "checkpoint": SOURCE_CHECKPOINT, "retention_days": int(retention_days),
+        },
+    ).fetchone()
+    return _stored(row) if row else None
+
+
+def planned_stops(conn, run_id: str) -> list[tuple[float, float]]:
+    """The run's planned stop coordinates (``run_stops`` for this run, gate
+    included, pins only) — the second input of the plausibility safeguard."""
+    rows = conn.execute(
+        "select lat, lng from run_stops where run_id = %s "
+        "and lat is not null and lng is not null",
+        (run_id,),
+    ).fetchall()
+    return [(row["lat"], row["lng"]) for row in rows]
 
 
 # --- the served position (five columns, one statement) -------------------------

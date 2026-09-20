@@ -56,6 +56,21 @@ commit and send is sent once by the next context poll; a coarse fix at a
 coordinate-less stop is one stop-unverified row, never two prompts; no log
 line, incident or push body carries a coordinate.
 
+The plausibility safeguard (U12: R32; R20's implausible reason) is the
+fourth part: a 5 km jump in 20 s flags the second fix and its custody check
+reads unverified/implausible, not away; accuracy zero, a fix on a planned
+stop's pin and identical consecutive coordinates flag while their neighbours
+(and identical accuracy, which iPhones repeat) do not; the flags sit on the
+trail row beside clock-skew; one
+implausible-movement row per run lists every flagged fix as a ledger event
+for the panel; a flagged fix corroborates no absent and never reads "bus
+seen at stop"; a forced failure in the step leaves the tap committed and the
+row flagged classification-failed, and that unjudged fix vouches for no stop
+either; a previous fix past retention is not compared against.
+
+Fixes are minted through conftest's ``Phone`` (see there): consecutive fixes
+are plausible unless a test builds an implausible one by hand.
+
 Isolation: an own throwaway school (school_sandbox) with two drivers, two
 buses, a morning and an afternoon route on bus 1, a morning route on bus 2,
 three students at their own stops (A's parent is a real signed-up account
@@ -78,7 +93,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, purge_accounts, purge_run, school_sandbox
+from conftest import DSN, Phone, haversine_m, purge_accounts, purge_run, school_sandbox
 from test_students_parents import signup_parent
 
 pytestmark = pytest.mark.skipif(
@@ -89,8 +104,10 @@ pytestmark = pytest.mark.skipif(
 BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
 SCHOOL_LAT, SCHOOL_LNG = -1.30, 36.80
 # Distinctive digits so a substring search over logs and incidents means
-# something: nothing else in the stack carries these.
+# something: nothing else in the stack carries these. The phone's home: a
+# run's first default fix sits exactly here, later ones a few metres on.
 FIX_LAT, FIX_LNG = -1.234567, 36.876543
+PHONE = Phone(home=(FIX_LAT, FIX_LNG))
 POSITION_COLUMNS = (
     "current_lat", "current_lng", "position_source", "position_at", "position_accuracy_m",
 )
@@ -258,9 +275,12 @@ def iso(moment: datetime) -> str:
     return moment.astimezone(timezone(timedelta(hours=3))).isoformat(timespec="milliseconds")
 
 
-def fix(lat=FIX_LAT, lng=FIX_LNG, accuracy=12.0, captured_at=None, **extra) -> dict:
-    captured = captured_at or iso(datetime.now(timezone.utc) - timedelta(seconds=2))
-    return {"lat": lat, "lng": lng, "accuracy_m": accuracy, "captured_at": captured, **extra}
+def fix(lat=None, lng=None, accuracy=None, captured_at=None, **extra) -> dict:
+    """The next plausible fix from the phone (conftest.Phone): defaults are
+    the phone's home, then a few metres on from the last fix, a fresh
+    accuracy and a capture time that follows the last one by the travel
+    time. Anything given explicitly is sent as given."""
+    return PHONE.fix(lat, lng, accuracy, captured_at, **extra)
 
 
 def post(client, headers, path, body, *, key="auto", raw_header=None) -> httpx.Response:
@@ -281,6 +301,9 @@ def key_of(response: httpx.Response) -> str | None:
 
 
 def start(client, headers, route_id, *, fix_body=None, key="auto", device=DEVICE_ID):
+    # A new run: the phone's clock rewinds and the start fix becomes the
+    # run's earliest (conftest.Phone.begin_run).
+    PHONE.begin_run(fix_body)
     body = {"route_id": route_id, "device_id": device}
     if fix_body is not None:
         body["fix"] = fix_body
@@ -617,19 +640,21 @@ def test_two_boards_inside_the_cache_window_share_a_capture_time_and_both_commit
         plan = layout(run_id)
         arrive_until(client, h, run_id, max(plan["by_student"][fleet["a"]["id"]],
                                             plan["by_student"][fleet["b"]["id"]]))
-        shared = iso(datetime.now(timezone.utc) - timedelta(seconds=3))
+        # One cached fix, read twice (U6's 15 s window): the same
+        # coordinates, accuracy and capture time on both taps.
+        shared = fix(captured_at=iso(datetime.now(timezone.utc) - timedelta(seconds=3)))
         one = action(client, h, "/api/runs/driver/boarding",
-                     {"student_id": fleet["a"]["id"], "on_bus": True},
-                     fix_body=fix(captured_at=shared))
+                     {"student_id": fleet["a"]["id"], "on_bus": True}, fix_body=shared)
         two = action(client, h, "/api/runs/driver/boarding",
-                     {"student_id": fleet["b"]["id"], "on_bus": True},
-                     fix_body=fix(captured_at=shared))
+                     {"student_id": fleet["b"]["id"], "on_bus": True}, fix_body=shared)
         assert one.status_code == 200, one.text
         assert two.status_code == 200, two.text
         boards = [r for r in trail(run_id) if r["action_kind"] == "board"]
         assert len(boards) == 2
         assert boards[0]["captured_at"] == boards[1]["captured_at"]
         assert boards[0]["action_key"] != boards[1]["action_key"]
+        # The re-read is the same observation, not a repeat (U12).
+        assert [tuple(r["flags"]) for r in boards] == [(), ()]
     finally:
         purge_run(run_id)
 
@@ -1160,18 +1185,18 @@ def test_no_log_line_incident_or_audit_detail_carries_a_coordinate(
     from app.dao import position_dao
 
     school = fleet["school_id"]
-    # The fix coordinates every tap in this module sends; nothing else in the
-    # stack carries these digits.
-    needles = ("1.234567", "36.876543")
     scope = SchoolScope(
         user_id=fleet["driver1"]["id"], school_id=school, role="driver", actor_kind="driver",
     )
     # A real pass and every failure branch of the wrapper, in-process, with
-    # a run whose trail carries the distinctive coordinates.
+    # a run whose trail carries these two fixes' coordinates (and the phone's
+    # home digits, which nothing else in the stack carries).
+    f_start, f_arrive = fix(), fix()
+    needles = tuple(coordinate_needles(f_start, f_arrive)) + ("1.234567", "36.876543")
     run_id = start(client, fleet["driver_headers"], fleet["morning"]["id"],
-                   fix_body=fix()).json()["id"]
+                   fix_body=f_start).json()["id"]
     try:
-        arrive(client, fleet["driver_headers"], run_id, expected=1)
+        arrive(client, fleet["driver_headers"], run_id, expected=1, fix_body=f_arrive)
         with caplog.at_level(logging.INFO):
             # The API container's own post-Start-Run pass may still hold the
             # school's advisory lock (it runs after the run-started fan-out);
@@ -1290,8 +1315,9 @@ CUSTODY_AWAY = "custody-away"
 UNVERIFIED = "unverified"
 
 
-def near_stop(coords: tuple, *, north_m: float = 0.0, accuracy: float = 12.0) -> dict:
-    """A fix ``north_m`` metres due north of a stop's coordinates."""
+def near_stop(coords: tuple, *, north_m: float = 0.0, accuracy: float | None = None) -> dict:
+    """A fix ``north_m`` metres due north of a stop's coordinates (the phone's
+    next accuracy unless given)."""
     return fix(lat=coords[0] + north_m * METRE, lng=coords[1], accuracy=accuracy)
 
 
@@ -1448,7 +1474,9 @@ def test_ae3_ae4_a_far_board_raises_one_custody_exception_with_a_prompt_and_a_ne
         assert row["stop_order"] == a_order and row["status"] == "open"
         assert row["seen_at_stop"] is True, "the Arrive fix was within the vicinity"
         assert row["distance_m"] == pytest.approx(1800, abs=5)
-        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (far["lat"], far["lng"], 12.0)
+        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (
+            far["lat"], far["lng"], far["accuracy_m"],
+        )
         assert [s["id"] for s in row["students"]] == [a_id]
         assert len(row["events"]) == 1
         event = row["events"][0]
@@ -2109,7 +2137,9 @@ def test_ae7_a_remote_absent_answered_not_at_stop_sends_call_now_once_and_alerts
         assert row["student_id"] == a_id and row["stop_order"] == a_order
         assert row["status"] == "open"
         assert row["distance_m"] == pytest.approx(3000, abs=5)
-        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (far["lat"], far["lng"], 12.0)
+        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (
+            far["lat"], far["lng"], far["accuracy_m"],
+        )
         assert [(e["prompt_state"], e["response"], e["student_id"]) for e in row["events"]] == [
             ("pending", None, a_id),
         ]
@@ -2687,3 +2717,372 @@ def test_a_forced_classification_error_leaves_the_absent_mark_committed_and_flag
         clear_injected_failure()
         purge_run(run_id)
         _clear_absences(client, admin_headers, a_id)
+
+
+# The plausibility safeguard (U12: R32; R20's implausible reason) -----------------
+
+IMPLAUSIBLE_MOVEMENT = "implausible-movement"
+PLAUSIBILITY_FLAGS = (
+    "clock-skew", "jump", "speed", "accuracy-zero", "repeat-coordinates", "at-planned-stop",
+)
+
+
+def flags_of(run_id: str) -> tuple:
+    return tuple(trail(run_id)[-1]["flags"])
+
+
+def inject_flag_write_failure() -> None:
+    """Refuse any plausibility flag on a trail row: the assessment's own
+    write fails, the bookkeeping flag still lands."""
+    vocabulary = ", ".join(f"'{flag}'" for flag in PLAUSIBILITY_FLAGS)
+    with db() as conn:
+        conn.execute(
+            "create or replace function it_gps_refuse_flags() returns trigger "
+            "language plpgsql as $$ begin "
+            f"if new.flags && array[{vocabulary}]::text[] then "
+            "raise exception 'injected: plausibility flags refused'; end if; "
+            "return new; end $$"
+        )
+        conn.execute("drop trigger if exists it_gps_refuse_flags on run_positions")
+        conn.execute(
+            "create trigger it_gps_refuse_flags before update on run_positions "
+            "for each row execute function it_gps_refuse_flags()"
+        )
+
+
+def clear_flag_write_failure() -> None:
+    with db() as conn:
+        conn.execute("drop trigger if exists it_gps_refuse_flags on run_positions")
+        conn.execute("drop function if exists it_gps_refuse_flags()")
+
+
+def test_a_five_km_jump_in_twenty_seconds_flags_the_fix_and_the_custody_check_reads_implausible(
+    client, admin_headers, fleet,
+):
+    """R32: the second of two fixes 5 km apart 20 s apart is flagged `jump`
+    and `speed`; the Board it rides classifies unverified/implausible — not
+    away, not within — with no prompt; the run's one implausible-movement
+    row lists the fix for the office with the distance it moved and the
+    child the tap named; a second flagged fix (accuracy zero) attaches to
+    the same row and widens its reason."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order, b_order = plan["by_student"][a_id], plan["by_student"][b_id]
+        a_stop, b_stop = plan["coords"][a_order], plan["coords"][b_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+        at_stop = trail(run_id)[-1]
+        assert tuple(at_stop["flags"]) == ()
+
+        # 5 km north of the stop, 20 s after the Arrive's fix.
+        far = PHONE.jump(a_stop[0] + 5000 * METRE, a_stop[1], after_s=20)
+        boarded = board(client, h, a_id, far)
+        assert boarded.status_code == 200, boarded.text
+        assert participation(run_id, a_id)["boarded_at"] is not None, "flags never block the tap"
+        last = trail(run_id)[-1]
+        assert last["action_kind"] == "board" and last["fix_reason"] == "none"
+        assert tuple(last["flags"]) == ("jump", "speed")
+        assert pending(client, h) == [], "an implausible fix raises no custody prompt"
+
+        rows = exceptions(client, admin_headers, run_id)
+        assert sorted((x["kind"], x["reason"]) for x in rows) == [
+            (IMPLAUSIBLE_MOVEMENT, "jump,speed"), (UNVERIFIED, "implausible"),
+        ]
+        unverified = next(x for x in rows if x["kind"] == UNVERIFIED)
+        assert unverified["stop_order"] is None and unverified["status"] is None
+        assert [s["id"] for s in unverified["students"]] == [a_id]
+        assert len(unverified["events"]) == 1
+        assert unverified["events"][0]["student_id"] == a_id
+        assert unverified["events"][0]["prompt_state"] is None
+        # The distance to the stop still travels on the unverified row.
+        assert unverified["distance_m"] == pytest.approx(5000, abs=5)
+
+        review = next(x for x in rows if x["kind"] == IMPLAUSIBLE_MOVEMENT)
+        assert review["stop_order"] is None and review["student_id"] is None
+        assert review["status"] is None and review["seen_at_stop"] is None
+        assert (review["fix_lat"], review["fix_lng"], review["fix_accuracy_m"]) == (
+            far["lat"], far["lng"], far["accuracy_m"],
+        )
+        # The row's distance is the jump: from the Arrive fix 30 m north of
+        # the stop to 5 km north of it.
+        jumped = 5000 - 30
+        assert review["distance_m"] == pytest.approx(jumped, abs=5)
+        assert [s["id"] for s in review["students"]] == [a_id]
+        assert len(review["events"]) == 1
+        event = review["events"][0]
+        assert event["student_id"] == a_id
+        assert event["prompt_state"] is None and event["response"] is None
+        assert event["distance_m"] == pytest.approx(jumped, abs=5)
+        assert (event["fix_lat"], event["fix_lng"], event["fix_accuracy_m"]) == (
+            far["lat"], far["lng"], far["accuracy_m"],
+        )
+        assert str(ledger(review["id"])[0]["action_key"]) == key_of(boarded)
+        assert event["call_now_due_at"] is None
+
+        # A second flagged fix on the run: accuracy zero at B's stop.
+        arrive_at_stop(client, h, run_id, b_order, b_stop)
+        assert flags_of(run_id) == (), "the plausible drive to B is not flagged"
+        zero = near_stop(b_stop, north_m=25, accuracy=0)
+        boarded_b = board(client, h, b_id, zero)
+        assert boarded_b.status_code == 200, boarded_b.text
+        assert flags_of(run_id) == ("accuracy-zero",)
+        assert pending(client, h) == []
+
+        rows = exceptions(client, admin_headers, run_id)
+        reviews = [x for x in rows if x["kind"] == IMPLAUSIBLE_MOVEMENT]
+        assert len(reviews) == 1 and reviews[0]["id"] == review["id"], "one row per run"
+        again = reviews[0]
+        assert again["reason"] == "jump,speed,accuracy-zero"
+        # The row keeps the first flagged fix; the ledger has both.
+        assert (again["fix_lat"], again["fix_lng"]) == (far["lat"], far["lng"])
+        assert again["distance_m"] == pytest.approx(jumped, abs=5)
+        assert [e["student_id"] for e in again["events"]] == [a_id, b_id]
+        assert [s["id"] for s in again["students"]] == [a_id, b_id]
+        assert (again["events"][1]["fix_lat"], again["events"][1]["fix_accuracy_m"]) == (zero["lat"], 0)
+        # Moved 5 m since the Arrive fix 30 m north of the stop.
+        assert again["events"][1]["distance_m"] == pytest.approx(5, abs=2)
+        checks = next(x for x in rows if x["kind"] == UNVERIFIED)
+        assert checks["id"] == unverified["id"]
+        assert [e["student_id"] for e in checks["events"]] == [a_id, b_id]
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY) == []
+    finally:
+        purge_run(run_id)
+
+
+def test_accuracy_zero_the_stop_pin_and_repeated_coordinates_or_accuracy_flag_and_their_neighbours_do_not(
+    client, admin_headers, fleet,
+):
+    """Each stateless and pairwise rule through the API, on the trail row:
+    a fix exactly on a planned stop's pin flags `at-planned-stop`, 30 m off
+    with accuracy 25 does not; accuracy 0 flags; the previous fix's
+    coordinates on a new capture flag `repeat-coordinates`; its accuracy on
+    a new capture, and distinct coordinates, do not (identical accuracy is
+    not a rule — iPhones repeat theirs). Every flagged fix — Arrive or
+    Board — lands on the one review row; only the Board's names a child."""
+    h = fleet["driver_headers"]
+    a_id, b_id, c_id = fleet["a"]["id"], fleet["b"]["id"], fleet["c"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order, b_order, c_order = (plan["by_student"][k] for k in (a_id, b_id, c_id))
+        assert (a_order, b_order, c_order) == (1, 2, 3), plan
+        a_pin, b_pin, c_pin = plan["coords"][1], plan["coords"][2], plan["coords"][3]
+        assert flags_of(run_id) == ()
+
+        on_pin = arrive(client, h, run_id, expected=1, fix_body=fix(lat=a_pin[0], lng=a_pin[1]))
+        assert on_pin.status_code == 200, on_pin.text
+        assert flags_of(run_id) == ("at-planned-stop",)
+
+        beside = board(client, h, a_id, near_stop(a_pin, north_m=30, accuracy=25))
+        assert beside.status_code == 200, beside.text
+        assert flags_of(run_id) == ()
+        assert pending(client, h) == [] and exceptions(client, admin_headers, run_id, CUSTODY_AWAY) == []
+
+        zero = near_stop(b_pin, north_m=30, accuracy=0)
+        assert arrive(client, h, run_id, expected=2, fix_body=zero).status_code == 200
+        assert flags_of(run_id) == ("accuracy-zero",)
+
+        # The Arrive's coordinates again on a fresh capture (5 s on, a new
+        # accuracy): a repeat, and the Board it rides is not checked.
+        same_place = PHONE.jump(zero["lat"], zero["lng"], after_s=5)
+        assert board(client, h, b_id, same_place).status_code == 200
+        assert flags_of(run_id) == ("repeat-coordinates",)
+        assert pending(client, h) == []
+
+        # C's stop with the previous fix's accuracy, 1.1 km on in the time a
+        # bus takes: nothing — identical accuracy is not a rule.
+        same_accuracy = near_stop(c_pin, north_m=30, accuracy=same_place["accuracy_m"])
+        assert arrive(client, h, run_id, expected=3, fix_body=same_accuracy).status_code == 200
+        assert flags_of(run_id) == ()
+
+        # Distinct coordinates and accuracy: nothing, and the check runs.
+        assert board(client, h, c_id, near_stop(c_pin, north_m=20)).status_code == 200
+        assert flags_of(run_id) == ()
+        assert pending(client, h) == []
+
+        rows = exceptions(client, admin_headers, run_id)
+        assert sorted((x["kind"], x["reason"]) for x in rows) == [
+            (IMPLAUSIBLE_MOVEMENT, "accuracy-zero,repeat-coordinates,at-planned-stop"),
+            (UNVERIFIED, "implausible"),
+        ]
+        review = next(x for x in rows if x["kind"] == IMPLAUSIBLE_MOVEMENT)
+        assert [e["student_id"] for e in review["events"]] == [None, None, b_id]
+        assert [s["id"] for s in review["students"]] == [b_id]
+        # The first flagged fix (the Arrive on the pin) is the row's fix; a
+        # run's first Arrive after Start Run has a previous fix, so it moved.
+        assert (review["fix_lat"], review["fix_lng"]) == (a_pin[0], a_pin[1])
+        assert review["distance_m"] > 1000
+        assert review["events"][2]["distance_m"] == pytest.approx(0, abs=1), "same place: moved nothing"
+        checks = next(x for x in rows if x["kind"] == UNVERIFIED)
+        assert [e["student_id"] for e in checks["events"]] == [b_id]
+    finally:
+        purge_run(run_id)
+
+
+def test_a_flagged_fix_corroborates_no_absent_and_never_reads_as_bus_seen_at_stop(
+    client, admin_headers, fleet,
+):
+    """R32 on the two readers that would otherwise trust the fix: a custody
+    row's "bus seen at stop" ignores a flagged fix at the stop until a
+    plausible one arrives; an Absent with a flagged fix inside the stop's
+    vicinity is unverified/implausible, never corroborated, and raises no
+    attestation prompt."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order, b_order = plan["by_student"][a_id], plan["by_student"][b_id]
+        a_stop, b_stop = plan["coords"][a_order], plan["coords"][b_order]
+        # The Arrive at A's stop sits exactly on the pin: flagged.
+        arrive_until(client, h, run_id, a_order - 1)
+        pinned = arrive(client, h, run_id, expected=a_order, fix_body=fix(lat=a_stop[0], lng=a_stop[1]))
+        assert pinned.status_code == 200, pinned.text
+        assert flags_of(run_id) == ("at-planned-stop",)
+
+        far = board(client, h, a_id, near_stop(a_stop, north_m=1800))
+        assert far.status_code == 200, far.text
+        assert flags_of(run_id) == ()
+        custody = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)
+        assert len(custody) == 1 and custody[0]["stop_order"] == a_order
+        assert custody[0]["seen_at_stop"] is False, "the only fix at the stop is flagged"
+
+        # A plausible fix at the stop — a stale client's retried Arrive,
+        # recorded as a no-op with its fix — flips it.
+        retried = arrive(client, h, run_id, expected=a_order, fix_body=near_stop(a_stop, north_m=40))
+        assert retried.status_code == 200 and retried.json()["noop"] is True
+        assert flags_of(run_id) == ()
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["seen_at_stop"] is True
+
+        # B: at the stop, accuracy zero — inside the vicinity by geometry,
+        # corroborated by nothing.
+        arrive_at_stop(client, h, run_id, b_order, b_stop)
+        marked = absent(client, h, b_id, near_stop(b_stop, north_m=40, accuracy=0))
+        assert marked.status_code == 200, marked.text
+        assert flags_of(run_id) == ("accuracy-zero",)
+        assert absence_today(b_id) is not None, "the mark itself stands"
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+        rows = exceptions(client, admin_headers, run_id)
+        checks = [x for x in rows if x["kind"] == UNVERIFIED]
+        assert [(x["reason"], [e["student_id"] for e in x["events"]]) for x in checks] == [
+            ("implausible", [b_id]),
+        ]
+        review = [x for x in rows if x["kind"] == IMPLAUSIBLE_MOVEMENT]
+        assert len(review) == 1
+        assert [e["student_id"] for e in review[0]["events"]] == [None, b_id]
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, b_id)
+
+
+def test_a_forced_failure_in_the_plausibility_step_leaves_the_tap_committed_and_flags_the_trail_row(
+    client, admin_headers, fleet,
+):
+    """R23/R40 for the fourth writer. Phase one: the flags land but every
+    run_exceptions insert fails — the Board commits, the row carries its flag
+    and `classification-failed`, nothing is listed. Phase two: the
+    assessment's own flag write is refused — the Board commits, the row reads
+    only `classification-failed`, and no check runs on the unjudged fix (no
+    row, no prompt). An unjudged fix vouches for nothing either: with that
+    row the only fix near the stop, a later far Board's custody row reads
+    "bus seen at stop: no" until a plausible fix at the stop arrives."""
+    h = fleet["driver_headers"]
+    a_id, b_id, c_id = fleet["a"]["id"], fleet["b"]["id"], fleet["c"]["id"]
+    f1, f2, f3 = [kid["id"] for kid in fleet["five"][:3]]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        order = plan["by_student"]
+        coords = plan["coords"]
+
+        arrive_at_stop(client, h, run_id, order[a_id], coords[order[a_id]])
+        inject_exception_insert_failure()
+        try:
+            boarded = board(client, h, a_id, near_stop(coords[order[a_id]], north_m=25, accuracy=0))
+            assert boarded.status_code == 200, boarded.text
+        finally:
+            clear_injected_failure()
+        assert participation(run_id, a_id)["boarded_at"] is not None
+        assert run_row(run_id)["students_boarded"] == 1
+        assert tuple(trail(run_id)[-1]["flags"]) == ("accuracy-zero", "classification-failed")
+        assert exceptions(client, admin_headers, run_id) == []
+        assert pending(client, h) == []
+
+        # B and C recorded at their stops on the way, so no stop is bypassed;
+        # the Arrive at the shared stop carries a fix from where the phone
+        # was (C's stop), so nothing plausible sits near the shared stop yet.
+        for kid in (b_id, c_id):
+            arrive_at_stop(client, h, run_id, order[kid], coords[order[kid]])
+            assert board(client, h, kid, near_stop(coords[order[kid]], north_m=20)).status_code == 200
+        shared_order, shared_stop = order[f1], coords[order[f1]]
+        arrive_until(client, h, run_id, shared_order)
+        assert exceptions(client, admin_headers, run_id) == []
+
+        inject_flag_write_failure()
+        try:
+            boarded_f1 = board(client, h, f1, near_stop(shared_stop, north_m=25, accuracy=0))
+            assert boarded_f1.status_code == 200, boarded_f1.text
+        finally:
+            clear_flag_write_failure()
+        assert participation(run_id, f1)["boarded_at"] is not None
+        last = trail(run_id)[-1]
+        assert last["action_kind"] == "board"
+        assert tuple(last["flags"]) == ("classification-failed",)
+        assert exceptions(client, admin_headers, run_id) == []
+        assert pending(client, h) == []
+
+        # A far Board at the same stop is checked normally; the unjudged fix
+        # 25 m from the stop does not make the bus "seen" there.
+        assert board(client, h, f2, near_stop(shared_stop, north_m=1800)).status_code == 200
+        assert flags_of(run_id) == ()
+        custody = exceptions(client, admin_headers, run_id, CUSTODY_AWAY)
+        assert len(custody) == 1 and custody[0]["stop_order"] == shared_order
+        assert custody[0]["seen_at_stop"] is False
+        # A plausible fix at the stop does.
+        assert board(client, h, f3, near_stop(shared_stop, north_m=20)).status_code == 200
+        assert flags_of(run_id) == ()
+        assert exceptions(client, admin_headers, run_id, CUSTODY_AWAY)[0]["seen_at_stop"] is True
+    finally:
+        clear_flag_write_failure()
+        clear_injected_failure()
+        purge_run(run_id)
+
+
+def test_a_previous_fix_past_retention_is_not_compared_against(client, admin_headers, fleet):
+    """R12 meets R32: the previous fix is read inside the school's retention
+    by receipt time. With the Start Run fix received 91 days ago (default
+    retention 90), a 10 km move 5 s later has nothing to be compared with;
+    the next 1 km move 5 s on is compared with the fix inside retention and
+    flagged."""
+    h = fleet["driver_headers"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        # Let the Start Run's own purge pass finish before back-dating, so the
+        # row is old for the reader but not swept from under the test.
+        time.sleep(1.5)
+        with db() as conn:
+            conn.execute(
+                "update run_positions set received_at = received_at - interval '91 days' "
+                "where run_id = %s",
+                (run_id,),
+            )
+        plan = layout(run_id)
+        # 30 m off each pin (a fix on the pin is its own flag).
+        stop1 = (plan["coords"][1][0] + 30 * METRE, plan["coords"][1][1])
+        stop2 = (plan["coords"][2][0] + 30 * METRE, plan["coords"][2][1])
+        first = arrive(client, h, run_id, expected=1, fix_body=PHONE.jump(*stop1, after_s=5))
+        assert first.status_code == 200, first.text
+        assert len(trail(run_id)) == 2, "the old row is still there, only out of retention"
+        assert flags_of(run_id) == ()
+
+        second = arrive(client, h, run_id, expected=2, fix_body=PHONE.jump(*stop2, after_s=5))
+        assert second.status_code == 200, second.text
+        assert flags_of(run_id) == ("jump", "speed")
+        review = exceptions(client, admin_headers, run_id, IMPLAUSIBLE_MOVEMENT)
+        assert len(review) == 1 and review[0]["reason"] == "jump,speed"
+        assert review[0]["distance_m"] == pytest.approx(haversine_m(stop1, stop2), abs=5)
+    finally:
+        purge_run(run_id)
