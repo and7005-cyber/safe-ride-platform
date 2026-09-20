@@ -10,6 +10,7 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { useToast } from "@/components/ui/use-toast";
 import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { useDriverContext } from "@/features/driver/driverHooks";
+import { postDriverAction } from "@/lib/actionEnvelope";
 import { api } from "@/lib/apiClient";
 // The driver board had no label map at all and rendered raw slugs like
 // "at-school" (U17). It now reads the same vocabulary as admin and parent.
@@ -81,6 +82,11 @@ export function DriverBoardingPage() {
 
   const refresh = () => qc.invalidateQueries({ queryKey: ["driver-context"] });
 
+  // The four outcome taps below go through the action envelope (GPS plan U6):
+  // the fix at the tap, one key per tap, the same envelope again on a retry.
+  // Undo stays a plain post — it is a correction of a tap, not a tap (U9).
+  const runId: string | null = activeRun?.id ?? null;
+
   const board = async (s: any) => {
     if (!(await confirm({
       title: `Board ${s.name}?`,
@@ -89,7 +95,7 @@ export function DriverBoardingPage() {
       destructive: false,
     }))) return;
     try {
-      await api.post("/api/runs/driver/boarding", { student_id: s.id, on_bus: true });
+      await postDriverAction("/api/runs/driver/boarding", { student_id: s.id, on_bus: true }, { runId });
       await refresh();
     } catch (err) {
       toast({ title: "Cannot update", description: (err as Error).message, variant: "destructive" });
@@ -104,7 +110,7 @@ export function DriverBoardingPage() {
       destructive: false,
     }))) return;
     try {
-      await api.post("/api/runs/driver/dropoff", { student_id: s.id });
+      await postDriverAction("/api/runs/driver/dropoff", { student_id: s.id }, { runId });
       await refresh();
     } catch (err) {
       toast({ title: "Cannot update", description: (err as Error).message, variant: "destructive" });
@@ -131,7 +137,7 @@ export function DriverBoardingPage() {
       cancelLabel: "Cancel",
     }))) return;
     try {
-      await api.post("/api/runs/driver/absent", { student_id: s.id });
+      await postDriverAction("/api/runs/driver/absent", { student_id: s.id }, { runId });
       await refresh();
     } catch (err) {
       toast({ title: "Cannot update", description: (err as Error).message, variant: "destructive" });
@@ -158,7 +164,7 @@ export function DriverBoardingPage() {
     });
     if (note == null) return;
     try {
-      await api.post("/api/runs/driver/handover", { student_id: s.id, note });
+      await postDriverAction("/api/runs/driver/handover", { student_id: s.id, note }, { runId });
       await refresh();
     } catch (err) {
       toast({ title: "Cannot record", description: (err as Error).message, variant: "destructive" });

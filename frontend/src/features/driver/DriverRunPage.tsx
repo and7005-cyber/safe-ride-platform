@@ -13,12 +13,57 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/use-toast";
 import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { nudgeStore } from "@/features/driver/components/nudgeStore";
 import { unlockAttentionAudio } from "@/features/driver/components/useAttentionCue";
 import { useDriverContext } from "@/features/driver/driverHooks";
-import { api } from "@/lib/apiClient";
+import { postDriverAction } from "@/lib/actionEnvelope";
+import { fixCapture, queryPermissionState } from "@/lib/geo/fixCapture";
+
+/** The location explainer (GPS plan U6: R4; F1) — shown before the browser's
+ * own prompt on a phone that has not answered it yet, and re-checked every
+ * run. What is collected, when, who reads it, how long it is kept, whom to
+ * ask. Exported so the copy is checkable. */
+export const LOCATION_EXPLAINER = {
+  title: "Share the bus's location during runs",
+  lead: "Your browser will ask next. Whatever you choose, the run starts.",
+  points: [
+    {
+      label: "What",
+      text:
+        "Your phone's position — where, how accurate, and when — taken at each tap: "
+        + "Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run.",
+    },
+    {
+      label: "When",
+      text: "Only while a run is in progress. Nothing is asked for before Start Run or after End Run.",
+    },
+    {
+      label: "Who sees it",
+      text:
+        "Your school's transport office and the provider, as the bus's position on their map and "
+        + "in the run's report. Parents see where the bus is, never your phone's details.",
+    },
+    {
+      label: "How long",
+      text:
+        "Positions stay with the run's record for the school's retention period — 90 days unless "
+        + "the school sets otherwise — then they are deleted.",
+    },
+    { label: "Questions", text: "Ask your transport coordinator." },
+  ],
+  continueLabel: "Continue",
+  cancelLabel: "Cancel",
+} as const;
 
 function morningFirst(routes: any[]) {
   return [...routes].sort(
@@ -36,6 +81,7 @@ export function DriverRunPage() {
   // placeholder and Start Run stays disabled until the driver picks a route.
   const [routeId, setRouteId] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [explainerOpen, setExplainerOpen] = useState(false);
 
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
@@ -46,16 +92,21 @@ export function DriverRunPage() {
 
   const refresh = () => qc.invalidateQueries({ queryKey: ["driver-context"] });
 
-  const start = async () => {
-    // Inside the tap, before any await: this is the one user gesture every
-    // run is guaranteed to have, and the prompt tone (GPS plan U3) can only
-    // play later if the audio element was activated by one.
-    unlockAttentionAudio();
+  // The Start Run tap, or the explainer's Continue: the GPS watch starts here,
+  // inside the gesture (GPS plan U6: R1, R4, R5), so a phone that has not
+  // answered the browser's prompt yet sees it now — after the explainer, not
+  // instead of it. The run starts whatever the answer is; the fix, or the
+  // reason there is none, rides the request.
+  const startRun = async () => {
+    setExplainerOpen(false);
     setBusy(true);
+    fixCapture.arm();
     try {
-      await api.post("/api/runs/driver/start", { route_id: routeId });
+      await postDriverAction("/api/runs/driver/start", { route_id: routeId }, { runId: null });
       await refresh();
     } catch (err) {
+      // No run to watch for.
+      fixCapture.disarm();
       // Surfaces the server's friendly 409s too ("already completed today",
       // "no students assigned yet") — R28/R28b.
       toast({ title: "Cannot start run", description: (err as Error).message, variant: "destructive" });
@@ -64,11 +115,33 @@ export function DriverRunPage() {
     }
   };
 
+  const start = async () => {
+    // Inside the tap, before any await: this is the one user gesture every
+    // run is guaranteed to have, and the prompt tone (GPS plan U3) can only
+    // play later if the audio element was activated by one.
+    unlockAttentionAudio();
+    // Re-checked every run: a phone that has already answered — either way —
+    // goes straight on; one that has not is told what it is about to be asked.
+    const state = await queryPermissionState();
+    if (state === "prompt" || state === "unknown") {
+      setExplainerOpen(true);
+      return;
+    }
+    await startRun();
+  };
+
   const arrive = async () => {
     if (!activeRun) return;
     setBusy(true);
     try {
-      const result = await api.post("/api/runs/driver/arrive", { run_id: activeRun.id });
+      // `expected_stop_order` makes a duplicate Arrive a no-op on the server
+      // (R33): this tap intends to reach the next stop, not "whatever is
+      // next by the time the retry lands".
+      const result = await postDriverAction(
+        "/api/runs/driver/arrive",
+        { run_id: activeRun.id, expected_stop_order: activeRun.stops_completed + 1 },
+        { runId: activeRun.id },
+      );
       // Prompts this Arrive raised go straight to the queue (GPS plan U3):
       // the card shows on this response, not one poll later; the poll then
       // owns them like any other pending prompt.
@@ -102,7 +175,7 @@ export function DriverRunPage() {
     }))) return;
     setBusy(true);
     try {
-      await api.post("/api/runs/driver/end", { run_id: activeRun.id });
+      await postDriverAction("/api/runs/driver/end", { run_id: activeRun.id }, { runId: activeRun.id });
       await refresh();
       toast({ title: "Run completed" });
       navigate("/driver");
@@ -229,6 +302,34 @@ export function DriverRunPage() {
           </div>
         </div>
       )}
+
+      {/* Closing it any other way than Continue is the driver cancelling their
+          own Start Run tap: nothing is asked for and no run starts. Continue
+          is a fresh gesture, so the browser's prompt lands inside it. */}
+      <Dialog open={explainerOpen} onOpenChange={(next) => (next ? null : setExplainerOpen(false))}>
+        <DialogContent className="max-w-md" data-testid="location-explainer">
+          <DialogHeader>
+            <DialogTitle>{LOCATION_EXPLAINER.title}</DialogTitle>
+            <DialogDescription>{LOCATION_EXPLAINER.lead}</DialogDescription>
+          </DialogHeader>
+          <dl className="space-y-2 text-sm">
+            {LOCATION_EXPLAINER.points.map((point) => (
+              <div key={point.label}>
+                <dt className="font-semibold">{point.label}</dt>
+                <dd className="text-muted-foreground">{point.text}</dd>
+              </div>
+            ))}
+          </dl>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setExplainerOpen(false)}>
+              {LOCATION_EXPLAINER.cancelLabel}
+            </Button>
+            <Button onClick={startRun} data-testid="location-explainer-continue">
+              {LOCATION_EXPLAINER.continueLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </DriverLayout>
   );
 }

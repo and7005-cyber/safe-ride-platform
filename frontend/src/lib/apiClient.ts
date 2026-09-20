@@ -75,6 +75,11 @@ interface RequestExtras {
    * aborts the fetch — required for the school switch to cut off the old
    * school's in-flight responses. */
   signal?: AbortSignal;
+  /** Per-call request headers (GPS plan U6): the driver action envelope
+   * sends its `Idempotency-Key` here. Merged after the standard headers, so a
+   * caller can never override Authorization or the school scope by accident
+   * — those two are set last. */
+  headers?: Record<string, string>;
 }
 
 function buildUrl(path: string, query?: Query) {
@@ -141,9 +146,9 @@ function extractDetailCode(data: any): string | null {
 async function request(
   method: string,
   path: string,
-  opts: { query?: Query; body?: unknown; signal?: AbortSignal } = {},
+  opts: { query?: Query; body?: unknown; signal?: AbortSignal; headers?: Record<string, string> } = {},
 ) {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -196,14 +201,14 @@ async function request(
 
 export const api = {
   get: (path: string, query?: Query, extras?: RequestExtras) =>
-    request("GET", path, { query, signal: extras?.signal }),
+    request("GET", path, { query, signal: extras?.signal, headers: extras?.headers }),
   post: (path: string, body?: unknown, extras?: RequestExtras) =>
-    request("POST", path, { body: body ?? {}, signal: extras?.signal }),
+    request("POST", path, { body: body ?? {}, signal: extras?.signal, headers: extras?.headers }),
   put: (path: string, body?: unknown, extras?: RequestExtras) =>
-    request("PUT", path, { body: body ?? {}, signal: extras?.signal }),
+    request("PUT", path, { body: body ?? {}, signal: extras?.signal, headers: extras?.headers }),
   // DELETE takes an optional JSON body (Cancel-a-Ride withdrawal sends
   // {student_id, scope}); unlike post/put it is NOT defaulted to {} so
   // existing body-less deletes keep sending no body and no Content-Type.
   del: (path: string, body?: unknown, extras?: RequestExtras) =>
-    request("DELETE", path, { body, signal: extras?.signal }),
+    request("DELETE", path, { body, signal: extras?.signal, headers: extras?.headers }),
 };

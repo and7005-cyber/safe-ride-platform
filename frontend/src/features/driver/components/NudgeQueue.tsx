@@ -4,6 +4,7 @@ import { BellRing, Check, UserX, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
 import { useDriverContext } from "@/features/driver/driverHooks";
+import { postDriverAction } from "@/lib/actionEnvelope";
 import { api } from "@/lib/apiClient";
 import {
   isPromptConflict,
@@ -41,6 +42,7 @@ export function NudgeQueue() {
       key={head.event_id}
       prompt={head}
       afternoon={data.active_run.type === "afternoon"}
+      runId={data.active_run.id}
     />
   );
 }
@@ -67,7 +69,15 @@ export function bypassedStopCopy(prompt: NudgePrompt, afternoon: boolean): {
   };
 }
 
-function NudgeCard({ prompt, afternoon }: { prompt: NudgePrompt; afternoon: boolean }) {
+function NudgeCard({
+  prompt,
+  afternoon,
+  runId,
+}: {
+  prompt: NudgePrompt;
+  afternoon: boolean;
+  runId: string;
+}) {
   const qc = useQueryClient();
   const { toast } = useToast();
   const cue = useAttentionCue();
@@ -107,18 +117,29 @@ function NudgeCard({ prompt, afternoon }: { prompt: NudgePrompt; afternoon: bool
   // records the tap on the exception's ledger by membership — the child's
   // stop on this run — and the event id travels only as a hint. The card is
   // not settled here — the refetch shrinks it to the children still without
-  // a record and removes it once the last one is recorded.
+  // a record and removes it once the last one is recorded. They are taps, so
+  // they ride the action envelope like the board page's (U6).
   const resolve = async (studentId: string, outcome: "recorded" | "absent") => {
     setBusy(true);
     try {
       if (outcome === "absent") {
-        await api.post("/api/runs/driver/absent", { student_id: studentId, event_id: prompt.event_id });
+        await postDriverAction(
+          "/api/runs/driver/absent",
+          { student_id: studentId, event_id: prompt.event_id },
+          { runId },
+        );
       } else if (afternoon) {
-        await api.post("/api/runs/driver/dropoff", { student_id: studentId, event_id: prompt.event_id });
+        await postDriverAction(
+          "/api/runs/driver/dropoff",
+          { student_id: studentId, event_id: prompt.event_id },
+          { runId },
+        );
       } else {
-        await api.post("/api/runs/driver/boarding", {
-          student_id: studentId, on_bus: true, event_id: prompt.event_id,
-        });
+        await postDriverAction(
+          "/api/runs/driver/boarding",
+          { student_id: studentId, on_bus: true, event_id: prompt.event_id },
+          { runId },
+        );
       }
     } catch (err) {
       toast({ title: "Cannot update", description: (err as Error).message, variant: "destructive" });
