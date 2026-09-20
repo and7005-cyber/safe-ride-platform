@@ -53,11 +53,6 @@ class RunIdPayload(BaseModel):
     run_id: str
 
 
-class PositionPayload(BaseModel):
-    lat: float
-    lng: float
-
-
 class BoardingPayload(BaseModel):
     student_id: str
     on_bus: bool
@@ -219,20 +214,6 @@ def end_run(
     background_tasks.add_task(push_service.notify_run_ended, run, scope=scope)
     background_tasks.add_task(_record_lifecycle_alert, scope, str(run["id"]), "run-completed")
     return run
-
-
-@router.post("/driver/position")
-def write_position(
-    payload: PositionPayload, background_tasks: BackgroundTasks,
-    scope: SchoolScope = Depends(require_driver_scope),
-):
-    # The run snapshot is captured at request time so the notification task
-    # never races a subsequent arrive/end request re-reading run state.
-    run = safe_call(lambda: dao.write_position(scope, payload.lat, payload.lng))
-    background_tasks.add_task(
-        push_service.notify_bus_position, run, payload.lat, payload.lng, scope=scope
-    )
-    return {"ok": True}
 
 
 @router.post("/driver/boarding")

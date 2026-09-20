@@ -1049,21 +1049,6 @@ class RunDao:
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
         return {"run_id": str(run_id), "unaccounted": outstanding}
 
-    def write_position(self, scope: SchoolScope, lat: float, lng: float) -> dict[str, Any]:
-        """Record the bus position; returns the active run snapshot."""
-        from app.core.errors import ForbiddenError
-
-        driver_id = scope.user_id
-        with get_connection(scope) as conn:
-            run = self.find_active_run_today(conn, self._bus_id_for_driver(conn, scope))
-            if not run or str(run["driver_id"]) != str(driver_id):
-                raise ForbiddenError("No active run for this driver")
-            conn.execute(
-                "update live_buses set current_lat = %s, current_lng = %s where id = %s",
-                (lat, lng, run["bus_id"]),
-            )
-        return dict(run)
-
     def toggle_boarding(
         self, scope: SchoolScope, student_id: str, on_bus: bool
     ) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -38,7 +38,6 @@ parent feed can filter by period even after the run itself is deleted
 import ipaddress
 import json
 import logging
-import math
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -65,16 +64,6 @@ INCIDENT_TITLES = {
 # the endpoint (500 chars) and the composed title is bounded here — a very long
 # route name must not push the payload over the edge.
 BROADCAST_TITLE_MAX_CHARS = 120
-
-
-def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Great-circle distance in meters."""
-    radius = 6371000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lng2 - lng1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
 
 
 def is_safe_push_endpoint(url: str) -> bool:
@@ -529,38 +518,6 @@ class PushService:
                 )
         except Exception:
             logger.exception("notify_bus_approaching failed")
-
-    def notify_bus_position(self, run: dict, lat: float, lng: float, scope: object = UNSET) -> None:
-        """Deprecated GPS-proximity variant (no longer wired — kept for API
-        back-compat). Bus-approaching now fires from notify_bus_approaching."""
-        try:
-            radius = get_settings().bus_approaching_radius_m
-            bus = self._bus_label(run.get("bus_id"), scope)
-            stops = self.dao.remaining_student_stops(
-                str(run["id"]), run["stops_completed"], scope=scope
-            )
-            near = [
-                s for s in stops
-                if s["student_status"] not in ("absent", "unaccounted")
-                and haversine_m(lat, lng, float(s["lat"]), float(s["lng"])) <= radius
-            ]
-            for link in self.dao.parents_of_students(
-                [s["student_id"] for s in near], scope=scope
-            ):
-                self._notify(
-                    link["parent_id"],
-                    type="bus-approaching",
-                    title="Bus approaching",
-                    body=f"{bus} is approaching {link['student_name']}'s stop.",
-                    student_id=link["student_id"],
-                    run_id=str(run["id"]),
-                    bus_id=run.get("bus_id"),
-                    run_type=run.get("type"),
-                    school_id=run.get("school_id"),
-                    scope=scope,
-                )
-        except Exception:
-            logger.exception("notify_bus_position failed")
 
     def deliver_plan_feed_rows(self, rows: list[dict]) -> dict:
         """Awaited push delivery for feed rows the fleet-plan apply transaction

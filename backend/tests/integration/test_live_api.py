@@ -554,12 +554,8 @@ def test_run_lifecycle_notifies_parents(client, admin_headers, parent_headers, d
     assert run.status_code == 200, run.text
     run_id = run.json()["id"]
 
-    # GPS near the first stop fires bus-approaching.
     track_children = client.get("/api/parent-portal/children", headers=parent_headers).json()
     child = next(c for c in track_children if c["name"] == PARENT_CHILD)
-    assert client.post(
-        "/api/runs/driver/position", json={"lat": -1.2902, "lng": 36.7823}, headers=driver_headers
-    ).status_code == 200
 
     # Reach stop 1 and board the child.
     assert client.post(
@@ -579,8 +575,10 @@ def test_run_lifecycle_notifies_parents(client, admin_headers, parent_headers, d
     assert ended.status_code == 200
     assert ended.json()["status"] == "completed"
 
-    # BackgroundTasks deliver after the response; poll briefly.
-    expected = {"run-started", "bus-approaching", "student-boarded", "reached-school"}
+    # BackgroundTasks deliver after the response; poll briefly. bus-approaching
+    # is not expected here: it fires on Arrive for the *next* stop's families,
+    # and this child rides from the first stop.
+    expected = {"run-started", "student-boarded", "reached-school"}
     deadline = time.time() + 10
     seen: set = set()
     while time.time() < deadline and not expected.issubset(seen):

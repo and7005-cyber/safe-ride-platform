@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.services.push_service import PushService, haversine_m, is_safe_push_endpoint
+from app.services.push_service import PushService, is_safe_push_endpoint
 
 
 class FakePushDao:
@@ -50,9 +50,6 @@ class FakePushDao:
             return self.run_students
         silent = {"absent", "unaccounted"}
         return [s for s in self.run_students if s["display_status"] not in silent]
-
-    def remaining_student_stops(self, run_id, stops_completed, scope=None):
-        return [s for s in self.stops if s["stop_order"] > stops_completed]
 
     def students_at_stop(self, run_id, stop_order, scope=None):
         return [s for s in self.stops if s["stop_order"] == stop_order]
@@ -332,20 +329,6 @@ def test_run_scoped_notifications_carry_run_type(service: PushService, dao: Fake
     }
 
 
-def test_deprecated_position_path_carries_run_type(
-    service: PushService, dao: FakePushDao
-) -> None:
-    dao.stops = [
-        {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
-         "student_name": "Leila", "student_status": "at-school"},
-    ]
-    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
-
-    service.notify_bus_position(RUN, -1.2920, 36.8219)
-
-    assert [n["run_type"] for n in dao.notifications] == ["morning"]
-
-
 def test_incident_passes_through_run_type_without_run_dedup(
     service: PushService, dao: FakePushDao
 ) -> None:
@@ -523,52 +506,6 @@ def test_admin_broadcast_title_is_length_bounded(
     assert dao.notifications[0]["title"].endswith("…")
 
 
-def test_bus_approaching_within_radius(service: PushService, dao: FakePushDao) -> None:
-    # ~550m from the bus position below.
-    dao.stops = [
-        {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
-         "student_name": "Leila", "student_status": "at-school"},
-        # Far stop (~5km) must not notify.
-        {"stop_order": 2, "lat": -1.3300, "lng": 36.8600, "student_id": "s2",
-         "student_name": "Baraka", "student_status": "at-school"},
-    ]
-    dao.parents = {
-        "s1": [link("p1", "s1", "Leila")],
-        "s2": [link("p2", "s2", "Baraka")],
-    }
-
-    service.notify_bus_position(RUN, -1.2871, 36.8219)
-
-    assert [n["type"] for n in dao.notifications] == ["bus-approaching"]
-    assert dao.notifications[0]["user_id"] == "p1"
-
-
-def test_bus_approaching_dedups_per_run(service: PushService, dao: FakePushDao) -> None:
-    dao.stops = [
-        {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
-         "student_name": "Leila", "student_status": "at-school"},
-    ]
-    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
-
-    service.notify_bus_position(RUN, -1.2920, 36.8219)
-    service.notify_bus_position(RUN, -1.2919, 36.8219)
-
-    assert len(dao.notifications) == 1
-
-
-def test_bus_approaching_skips_passed_stops(service: PushService, dao: FakePushDao) -> None:
-    run = {**RUN, "stops_completed": 1}
-    dao.stops = [
-        {"stop_order": 1, "lat": -1.2921, "lng": 36.8219, "student_id": "s1",
-         "student_name": "Leila", "student_status": "at-school"},
-    ]
-    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
-
-    service.notify_bus_position(run, -1.2921, 36.8219)
-
-    assert dao.notifications == []
-
-
 def test_bus_approaching_fires_for_next_stop_only(service: PushService, dao: FakePushDao) -> None:
     # Bus just arrived at stop 1; only the NEXT stop (2) gets "approaching".
     run = {**RUN, "stops_completed": 1}
@@ -600,12 +537,6 @@ def test_bus_approaching_skips_absent_and_gate(service: PushService, dao: FakePu
     gate_run = {**RUN, "stops_completed": 5}
     service.notify_bus_approaching(gate_run)
     assert dao.notifications == []
-
-
-def test_haversine_known_distance() -> None:
-    # Nairobi CBD to Westlands is roughly 3.2-3.5 km.
-    distance = haversine_m(-1.2864, 36.8172, -1.2672, 36.8071)
-    assert 2000 < distance < 5000
 
 
 def test_push_failures_never_raise(service: PushService, dao: FakePushDao) -> None:

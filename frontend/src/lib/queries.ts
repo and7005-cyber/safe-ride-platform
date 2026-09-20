@@ -6,7 +6,6 @@ import { getActiveSchoolId, setActiveSchoolId, useActiveSchoolId } from "@/lib/s
 
 // Shared admin/data hooks. Polling cadences mirror the live app's realtime
 // channels (15s for admin lists/badge/alerts; 5s for live driver/parent views).
-// Fleet map intentionally has NO refetchInterval (live has no channel there).
 
 export const POLL_ADMIN = 15_000;
 export const POLL_LIVE = 5_000;

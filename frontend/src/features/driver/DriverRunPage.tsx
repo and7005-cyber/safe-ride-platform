@@ -43,9 +43,6 @@ export function DriverRunPage() {
   // the list as soon as that child is resolved on the board screen.
   const blocking: { id: string; name: string }[] = data?.blocking ?? [];
 
-  // Bus position is derived from stop arrivals on the backend (no device GPS):
-  // the admin's/driver's device location must never become the bus position.
-
   const refresh = () => qc.invalidateQueries({ queryKey: ["driver-context"] });
 
   const start = async () => {
