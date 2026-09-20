@@ -1,14 +1,52 @@
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
+from app.core.config import GPS_CLOCK_SKEW_TOLERANCE_S, GPS_FIX_ACCURACY_CAP_M
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
-from app.dao import exception_dao, participation_dao
+from app.dao import exception_dao, idempotency_dao, participation_dao, position_dao
+from app.dao.idempotency_dao import ActionEnvelope
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
+from app.services.position_rules import (
+    FLAG_CLASSIFICATION_FAILED,
+    NormalisedFix,
+    normalise_fix,
+)
 
 logger = logging.getLogger("saferide.runs")
+
+
+@dataclass
+class _Tap:
+    """One tapped action's envelope state inside its transaction (GPS plan
+    U7): the action kind, the claimed key (or None), the normalised fix, the
+    diagnostic device id, who and where, and — once written — the trail row
+    the savepoint tier may flag."""
+
+    action: str
+    key: str | None
+    fix: NormalisedFix
+    device_id: str | None
+    school_id: str
+    driver_id: str
+    session_id: str | None
+    trail_row_id: str | None = None
+
+
+# Columns of a live_runs row that never leave the DAO layer (GPS plan U7): the
+# auth session id is an internal binding for Phase 2 pings and the trail, not
+# a fact any phone or staff browser needs. Internal readers keep the raw row.
+_INTERNAL_RUN_COLUMNS = frozenset({"started_session_id"})
+
+
+def public_run(row: Any) -> dict[str, Any]:
+    """A live_runs row — or a joined row carrying its columns — as the dict a
+    response may carry: every place a run leaves this layer goes through here."""
+    return {key: value for key, value in dict(row).items() if key not in _INTERNAL_RUN_COLUMNS}
 
 
 class RunDao:
@@ -86,7 +124,7 @@ class RunDao:
                 """,
                 {"school_id": scope.school_id, "driver_id": scope.user_id},
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [public_run(r) for r in rows]
 
     def _assert_no_active_run_conflict(
         self, conn, bus_id: str, date, exclude_run_id: str | None = None
@@ -160,7 +198,7 @@ class RunDao:
                 conn, action="run-created", actor=actor, scope=scope,
                 resource_type="run", resource_id=row["id"], detail={},
             )
-        return dict(row)
+        return public_run(row)
 
     def update_run(
         self, scope: SchoolScope, run_id: str, data: dict, actor: dict
@@ -237,7 +275,7 @@ class RunDao:
                     conn, action="run-updated", actor=actor, scope=scope,
                     resource_type="run", resource_id=run_id, detail={},
                 )
-        return dict(row) if row else None
+        return public_run(row) if row else None
 
     def delete_run(self, scope: SchoolScope, run_id: str, actor: dict) -> None:
         """Delete a run — the admin's recovery path for a run started in error
@@ -395,7 +433,7 @@ class RunDao:
             # Stop exceptions with their derived status (GPS plan U2/R21): the
             # same read the staff list route serves, on this connection.
             exceptions = exception_dao.list_exceptions(conn, dict(run))
-        report = dict(run)
+        report = public_run(run)
         report["absent_students"] = [dict(a) for a in absent]
         report["unaccounted"] = outstanding
         report["approximate"] = approximate
@@ -457,7 +495,7 @@ class RunDao:
             # flags only when it covers the RUN's type; pre-run there is no
             # run to match, so only whole-day rows flag (the %s arm is NULL
             # then, and `a.scope = null` matches nothing).
-            active_dict = dict(active) if active else None
+            active_dict = public_run(active) if active else None
             # display_status travels with the roster (U3) so the driver phone
             # reads the same derived value as the admin list and the parent app.
             # It used to project the raw status column and show a stale on-bus
@@ -609,8 +647,136 @@ class RunDao:
         ).fetchone()
         return dict(row) if row else None
 
-    def start_run(self, scope: SchoolScope, route_id: str) -> dict[str, Any]:
-        """Atomic: validate, snapshot stops, create the in-progress run."""
+    # --- the action envelope (GPS plan U7: R1–R3, R7, R8, R33, R36) ----------
+    # Every driver action arrives with an optional fix, an optional
+    # Idempotency-Key and a diagnostic device id (U6's envelope). Three steps,
+    # all on the action's own connection, so the outcome, the trail row, the
+    # five position columns and the key row commit or roll back together:
+    #
+    #   _open_tap    right after the ownership checks and BEFORE the business
+    #                guards — normalise the fix, claim the key; a replay or a
+    #                conflict leaves here. Before the guards on purpose: a
+    #                drop-off whose first attempt committed and whose response
+    #                was lost must replay 200 on retry, not hit "already
+    #                confirmed".
+    #   _record_tap  with the outcome — the trail row (fix or reason), the
+    #                session re-bind on the run, and, where the action serves
+    #                a position, the five columns in one statement.
+    #   _seal_tap    the LAST statement before commit — the response onto the
+    #                key row, so the key is never committed ahead of the
+    #                action nor the response after it.
+    #
+    # The savepoint tier (U2/U3 today, U9/U10 next) hangs off the same seam:
+    # a failure there rolls back to its savepoint, flags the trail row
+    # `classification-failed`, and the tap still commits (R23, R40).
+
+    @staticmethod
+    def _open_tap(
+        conn, scope: SchoolScope, envelope: ActionEnvelope | None, *,
+        action: str, run_id: str | None, identity: dict[str, Any],
+    ) -> _Tap:
+        envelope = envelope or ActionEnvelope()
+        # U11 resolves the school's own cap here; the system default until then.
+        fix = normalise_fix(
+            envelope.fix,
+            now=datetime.now(timezone.utc),
+            accuracy_cap_m=GPS_FIX_ACCURACY_CAP_M,
+            skew_tolerance_s=GPS_CLOCK_SKEW_TOLERANCE_S,
+        )
+        tap = _Tap(
+            action=action,
+            key=envelope.key,
+            fix=fix,
+            device_id=idempotency_dao.device_id_of(envelope.device_id),
+            school_id=str(scope.school_id),
+            driver_id=str(scope.user_id),
+            session_id=scope.session_id,
+        )
+        if tap.key:
+            idempotency_dao.claim(
+                conn,
+                school_id=tap.school_id,
+                driver_id=tap.driver_id,
+                key=tap.key,
+                run_id=str(run_id) if run_id else None,
+                action=action,
+                request_fingerprint=idempotency_dao.fingerprint(
+                    action=action, driver_id=tap.driver_id,
+                    run_id=str(run_id) if run_id else None, identity=identity, fix=fix,
+                ),
+            )
+        return tap
+
+    @staticmethod
+    def _record_tap(conn, tap: _Tap, *, run_id: str, bus_id: str) -> str:
+        """The trail row for this tap, and the run bound to the session that
+        tapped (R28: Start Run stamps it, any later tap from a new session
+        re-binds it)."""
+        tap.trail_row_id = position_dao.append_action_row(
+            conn,
+            school_id=tap.school_id,
+            run_id=str(run_id),
+            bus_id=str(bus_id),
+            action_kind=tap.action,
+            action_key=tap.key,
+            session_id=tap.session_id,
+            device_id=tap.device_id,
+            fix=tap.fix,
+        )
+        if tap.session_id:
+            conn.execute(
+                "update live_runs set started_session_id = %s "
+                "where id = %s and started_session_id is distinct from %s",
+                (tap.session_id, run_id, tap.session_id),
+            )
+        return tap.trail_row_id
+
+    @staticmethod
+    def _serve_position(
+        conn, tap: _Tap, bus_id: str, *, checkpoint: tuple[Any, Any] | None = None
+    ) -> None:
+        """The served position after this tap (R7, R8): the fix when it is
+        servable (present, not clock-skewed — coarse included, with its
+        accuracy beside it for U8 to label), else the planned checkpoint when
+        the caller has one with coordinates, else untouched."""
+        if tap.fix.servable:
+            position_dao.write_action_position(conn, str(bus_id), tap.fix.fix)
+        elif checkpoint and checkpoint[0] is not None and checkpoint[1] is not None:
+            position_dao.write_checkpoint_position(
+                conn, str(bus_id), checkpoint[0], checkpoint[1]
+            )
+
+    @staticmethod
+    def _seal_tap(conn, tap: _Tap, body: Any, *, run_id: str | None) -> None:
+        if tap.key:
+            idempotency_dao.seal(
+                conn, school_id=tap.school_id, driver_id=tap.driver_id, key=tap.key,
+                run_id=str(run_id) if run_id else None, body=body,
+            )
+
+    @staticmethod
+    def _flag_classification_failed(conn, tap: _Tap | None) -> None:
+        """Mark the tap's trail row after an exception-side savepoint rolled
+        back (R40). Its own savepoint: the flag is bookkeeping and must never
+        take the tap down with it."""
+        if tap is None or not tap.trail_row_id:
+            return
+        try:
+            with conn.transaction():
+                position_dao.add_flag(conn, tap.trail_row_id, FLAG_CLASSIFICATION_FAILED)
+        except Exception:
+            logger.exception("could not flag trail row %s", tap.trail_row_id)
+
+    def start_run(
+        self, scope: SchoolScope, route_id: str, *, envelope: ActionEnvelope | None = None
+    ) -> dict[str, Any]:
+        """Atomic: validate, snapshot stops, create the in-progress run.
+
+        GPS plan U7/R36: the tap's fix goes to the trail, the run is stamped
+        with the tapping session, and the served position is the school
+        checkpoint — never the fix — until the first later fix, so a run
+        started from the driver's home never puts their home on the map.
+        """
         from app.core.errors import ConflictError, ForbiddenError
 
         driver_id = scope.user_id
@@ -626,6 +792,10 @@ class RunDao:
             ).fetchone()
             if not route:
                 raise ForbiddenError("Route is not assigned to this driver's bus")
+            tap = self._open_tap(
+                conn, scope, envelope, action="start", run_id=None,
+                identity={"route_id": str(route_id)},
+            )
             # A route runs at most once per day, whoever created the run (R24).
             completed_today = conn.execute(
                 """
@@ -674,15 +844,16 @@ class RunDao:
                 """
                 insert into live_runs
                     (bus_id, route_id, school_id, driver_id, type, date, start_time, status,
-                     total_stops, stops_completed, total_students, students_boarded, incidents)
+                     total_stops, stops_completed, total_students, students_boarded, incidents,
+                     started_session_id)
                 values
                     (%s, %s, %s, %s, %s, (now() at time zone 'Africa/Nairobi')::date,
                      to_char(now() at time zone 'Africa/Nairobi', 'HH24:MI'), 'in-progress',
-                     %s, 0, %s, 0, 0)
+                     %s, 0, %s, 0, 0, %s)
                 returning *
                 """,
                 (bus["id"], route_id, route["school_id"], driver_id, route["type"],
-                 len(distinct_orders), roster_size),
+                 len(distinct_orders), roster_size, tap.session_id),
             ).fetchone()
             for s in kept:
                 conn.execute(
@@ -799,19 +970,38 @@ class RunDao:
                 """,
                 (run["id"], route["school_id"], route_id, route["type"]),
             )
-            # Position the bus at the school when the run starts; from here the
-            # position is the last stop the driver arrives at (no device GPS).
+            # Position the bus at the school when the run starts — the school
+            # checkpoint, all five columns (GPS plan U7/R36). The tap's fix is
+            # recorded on the trail below but never served from Start Run.
             school = conn.execute(
                 "select lat, lng from live_schools where id = %s", (route["school_id"],)
             ).fetchone()
             if school and school["lat"] is not None and school["lng"] is not None:
-                conn.execute(
-                    "update live_buses set current_lat = %s, current_lng = %s where id = %s",
-                    (school["lat"], school["lng"], bus["id"]),
+                position_dao.write_checkpoint_position(
+                    conn, str(bus["id"]), school["lat"], school["lng"]
                 )
-        return dict(run)
+            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(bus["id"]))
+            body = public_run(run)
+            self._seal_tap(conn, tap, body, run_id=str(run["id"]))
+        return body
 
-    def arrive_next_stop(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
+    def arrive_next_stop(
+        self, scope: SchoolScope, run_id: str, *,
+        expected_stop_order: int | None = None,
+        envelope: ActionEnvelope | None = None,
+    ) -> dict[str, Any]:
+        """Arrive at the next stop; returns ``{run, arrival_incident, prompts,
+        noop}`` plus router-only keys.
+
+        ``expected_stop_order`` (GPS plan U7/R33) is the stop the client
+        meant to reach — ``stops_completed + 1`` as it last saw it. When it
+        is present and is not the next stop now, the tap is a *recorded
+        no-op*: the trail row is written with its fix, nothing else moves —
+        no progress, no served position, no incident, no exception
+        evaluation, no prompt auto-resolution — and the response is the
+        current run with ``noop`` true. Without it (older clients) every tap
+        is "arrive at next", the catch-up behaviour below.
+        """
         from app.core.errors import ConflictError, ForbiddenError
 
         driver_id = scope.user_id
@@ -822,13 +1012,32 @@ class RunDao:
             ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
+            tap = self._open_tap(
+                conn, scope, envelope, action="arrive", run_id=str(run_id),
+                identity={"run_id": str(run_id), "expected_stop_order": expected_stop_order},
+            )
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
             self._assert_service_day(conn, run)
+            if (
+                expected_stop_order is not None
+                and expected_stop_order != run["stops_completed"] + 1
+            ):
+                self._record_tap(conn, tap, run_id=str(run_id), bus_id=str(run["bus_id"]))
+                current = conn.execute(
+                    "select * from live_runs where id = %s", (run_id,)
+                ).fetchone()
+                body = {
+                    "run": public_run(current), "arrival_incident": None, "prompts": [],
+                    "noop": True,
+                }
+                self._seal_tap(conn, tap, body, run_id=str(run_id))
+                return {**body, "auto_resolved": []}
             new_completed = min(run["stops_completed"] + 1, run["total_stops"])
             conn.execute(
                 "update live_runs set stops_completed = %s where id = %s", (new_completed, run_id)
             )
+            self._record_tap(conn, tap, run_id=str(run_id), bus_id=str(run["bus_id"]))
             # Record WHEN the stop was reached, not just how many have been (U10).
             # The no-progress flag measures elapsed time between arrivals, and the
             # office force-close needs evidence the bus actually reached the school
@@ -851,13 +1060,14 @@ class RunDao:
                 "select * from run_stops where run_id = %s and stop_order = %s order by is_school_gate desc limit 1",
                 (run_id, new_completed),
             ).fetchone()
-            # The bus's live position is the stop it just arrived at (no GPS).
-            # Coordinate-less stops leave the position at the previous stop.
-            if gate and gate["lat"] is not None and gate["lng"] is not None:
-                conn.execute(
-                    "update live_buses set current_lat = %s, current_lng = %s where id = %s",
-                    (gate["lat"], gate["lng"], run["bus_id"]),
-                )
+            # The served position (GPS plan U7/R8): the tap's fix when it is
+            # servable, else the stop just arrived at as a checkpoint, all
+            # five columns either way. A coordinate-less stop without a fix
+            # leaves the position where it was.
+            self._serve_position(
+                conn, tap, str(run["bus_id"]),
+                checkpoint=(gate["lat"], gate["lng"]) if gate else None,
+            )
             is_last = new_completed >= run["total_stops"]
             if gate and (gate["is_school_gate"] or is_last):
                 # Idempotent per run: only the first arrival at the gate emits.
@@ -896,9 +1106,9 @@ class RunDao:
             # transaction is already in progress). Everything above is the
             # atomic core and commits exactly as before; a failure in here rolls
             # back to the savepoint, is logged with the run and stop order only
-            # — never a coordinate — and swallowed, so a prompt-side bug can
-            # never block a driver's tap (R23, R40). No trail row exists yet
-            # (U7), so 'classification-failed' is this log line for now.
+            # — never a coordinate — flags the tap's trail row
+            # `classification-failed` (U7), and is swallowed, so a prompt-side
+            # bug can never block a driver's tap (R23, R40).
             bypassed = None
             passed_order = new_completed - 1
             try:
@@ -912,6 +1122,7 @@ class RunDao:
                     "(run=%s stop_order=%s)",
                     run_id, passed_order,
                 )
+                self._flag_classification_failed(conn, tap)
             # Prompt auto-resolution on Arrive (GPS plan U3/R17, R34): shown
             # remote-absent prompts close as unanswered, nothing else — its own
             # savepoint so a fault in one exception-side step never rolls back
@@ -925,26 +1136,34 @@ class RunDao:
                     "prompt auto-resolution on Arrive failed; the Arrive still commits (run=%s)",
                     run_id,
                 )
+                self._flag_classification_failed(conn, tap)
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
+            prompts = [bypassed["prompt"]] if bypassed and bypassed["prompt"] else []
+            body: dict[str, Any] = {
+                "run": public_run(updated), "arrival_incident": arrival_incident,
+                "prompts": prompts, "noop": False,
+            }
+            # The stored response is the action result only: prompts are
+            # re-derived by the context poll, so a replay carries none (R33).
+            self._seal_tap(conn, tap, {**body, "prompts": []}, run_id=str(run_id))
         result: dict[str, Any] = {
-            "run": dict(updated), "arrival_incident": arrival_incident, "prompts": [],
+            **body,
             # For the router (U10 decides call-now from it); popped before the
             # response leaves.
             "auto_resolved": auto_resolved,
         }
-        if bypassed:
-            if bypassed["prompt"]:
-                result["prompts"].append(bypassed["prompt"])
-            if bypassed["raised"]:
-                # For the router's office alert only; it pops this before the
-                # response leaves.
-                result["bypassed_stop"] = {
-                    key: bypassed[key]
-                    for key in ("exception_id", "stop_order", "stop_name", "students")
-                }
+        if bypassed and bypassed["raised"]:
+            # For the router's office alert only; it pops this before the
+            # response leaves.
+            result["bypassed_stop"] = {
+                key: bypassed[key]
+                for key in ("exception_id", "stop_order", "stop_name", "students")
+            }
         return result
 
-    def end_run(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
+    def end_run(
+        self, scope: SchoolScope, run_id: str, *, envelope: ActionEnvelope | None = None
+    ) -> dict[str, Any]:
         """Complete a run — refused while any roster child is unaccounted (U4).
 
         The end-of-run sweep is gone. It used to write a terminal status to
@@ -968,6 +1187,10 @@ class RunDao:
             ).fetchone()
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("Run is not owned by this driver")
+            tap = self._open_tap(
+                conn, scope, envelope, action="end", run_id=str(run_id),
+                identity={"run_id": str(run_id)},
+            )
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
             self._assert_service_day(conn, run)
@@ -1025,19 +1248,20 @@ class RunDao:
                 """,
                 (column_status, run_id),
             )
-            # Clear the bus live position.
-            conn.execute(
-                "update live_buses set current_lat = null, current_lng = null where id = %s",
-                (run["bus_id"],),
-            )
+            # The tap's trail row (the End Run fix is kept), then nothing is
+            # current any more (R11): all five position columns null.
+            self._record_tap(conn, tap, run_id=str(run_id), bus_id=str(run["bus_id"]))
+            position_dao.clear_position(conn, run["bus_id"])
             # Every prompt still pending closes as unanswered with the run
             # (GPS plan U3/R17, R34) — after the gate, so a refused closure
             # leaves them pending; no call-now follows (the gate owns the
             # child). Savepoint: a fault here never keeps a run open.
             auto_resolved = self._close_pending_prompts(conn, str(run_id), "End Run")
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
-        result = dict(updated)
-        result["boarded_student_ids"] = boarded_ids
+            body = public_run(updated)
+            body["boarded_student_ids"] = boarded_ids
+            self._seal_tap(conn, tap, body, run_id=str(run_id))
+        result = dict(body)
         result["auto_resolved"] = auto_resolved
         return result
 
@@ -1111,10 +1335,8 @@ class RunDao:
                 """,
                 (final_count, run_id),
             )
-            conn.execute(
-                "update live_buses set current_lat = null, current_lng = null where id = %s",
-                (run["bus_id"],),
-            )
+            # Nothing is current outside a run (R11): all five columns null.
+            position_dao.clear_position(conn, run["bus_id"])
             # The office close ends the prompts too (GPS plan U3/R17, R34):
             # pending → unanswered, shown or not, never a call-now.
             auto_resolved = self._close_pending_prompts(conn, str(run_id), "force-close")
@@ -1130,7 +1352,7 @@ class RunDao:
                 detail={"unaccounted_count": len(outstanding)},
             )
 
-        result = dict(updated)
+        result = public_run(updated)
         # Only children the driver was recorded as observing aboard, and only
         # when the gate arrival was itself recorded (R13). The office was not on
         # the bus; a notification on its say-so would be the manufactured claim
@@ -1142,9 +1364,9 @@ class RunDao:
         result["auto_resolved"] = auto_resolved
         return result
 
-    @staticmethod
     def _attach_resolution_tap(
-        conn, run: dict[str, Any], event_id: str | None, student_id: str, action: str
+        self, conn, run: dict[str, Any], event_id: str | None, student_id: str, action: str,
+        *, tap: _Tap | None = None,
     ) -> None:
         """Record the outcome as a bypassed-stop resolution when the child sits
         at the stop of a pending prompt of this run (GPS plan U3/R15).
@@ -1153,7 +1375,8 @@ class RunDao:
         the run's own stop snapshot is the key, so a catch-up sequence from the
         board page answers the prompt exactly as the card's shortcuts do. The
         card's event id is a hint the DAO may log and ignore. In a savepoint —
-        the tap has already been recorded above it and is never refused (R23).
+        the tap has already been recorded above it and is never refused (R23);
+        a failure flags the tap's trail row (U7/R40).
         """
         try:
             with conn.transaction():
@@ -1163,6 +1386,7 @@ class RunDao:
                 "resolution tap not attached; the %s still commits (run=%s event=%s)",
                 action, run["id"], event_id,
             )
+            self._flag_classification_failed(conn, tap)
 
     def record_parent_contact(
         self, scope: SchoolScope, run_id: str, student_id: str
@@ -1186,7 +1410,7 @@ class RunDao:
 
     def toggle_boarding(
         self, scope: SchoolScope, student_id: str, on_bus: bool, *,
-        event_id: str | None = None,
+        event_id: str | None = None, envelope: ActionEnvelope | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Board a student on a morning run; returns (student, run snapshot).
 
@@ -1196,7 +1420,9 @@ class RunDao:
         assertion is worse than routing the fix through the office (R26).
 
         ``event_id`` names the bypassed-stop prompt the tap came through, when
-        it did (GPS plan U3); see _attach_resolution_tap.
+        it did (GPS plan U3); see _attach_resolution_tap. ``envelope`` is the
+        tap's fix, key and device id (U7); the key is claimed once the run
+        and the roster membership are proven, before the business guards.
         """
         from app.core.errors import ConflictError, ForbiddenError
 
@@ -1206,6 +1432,16 @@ class RunDao:
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
+            stop = conn.execute(
+                "select * from run_stops where run_id = %s and student_id = %s limit 1",
+                (run["id"], student_id),
+            ).fetchone()
+            if not stop:
+                raise ForbiddenError("Student is not on this run")
+            tap = self._open_tap(
+                conn, scope, envelope, action="board", run_id=str(run["id"]),
+                identity={"student_id": str(student_id), "on_bus": bool(on_bus)},
+            )
             if run["type"] == "afternoon":
                 raise ConflictError("Use drop-off on afternoon runs")
             if not on_bus:
@@ -1213,12 +1449,6 @@ class RunDao:
                     "Un-boarding is disabled — refresh the app and contact the "
                     "office to correct a mistake"
                 )
-            stop = conn.execute(
-                "select * from run_stops where run_id = %s and student_id = %s limit 1",
-                (run["id"], student_id),
-            ).fetchone()
-            if not stop:
-                raise ForbiddenError("Student is not on this run")
             if stop["stop_order"] > run["stops_completed"]:
                 raise ConflictError("Stop has not been reached yet")
             row = conn.execute(
@@ -1231,7 +1461,9 @@ class RunDao:
             participation_dao.record_boarding(
                 conn, str(run["id"]), student_id, row["name"], str(driver_id), presumed=False
             )
-            self._attach_resolution_tap(conn, run, event_id, student_id, "boarding")
+            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._serve_position(conn, tap, str(run["bus_id"]))
+            self._attach_resolution_tap(conn, run, event_id, student_id, "boarding", tap=tap)
             # Recount students_boarded from participation in the SAME
             # transaction — never increment/decrement, so repeated taps can't
             # drift the counter (R15), and it no longer reads a status column
@@ -1241,10 +1473,13 @@ class RunDao:
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (boarded_count, run["id"]),
             ).fetchone()
-        return dict(row), dict(run)
+            body = dict(row)
+            self._seal_tap(conn, tap, body, run_id=str(run["id"]))
+        return body, public_run(run)
 
     def dropoff_student(
-        self, scope: SchoolScope, student_id: str, *, event_id: str | None = None
+        self, scope: SchoolScope, student_id: str, *, event_id: str | None = None,
+        envelope: ActionEnvelope | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Confirm a drop-off at a reached stop on the driver's active
         afternoon run; returns (student, run snapshot).
@@ -1253,7 +1488,8 @@ class RunDao:
         must already be reached, and they must still be 'on-bus' (R32).
         students_boarded is recounted as the roster's dropped-off count in the
         same transaction — never incremented — so mobile retries can't drift
-        it.
+        it. With a key (U7) a retry of a committed drop-off replays its
+        response instead of meeting "already confirmed".
         """
         from app.core.errors import ConflictError, ForbiddenError
 
@@ -1263,14 +1499,18 @@ class RunDao:
             run = self.find_active_run_today(conn, bus_id) if bus_id else None
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
-            if run["type"] != "afternoon":
-                raise ConflictError("Drop-off is only available on afternoon runs")
             stop = conn.execute(
                 "select * from run_stops where run_id = %s and student_id = %s limit 1",
                 (run["id"], student_id),
             ).fetchone()
             if not stop:
                 raise ForbiddenError("Student is not on this run")
+            tap = self._open_tap(
+                conn, scope, envelope, action="dropoff", run_id=str(run["id"]),
+                identity={"student_id": str(student_id)},
+            )
+            if run["type"] != "afternoon":
+                raise ConflictError("Drop-off is only available on afternoon runs")
             if stop["stop_order"] > run["stops_completed"]:
                 raise ConflictError("Stop has not been reached yet")
             # Precondition re-keyed onto participation (U2), not the status
@@ -1289,16 +1529,21 @@ class RunDao:
                 (student_id,),
             ).fetchone()
             participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
-            self._attach_resolution_tap(conn, run, event_id, student_id, "drop-off")
+            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._serve_position(conn, tap, str(run["bus_id"]))
+            self._attach_resolution_tap(conn, run, event_id, student_id, "drop-off", tap=tap)
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (dropped_count, run["id"]),
             ).fetchone()
-        return dict(row), dict(run)
+            body = dict(row)
+            self._seal_tap(conn, tap, body, run_id=str(run["id"]))
+        return body, public_run(run)
 
     def record_handover(
-        self, scope: SchoolScope, student_id: str, note: str
+        self, scope: SchoolScope, student_id: str, note: str, *,
+        envelope: ActionEnvelope | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Record a hand-over away from the child's own stop (U4/R12).
 
@@ -1330,6 +1575,10 @@ class RunDao:
             ).fetchone()
             if not stop:
                 raise ForbiddenError("Student is not on this run")
+            tap = self._open_tap(
+                conn, scope, envelope, action="handover", run_id=str(run["id"]),
+                identity={"student_id": str(student_id), "note": note},
+            )
             aboard = participation_dao.get_for_student(conn, str(run["id"]), student_id)
             if not aboard or aboard["boarded_at"] is None:
                 raise ConflictError("Student is not on the bus")
@@ -1342,12 +1591,18 @@ class RunDao:
                 "update live_students set status = 'dropped-off' where id = %s returning *",
                 (student_id,),
             ).fetchone()
+            # Trail row and served position like every tap (U7); a hand-over
+            # is never a check (R19), so nothing classifies here.
+            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._serve_position(conn, tap, str(run["bus_id"]))
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
                 (dropped_count, run["id"]),
             ).fetchone()
-        return dict(row), dict(run)
+            body = dict(row)
+            self._seal_tap(conn, tap, body, run_id=str(run["id"]))
+        return body, public_run(run)
 
     def reverse_own_action(
         self, scope: SchoolScope, student_id: str
@@ -1429,11 +1684,11 @@ class RunDao:
             student = conn.execute(
                 "select * from live_students where id = %s", (student_id,)
             ).fetchone()
-        return dict(student), dict(run), reversed_what
+        return dict(student), public_run(run), reversed_what
 
     def mark_student_absent(
         self, scope: SchoolScope, student_id: str, *, whole_day: bool = False,
-        event_id: str | None = None,
+        event_id: str | None = None, envelope: ActionEnvelope | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Driver marks a roster student absent mid-run (U8/R17-R20); returns
         (student, run snapshot enriched with route_name/bus_name for the
@@ -1484,6 +1739,10 @@ class RunDao:
             ).fetchone()
             if not stop:
                 raise ForbiddenError("Student is not on this run")
+            tap = self._open_tap(
+                conn, scope, envelope, action="absent", run_id=str(run["id"]),
+                identity={"student_id": str(student_id), "whole_day": bool(whole_day)},
+            )
             period = "day" if whole_day else run["type"]
             # school_id stamped from the driver's scope (U7) — the roster
             # check above proved the student rides this school's run.
@@ -1551,7 +1810,9 @@ class RunDao:
             # (U2). On an afternoon run this retracts the presumed board the
             # auto-board wrote — the correction that presumption exists to allow.
             participation_dao.clear_for_student(conn, str(run["id"]), student_id)
-            self._attach_resolution_tap(conn, run, event_id, student_id, "absent mark")
+            self._record_tap(conn, tap, run_id=str(run["id"]), bus_id=str(run["bus_id"]))
+            self._serve_position(conn, tap, str(run["bus_id"]))
+            self._attach_resolution_tap(conn, run, event_id, student_id, "absent mark", tap=tap)
             boarded_count = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))
                 if run["type"] == "afternoon"
@@ -1571,7 +1832,9 @@ class RunDao:
                 """,
                 (run["id"],),
             ).fetchone()
-        run = dict(run)
+            body = dict(student)
+            self._seal_tap(conn, tap, body, run_id=str(run["id"]))
+        run = public_run(run)
         run["bus_name"] = names["bus_name"] if names else None
         run["route_name"] = names["route_name"] if names else None
         # newly_recorded lets the API layer keep the school-side incident
@@ -1580,7 +1843,7 @@ class RunDao:
         # What the parent message may claim (U8/R21). Not run["type"]: an
         # explicit whole-day confirmation says more than this run does.
         run["absence_period"] = period
-        return dict(student), run
+        return body, run
 
     # _count_run_students_with_status is gone (U2): every counter now reads
     # participation. Counting a status column that no longer tracks boarding

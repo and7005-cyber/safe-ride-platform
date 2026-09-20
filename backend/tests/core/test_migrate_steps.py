@@ -115,3 +115,37 @@ def test_role_sync_skips_without_a_password(monkeypatch):
 def test_fetch_bootstrap_skips_without_the_ssm_name(monkeypatch):
     monkeypatch.delenv("PROVIDER_BOOTSTRAP_SSM", raising=False)
     assert mh._fetch_bootstrap() is None
+
+
+# --- the on-demand GPS purge action (GPS plan U7/R12) -----------------------
+
+
+class TestGpsPurgeEvent:
+    SCHOOL = "5cae0000-0000-0000-0000-000000000001"
+
+    def test_defaults_and_bound(self):
+        assert mh._parse_gps_purge_event({"school_id": self.SCHOOL}) == (self.SCHOOL, 100)
+        assert mh._parse_gps_purge_event({"school_id": self.SCHOOL, "max_batches": 3}) == (
+            self.SCHOOL, 3,
+        )
+        assert mh._parse_gps_purge_event({"school_id": self.SCHOOL, "max_batches": 5000}) == (
+            self.SCHOOL, 1000,
+        )
+
+    @pytest.mark.parametrize("event", [
+        {}, {"school_id": "nope"}, {"school_id": None},
+        {"school_id": SCHOOL, "max_batches": 0},
+        {"school_id": SCHOOL, "max_batches": "10"},
+        {"school_id": SCHOOL, "max_batches": True},
+    ])
+    def test_invalid_events_are_refused_before_any_connection(self, event, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        result = mh.handler({"action": "gps-purge", **event})
+        assert result["status"] == "error"
+        assert "gps-purge" in result["reason"]
+
+    def test_an_unknown_action_is_refused_without_migrating(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        assert mh.handler({"action": "drop-everything"}) == {
+            "status": "error", "reason": "unknown action 'drop-everything'",
+        }

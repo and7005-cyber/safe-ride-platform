@@ -1,15 +1,19 @@
 import logging
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, Header
 from pydantic import BaseModel
 
 from app.api._helpers import map_error, safe_call
 from app.core.auth import get_current_user
-from app.core.errors import ClosureRefusedError
+from app.core.errors import ActionReplayed, ClosureRefusedError
 from app.core.permissions import require_driver_scope, require_school, require_staff
 from app.core.scope import STAFF_ROLES, SchoolScope
 from app.dao.exception_dao import ExceptionDao
+from app.dao.idempotency_dao import ActionEnvelope, parse_key
 from app.dao.incident_dao import IncidentDao
+from app.dao.position_dao import PositionDao
 from app.dao.run_dao import RunDao
 from app.services.push_service import PushService
 
@@ -19,11 +23,19 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 dao = RunDao()
 incident_dao = IncidentDao()
 exception_dao = ExceptionDao()
+position_dao = PositionDao()
 push_service = PushService()
 # The runs list serves two surfaces (U7): staff read their school's runs; a
 # driver token resolves to their own school and the DAO narrows to their
 # bus's runs. Everything mutating below is require_staff or driver-scoped.
 require_staff_or_driver = require_school(*STAFF_ROLES, "driver")
+
+T = TypeVar("T")
+
+# The driver's action envelope (GPS plan U7; client half U6): every one of
+# the seven action routes reads this header. Absent, blank or not a UUID
+# means "no key" — the action runs normally and stores nothing — never a 4xx.
+IdempotencyKeyHeader = Header(default=None, alias="Idempotency-Key")
 
 
 class RunPayload(BaseModel):
@@ -47,15 +59,34 @@ class RunPayload(BaseModel):
     incidents: int | None = 0
 
 
-class StartRunPayload(BaseModel):
+class EnvelopeFields(BaseModel):
+    """What every driver action body may carry beside its own fields (GPS
+    plan U7, client half U6). Both are ``Any`` on purpose: the fix is
+    validated leniently inside the transaction — a malformed or out-of-range
+    value becomes reason ``invalid`` on the trail row, never a 422 (R40) —
+    and the device id is diagnostic only, stored as an opaque string when it
+    is one and dropped otherwise. Older clients send neither."""
+
+    fix: Any = None
+    device_id: Any = None
+
+
+class StartRunPayload(EnvelopeFields):
     route_id: str
 
 
-class RunIdPayload(BaseModel):
+class RunIdPayload(EnvelopeFields):
     run_id: str
 
 
-class BoardingPayload(BaseModel):
+class ArrivePayload(RunIdPayload):
+    # The stop this tap meant to reach — stops_completed + 1 as the client last
+    # saw it (GPS plan U7/R33). A tap whose expectation has passed is a
+    # recorded no-op; absent (older clients), every tap is "arrive at next".
+    expected_stop_order: int | None = None
+
+
+class BoardingPayload(EnvelopeFields):
     student_id: str
     on_bus: bool
     # The bypassed-stop prompt this tap came through, when it did (GPS plan
@@ -64,14 +95,14 @@ class BoardingPayload(BaseModel):
     event_id: str | None = None
 
 
-class StudentIdPayload(BaseModel):
+class StudentIdPayload(EnvelopeFields):
     student_id: str
     # Same courtesy for drop-off (GPS plan U3); reverse takes it up in U9 for
     # the prompt's undo, and contacted ignores it.
     event_id: str | None = None
 
 
-class AbsentPayload(BaseModel):
+class AbsentPayload(EnvelopeFields):
     student_id: str
     # Default false: a driver sees one run. Claiming the whole day from a single
     # stop was the old behaviour, and it struck the child off the other run's
@@ -84,9 +115,29 @@ class PromptAnswerPayload(BaseModel):
     answer: str
 
 
-class HandoverPayload(BaseModel):
+class HandoverPayload(EnvelopeFields):
     student_id: str
     note: str
+
+
+def _envelope(key_header: str | None, payload: EnvelopeFields) -> ActionEnvelope:
+    return ActionEnvelope(key=parse_key(key_header), fix=payload.fix, device_id=payload.device_id)
+
+
+def _tap(action: Callable[[], T]) -> tuple[T | Any, bool]:
+    """``safe_call`` for the envelope actions: ``(result, replayed)``.
+
+    A key seen before with the same fingerprint raises ``ActionReplayed``
+    from inside the DAO with the stored body; the router returns that body
+    as-is and dispatches nothing — the push, the office alert and the purge
+    already happened for the tap that first carried the key (R33).
+    """
+    try:
+        return action(), False
+    except ActionReplayed as replay:
+        return replay.body, True
+    except Exception as error:
+        raise map_error(error) from error
 
 
 # Admin run CRUD (U7: school-scoped) ------------------------------------------
@@ -244,22 +295,47 @@ def respond_to_prompt(
 def start_run(
     payload: StartRunPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
-    run = safe_call(lambda: dao.start_run(scope, payload.route_id))
+    """Start a run (GPS plan U7 envelope). The fix is recorded on the trail
+    and the served position stays at the school checkpoint (R36); the run is
+    stamped with this session. After the response is built, one bounded
+    retention pass runs for the school (R12) — skipped, never failed, when
+    another pass holds the lock or the batch times out."""
+    run, replayed = _tap(
+        lambda: dao.start_run(scope, payload.route_id, envelope=_envelope(idempotency_key, payload))
+    )
+    if replayed:
+        return run
     background_tasks.add_task(push_service.notify_run_started, run, scope=scope)
     background_tasks.add_task(_record_lifecycle_alert, scope, str(run["id"]), "run-started")
+    background_tasks.add_task(_purge_after_start, scope)
     return run
 
 
 @router.post("/driver/arrive")
 def arrive(
-    payload: RunIdPayload, background_tasks: BackgroundTasks,
+    payload: ArrivePayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
-    result = safe_call(lambda: dao.arrive_next_stop(scope, payload.run_id))
+    """Arrive at the next stop. Response ``{run, arrival_incident, prompts,
+    noop}``. With ``expected_stop_order`` behind the run's progress the tap is
+    a recorded no-op (GPS plan U7/R33): ``noop`` true, the current run, no
+    incident, no prompts, and nothing dispatched from here."""
+    result, replayed = _tap(
+        lambda: dao.arrive_next_stop(
+            scope, payload.run_id, expected_stop_order=payload.expected_stop_order,
+            envelope=_envelope(idempotency_key, payload),
+        )
+    )
+    if replayed:
+        return result
     # Prompts this Arrive closed as unanswered (GPS plan U3): U10 decides the
     # call-now notice from them here; until then they stay off the response.
     result.pop("auto_resolved", None)
+    if result.get("noop"):
+        return result
     if result.get("arrival_incident"):
         background_tasks.add_task(push_service.notify_reached_school, result["run"], scope=scope)
     # Arriving a stop means the next stop's children should get ready.
@@ -286,9 +362,13 @@ def arrive(
 def end_run(
     payload: RunIdPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
     try:
-        run = dao.end_run(scope, payload.run_id)
+        run = dao.end_run(scope, payload.run_id, envelope=_envelope(idempotency_key, payload))
+    except ActionReplayed as replay:
+        # The same tap again (GPS plan U7/R33): the stored body, no fan-out.
+        return replay.body
     except ClosureRefusedError as refusal:
         # Recorded before the 409 leaves, not as a background task: FastAPI
         # returns the error response through its own handler, which carries no
@@ -308,14 +388,19 @@ def end_run(
 def toggle_boarding(
     payload: BoardingPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
     # Morning-only and one-way: the DAO 409s afternoon runs (use /driver/
     # dropoff) and on_bus=false (un-boarding retracts a sent safety push).
-    student, run = safe_call(
+    outcome, replayed = _tap(
         lambda: dao.toggle_boarding(
-            scope, payload.student_id, payload.on_bus, event_id=payload.event_id
+            scope, payload.student_id, payload.on_bus, event_id=payload.event_id,
+            envelope=_envelope(idempotency_key, payload),
         )
     )
+    if replayed:
+        return outcome
+    student, run = outcome
     background_tasks.add_task(
         push_service.notify_student_boarded, run, payload.student_id, scope=scope
     )
@@ -326,13 +411,20 @@ def toggle_boarding(
 def dropoff_student(
     payload: StudentIdPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
     """Confirm a drop-off at a reached stop on the driver's active afternoon
     run (R32). The tap-time notification carries run_id + student_id so the
     dedup index suppresses retries."""
-    student, run = safe_call(
-        lambda: dao.dropoff_student(scope, payload.student_id, event_id=payload.event_id)
+    outcome, replayed = _tap(
+        lambda: dao.dropoff_student(
+            scope, payload.student_id, event_id=payload.event_id,
+            envelope=_envelope(idempotency_key, payload),
+        )
     )
+    if replayed:
+        return outcome
+    student, run = outcome
     background_tasks.add_task(
         push_service.notify_student_dropped_off, student, run, scope=scope
     )
@@ -343,6 +435,7 @@ def dropoff_student(
 def record_handover(
     payload: HandoverPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
     """Record a hand-over away from the child's stop (U4/R12).
 
@@ -354,9 +447,15 @@ def record_handover(
     The parent is told their child left the bus, with the driver's note, so the
     message matches what happened rather than the route's expectation.
     """
-    student, run = safe_call(
-        lambda: dao.record_handover(scope, payload.student_id, payload.note)
+    outcome, replayed = _tap(
+        lambda: dao.record_handover(
+            scope, payload.student_id, payload.note,
+            envelope=_envelope(idempotency_key, payload),
+        )
     )
+    if replayed:
+        return outcome
+    student, run = outcome
     background_tasks.add_task(
         push_service.notify_student_handover, student, run, payload.note, scope=scope
     )
@@ -414,6 +513,30 @@ def _record_lifecycle_alert(
         logger.exception("recording %s lifecycle alert failed", incident_type)
 
 
+def _purge_after_start(scope: SchoolScope) -> None:
+    """One bounded retention pass for the school after a Start Run (GPS plan
+    U7/R12), wrapped like the lifecycle-alert helper: locked, timed out or
+    failed means skipped and logged — never an error to the driver. The log
+    line carries the school id and counts only; the statements bind ids and
+    intervals, never a coordinate."""
+    try:
+        outcome = position_dao.purge_after_start(scope)
+    except Exception as error:  # noqa: BLE001 — the driver's response is already built
+        logger.warning(
+            "gps purge skipped (school=%s): %s %s",
+            scope.school_id, type(error).__name__, getattr(error, "sqlstate", "") or "",
+        )
+        return
+    if outcome is None:
+        logger.info("gps purge skipped (school=%s): another pass holds the lock", scope.school_id)
+        return
+    logger.info(
+        "gps purge pass (school=%s retention_days=%s): trail=%s exceptions=%s events=%s keys=%s",
+        scope.school_id, outcome["retention_days"], outcome["trail_rows_deleted"],
+        outcome["exceptions_nulled"], outcome["events_nulled"], outcome["keys_deleted"],
+    )
+
+
 def _record_closure_refusal(scope: SchoolScope, refusal: ClosureRefusedError) -> None:
     """Office alert for a refused closure (U11/R29).
 
@@ -455,6 +578,7 @@ def _record_absent_incident(scope: SchoolScope, student: dict, run: dict) -> Non
 def mark_student_absent(
     payload: AbsentPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
+    idempotency_key: str | None = IdempotencyKeyHeader,
 ):
     """Driver marks a roster student absent at the stop (U8/R17). The DAO writes
     the absence row scoped to this run's period, the run_absences snapshot, the
@@ -465,12 +589,15 @@ def mark_student_absent(
     they can only know from something a parent told them, so it is a separate
     confirmation rather than the default.
     """
-    student, run = safe_call(
+    outcome, replayed = _tap(
         lambda: dao.mark_student_absent(
             scope, payload.student_id, whole_day=payload.whole_day,
-            event_id=payload.event_id,
+            event_id=payload.event_id, envelope=_envelope(idempotency_key, payload),
         )
     )
+    if replayed:
+        return outcome
+    student, run = outcome
     background_tasks.add_task(
         push_service.notify_student_absent, student, run, scope=scope
     )

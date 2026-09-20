@@ -8,6 +8,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger("saferide.config")
 
+# GPS tracking system defaults (GPS plan U7). Module constants, deliberately
+# NOT Settings fields yet: U11 makes each env-overridable and threads it
+# through the SAM template per the live-parity rule, and adds the per-school
+# resolver on top. Until then every reader takes these.
+GPS_POSITION_RETENTION_DAYS = 90     # trail retention when the school has none set
+GPS_PURGE_BATCH_ROWS = 2000          # trail rows deleted per Start Run purge pass
+GPS_PURGE_STATEMENT_TIMEOUT_MS = 2000
+GPS_ACTION_KEY_TTL_DAYS = 7          # idempotency keys purged after this
+GPS_KEY_LOCK_TIMEOUT_MS = 2000       # wait on an in-flight duplicate before 409
+GPS_FIX_ACCURACY_CAP_M = 200.0       # accuracy above this is `coarse`
+GPS_CLOCK_SKEW_TOLERANCE_S = 30      # capture time this far ahead of receipt is skew
+
 
 def _maybe_b64_json(value: str) -> str:
     """Accept a JSON secret either raw or base64url-encoded.

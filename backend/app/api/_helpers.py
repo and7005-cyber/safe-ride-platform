@@ -5,7 +5,12 @@ from typing import TypeVar
 from fastapi import HTTPException
 from psycopg import Error as PsycopgError
 
-from app.core.errors import PromptConflictError, SafeRideError, to_http_exception
+from app.core.errors import (
+    IdempotencyConflictError,
+    PromptConflictError,
+    SafeRideError,
+    to_http_exception,
+)
 
 T = TypeVar("T")
 
@@ -15,6 +20,14 @@ BAD_REQUEST_SQLSTATES = {"22P02", "22007", "22008", "23514"}
 
 
 def map_error(error: Exception) -> HTTPException:
+    if isinstance(error, IdempotencyConflictError):
+        # Same shape as the prompt conflicts (GPS plan U7/R33): `code` is
+        # what the client branches on; the detail never carries the stored
+        # response or any of the request's own fields.
+        return HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        )
     if isinstance(error, PromptConflictError):
         # Structured like the auth surface's second-factor refusals: the
         # client branches on `code`, never on the sentence (GPS plan U3).

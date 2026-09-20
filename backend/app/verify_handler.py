@@ -398,7 +398,9 @@ _CHECK_SETS["gps"] = [
         "coalesce(s.position_retention_days, 90) as retention_days, "
         "count(p.id) as rows_past_retention from live_schools s "
         "left join run_positions p on p.school_id = s.id "
-        "and p.received_at < now() - make_interval(days => coalesce(s.position_retention_days, 90)) "
+        # Seconds, as the purge's own cutoff (position_dao.RETENTION_CUTOFF_SQL):
+        # an interval's day field is session-zone calendar arithmetic.
+        "and p.received_at < now() - make_interval(secs => coalesce(s.position_retention_days, 90) * 86400) "
         "group by 1, 2, 3 order by 4 desc, 2",
         False,
     ),

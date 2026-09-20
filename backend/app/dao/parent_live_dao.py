@@ -255,7 +255,11 @@ class ParentLiveDao:
                     """,
                     (student["bus_id"],),
                 ).fetchone()
-                run = dict(r) if r else None
+                # The response shape of a run row is RunDao's (GPS plan U7):
+                # internal columns such as the starting session never travel.
+                from app.dao.run_dao import public_run
+
+                run = public_run(r) if r else None
         return {"student": dict(student), "stops": stops, "run": run}
 
     def list_alerts(

@@ -203,6 +203,33 @@ def test_driver_scope_without_a_driver_membership_is_403():
     expect(403, lambda: resolve_driver_scope(u, None))
 
 
+# --- the auth session on the scope (GPS plan U7/R28) -------------------------
+
+
+def test_driver_scope_carries_the_sessions_id():
+    u = user([member(SCHOOL_A, "driver")])
+    u["session_id"] = "5e55-1"
+    assert resolve_driver_scope(u, None).session_id == "5e55-1"
+
+
+def test_staff_and_provider_scopes_carry_the_sessions_id():
+    u = user([member(SCHOOL_A, "director")])
+    u["session_id"] = "5e55-2"
+    assert resolve(u, SCHOOL_A).session_id == "5e55-2"
+    p = user(provider={"totp_enrolled": True}, support={"id": "ss-1", "school_id": SCHOOL_A})
+    p["session_id"] = "5e55-3"
+    assert resolve(p, SCHOOL_A).session_id == "5e55-3"
+
+
+def test_a_user_dict_without_a_session_yields_no_session_id():
+    # Callers built outside a request (tests, scripts) — nothing to stamp.
+    u = user([member(SCHOOL_A, "driver")])
+    assert resolve_driver_scope(u, None).session_id is None
+    u["session_id"] = None
+    assert resolve_driver_scope(u, None).session_id is None
+    assert SchoolScope(user_id="u", school_id=SCHOOL_A, role="driver").session_id is None
+
+
 # --- parent scope ------------------------------------------------------------
 
 
