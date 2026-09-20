@@ -32,7 +32,7 @@ import { PlacePicker, type Provenance, type ResolvedPlace } from "@/features/adm
 import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
-import { POLL_LIVE, useBuses, useSchools } from "@/lib/queries";
+import { POLL_LIVE, useBuses, useSchoolKey } from "@/lib/queries";
 
 // Distinct, high-contrast colours assigned deterministically per bus.
 const PALETTE = [
@@ -95,7 +95,7 @@ const fmtMin = (s?: number) => (s == null ? "—" : `${Math.max(1, Math.round(s 
 export function FleetMapPage() {
   // Live polling so the map keeps up as buses arrive at stops.
   const { data: buses = [] } = useBuses({ poll: POLL_LIVE });
-  const { data: schools = [] } = useSchools();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -114,7 +114,6 @@ export function FleetMapPage() {
   // Route planner state.
   const [rows, setRows] = useState<PlanRow[]>([{ address: "", pickup_time: "" }]);
   const [type, setType] = useState("morning");
-  const [schoolId, setSchoolId] = useState("none");
   // Route gate anchor (HH:MM, R3-UI/U4): the bell time the schedule is solved
   // backwards from. Empty = inherit the school bell (then the system default).
   // Sent as `gate_anchor` on /route-options (so the preview is bell-anchored)
@@ -131,7 +130,6 @@ export function FleetMapPage() {
   // Save-to-Routes dialog (R17/R19) and CSV import (R21).
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveName, setSaveName] = useState("");
-  const [saveSchoolId, setSaveSchoolId] = useState("none");
   const [saveBusId, setSaveBusId] = useState("none");
   const [saveError, setSaveError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -181,7 +179,7 @@ export function FleetMapPage() {
         depot_address: place.address || null,
         depot_provenance: place.provenance,
       });
-      await queryClient.invalidateQueries({ queryKey: ["buses"] });
+      await queryClient.invalidateQueries({ queryKey: schoolKey("buses") });
       setDepotBus(null);
       toast({ title: place.lat != null || place.address ? "Depot saved" : "Depot removed" });
     } catch (err) {
@@ -207,7 +205,6 @@ export function FleetMapPage() {
     requestGeneration.current += 1;
     setRows([{ address: "", pickup_time: "" }]);
     setType("morning");
-    setSchoolId("none");
     setGateAnchor("");
     setOptions(null);
     setUnresolved([]);
@@ -229,7 +226,7 @@ export function FleetMapPage() {
     try {
       const res = await api.post("/api/fleet/route-options", {
         type,
-        school_id: schoolId === "none" ? null : schoolId,
+        // U12: the preview's school is the ACTIVE school (request scope).
         gate_anchor: gateAnchor || null,
         stops: stops.map((s) => ({
           address: s.address,
@@ -328,7 +325,6 @@ export function FleetMapPage() {
 
   const openSaveDialog = () => {
     setSaveName(`Planned route ${new Date().toISOString().slice(0, 10)}`);
-    setSaveSchoolId(schoolId); // planner's school preselected; "none" must be changed
     setSaveBusId("none");
     setSaveError("");
     setSaveOpen(true);
@@ -338,10 +334,6 @@ export function FleetMapPage() {
     // Snapshot at click time — never re-read planner state after the await.
     const option = activeOption;
     if (!option) return;
-    if (saveSchoolId === "none") {
-      setSaveError("Please choose a school — every route belongs to one.");
-      return;
-    }
     const name = saveName.trim();
     if (!name) {
       setSaveError("Please give the route a name.");
@@ -353,7 +345,7 @@ export function FleetMapPage() {
       await api.post("/api/fleet/routes", {
         name,
         type,
-        school_id: saveSchoolId,
+        // U12: the route lands in the ACTIVE school (request scope).
         bus_id: saveBusId === "none" ? null : saveBusId,
         gate_anchor: gateAnchor || null,
         stops: option.stops.map((s) => ({
@@ -377,7 +369,7 @@ export function FleetMapPage() {
           </ToastAction>
         ),
       });
-      queryClient.invalidateQueries({ queryKey: ["routes"] });
+      queryClient.invalidateQueries({ queryKey: schoolKey("routes") });
       resetPlanner();
     } catch (err) {
       // Bus conflicts (409) and other failures keep the dialog open with the
@@ -590,27 +582,15 @@ export function FleetMapPage() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
-                  <Label>Direction</Label>
-                  <Select value={type} onValueChange={setType}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="morning">Morning</SelectItem>
-                      <SelectItem value="afternoon">Afternoon</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label>School</Label>
-                  <Select value={schoolId} onValueChange={setSchoolId}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="none">— None —</SelectItem>
-                      {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
+              <div className="space-y-1">
+                <Label>Direction</Label>
+                <Select value={type} onValueChange={setType}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="morning">Morning</SelectItem>
+                    <SelectItem value="afternoon">Afternoon</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
 
               {/* Gate anchor (R3-UI/U4): the bell time the schedule is solved
@@ -826,16 +806,6 @@ export function FleetMapPage() {
             <div className="space-y-1">
               <Label>Route name</Label>
               <Input value={saveName} onChange={(e) => setSaveName(e.target.value)} />
-            </div>
-            <div className="space-y-1">
-              <Label>School</Label>
-              <Select value={saveSchoolId} onValueChange={(v) => { setSaveSchoolId(v); setSaveError(""); }}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">— Choose a school —</SelectItem>
-                  {schools.map((s: any) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
             </div>
             <div className="space-y-1">
               <Label>Bus</Label>

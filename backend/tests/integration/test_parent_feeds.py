@@ -269,11 +269,13 @@ def backdate_incident(bus: dict, description: str, hours: int) -> str:
     with psycopg.connect(DB_URL, autocommit=True) as conn:
         row = conn.execute(
             """
-            insert into live_incidents (bus_id, bus_name, type, description, created_at)
-            values (%s, %s, 'other', %s, now() - (%s || ' hours')::interval)
+            insert into live_incidents (bus_id, bus_name, type, description, created_at,
+                                        school_id)
+            values (%s, %s, 'other', %s, now() - (%s || ' hours')::interval,
+                    (select school_id from live_buses where id = %s))
             returning id
             """,
-            (bus["bus_id"], bus["bus_name"], description, hours),
+            (bus["bus_id"], bus["bus_name"], description, hours, bus["bus_id"]),
         ).fetchone()
     return str(row[0])
 

@@ -4,6 +4,7 @@ This guide is for bus drivers. It explains how to sign in, run your morning and 
 
 ## Before you start
 
+- **Your account is created by your school's office** — there is no driver sign-up in the app. The office sets up your account and assigns your PIN; everything you see in the app (your bus, your routes, your students) belongs to your school and nothing else ever appears.
 - You need a **smartphone with an internet connection** (mobile data or Wi-Fi). SafeRide runs in your phone's web browser — there is no app to install.
 - You need your **driver PIN**. The school office assigns it when they create your account. If you don't have a PIN, or you forget it, ask the office — you cannot set or reset it yourself.
 - The office must have **assigned you a bus** and given that bus at least one **route** with students. If the app says "No bus is assigned to you yet. Contact your administrator." or "No routes assigned to this bus yet.", the office needs to finish your setup.
@@ -11,6 +12,8 @@ This guide is for bus drivers. It explains how to sign in, run your morning and 
 > **Tip:** Open `https://saferidelive.co.ke` in your browser and add it to your home screen so it is one tap away every morning.
 
 ## Signing in
+
+Nothing about driver sign-in has changed: your PIN identifies you, and your school follows from your account.
 
 1. Open `https://saferidelive.co.ke/auth`.
 2. Tap the **Driver PIN** tab.

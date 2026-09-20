@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -7,6 +8,8 @@ from psycopg import Error as PsycopgError
 from app.core.errors import SafeRideError, to_http_exception
 
 T = TypeVar("T")
+
+logger = logging.getLogger("saferide.scope")
 
 BAD_REQUEST_SQLSTATES = {"22P02", "22007", "22008", "23514"}
 
@@ -21,6 +24,17 @@ def map_error(error: Exception) -> HTTPException:
             return HTTPException(status_code=404, detail="Referenced record was not found")
         if error.sqlstate == "23505":
             return HTTPException(status_code=409, detail="Record already exists")
+        if error.sqlstate == "42501":
+            # Row security refused a write the DAO predicates should already
+            # have filtered: answer with the not-found contract, but log the
+            # denial loudly — it means a scope bug, not a user mistake.
+            diag = getattr(error, "diag", None)
+            logger.error(
+                "row-security denial sqlstate=42501 table=%s message=%s",
+                getattr(diag, "table_name", None),
+                getattr(diag, "message_primary", None),
+            )
+            return HTTPException(status_code=404, detail="Not found")
     return HTTPException(status_code=500, detail="Unexpected backend error")
 
 

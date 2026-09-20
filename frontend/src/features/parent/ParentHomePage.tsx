@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Bus, CalendarX, Clock, MapPin, Phone, TriangleAlert } from "lucide-react";
+import { Bus, CalendarX, Clock, MapPin, Phone, School, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,14 +14,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/use-toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/apiClient";
 import {
   PARENT_NAV,
+  useAnswerPendingLink,
   useChildren,
+  usePendingLinks,
   type CancelScope,
   type ChildCancellation,
+  type PendingLink,
 } from "@/features/parent/parentHooks";
 import {
   PARENT_STUDENT_STATUS_LABEL,
@@ -55,6 +59,15 @@ export const CANCEL_SCOPE_OPTIONS: { scope: CancelScope; label: string }[] = [
  * rule (a 'day' cancel then records the afternoon). */
 export const CANCEL_DIALOG_NOTE =
   "Cancellations apply to today only. 'Rest of day' after this morning's run cancels the afternoon ride.";
+
+/** The pending-card line (U13/AE22): the school's claim in one sentence —
+ * NEVER a child's name, grade or id (the API sends none by design: until the
+ * parent accepts, the card may only disclose that the school claims a link). */
+export function pendingCardText(link: Pick<PendingLink, "linkCount">): string {
+  return link.linkCount === 1
+    ? "wants to connect a student record to your account."
+    : `wants to connect ${link.linkCount} student records to your account.`;
+}
 
 export interface WithdrawChoice {
   scope: CancelScope;
@@ -156,7 +169,47 @@ export function ParentHomePage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { data: children = [], isLoading } = useChildren();
+  // Pending link cards (U13/AE22): one per school claiming a link, rendered
+  // ABOVE the children list; the card names the school only, never a child.
+  const { data: pendingLinks = [] } = usePendingLinks();
+  const answerLink = useAnswerPendingLink();
+  const [pendingBusy, setPendingBusy] = useState(false);
+
+  const acceptLink = async (link: PendingLink) => {
+    setPendingBusy(true);
+    try {
+      await answerLink.mutateAsync({ schoolId: link.schoolId, verb: "accept" });
+      toast({ title: `Connected to ${link.schoolName ?? "the school"}` });
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setPendingBusy(false);
+    }
+  };
+
+  const declineLink = async (link: PendingLink) => {
+    if (
+      !(await confirm({
+        title: `Not your child at ${link.schoolName ?? "this school"}?`,
+        description:
+          "This removes the school's link request. The school will be alerted that the parent email on the student record doesn't match, so they can correct the family's contact details.",
+        confirmLabel: "Not my child",
+        cancelLabel: "Go back",
+      }))
+    )
+      return;
+    setPendingBusy(true);
+    try {
+      await answerLink.mutateAsync({ schoolId: link.schoolId, verb: "decline" });
+      toast({ title: "Link declined", description: "The school has been alerted." });
+    } catch (err) {
+      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+    } finally {
+      setPendingBusy(false);
+    }
+  };
 
   // Cancel dialog state: the child is captured by id and re-derived from the
   // live rows each render, so the 5s poll keeps the dialog honest. No
@@ -245,6 +298,53 @@ export function ParentHomePage() {
           <h2 className="font-heading text-xl font-bold">Good morning, {firstName} 👋</h2>
           <p className="text-sm text-muted-foreground">Today's bus status at a glance</p>
         </div>
+
+        {/* Pending link cards (U13/AE22): the school and a claim count only —
+            no child details exist here until the parent accepts. */}
+        {pendingLinks.map((link) => (
+          <Card
+            key={link.schoolId}
+            className="border-primary/40"
+            data-testid={`pending-card-${link.schoolId}`}
+          >
+            <CardContent className="space-y-3 p-4">
+              <div className="flex items-start gap-3">
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                  <School className="h-5 w-5" />
+                </span>
+                <div className="flex-1">
+                  <p className="font-heading text-base font-semibold">
+                    {link.schoolName ?? "A school"}
+                  </p>
+                  <p className="text-sm text-muted-foreground">{pendingCardText(link)}</p>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Accept if this is your child's school. If it isn't, choose "Not
+                my child" and the school will be alerted to check its records.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  size="sm"
+                  disabled={pendingBusy}
+                  onClick={() => void acceptLink(link)}
+                  data-testid="pending-accept"
+                >
+                  Accept
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={pendingBusy}
+                  onClick={() => void declineLink(link)}
+                  data-testid="pending-decline"
+                >
+                  Not my child
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
 
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>

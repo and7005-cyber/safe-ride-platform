@@ -21,15 +21,19 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
+import { useIsDirector } from "@/lib/auth";
 import { emailError, phoneError } from "@/lib/validation";
-import { useParents } from "@/lib/queries";
+import { useParents, useSchoolKey } from "@/lib/queries";
 
 export function ParentsPage() {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
+  const isDirector = useIsDirector();
   const { toast } = useToast();
   const confirm = useConfirm();
   const { data: parents = [] } = useParents();
@@ -47,7 +51,7 @@ export function ParentsPage() {
     if (!editId) return;
     try {
       await api.put(`/api/accounts/parents/${editId}`, form);
-      await qc.invalidateQueries({ queryKey: ["accounts-parents"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("accounts-parents") });
       setOpen(false);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -61,7 +65,7 @@ export function ParentsPage() {
       confirmLabel: "Delete parent",
     }))) return;
     await api.del(`/api/accounts/parents/${id}`);
-    await qc.invalidateQueries({ queryKey: ["accounts-parents"] });
+    await qc.invalidateQueries({ queryKey: schoolKey("accounts-parents") });
   };
 
   const emailErr = emailError(form.email, true);
@@ -90,17 +94,44 @@ export function ParentsPage() {
                 <TableCell>{p.students.join(", ") || "—"}</TableCell>
                 <TableCell>
                   {p.status === "registered" ? (
-                    <Badge variant="success">Registered</Badge>
+                    <span className="flex items-center gap-1.5">
+                      <Badge variant="success">Registered</Badge>
+                      {/* U6/R33: a parent with a child at another school is
+                          frozen for this school — marked, never named. */}
+                      {p.shared && (
+                        <Badge variant="outline" data-testid={`parent-shared-${p.id}`}>Shared</Badge>
+                      )}
+                    </span>
                   ) : (
                     <Badge variant="secondary">Awaiting signup</Badge>
                   )}
                 </TableCell>
                 <TableCell className="text-right">
                   {p.status === "registered" ? (
-                    <>
-                      <Button variant="ghost" size="icon" onClick={() => startEdit(p)}><Pencil className="h-4 w-4" /></Button>
-                      <Button variant="ghost" size="icon" onClick={() => remove(p.id)}><Trash2 className="h-4 w-4" /></Button>
-                    </>
+                    p.shared ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          {/* span wrapper: disabled buttons swallow the hover */}
+                          <span className="inline-flex">
+                            <Button variant="ghost" size="icon" disabled aria-label="Edit parent (shared)">
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          This parent also has a child at another school, so
+                          their account can't be changed from here.
+                        </TooltipContent>
+                      </Tooltip>
+                    ) : (
+                      <>
+                        <Button variant="ghost" size="icon" onClick={() => startEdit(p)}><Pencil className="h-4 w-4" /></Button>
+                        {/* Director-only (U12/R8): the server 403s the backstop. */}
+                        {isDirector && (
+                          <Button variant="ghost" size="icon" title="Delete parent" onClick={() => remove(p.id)}><Trash2 className="h-4 w-4" /></Button>
+                        )}
+                      </>
+                    )
                   ) : (
                     <span className="text-xs text-muted-foreground">—</span>
                   )}

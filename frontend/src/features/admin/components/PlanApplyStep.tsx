@@ -15,6 +15,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PlanApplyDialog } from "@/features/admin/components/PlanApplyDialog";
 import { api } from "@/lib/apiClient";
+import { useSchoolKey } from "@/lib/queries";
 import {
   ACTIVE_RUN_WARNING,
   ALREADY_APPLIED_DESCRIPTION,
@@ -65,6 +66,7 @@ export function PlanApplyStep({
   onGenerateDraft: (opts?: { skipConfirm?: boolean }) => Promise<void>;
 }) {
   const qc = useQueryClient();
+  const schoolKey = useSchoolKey();
   const { toast } = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
@@ -82,8 +84,8 @@ export function PlanApplyStep({
       return;
     try {
       await api.post(`/api/fleet-plans/${draft.id}/discard`);
-      await qc.invalidateQueries({ queryKey: ["fleet-plans"] });
-      await qc.invalidateQueries({ queryKey: ["fleet-plan-review"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plans") });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plan-review") });
       toast({ title: "Draft discarded" });
       onStepChange("draft");
     } catch (err) {
@@ -156,11 +158,11 @@ export function PlanApplyStep({
         onApplyResult({ act: "apply", ...res });
       }
       await Promise.all([
-        qc.invalidateQueries({ queryKey: ["fleet-plans"] }),
-        qc.invalidateQueries({ queryKey: ["fleet-plan-review"] }),
-        qc.invalidateQueries({ queryKey: ["routes"] }),
-        qc.invalidateQueries({ queryKey: ["students"] }),
-        qc.invalidateQueries({ queryKey: ["buses"] }),
+        qc.invalidateQueries({ queryKey: schoolKey("fleet-plans") }),
+        qc.invalidateQueries({ queryKey: schoolKey("fleet-plan-review") }),
+        qc.invalidateQueries({ queryKey: schoolKey("routes") }),
+        qc.invalidateQueries({ queryKey: schoolKey("students") }),
+        qc.invalidateQueries({ queryKey: schoolKey("buses") }),
       ]);
       onStepChange("apply");
     } catch (err) {
@@ -229,11 +231,11 @@ export function PlanApplyStep({
         });
       }
       await Promise.all([
-        qc.invalidateQueries({ queryKey: ["fleet-plans"] }),
-        qc.invalidateQueries({ queryKey: ["fleet-plan-review"] }),
-        qc.invalidateQueries({ queryKey: ["routes"] }),
-        qc.invalidateQueries({ queryKey: ["students"] }),
-        qc.invalidateQueries({ queryKey: ["buses"] }),
+        qc.invalidateQueries({ queryKey: schoolKey("fleet-plans") }),
+        qc.invalidateQueries({ queryKey: schoolKey("fleet-plan-review") }),
+        qc.invalidateQueries({ queryKey: schoolKey("routes") }),
+        qc.invalidateQueries({ queryKey: schoolKey("students") }),
+        qc.invalidateQueries({ queryKey: schoolKey("buses") }),
       ]);
     } catch (err) {
       // Residual drift 409s verbatim — fleet drift (a vanished/shrunk/

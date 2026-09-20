@@ -1,16 +1,59 @@
-# SafeRide Administrator Guide
+# SafeRide School Staff Guide
 
-This guide is for school transport coordinators and office staff. As an administrator you set up the fleet (schools, buses, drivers, routes, students), keep daily attendance up to date, monitor live runs, and handle alerts from drivers and parents.
+This guide is for a school's staff — the **director** and the **transport coordinator**. You set up the fleet (buses, drivers, routes, students), keep daily attendance up to date, monitor live runs, and handle alerts from drivers and parents.
+
+Everything you see and do in the console belongs to **your school**. Another school's buses, students and runs do not appear anywhere — not in lists, not in search, not by ID. If you work at more than one school, see [Switching schools](#your-school-and-switching-schools).
 
 ## Your account
 
-Administrator accounts are **provisioned by the SafeRide operations team** — there is no self-service admin sign-up (the in-app "Create account" form only offers Parent and Driver roles). You will receive your email and initial password from the operator.
+Staff accounts are personal — **never share a login**. Every change made in the console is recorded against the person who made it, so the record of "who did what" is only right if everyone uses their own account.
 
-**To sign in:** open `https://saferidelive.co.ke/auth`, stay on the **Email & Password** tab, enter your email and password, and click **Sign In**. If you forget your password, use **"Forgot password?"** — you'll get a single-use reset link by email. After too many failed attempts sign-in is briefly throttled ("Too many login attempts. Try again shortly."); wait a few minutes.
+- The **first director** of a school is set up by SafeRide (Kuumbai Kenya) when the school is created.
+- Every other staff account is created by a **director** on the [Staff page](#staff-director-only) — there is no self-service staff sign-up (the in-app "Create account" form is for parents only).
+
+**To sign in:** open `https://saferidelive.co.ke/auth`, stay on the **Email & Password** tab, enter your email and password, and click **Sign In**. After too many failed attempts sign-in is briefly throttled ("Too many login attempts. Try again shortly."); wait a few minutes.
+
+**First sign-in with a temporary password:** the director who created your account gives you a one-time temporary password. It is valid for **72 hours** — sign in before it expires (after that, ask for a new one). The app will not show you any page until you **set your own password**; the temporary password then stops working for everyone, including the director who set it.
+
+**Changing your password:** you can change your own password any time from the console (your current password is required). Changing it signs out your other devices.
+
+**Locked out?** There is no self-service e-mail reset for staff. A **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
+
+## Director and transport coordinator
+
+A school has two staff roles. Both see the whole console and do the daily work; the difference is **deletions and staff management**, and the server enforces it — hiding a button is never the only barrier.
+
+| Action | Coordinator | Director |
+| --- | --- | --- |
+| View everything in the school | Yes | Yes |
+| Add and edit buses, drivers, students, routes, runs | Yes | Yes |
+| Mark/clear absences, force-close a stale run | Yes | Yes |
+| Delete a run that is **still open** (started in error) | Yes | Yes |
+| Draft, apply and restore fleet plans; message parents | Yes | Yes |
+| Edit School Settings | Yes | Yes |
+| Delete routes, buses, drivers, students | No | Yes |
+| Delete alerts, **completed** runs, parent accounts | No | Yes |
+| Staff page: create, remove, reset passwords | No | Yes |
+
+The rule of thumb: removals that are part of the daily job (an absence, a student off a route, a run that recorded nothing yet) are **edits** and stay with the coordinator; deleting a completed record destroys history and needs the director.
+
+## Your school, and switching schools
+
+The bottom of the sidebar shows the **active school** — its name and its **school code** (e.g. `MSB-001`, assigned by SafeRide and never editable). Quote the code when you contact support.
+
+Most people belong to one school and never think about this. If you hold a role at **more than one school** (for example an owner who is director at both), the school card becomes a **switcher**: click it and pick a school from **"Your schools"**. Switching replaces everything on screen with the other school's data — nothing from the first school remains — and lands you on its Dashboard. On sign-in with several schools, the app asks you to **choose a school to work in** first.
+
+Each browser tab works in one school at a time, so a second tab left on school A keeps acting on school A even after you switch this one to school B.
+
+## Who did what
+
+Every create, change and removal in the console is recorded with the acting person, and the screens that show a result name them — who applied a fleet plan, who force-closed a run, who acknowledged an alert, who marked an absence.
+
+If a name shows as **"SafeRide"**, the action was taken by SafeRide (Kuumbai) support working inside your school — for example after you asked them to fix something. While they work you'll see a support banner in the console naming the reason; their individual identity is kept on SafeRide's side by design.
 
 ## The admin console at a glance
 
-The left sidebar lists the eleven sections of the console:
+The left sidebar lists the sections of the console (everything scoped to your active school):
 
 | Section | What it is for |
 | --- | --- |
@@ -18,13 +61,16 @@ The left sidebar lists the eleven sections of the console:
 | **Fleet Map** | Live bus positions on a map, plus the route planner |
 | **Buses** | The vehicle register |
 | **Routes** | Routes, their stops and stop order; messaging a route's parents |
-| **Fleet Plan** | Drafting a school's whole route network from its students; review, apply, restore |
+| **Fleet Plan** | Drafting the school's whole route network from its students; review, apply, restore |
 | **Students** | Student records, parent contacts, route assignment, daily absences |
 | **Run History** | Every run, with a detailed report per run |
-| **Schools** | School records and gate locations |
 | **Parents** | Registered parent accounts |
 | **Drivers** | Driver accounts and PINs |
 | **Alerts** | Incident feed from drivers and parent cancellations |
+| **Staff** | Staff accounts and role offers — **directors only** |
+| **Settings** | The school's own record: name, contact, bell times, gate location |
+
+(The old **Schools** page is gone: the console works inside one school, so its record lives under **Settings** — see [School Settings](#school-settings).)
 
 The **bell icon** in the top bar shows a red count of unacknowledged alerts and jumps to the Alerts page. The avatar menu (top right) has **Sign Out**. Screens refresh automatically — admin lists roughly every 15 seconds, the Fleet Map every 5.
 
@@ -32,20 +78,44 @@ The **bell icon** in the top bar shows a red count of unacknowledged alerts and 
 
 Set things up in this order — each step depends on the previous one:
 
-1. **Add your school** (Schools) — routes and runs need a school gate location.
-2. **Add drivers** (Drivers) — each gets a 4-digit PIN to sign in with.
-3. **Add buses** (Buses) — and assign a driver to each.
-4. **Add students** (Students) — with parent contacts and home locations.
-5. **Create routes** (Routes or the Fleet Map route planner) — assign a bus and a school, and put students on the route.
-6. **Dry-run**: have a driver sign in with their PIN and confirm they see the bus and route on their Home screen.
+1. **Check School Settings** — your school is created by SafeRide, but routes and runs need the **gate location** and bell times to be right. Confirm them (Settings) before anything else.
+2. **Add staff** (Staff, director only) — give the coordinator their own account.
+3. **Add drivers** (Drivers) — each gets a 4-digit PIN to sign in with.
+4. **Add buses** (Buses) — and assign a driver to each.
+5. **Add students** (Students) — with parent contacts and home locations.
+6. **Create routes** (Routes, the Fleet Plan page, or the Fleet Map route planner) — assign a bus, and put students on the route.
+7. **Dry-run**: have a driver sign in with their PIN and confirm they see the bus and route on their Home screen.
 
 The sections below cover each screen in detail.
 
-## Schools
+## School Settings
 
-Click **Add School** and fill in **Name**, **Address**, **Phone**, and — required — the **Location**: click the map to drop the pin on the **school gate**. The gate becomes the start point of afternoon routes and the end point of morning routes, so place it accurately. Both an address and a map location are required to save.
+The **Settings** page holds your school's own record: **Name**, **Address**, **Phone**, the **bell times** (morning and afternoon, `HH:MM`), and — required — the **gate location**: click the map to drop the pin on the **school gate**. The gate is the start point of afternoon routes and the end point of morning routes, so place it accurately. Both an address and a map location are required to save. Either staff role can edit these.
 
-Deleting a school leaves any routes pointing at it without a destination — reassign those routes first.
+The page also shows your **school code** (e.g. `MSB-001`). It is assigned by SafeRide when the school is created and cannot be changed — use it to identify the school in support requests and role offers.
+
+There is no way to create or delete a school from the console: schools are set up by SafeRide (Kuumbai Kenya), and a school created by mistake is removed by them operationally.
+
+## Staff (director only)
+
+The **Staff** page lists the school's directors and coordinators, plus any outstanding role offers. Coordinators do not see this page.
+
+### Creating a staff account
+
+Click **Add Staff** and enter the person's **Email**, **Full name**, and **Role** (Coordinator or Director). What happens next depends on the email:
+
+- **A new email** gets a fresh account with a **temporary password, shown to you exactly once** — copy it and hand it over in person or by a channel you trust. It is valid for **72 hours** and must be replaced at their first sign-in, after which it works for no one (you included).
+- **An email that already has a SafeRide account** (say, the owner of another school, or one of your drivers' emails) is **offered the role** instead: nothing changes for them until they sign in and accept. Their password is untouched and no temporary password is issued. The row shows as **Offered** until they accept; you can **Cancel** an unanswered offer. The person sees the offer at sign-in with your school's **name and code** and who offered it — tell them the code through a channel you trust so they can check it before accepting.
+
+Staff creation is rate-limited (about 20 per hour) — enough for onboarding, and a brake on mistakes.
+
+### The staff list
+
+- **Password set on** shows when each person last set their own password. A **"—"** means they are still on a temporary password and have not signed in yet.
+- **Reset password** issues a fresh temporary password (shown to you once, same 72-hour rule). Their current password and every open session stop working immediately — use this when someone is locked out.
+- **Remove** ends the person's access to this school **at once**, open sessions included. Their account survives (they may work at other schools or be a parent); only the role here is removed.
+
+**A school always keeps at least one director.** Removing the last director — yourself included — is refused until another director exists.
 
 ## Drivers
 
@@ -55,7 +125,9 @@ Click **Add Driver** and fill in **Full name**, **Email**, **Password** (min 6 c
 
 PINs are **unique across drivers** — if you pick one that's taken you'll see "That PIN is already in use by another driver".
 
-The table shows each driver's PIN state (**Set** / **None**) and assigned bus. Deleting a driver removes the account and unassigns their bus.
+A driver **belongs to your school**: they are created here, sign in by PIN, and only ever see your school's buses, routes and runs. There is no driver self-signup. If you see "That email is already in use", the address already has a SafeRide account — use a different email for the driver.
+
+The table shows each driver's PIN state (**Set** / **None**) and assigned bus. Deleting a driver (director only) removes the account and unassigns their bus.
 
 ## Buses
 
@@ -77,15 +149,17 @@ Click **Add Student** and fill in:
 - **Parent 1** (name, phone, email) and optionally **Parent 2**. Rules: Parent 1's name is required, and **across the two parents there must be at least one phone and at least one email**. Phone numbers must be valid Kenyan mobiles (`0712 345 678` or `+254712345678`).
 - **Home address** — type to search (Google address lookup), or click the map to drop the pin; the address fills in automatically. The pin is where the bus will stop.
 - **Pickup time** (e.g. `06:45`).
-- **School**, **Morning route** and **Afternoon route**. Students are assigned to routes; the bus is whatever bus runs the route.
+- **Morning route** and **Afternoon route**. Students are assigned to routes; the bus is whatever bus runs the route. (The student belongs to your active school automatically — there is no school field.)
 
 **Parent emails matter:** the email you record here is what links the parent's app account. When a parent signs up with that exact email, their account attaches to the child automatically (up to two parent accounts per child). If a parent says the app shows no children, the email on the student record is almost always the mismatch.
+
+**If the email belongs to a parent whose children are at another school**, nothing attaches automatically: the parent sees a **pending card** naming your school (never the child) and the link takes effect only when they **accept** it. If they tap **"Not my child"**, the link is cleared, that email is removed from the student record, and your Alerts page gets a **mismatched-email alert** — re-check the address with the family.
 
 ### Bulk upload
 
 **Bulk Upload** accepts a CSV or Excel file — click **Download template** for the exact format. Columns: `name, grade, parent_name, parent_phone, parent_email, parent2_name, parent_phone2, parent2_email, home_address, home_lat, home_lng, pickup_time`. Bad rows are reported individually and never block the good ones.
 
-The upload happens in **two steps**, and it is **scoped to a school**: pick the **School** first — every imported student is enrolled there, and the fleet-plan drafts and pin map only see a school's own students.
+The upload happens in **two steps**, and it is **scoped to your active school**: every imported student is enrolled there, and the fleet-plan drafts and pin map only ever see the school's own students.
 
 **Step 1 — check.** Choosing the file doesn't import anything yet. Every row's address is looked up and sorted into three tiers:
 
@@ -114,7 +188,7 @@ Mark absences **before the driver starts the run** — absent students' stops ar
 
 A route is an ordered list of stops run by one bus, in one direction: **Morning** routes end at the school gate; **Afternoon** routes start there and run in reverse.
 
-**Add Route** asks for **Name**, **Type** (Morning/Afternoon), **Bus**, and **School**. Students are then attached to the route from their own records (Students page), and each student's home pin becomes a stop.
+**Add Route** asks for **Name**, **Type** (Morning/Afternoon) and **Bus** — the route belongs to your active school. Students are then attached to the route from their own records (Students page), and each student's home pin becomes a stop.
 
 Each route card shows its stops in order on a small map, plus a mode badge:
 
@@ -138,9 +212,9 @@ The map shows a colored bus marker for every bus currently on an active run — 
 The planner (right-hand panel) builds an optimized route from scratch:
 
 1. Add stops — type each **address** and a pickup **time**, or **Upload CSV** (`address, pickup_time, lat, lng`; up to 24 stops).
-2. Pick a **Direction** (Morning/Afternoon) and **School**.
+2. Pick a **Direction** (Morning/Afternoon). The planner works against your active school's gate.
 3. Click **Get route options** — you get one or more strategies with total distance and duration (in traffic where available), and a drag-to-reorder stop list. Unlocatable addresses are flagged.
-4. Click **Save to Routes**, give the route a **name**, a **school** (required) and optionally a **bus**.
+4. Click **Save to Routes**, give the route a **name** and optionally a **bus** — it lands in your active school.
 
 The saved route appears on the Routes page with the **Planner** badge.
 
@@ -150,7 +224,7 @@ The Fleet Plan page drafts a school's complete route network from its enrolled s
 
 Work through the four steps in order:
 
-1. **Fleet** — tick every bus this school may use and click **Confirm fleet**. A claimed bus is unavailable to other schools until it is released here. A bus running multiple trips per period is claimed but excluded from drafting, and a bus without a depot is planned without its depot leg — both are called out under the list.
+1. **Fleet** — tick every bus the plan may use and click **Confirm fleet**. The list shows your school's own buses (a bus belongs to the school that created it and is never shared). A bus running multiple trips per period is confirmed but excluded from drafting, and a bus without a depot is planned without its depot leg — both are called out under the list.
 2. **Draft** — click **Generate draft**. The system reads every enrolled student's home pin and the confirmed fleet and proposes mirrored morning/afternoon routes. Only one draft is open per school: drafting again asks first, because the new draft **supersedes** the open one and its review edits are discarded. The optional solver seed reproduces a draft exactly; leave it empty normally.
 3. **Review** — the map shows each bus's legs, and the panels beside it show every child's ride time, each bus's seats used per leg, the computed stop times, and — before anything is sent — **the changes families will be told about** with the count of families that will be notified. Children the plan could not seat appear in the red **unplaceable** panel with the reason (no seats, too many stops, no located address); use **Place** to seat one by hand, choosing a bus and a position per leg. You can also reorder stops with the arrows or by dragging, **Move** a child to another bus (moving just one leg splits the pair across buses), **Pin** a child so re-solving keeps them where they are, and change a child's ridership pattern (both ways, morning only, afternoon only, split) — pattern edits live in the draft until you apply. An edit that would break a hard rule (bus capacity, the 24-stop cap) is refused with the rule named, and the draft is unchanged. **Re-solve** re-optimises the whole draft: pinned children and pattern edits are kept; other manual arrangements are discarded.
 4. **Apply** — one explicit act that **replaces the school's live routes** and **notifies every affected family** (changed bus, stop moved 5 or more minutes against what they were last told, first plan, lost seat). If students enrolled, moved house, or left after you drafted, the apply dialog lists each change for individual confirmation — or offers **Discard and re-draft** when the list is long. Any still-unplaceable child must be **acknowledged by name, per leg**: they will have no seat from the next run. Applying between runs takes effect the **same day** — "next run" can mean this afternoon — and if a run is active right now, parents' live tracking will not match the bus until that run ends.
@@ -193,7 +267,7 @@ After closing, the run report lists those children with a **Mark called** button
 Two other admin powers live here:
 
 - **Add/Edit Run** records a run manually or corrects its details. You **cannot** set a live run to Completed — finishing a run is a claim that every child is accounted for, and only the driver's End Run or your force-close can make it. A finished run cannot be reopened either; start a new run instead.
-- **Delete run** — the recovery tool for a run started in error. A route can only be run **once per day**, so deleting the mistaken run frees the route again. Deleting a run that is still open records nothing about any child. **A finished run from today cannot be deleted** once its children have records: those records are the only evidence of who was on that bus, and removing them would show a whole busload as never having travelled.
+- **Delete run** — the recovery tool for a run started in error. A route can only be run **once per day**, so deleting the mistaken run frees the route again. Deleting a run that is **still open** records nothing about any child and is available to both staff roles; deleting a **completed** run is director-only. **A finished run from today cannot be deleted by anyone** once its children have records: those records are the only evidence of who was on that bus, and removing them would show a whole busload as never having travelled.
 
 ## Parents
 
@@ -202,7 +276,9 @@ This page lists every parent contact in the system. **Status** tells you where e
 - **Registered** — the parent has created their app account.
 - **Awaiting signup** — the email exists on a student record but the parent hasn't signed up yet. Chase these before launch day so parents get notifications from day one.
 
-You can **edit** a registered parent's name, email and phone, or **delete** the account (which removes its student links). Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
+You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
+
+A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting.
 
 ## Alerts
 
@@ -223,7 +299,7 @@ The **Driver Alerts** page is the incident feed. Entries arrive from:
 
 Lifecycle alerts arrive pre-acknowledged and are **excluded from the incident counters** — there are several per bus per day, and counting them would turn the Dashboard's incidents tile red on a completely ordinary morning. They never reach parents: several of them name other people's children.
 
-New items carry a **"New"** badge and count toward the bell and sidebar badges. Click **Ack** once handled — acknowledged alerts stay in the feed, dimmed. Delete removes an alert permanently.
+New items carry a **"New"** badge and count toward the bell and sidebar badges. Click **Ack** once handled — acknowledged alerts stay in the feed, dimmed, and record who acknowledged them. Delete removes an alert permanently (director only — alerts are history).
 
 ## Reference
 
@@ -236,8 +312,9 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Run | In progress, Delayed, Completed |
 | Route/run type | Morning, Afternoon |
 | Student (today) | At home, On bus, Expected on bus, At school, Dropped off, Absent today / Absent (AM) / Absent (PM), Unaccounted, Unassigned |
-| Parent account | Registered, Awaiting signup |
+| Parent account | Registered, Awaiting signup (plus the **Shared** mark) |
 | Driver PIN | Set, None |
+| Staff | Active, Offered |
 
 **Validation rules**
 
@@ -245,7 +322,8 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 - Passwords: 6–72 characters. Driver PINs: 4 digits, unique per driver, viewable only once at creation/reset.
 - Students: Parent 1 name required; at least one phone and one email across the two parent contacts.
 - Bus capacity: 1–100. Route planner: max 24 stops. Broadcasts: 500 characters, 12 per hour.
-- Schools: address **and** map location both required.
+- School Settings: address **and** map location both required; bell times `HH:MM`.
+- Staff temporary passwords: server-generated, shown once, valid unused for 72 hours, replaced at first sign-in.
 
 ## Troubleshooting — calls you will get
 
@@ -257,7 +335,11 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: route shows "Completed today" but needs to run again | Delete the erroneous run in Run History. |
 | Driver: boarded/absented the wrong student | Drivers can't undo these (parents were already notified). Correct the record from the office and inform the affected parent. |
 | Driver forgot their PIN | Drivers → edit → Reset PIN; the new PIN shows once. |
-| Parent: "No children are linked to your account yet" | The parent's sign-up email doesn't match the student record. Fix the email on the student (or have the parent re-register with the recorded email). |
+| Staff member locked out of their account | A director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
+| A director is locked out and there is no other director | Contact SafeRide support — they can step in and issue the reset. |
+| New staff member's temporary password "doesn't work" | Temporary passwords expire after **72 hours** unused. Reset it and hand over the new one. |
+| Parent: "No children are linked to your account yet" | The parent's sign-up email doesn't match the student record. Fix the email on the student (or have the parent re-register with the recorded email). If the parent's other children are at another school, the link shows on their phone as a **pending card** — ask them to accept it. |
+| Alerts: "mismatched email" from a parent decline | A parent answered your link with "Not my child". The email was removed from the student's record — verify the address with the family and re-enter it. |
 | Parent: wants name/phone/address changed | Edit it on the Students or Parents page — parents can't self-edit. |
 | Parent: no notifications | Check they've registered (Parents page shows "Registered"), and that they enabled push in their Profile tab; otherwise alerts still appear in their in-app feed. |
 | Bus missing from Fleet Map | The bus only appears during an active run, and only advances as the driver taps "Arrive Next Stop". |

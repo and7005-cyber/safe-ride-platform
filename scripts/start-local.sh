@@ -102,6 +102,22 @@ wait_for_http() {
   done
 }
 
+create_app_role() {
+  # Tenancy (U1): keep the local runtime role in sync (see reset-local-db.sh).
+  local pw="${DB_APP_PASSWORD:-saferide}"
+  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 <<SQL
+do \$\$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'saferide_app') then
+    execute format('create role saferide_app login nobypassrls password %L', '${pw}');
+  else
+    execute format('alter role saferide_app with login nobypassrls password %L', '${pw}');
+  end if;
+end
+\$\$;
+SQL
+}
+
 apply_migrations() {
   if [ ! -d "$MIGRATIONS_DIR" ]; then
     echo "Cannot initialize local database: migrations directory is missing at $MIGRATIONS_DIR." >&2
@@ -160,8 +176,15 @@ apply_seed() {
 }
 
 apply_migration_and_seed() {
+  create_app_role
   apply_migrations
   apply_seed
+  # U14: 015's data-dependent steps defer themselves on an empty database;
+  # the post-seed second pass arms the constraints and row security
+  # (double-apply is a designed no-op).
+  echo "Re-applying 015 post-seed (constraints + row security)..."
+  docker compose -f "$COMPOSE_FILE" exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 < "$MIGRATIONS_DIR/015_tenancy_constraints_rls.sql"
 }
 
 start_frontend() {

@@ -44,7 +44,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.core.config import get_settings
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection
 from app.dao.push_dao import PushDao
 
 logger = logging.getLogger("saferide.push")
@@ -102,13 +102,20 @@ class PushService:
         self._firebase_failed = False
 
     # Event entry points (called from routers via BackgroundTasks) ------------
+    # Every entry point takes the dispatching request's scope explicitly (U7)
+    # and threads it into each DAO read/write, so the background task never
+    # leans on the context-var fallback the strict seam now refuses for
+    # school-scoped requests. Feed rows stamp the run/route/plan school where
+    # one is derivable.
 
-    def notify_run_started(self, run: dict) -> None:
+    def notify_run_started(self, run: dict, scope: object = UNSET) -> None:
         """Morning: 'bus on the way'. Afternoon: 'child on the way home'."""
         try:
-            bus = self._bus_label(run.get("bus_id"))
-            students = self.dao.students_on_run(str(run["id"]))
-            for link in self.dao.parents_of_students([s["id"] for s in students]):
+            bus = self._bus_label(run.get("bus_id"), scope)
+            students = self.dao.students_on_run(str(run["id"]), scope=scope)
+            for link in self.dao.parents_of_students(
+                [s["id"] for s in students], scope=scope
+            ):
                 if run.get("type") == "afternoon":
                     self._notify(
                         link["parent_id"],
@@ -119,6 +126,8 @@ class PushService:
                         run_id=str(run["id"]),
                         bus_id=run.get("bus_id"),
                         run_type=run.get("type"),
+                        school_id=run.get("school_id"),
+                        scope=scope,
                     )
                 else:
                     self._notify(
@@ -130,14 +139,16 @@ class PushService:
                         run_id=str(run["id"]),
                         bus_id=run.get("bus_id"),
                         run_type=run.get("type"),
+                        school_id=run.get("school_id"),
+                        scope=scope,
                     )
         except Exception:
             logger.exception("notify_run_started failed")
 
-    def notify_student_boarded(self, run: dict, student_id: str) -> None:
+    def notify_student_boarded(self, run: dict, student_id: str, scope: object = UNSET) -> None:
         try:
-            bus = self._bus_label(run.get("bus_id"))
-            for link in self.dao.parents_of_students([student_id]):
+            bus = self._bus_label(run.get("bus_id"), scope)
+            for link in self.dao.parents_of_students([student_id], scope=scope):
                 self._notify(
                     link["parent_id"],
                     type="student-boarded",
@@ -147,17 +158,19 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_student_boarded failed")
 
-    def notify_student_dropped_off(self, student: dict, run: dict) -> None:
+    def notify_student_dropped_off(self, student: dict, run: dict, scope: object = UNSET) -> None:
         """Driver confirmed the drop-off at the child's stop (afternoon,
         tap-time) — tell that child's linked parents. Run-scoped
         (run_id + student_id set) so a retried tap is dedup-suppressed."""
         try:
             student_id = str(student["id"])
-            for link in self.dao.parents_of_students([student_id]):
+            for link in self.dao.parents_of_students([student_id], scope=scope):
                 self._notify(
                     link["parent_id"],
                     type="dropped-off",
@@ -167,11 +180,15 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_student_dropped_off failed")
 
-    def notify_student_handover(self, student: dict, run: dict, note: str) -> None:
+    def notify_student_handover(
+        self, student: dict, run: dict, note: str, scope: object = UNSET
+    ) -> None:
         """Driver handed the child over away from their stop (U4/R12).
 
         Reuses the 'dropped-off' type on purpose: from the family's side this is
@@ -181,7 +198,7 @@ class PushService:
         """
         try:
             student_id = str(student["id"])
-            for link in self.dao.parents_of_students([student_id]):
+            for link in self.dao.parents_of_students([student_id], scope=scope):
                 self._notify(
                     link["parent_id"],
                     type="dropped-off",
@@ -194,11 +211,15 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_student_handover failed")
 
-    def notify_correction(self, student: dict, run: dict, reversed_what: str) -> None:
+    def notify_correction(
+        self, student: dict, run: dict, reversed_what: str, scope: object = UNSET
+    ) -> None:
         """The driver corrected their own mis-tap (U5/R10).
 
         Its own notification type, because the dedup index keys on
@@ -215,7 +236,7 @@ class PushService:
             superseded = (
                 ["student-absent"] if reversed_what == "absence" else ["dropped-off"]
             )
-            self.dao.retract_notifications(str(run["id"]), student_id, superseded)
+            self.dao.retract_notifications(str(run["id"]), student_id, superseded, scope=scope)
 
             if reversed_what == "absence":
                 type_ = "absence-corrected"
@@ -228,7 +249,7 @@ class PushService:
                     "was marked as dropped off by mistake. They are still on the bus — "
                     "the driver will confirm when they get off."
                 )
-            for link in self.dao.parents_of_students([student_id]):
+            for link in self.dao.parents_of_students([student_id], scope=scope):
                 self._notify(
                     link["parent_id"],
                     type=type_,
@@ -238,11 +259,16 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_correction failed")
 
-    def notify_student_absent(self, student: dict, run: dict, reason: str | None = None) -> None:
+    def notify_student_absent(
+        self, student: dict, run: dict, reason: str | None = None,
+        scope: object = UNSET,
+    ) -> None:
         """Driver marked the child absent at pickup — tell that child's linked
         parents and nobody else. Run-scoped (run_id + student_id set) so a
         repeat mark within the same run is dedup-suppressed. The school-side
@@ -270,7 +296,7 @@ class PushService:
                 )
             else:
                 template = f"{name_slot} is marked absent for the whole day and will not travel."
-            for link in self.dao.parents_of_students([student_id]):
+            for link in self.dao.parents_of_students([student_id], scope=scope):
                 body = template.format(name=link["student_name"])
                 if reason:
                     body = f"{body} Reason: {reason}"
@@ -283,6 +309,8 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_student_absent failed")
@@ -308,6 +336,8 @@ class PushService:
             }
             phrase = phrases.get(scope, "ride today has been cancelled")
             delivered = intended = 0
+            # Parent-portal dispatch (no request scope until U11); the row
+            # still stamps the child's school where the caller supplied it.
             for link in self.dao.parents_of_students([student_id]):
                 intended += 1
                 try:
@@ -320,6 +350,7 @@ class PushService:
                         run_id=None,
                         bus_id=student.get("bus_id"),
                         run_type=scope if scope in ("morning", "afternoon") else None,
+                        school_id=student.get("school_id"),
                     )
                     delivered += 1
                 except Exception:
@@ -334,7 +365,7 @@ class PushService:
         except Exception:
             logger.exception("notify_ride_cancelled failed")
 
-    def notify_reached_school(self, run: dict) -> None:
+    def notify_reached_school(self, run: dict, scope: object = UNSET) -> None:
         """Morning arrival at the school gate (or morning run end).
 
         Only parents of students actually on the bus are told their child
@@ -344,7 +375,7 @@ class PushService:
         try:
             if run.get("type") != "morning":
                 return
-            for link in self._boarded_links(run):
+            for link in self._boarded_links(run, scope):
                 self._notify(
                     link["parent_id"],
                     type="reached-school",
@@ -354,11 +385,13 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_reached_school failed")
 
-    def notify_run_ended(self, run: dict) -> None:
+    def notify_run_ended(self, run: dict, scope: object = UNSET) -> None:
         """Morning: reached-school for boarded students. Afternoon: nothing —
         confirmed drop-offs were notified at tap time by
         notify_student_dropped_off, and students the driver never confirmed
@@ -366,11 +399,11 @@ class PushService:
         normalizes their status."""
         try:
             if run.get("type") == "morning":
-                self.notify_reached_school(run)
+                self.notify_reached_school(run, scope)
         except Exception:
             logger.exception("notify_run_ended failed")
 
-    def notify_incident(self, incident: dict) -> None:
+    def notify_incident(self, incident: dict, scope: object = UNSET) -> None:
         try:
             # Student-stamped incidents are child-specific (driver-absent
             # reports, parent cancellations): admin Alerts page only. A
@@ -392,7 +425,7 @@ class PushService:
             # One notification per parent, however many children they have on
             # the bus — the message never references a specific child.
             notified: set[str] = set()
-            for link in self.dao.parents_of_bus(str(incident["bus_id"])):
+            for link in self.dao.parents_of_bus(str(incident["bus_id"]), scope=scope):
                 parent_id = str(link["parent_id"])
                 if parent_id in notified:
                     continue
@@ -406,11 +439,15 @@ class PushService:
                     run_id=None,  # incidents are not deduped: each report matters
                     bus_id=incident.get("bus_id"),
                     run_type=incident.get("run_type"),
+                    school_id=incident.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_incident failed")
 
-    def notify_admin_broadcast(self, route: dict, body: str, parent_ids: list[str]) -> None:
+    def notify_admin_broadcast(
+        self, route: dict, body: str, parent_ids: list[str], scope: object = UNSET
+    ) -> None:
         """Admin route broadcast (U8: R20, R21, R23; AE5): one 'admin-notice'
         feed row + push per DISTINCT parent with a child assigned to the route.
 
@@ -448,6 +485,8 @@ class PushService:
                         run_id=None,
                         bus_id=route.get("bus_id"),
                         run_type=None,
+                        school_id=route.get("school_id"),
+                        scope=scope,
                     )
                     delivered += 1
                 except Exception:
@@ -460,7 +499,7 @@ class PushService:
         except Exception:
             logger.exception("notify_admin_broadcast failed")
 
-    def notify_bus_approaching(self, run: dict) -> None:
+    def notify_bus_approaching(self, run: dict, scope: object = UNSET) -> None:
         """Stop-based 'bus-approaching': the instant the driver arrives at a
         stop, alert the parents whose child's stop is the *next* one. No GPS —
         the run's stops_completed (already advanced by arrive_next_stop) tells
@@ -468,12 +507,14 @@ class PushService:
         at most once per run."""
         try:
             next_order = (run.get("stops_completed") or 0) + 1
-            bus = self._bus_label(run.get("bus_id"))
+            bus = self._bus_label(run.get("bus_id"), scope)
             students = [
-                s for s in self.dao.students_at_stop(str(run["id"]), next_order)
+                s for s in self.dao.students_at_stop(str(run["id"]), next_order, scope=scope)
                 if s["student_status"] not in ("absent", "unaccounted")
             ]
-            for link in self.dao.parents_of_students([s["student_id"] for s in students]):
+            for link in self.dao.parents_of_students(
+                [s["student_id"] for s in students], scope=scope
+            ):
                 self._notify(
                     link["parent_id"],
                     type="bus-approaching",
@@ -483,23 +524,29 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_bus_approaching failed")
 
-    def notify_bus_position(self, run: dict, lat: float, lng: float) -> None:
+    def notify_bus_position(self, run: dict, lat: float, lng: float, scope: object = UNSET) -> None:
         """Deprecated GPS-proximity variant (no longer wired — kept for API
         back-compat). Bus-approaching now fires from notify_bus_approaching."""
         try:
             radius = get_settings().bus_approaching_radius_m
-            bus = self._bus_label(run.get("bus_id"))
-            stops = self.dao.remaining_student_stops(str(run["id"]), run["stops_completed"])
+            bus = self._bus_label(run.get("bus_id"), scope)
+            stops = self.dao.remaining_student_stops(
+                str(run["id"]), run["stops_completed"], scope=scope
+            )
             near = [
                 s for s in stops
                 if s["student_status"] not in ("absent", "unaccounted")
                 and haversine_m(lat, lng, float(s["lat"]), float(s["lng"])) <= radius
             ]
-            for link in self.dao.parents_of_students([s["student_id"] for s in near]):
+            for link in self.dao.parents_of_students(
+                [s["student_id"] for s in near], scope=scope
+            ):
                 self._notify(
                     link["parent_id"],
                     type="bus-approaching",
@@ -509,6 +556,8 @@ class PushService:
                     run_id=str(run["id"]),
                     bus_id=run.get("bus_id"),
                     run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
                 )
         except Exception:
             logger.exception("notify_bus_position failed")
@@ -549,7 +598,7 @@ class PushService:
 
     # Internals ----------------------------------------------------------------
 
-    def _boarded_links(self, run: dict) -> list[dict]:
+    def _boarded_links(self, run: dict, scope: object = UNSET) -> list[dict]:
         """Parent links for children the driver actually observed boarding.
 
         end_run supplies run["boarded_student_ids"] from participation —
@@ -562,14 +611,14 @@ class PushService:
         """
         boarded_ids = run.get("boarded_student_ids")
         if boarded_ids is None:
-            students = self.dao.students_on_run(str(run["id"]))
+            students = self.dao.students_on_run(str(run["id"]), scope=scope)
             boarded_ids = [s["id"] for s in students if s.get("display_status") == "on-bus"]
-        return self.dao.parents_of_students(list(boarded_ids))
+        return self.dao.parents_of_students(list(boarded_ids), scope=scope)
 
-    def _bus_label(self, bus_id: str | None) -> str:
+    def _bus_label(self, bus_id: str | None, scope: object = UNSET) -> str:
         if not bus_id:
             return "The school bus"
-        return self.dao.bus_name(str(bus_id)) or "The school bus"
+        return self.dao.bus_name(str(bus_id), scope=scope) or "The school bus"
 
     def _notify(
         self,
@@ -582,6 +631,8 @@ class PushService:
         run_id: str | None,
         bus_id: str | None,
         run_type: str | None = None,
+        school_id: str | None = None,
+        scope: object = UNSET,
     ) -> None:
         row = self.dao.insert_notification(
             str(parent_id),
@@ -592,6 +643,8 @@ class PushService:
             run_id=run_id,
             bus_id=str(bus_id) if bus_id else None,
             run_type=run_type,
+            school_id=str(school_id) if school_id else None,
+            scope=scope,
         )
         if row is None:
             return  # run-scoped dedup suppressed a repeat
@@ -742,6 +795,7 @@ def notify_route_changes(
     student_ids: list[str] | None = None,
     *,
     seed_only: bool = False,
+    scope: object = UNSET,
 ) -> dict | None:
     """R15 fan-out for a manual live-route edit (U13).
 
@@ -790,6 +844,13 @@ def notify_route_changes(
     silent — drift they cause is notified by the NEXT edit or apply, measured
     against the baseline seeded here.
 
+    ``scope`` is the dispatching request's scope (U7): the mutation ran
+    inside a school-scoped request, and this post-commit task must open its
+    connection through the same explicit scope — an unthreaded dispatch
+    inside a SchoolScope request fails loudly under the strict seam (and is
+    swallowed here per the best-effort contract, returning None with nothing
+    written, never a silent partial success).
+
     Best-effort by design (background context): any failure is logged, never
     raised into the caller's response path.
     """
@@ -812,7 +873,7 @@ def notify_route_changes(
         push_dao = PushDao()
         feed_rows: list[dict] = []
         notified: list[dict] = []
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             # 1. Resolve the affected student set.
             affected = {str(s) for s in (student_ids or [])}
             rids = {str(r) for r in (route_ids or [])}
@@ -961,16 +1022,22 @@ def notify_route_changes(
             # exactly when a notification is sent. Seed-only rows count as
             # sent: their communication is the roster interaction itself.
             if notified and not seed_only:
+                # Recipient rule (U7): accepted links on enabled accounts only.
                 families: dict[str, list[str]] = {}
                 for pr in conn.execute(
-                    "select parent_id, student_id from live_parent_students "
-                    "where student_id = any(%s::uuid[])",
+                    "select ps.parent_id, ps.student_id from live_parent_students ps "
+                    "join app_users u on u.id = ps.parent_id "
+                    "where ps.student_id = any(%s::uuid[]) "
+                    "and ps.status = 'accepted' and u.disabled_at is null",
                     (sorted({r["student_id"] for r in notified}),),
                 ).fetchall():
                     families.setdefault(str(pr["student_id"]), []).append(
                         str(pr["parent_id"])
                     )
-                feed_rows = _write_manual_edit_feed_rows(conn, push_dao, notified, families)
+                feed_rows = _write_manual_edit_feed_rows(
+                    conn, push_dao, notified, families,
+                    school_id=getattr(scope, "school_id", None),
+                )
             if notified:
                 FleetPlanDao._write_baselines(conn, notified)
 
@@ -990,7 +1057,8 @@ def notify_route_changes(
 
 
 def _write_manual_edit_feed_rows(
-    conn, push_dao: PushDao, rows: list[dict], families: dict[str, list[str]]
+    conn, push_dao: PushDao, rows: list[dict], families: dict[str, list[str]],
+    school_id: str | None = None,
 ) -> list[dict]:
     """Feed rows for one manual-edit act, inserted on the CALLER's transaction
     connection — the U6 composer's grouping (one row per (family, student,
@@ -1035,6 +1103,7 @@ def _write_manual_edit_feed_rows(
                     bus_id=g["placed"][0]["current"]["bus_id"],
                     run_type=next(iter(legs)) if len(legs) == 1 else None,
                     plan_audit_id=None,
+                    school_id=school_id,
                 )
                 if inserted:
                     feed_rows.append(inserted)
@@ -1052,6 +1121,7 @@ def _write_manual_edit_feed_rows(
                     student_id=sid, bus_id=None,
                     run_type=next(iter(legs)) if len(legs) == 1 else None,
                     plan_audit_id=None,
+                    school_id=school_id,
                 )
                 if inserted:
                     feed_rows.append(inserted)

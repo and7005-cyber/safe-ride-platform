@@ -18,7 +18,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_run
+from conftest import purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -48,8 +48,17 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT XB School", lat=-1.30, lng=36.80) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
@@ -67,11 +76,11 @@ def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
     pytest.fail(f"could not create throwaway driver: {response.text}")
 
 
-def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers):
+def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers, sandbox):
     """The full chain: derived bus A, afternoon run on bus B — context roster,
     total_students, and the absence-clear guard all follow the RUN."""
     marker = uuid.uuid4().hex[:6]
-    created: dict[str, list] = {"buses": [], "schools": [], "students": [], "drivers": []}
+    created: dict[str, list] = {"buses": [], "students": [], "drivers": []}
     run_id = None
     driver_b_headers = None
     try:
@@ -89,12 +98,7 @@ def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers):
             headers=admin_headers,
         ).json()
         created["buses"] = [bus_a["id"], bus_b["id"]]
-        school = client.post(
-            "/api/fleet/schools",
-            json={"name": f"IT XB School {marker}", "lat": -1.30, "lng": 36.80},
-            headers=admin_headers,
-        ).json()
-        created["schools"] = [school["id"]]
+        school = {"id": sandbox["id"], "name": sandbox["name"]}
         morning = client.post(
             "/api/fleet/routes",
             json={"name": f"IT XB Morning {marker}", "type": "morning",
@@ -177,7 +181,5 @@ def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers):
             client.delete(f"/api/students/{sid}", headers=admin_headers)
         for bid in created["buses"]:
             client.delete(f"/api/fleet/buses/{bid}", headers=admin_headers)
-        for scid in created["schools"]:
-            client.delete(f"/api/fleet/schools/{scid}", headers=admin_headers)
         for did in created["drivers"]:
             client.delete(f"/api/accounts/drivers/{did}", headers=admin_headers)

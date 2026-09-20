@@ -3,6 +3,7 @@ import {
   ADMIN,
   API_URL,
   DRIVER,
+  SCHOOL_A_ID,
   SEED,
   apiCancelRide,
   apiDriverToken,
@@ -15,6 +16,7 @@ import {
   fieldInput,
   pickSelectOption,
   purgeRun,
+  schoolHeaders,
   uniqueName,
 } from "./helpers";
 
@@ -24,12 +26,14 @@ import {
 
 test.beforeAll(async ({ request }) => {
   const token = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(token);
+  // U12: staff-surface calls carry the school scope; this suite works in the
+  // seeded school A. School create/delete no longer exists, so the sweep has
+  // no schools entry.
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
   const sweep: Array<{ list: string; del: (id: string) => string; name?: string }> = [
     { list: "/api/fleet/routes", del: (id) => `/api/fleet/routes/${id}` },
     { list: "/api/students", del: (id) => `/api/students/${id}` },
     { list: "/api/fleet/buses", del: (id) => `/api/fleet/buses/${id}` },
-    { list: "/api/fleet/schools", del: (id) => `/api/fleet/schools/${id}` },
     { list: "/api/accounts/drivers", del: (id) => `/api/accounts/drivers/${id}` },
   ];
   for (const entity of sweep) {
@@ -45,7 +49,7 @@ test.beforeAll(async ({ request }) => {
 });
 
 async function adminLogin(page: Page) {
-  await signInAs(page, ADMIN);
+  await signInAs(page, ADMIN, SCHOOL_A_ID);
 }
 
 function dialog(page: Page) {
@@ -89,22 +93,38 @@ test("admin can create, edit, search, and delete a bus", async ({ page }) => {
   await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
 });
 
-test("admin can create and delete a school with a map location", async ({ page }) => {
-  const name = uniqueName("E2E School");
+test("admin edits the active school's settings (no create or delete, U12/R23)", async ({
+  page,
+  request,
+}) => {
+  // The Schools page is gone: the console works inside ONE school whose
+  // settings (name, bells, location) are edited here. Save a new afternoon
+  // bell, verify it persisted, then restore the original value.
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
+  const before = await (await request.get(`${API_URL}/api/fleet/school`, { headers })).json();
+
   await adminLogin(page);
-  await page.goto("/schools");
+  await page.goto("/settings");
+  await expect(page.getByRole("heading", { name: "School Settings" })).toBeVisible();
+  // The school's non-editable code is shown; there is no Add and no Delete.
+  await expect(page.getByTestId("school-code")).toContainText(before.code ?? "");
+  await expect(page.getByRole("button", { name: /Add School/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Delete/ })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Add School" }).click();
-  await fieldInput(dialog(page), "Name").fill(name);
-  await fieldInput(dialog(page), "Address").fill("1 Test Lane, Nairobi");
-  await fieldInput(dialog(page), "Phone").fill("+254700999999");
-  await dialog(page).getByTestId("map-picker").click({ position: { x: 150, y: 120 } });
-  await dialog(page).getByRole("button", { name: "Save" }).click();
-  await expect(page.getByText(name)).toBeVisible();
+  await page.getByTestId("afternoon-bell").fill("16:05");
+  await page.getByRole("button", { name: "Save" }).click();
+  // .first(): the toast text also lands in sonner's aria-live announcer.
+  await expect(page.getByText("School settings saved").first()).toBeVisible();
 
-  await cardContaining(page, name).getByRole("button").last().click();
-  await confirmDelete(page);
-  await expect(page.getByText(name)).toHaveCount(0);
+  const after = await (await request.get(`${API_URL}/api/fleet/school`, { headers })).json();
+  expect(after.afternoon_bell).toBe("16:05");
+  expect(after.id).toBe(before.id);
+
+  // Restore so later suites see the seeded bell again.
+  await page.getByTestId("afternoon-bell").fill(before.afternoon_bell ?? "");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("School settings saved").first()).toBeVisible();
 });
 
 test("admin can create and delete a route attached to a bus and school", async ({ page, request }) => {
@@ -113,7 +133,7 @@ test("admin can create and delete a route attached to a bus and school", async (
   // of them now 409s (R1). Attach the route to a fresh bus instead.
   const busName = uniqueName("E2E RouteBus");
   const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(adminToken);
+  const headers = schoolHeaders(adminToken, SCHOOL_A_ID);
   const busResp = await request.post(`${API_URL}/api/fleet/buses`, {
     headers,
     data: { name: busName, plate_number: "E2E 100", capacity: 20, status: "idle" },
@@ -133,7 +153,7 @@ test("admin can create and delete a route attached to a bus and school", async (
   await expect(dialog(page).getByTestId("route-gate-anchor")).toBeVisible();
   await pickSelectOption(dialog(page), "Type", "Afternoon");
   await pickSelectOption(dialog(page), "Bus", busName);
-  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  // U12: no School field — the route lands in the tab's active school.
   await dialog(page).getByRole("button", { name: "Save" }).click();
   await expect(page.getByText(name)).toBeVisible();
 
@@ -240,10 +260,9 @@ test("bulk upload triages rows and imports after a one-click pin confirm", async
   await page.goto("/students");
   await page.getByRole("button", { name: "Bulk Upload" }).click();
 
-  // The file chooser stays locked until the upload's school scope is picked —
-  // every committed row is stamped with it.
-  await expect(dialog(page).getByRole("button", { name: "Choose file" })).toBeDisabled();
-  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  // U12: the upload is scoped to the tab's active school — no picker, the
+  // chooser is ready straight away.
+  await expect(dialog(page).getByRole("button", { name: "Choose file" })).toBeEnabled();
   await dialog(page)
     .locator('input[type="file"]')
     .setInputFiles({ name: "students.csv", mimeType: "text/csv", buffer: Buffer.from(csv) });
@@ -280,7 +299,7 @@ test("bulk upload triages rows and imports after a one-click pin confirm", async
 
   // API cleanup (the beforeAll sweep also catches aborted runs).
   const token = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(token);
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
   const students = await request.get(`${API_URL}/api/students`, { headers });
   for (const row of await students.json()) {
     if ([nameA, nameB].includes(row.name)) {
@@ -299,20 +318,17 @@ test("bulk upload triages rows and imports after a one-click pin confirm", async
 test("pin map shows a named pin and jumps to the student editor", async ({ page, request }) => {
   const name = uniqueName("E2E PinKid");
   const token = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(token);
-  const schoolsResp = await request.get(`${API_URL}/api/fleet/schools`, { headers });
-  expect(schoolsResp.ok()).toBeTruthy();
-  const school = (await schoolsResp.json()).find((s: any) => s.name === SEED.school);
-  expect(school).toBeTruthy();
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
 
-  // A student with a placed pin at the seeded school, staged via API.
+  // A student with a placed pin at the seeded school, staged via API — the
+  // request scope stamps the school (U12).
   const created = await request.post(`${API_URL}/api/students`, {
     headers,
     data: {
       name, grade: "Grade 2", parent_name: "E2E Pin Parent",
       parent_phone: "+254711222666", parent_email: "e2e-pin-parent@test.local",
       home_address: "E2E Pin Lane, Nairobi", home_lat: -1.2921, home_lng: 36.8219,
-      provenance: "imported", school_id: school.id, route_ids: [],
+      provenance: "imported", route_ids: [],
     },
   });
   expect(created.ok()).toBeTruthy();
@@ -322,7 +338,7 @@ test("pin map shows a named pin and jumps to the student editor", async ({ page,
     await adminLogin(page);
     await page.goto("/students");
     await page.getByRole("button", { name: "Pin map" }).click();
-    await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+    // U12: the dialog shows the ACTIVE school's pins — no picker.
 
     // The audited aggregate answers with the student's named pin.
     await expect(dialog(page).getByTestId("pin-map-summary")).not.toHaveText(
@@ -380,26 +396,46 @@ test("admin can edit and delete a registered parent account", async ({ page, req
   });
   expect(signup.ok()).toBeTruthy();
 
-  await adminLogin(page);
-  await page.goto("/parents");
-  await expect(page.getByRole("row", { name: new RegExp(fullName) })).toBeVisible();
+  // U6/R33: the Parents page lists only parents linked to THIS school's
+  // students — an unlinked signup is invisible here. Stage a student carrying
+  // the parent's email so the account is linked (and later editable) at A.
+  const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = schoolHeaders(adminToken, SCHOOL_A_ID);
+  const studentResp = await request.post(`${API_URL}/api/students`, {
+    headers,
+    data: {
+      name: uniqueName("E2E ParentAcct Kid"), grade: "Grade 1",
+      parent_name: fullName, parent_phone: "+254711222444", parent_email: email,
+      home_address: "Parent Lane, Nairobi", route_ids: [],
+    },
+  });
+  expect(studentResp.ok()).toBeTruthy();
+  const studentId = (await studentResp.json()).id;
 
-  const row = page.getByRole("row", { name: new RegExp(fullName) });
-  await row.getByRole("button").first().click();
-  await fieldInput(dialog(page), "Full name").fill(renamed);
-  await dialog(page).getByRole("button", { name: "Save" }).click();
-  await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
+  try {
+    await adminLogin(page);
+    await page.goto("/parents");
+    await expect(page.getByRole("row", { name: new RegExp(fullName) })).toBeVisible();
 
-  await page.getByRole("row", { name: new RegExp(renamed) }).getByRole("button").last().click();
-  await confirmDelete(page);
-  await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
+    const row = page.getByRole("row", { name: new RegExp(fullName) });
+    await row.getByRole("button").first().click();
+    await fieldInput(dialog(page), "Full name").fill(renamed);
+    await dialog(page).getByRole("button", { name: "Save" }).click();
+    await expect(page.getByRole("row", { name: new RegExp(renamed) })).toBeVisible();
+
+    await page.getByRole("row", { name: new RegExp(renamed) }).getByRole("button").last().click();
+    await confirmDelete(page);
+    await expect(page.getByRole("row", { name: new RegExp(renamed) })).toHaveCount(0);
+  } finally {
+    await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
+  }
 });
 
 test("creating a student with a registered parent's email links it to that parent", async ({ page, request }) => {
   // Parent ↔ student assignment happens in the student form now (R12): a
   // student carrying a registered parent's email is auto-linked on save.
   const adminToken = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(adminToken);
+  const headers = schoolHeaders(adminToken, SCHOOL_A_ID);
 
   const parentEmail = `e2e-assign-${Date.now()}@test.local`;
   const parentName = uniqueName("E2E AssignParent");
@@ -536,11 +572,14 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
 
   await page.getByTestId("get-route-options").click();
 
-  // An ordered, enriched route comes back with totals and stops.
+  // An ordered, enriched route comes back with totals and stops. The two
+  // addresses plus the school-gate anchor (U12: the plan is always solved
+  // against the tab's active school, so the gate rides along as a stop).
   await expect(page.getByTestId("route-result")).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("button", { name: "Optimised (traffic-aware)" })).toBeVisible();
   await expect(page.getByTestId("route-distance")).not.toHaveText("—");
-  await expect(page.getByTestId("route-stops").locator("li")).toHaveCount(2);
+  await expect(page.getByTestId("route-stops").locator("li")).toHaveCount(3);
+  await expect(page.getByTestId("route-stops").getByText("School", { exact: true })).toBeVisible();
 
   // Reorder (drag-to-reorder uses the same backend path) recomputes the route.
   await page.getByRole("button", { name: "Move down" }).first().click();
@@ -550,7 +589,7 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
   // Save the selected option as a route (R17): name + required school.
   await page.getByTestId("save-to-routes").click();
   await fieldInput(dialog(page), "Route name").fill(routeName);
-  await pickSelectOption(dialog(page), "School", new RegExp(SEED.school));
+  // U12: no School field — the route lands in the tab's active school.
   await dialog(page).getByTestId("confirm-save-route").click();
 
   // Success closes the dialog, confirms with a Routes link, and resets the planner (R19).
@@ -562,7 +601,7 @@ test("route planner returns a Google traffic-aware route, saves it, and resets",
 
   // The route persisted with its ordered custom stops.
   const token = await apiToken(request, ADMIN.email, ADMIN.password);
-  const headers = authHeaders(token);
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
   const listed = await request.get(`${API_URL}/api/fleet/routes`, { headers });
   expect(listed.ok()).toBeTruthy();
   const saved = (await listed.json()).find((r: { name: string }) => r.name === routeName);
@@ -595,16 +634,16 @@ test("a parent cancellation shows a scoped badge and an office alert without cha
     const row = page.getByRole("row", { name: new RegExp(SEED.parentChild) });
     // Display honesty (R19): a partial cancellation gates that run's roster and
     // never rewrites the displayed day status. The selector pins the status
-    // cell (index 7) — a day-absent student would read "Absent today" in both
-    // the name badge and the status cell, and this assertion must fail for that
-    // shape.
+    // cell (index 6 — the School column left with the single-school console,
+    // U12) — a day-absent student would read "Absent today" in both the name
+    // badge and the status cell, and this assertion must fail for that shape.
     //
     // The undisturbed value is "At home", not "At school": since U3 the status
     // is derived from participation, and a child with none today is simply not
     // in the system's care. "At school" was the raw column's leftover from
     // whenever it was last written, which is the staleness the derivation
     // removed.
-    await expect(row.getByRole("cell").nth(7).getByText("At home")).toBeVisible();
+    await expect(row.getByRole("cell").nth(6).getByText("At home")).toBeVisible();
     // The name cell carries the scope-labelled absence badge (U10).
     await expect(row.getByText("Absent (PM)")).toBeVisible();
     await expect(row.getByText("Absent today")).toHaveCount(0);

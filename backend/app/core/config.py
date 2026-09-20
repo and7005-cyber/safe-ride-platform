@@ -35,6 +35,11 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     pin_pepper: str = Field(default="saferide-local-pin-pepper", alias="PIN_PEPPER")
+    # Provider second factor (U10): TOTP secrets are derived per account from
+    # this pepper + the row's salt and never stored. Production holds it in
+    # SSM (/saferide/totp-pepper); rotating it forces every provider to
+    # re-enrol (the stored pepper key id names the cause).
+    totp_pepper: str = Field(default="saferide-local-totp-pepper", alias="TOTP_PEPPER")
     app_base_url: str = Field(default="http://localhost:5173", alias="APP_BASE_URL")
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
@@ -45,6 +50,10 @@ class Settings(BaseSettings):
         alias="DEMO_SCHOOL_ID",
     )
     trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    # Tenancy compatibility window (U5): while False, a school-scoped request
+    # without an X-School-Id header falls back to the caller's only (or last
+    # used) school; flipping to True makes the header mandatory (400).
+    scope_header_required: bool = Field(default=False, alias="SCOPE_HEADER_REQUIRED")
     # Minimum turnaround between a bus's back-to-back trips in one period (U6/R20):
     # stands in for the unmodeled gate<->wave deadhead. Global for this pass.
     turnaround_buffer_min: int = Field(default=15, alias="TURNAROUND_BUFFER_MIN")

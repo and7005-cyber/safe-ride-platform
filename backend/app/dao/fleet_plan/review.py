@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from app.core.db import get_connection
 from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.dao.audit_dao import record_audit
 from app.dao.fleet_plan._shared import (
     CONSTRAINT_STOP_CAP,
     UNASSIGNED_CONSTRAINT,
@@ -43,7 +44,7 @@ class ReviewOps:
 
     # --- review surface (U5) --------------------------------------------------
 
-    def review(self, school_id: str) -> dict[str, Any]:
+    def review(self, scope) -> dict[str, Any]:
         """The open draft's computed review surface (R10/R24): the stored
         document plus per-child ride times with wall-clock stop times, per-bus
         capacity use, total driving, the per-leg unplaceable lists, the diff
@@ -53,7 +54,8 @@ class ReviewOps:
         can assemble the apply payload without a blind POST. Read-only and
         provider-free: every number is arithmetic over the stored
         durations."""
-        with get_connection() as conn:
+        school_id = scope.school_id
+        with get_connection(scope) as conn:
             school = conn.execute(
                 "select id, name, lat, lng, morning_bell, afternoon_bell "
                 "from live_schools where id = %s",
@@ -175,9 +177,14 @@ class ReviewOps:
     # simplification, unchanged.
 
     @staticmethod
-    def _draft_for_update(conn, plan_id: str) -> dict:
+    def _draft_for_update(conn, plan_id: str, school_id: str | None = None) -> dict:
+        """Lock the draft row. ``school_id`` (U7) pins the plan to the ACTIVE
+        school: a foreign plan id answers the not-found contract."""
+        school_sql = " and school_id = %s" if school_id is not None else ""
+        params: tuple = (plan_id,) if school_id is None else (plan_id, school_id)
         row = conn.execute(
-            "select * from live_fleet_plans where id = %s for update", (plan_id,)
+            f"select * from live_fleet_plans where id = %s{school_sql} for update",
+            params,
         ).fetchone()
         if not row:
             raise NotFoundError("Plan not found")
@@ -190,10 +197,15 @@ class ReviewOps:
         return row
 
     @staticmethod
-    def _persist(conn, plan_id: str, document: dict, degraded_recompute: bool) -> dict:
+    def _persist(
+        conn, plan_id: str, document: dict, degraded_recompute: bool,
+        *, scope=None, actor: dict | None = None, edit: str | None = None,
+    ) -> dict:
         """Write the edited document back. The degraded flag is monotone: a
         recompute that fell back to the offline estimate marks the draft
-        degraded exactly like a degraded generation (observable, R10)."""
+        degraded exactly like a degraded generation (observable, R10).
+        ``edit`` names the review edit for the plan-updated audit row (U7),
+        written in the SAME transaction as the document write."""
         degraded = bool(document.get("degraded") or degraded_recompute)
         document["degraded"] = degraded
         row = conn.execute(
@@ -201,11 +213,17 @@ class ReviewOps:
             "where id = %s returning *",
             (Jsonb(document), degraded, plan_id),
         ).fetchone()
+        if edit is not None:
+            record_audit(
+                conn, action="plan-updated", actor=actor, scope=scope,
+                resource_type="plan", resource_id=plan_id, detail={"edit": edit},
+            )
         return dict(row)
 
     def move_student(
-        self, plan_id: str, student_id: str, to_bus_id: str,
+        self, scope, plan_id: str, student_id: str, to_bus_id: str,
         legs: list[str] | None = None, position: int | None = None,
+        actor: dict | None = None,
     ) -> dict[str, Any]:
         """Move a placed child to another bus — both legs by default (R6/R9).
         An explicit ONE-leg move of a both-legs rider leaves the legs on
@@ -216,8 +234,8 @@ class ReviewOps:
         else appended). Capacity/stop-cap violations 422 with the constraint
         named; the draft is left unchanged."""
         sid = str(student_id)
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             target = _bus_doc(document, to_bus_id)
 
@@ -267,10 +285,14 @@ class ReviewOps:
                     patterns[sid] = plan_solver.PATTERN_BOTH
 
             degraded = _recompute_legs(document, basis, targets)
-            return self._persist(conn, plan_id, document, degraded)
+            return self._persist(
+                conn, plan_id, document, degraded,
+                scope=scope, actor=actor, edit="move",
+            )
 
     def reorder_stops(
-        self, plan_id: str, bus_id: str, leg: str, order: list[str]
+        self, scope, plan_id: str, bus_id: str, leg: str, order: list[str],
+        actor: dict | None = None,
     ) -> dict[str, Any]:
         """Reorder one route's stops to an explicit FULL-order echo of stop
         keys (the shipped stop-order contract's shape, against the document).
@@ -278,8 +300,8 @@ class ReviewOps:
         on the stop cap before anything else; duplicates and set mismatches
         are 400s. Times recompute along the new fixed order."""
         _validate_leg(leg)
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             bus_doc = _bus_doc(document, bus_id)
             leg_doc = bus_doc["legs"][leg]
@@ -299,11 +321,15 @@ class ReviewOps:
                 )
             leg_doc["stops"] = [by_key[key] for key in order]
             degraded = _recompute_legs(document, basis, {(str(bus_id), leg)})
-            return self._persist(conn, plan_id, document, degraded)
+            return self._persist(
+                conn, plan_id, document, degraded,
+                scope=scope, actor=actor, edit="reorder",
+            )
 
     def set_pin(
-        self, plan_id: str, student_id: str,
+        self, scope, plan_id: str, student_id: str,
         bus: Any = None, order: Any = None, unpin: str | None = None,
+        actor: dict | None = None,
     ) -> dict[str, Any]:
         """Pin or unpin a child (R9/R13): a bus pin (per leg or both) and/or an
         order pin (0-based position per leg or both), stored in the document
@@ -311,8 +337,8 @@ class ReviewOps:
         dimension ('bus'/'order') or 'all'. Pins never move anyone by
         themselves — no recompute."""
         sid = str(student_id)
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             _basis_student(basis, sid)
             pins = document.setdefault("pins", {})
@@ -328,7 +354,10 @@ class ReviewOps:
                         pins[sid] = entry
                     else:
                         pins.pop(sid, None)
-                return self._persist(conn, plan_id, document, False)
+                return self._persist(
+                    conn, plan_id, document, False,
+                    scope=scope, actor=actor, edit="pin",
+                )
 
             bus_map = _normalize_per_leg(bus, "bus pin")
             order_map = _normalize_per_leg(order, "order pin")
@@ -353,9 +382,15 @@ class ReviewOps:
                     if not isinstance(value, int) or value < 0:
                         raise BadRequestError("Order pin positions must be integers >= 0")
                 entry["order"] = {**(entry.get("order") or {}), **order_map}
-            return self._persist(conn, plan_id, document, False)
+            return self._persist(
+                conn, plan_id, document, False,
+                scope=scope, actor=actor, edit="pin",
+            )
 
-    def set_pattern(self, plan_id: str, student_id: str, pattern: str) -> dict[str, Any]:
+    def set_pattern(
+        self, scope, plan_id: str, student_id: str, pattern: str,
+        actor: dict | None = None,
+    ) -> dict[str, Any]:
         """Change a child's ridership pattern in the DRAFT only (R20 —
         live_students is untouched until apply). Removing a leg drops the
         child's stop from that leg and recomputes its times; a widened leg
@@ -368,8 +403,8 @@ class ReviewOps:
                 f"Unknown pattern '{pattern}' — expected one of {list(plan_solver.PATTERNS)}"
             )
         sid = str(student_id)
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             bs = _basis_student(basis, sid)
             new_legs = set(_pattern_legs(pattern))
@@ -422,11 +457,15 @@ class ReviewOps:
 
             document.setdefault("patterns", {})[sid] = pattern
             degraded = _recompute_legs(document, basis, targets)
-            return self._persist(conn, plan_id, document, degraded)
+            return self._persist(
+                conn, plan_id, document, degraded,
+                scope=scope, actor=actor, edit="pattern",
+            )
 
     def assign_student(
-        self, plan_id: str, student_id: str, bus_id: str,
+        self, scope, plan_id: str, student_id: str, bus_id: str,
         position: Any = None, legs: list[str] | None = None,
+        actor: dict | None = None,
     ) -> dict[str, Any]:
         """Place a currently-UNPLACEABLE child onto a bus at an explicit
         position, per pattern legs — the manual mid-year placement path until
@@ -435,8 +474,8 @@ class ReviewOps:
         constraints re-checked (422, draft unchanged); a child without home
         coordinates cannot be assigned (409 — resolve the address first)."""
         sid = str(student_id)
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             target = _bus_doc(document, bus_id)
             entries = [
@@ -482,11 +521,14 @@ class ReviewOps:
                 if not (str(u["student_id"]) == sid and u["leg"] in assign_legs)
             ]
             degraded = _recompute_legs(document, basis, targets)
-            return self._persist(conn, plan_id, document, degraded)
+            return self._persist(
+                conn, plan_id, document, degraded,
+                scope=scope, actor=actor, edit="assign",
+            )
 
     # --- in-draft re-solve (U5, R13) --------------------------------------------
 
-    def resolve_draft(self, plan_id: str) -> dict[str, Any]:
+    def resolve_draft(self, scope, plan_id: str, actor: dict | None = None) -> dict[str, Any]:
         """Re-run the solver on the draft's CURRENT basis with the document's
         pins and pattern edits as inputs (R13 — full re-optimisation only on
         explicit request). A fresh in-memory matrix is fetched (never
@@ -494,8 +536,8 @@ class ReviewOps:
         unchanged inputs reproduces bit-identically. Unpinned manual
         arrangements — moves, reorders, assigns — are DISCARDED, and the
         response says so explicitly; pins and pattern edits survive."""
-        with get_connection() as conn:
-            plan = self._draft_for_update(conn, plan_id)
+        with get_connection(scope) as conn:
+            plan = self._draft_for_update(conn, plan_id, scope.school_id)
             document, basis = plan["document"], plan["basis"]
             patterns = document.get("patterns") or {}
             pins = document.get("pins") or {}
@@ -578,6 +620,10 @@ class ReviewOps:
                 "where id = %s returning *",
                 (Jsonb(new_doc), degraded, plan_id),
             ).fetchone()
+            record_audit(
+                conn, action="plan-updated", actor=actor, scope=scope,
+                resource_type="plan", resource_id=plan_id, detail={"edit": "resolve"},
+            )
         logger.info(
             "fleet plan re-solve %s: seed=%s degraded=%s pins=%d patterns=%d",
             plan_id, seed_val, degraded, len(pins), len(patterns),

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -8,17 +9,30 @@ from app.core.auth import get_current_user
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, SafeRideError, to_http_exception
 from app.core.rate_limit import SlidingWindowLimiter, client_ip
+from app.dao.membership_dao import MembershipDao
 from app.schemas.auth import (
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
+    MembershipOut,
+    MeResponse,
+    OfferOut,
     PinLoginRequest,
+    ProviderStateOut,
     ResetPasswordRequest,
     SignupRequest,
+    SupportSessionOut,
+    TotpRequest,
 )
 from app.services.auth_service import AuthService
+from app.services.provider_service import AuthCodeError, ProviderService
+
+_scope_logger = logging.getLogger("saferide.scope")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 service = AuthService()
+provider_service = ProviderService()
+memberships_dao = MembershipDao()
 T = TypeVar("T")
 
 # Last reset link, exposed only in local dev for the email-less flow.
@@ -35,6 +49,10 @@ login_ip_limiter = SlidingWindowLimiter(
     max_attempts=100 * _IP_BUDGET_MULTIPLIER, window_seconds=300
 )
 login_account_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=300)
+# The provider code step (U10): its own per-IP net on top of the pre-auth
+# token's five-attempt budget — the token caps one stolen password, the IP
+# budget caps token-farming request rates. Never scaled.
+totp_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
 # The 4-digit PIN space is tiny, so PIN logins get the strictest IP budget.
 pin_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
 signup_ip_limiter = SlidingWindowLimiter(
@@ -43,16 +61,37 @@ signup_ip_limiter = SlidingWindowLimiter(
 forgot_ip_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=60)
 forgot_account_limiter = SlidingWindowLimiter(max_attempts=3, window_seconds=900)
 reset_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
+# Change-password is authenticated, so the budget keys on the account itself
+# (U8): 5 attempts / 15 min stops an attacker holding a stolen session from
+# brute-forcing the current password, while never troubling a real user.
+change_password_account_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=900)
 
 _LOGIN_LIMIT_MESSAGE = "Too many login attempts. Try again shortly."
 _RESET_LIMIT_MESSAGE = "Too many password reset attempts. Try again shortly."
 
 
 def map_error(error: Exception) -> HTTPException:
+    if isinstance(error, AuthCodeError):
+        # Second-factor refusals the client must branch on (U10): the detail
+        # carries a machine code (`preauth-voided`, `totp-step-up-required`).
+        return HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        )
     if isinstance(error, SafeRideError):
         return to_http_exception(error)
     if isinstance(error, PsycopgError) and error.sqlstate == "23505":
         return HTTPException(status_code=409, detail="Record already exists")
+    if isinstance(error, PsycopgError) and error.sqlstate == "42501":
+        # Same contract as api/_helpers.map_error: a row-security denial is a
+        # scope bug — log loudly, answer with not-found.
+        diag = getattr(error, "diag", None)
+        _scope_logger.error(
+            "row-security denial sqlstate=42501 table=%s message=%s",
+            getattr(diag, "table_name", None),
+            getattr(diag, "message_primary", None),
+        )
+        return HTTPException(status_code=404, detail="Not found")
     return HTTPException(status_code=500, detail="Unexpected backend error")
 
 
@@ -80,11 +119,33 @@ def login(request: LoginRequest, http_request: Request):
     account_key = f"{ip}|{request.email.strip().lower()}"
     login_ip_limiter.check(ip, _LOGIN_LIMIT_MESSAGE)
     login_account_limiter.check(account_key, _LOGIN_LIMIT_MESSAGE)
-    result = safe_call(lambda: service.login(request.email, request.password))
+    result = safe_call(lambda: _login_flow(request.email, request.password))
     # A successful login clears the account budget so legitimate users who
     # mistype a few times are not locked out after signing in.
     login_account_limiter.clear(account_key)
     return result
+
+
+def _login_flow(email: str, password: str):
+    """An active provider identity NEVER gets a session from the password
+    alone (U10/AE19): it gets a five-minute pre-auth token and the flag for
+    the second step. Everyone else follows the standard login."""
+    preauth = provider_service.begin_provider_login(email, password)
+    if preauth is not None:
+        return preauth
+    return service.login(email, password)
+
+
+@router.post("/totp")
+def totp(request: TotpRequest, http_request: Request):
+    """The provider login's second step: pre-auth token (+ code once
+    enrolled) → bearer session with ``totp_verified_at`` stamped."""
+    totp_ip_limiter.check(
+        client_ip(http_request), "Too many code attempts. Try again shortly."
+    )
+    return safe_call(
+        lambda: provider_service.complete_totp(request.token, request.code)
+    )
 
 
 @router.post("/pin-login")
@@ -103,18 +164,105 @@ def logout(authorization: str | None = Header(default=None)):
     token = ""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
+    # A stepped-in provider's logout also ends the support session, with its
+    # own cause on the record (U10/AE29). No-op for everyone else.
+    provider_service.end_support_on_logout(token)
     service.logout(token)
     return {"ok": True}
 
 
-@router.get("/me")
+@router.get("/me", response_model=MeResponse, response_model_by_alias=True)
 def me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "fullName": user.get("full_name"),
-        "role": user.get("role"),
-    }
+    memberships = user.get("memberships") or []
+    provider = user.get("provider")
+    return MeResponse(
+        id=user["id"],
+        email=user["email"],
+        fullName=user.get("full_name"),
+        role=user.get("role"),
+        memberships=[
+            MembershipOut(
+                schoolId=m["school_id"],
+                schoolName=m.get("school_name"),
+                schoolCode=m.get("school_code"),
+                role=m["role"],
+            )
+            for m in memberships
+            if m["state"] == "active"
+        ],
+        pendingOffers=[
+            OfferOut(
+                id=m.get("id"),
+                schoolId=m["school_id"],
+                schoolName=m.get("school_name"),
+                schoolCode=m.get("school_code"),
+                role=m["role"],
+                offeredBy=m.get("offered_by_name"),
+                offeredAt=m.get("created_at"),
+            )
+            for m in memberships
+            if m["state"] == "offered"
+        ],
+        activeSchoolId=user.get("last_school_id"),
+        provider=(
+            ProviderStateOut(
+                totpEnrolled=bool(provider.get("totp_enrolled")),
+                # Step-up freshness (U10): the dialog shows the code input up
+                # front when the session's last code is stale.
+                totpVerifiedAt=(
+                    user["totp_verified_at"].isoformat()
+                    if user.get("totp_verified_at")
+                    else None
+                ),
+            )
+            if provider
+            else None
+        ),
+        supportSession=(
+            SupportSessionOut(
+                id=support["id"],
+                schoolId=support["school_id"],
+                schoolName=support.get("school_name"),
+                schoolCode=support.get("school_code"),
+                reason=support.get("reason"),
+                startedAt=support.get("started_at"),
+            )
+            if (support := user.get("support_session"))
+            else None
+        ),
+        mustChangePassword=user.get("must_change_password", False),
+    )
+
+
+@router.post("/change-password")
+def change_password(request: ChangePasswordRequest, user: dict = Depends(get_current_user)):
+    """Any authenticated role; on the must-change allowlist (R30), and even
+    then the CURRENT password is required. Keeps the calling session, revokes
+    every other one."""
+    change_password_account_limiter.check(
+        str(user["id"]), "Too many password change attempts. Try again shortly."
+    )
+    safe_call(
+        lambda: service.change_password(
+            user, request.current_password, request.new_password
+        )
+    )
+    return {"ok": True}
+
+
+# Role offers (U8/AE15): auth-surface — the offer belongs to the CALLING
+# account, no school header involved; anyone else's offer does not exist.
+
+@router.post("/offers/{offer_id}/accept")
+def accept_offer(offer_id: str, user: dict = Depends(get_current_user)):
+    safe_call(lambda: memberships_dao.accept_offer(offer_id, actor=user))
+    return {"ok": True}
+
+
+@router.post("/offers/{offer_id}/decline")
+def decline_offer(offer_id: str, user: dict = Depends(get_current_user)):
+    safe_call(lambda: memberships_dao.decline_offer(offer_id, actor=user))
+    return {"ok": True}
 
 
 @router.post("/forgot-password")

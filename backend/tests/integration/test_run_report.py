@@ -383,10 +383,11 @@ def test_legacy_fallback_excludes_non_covering_scopes(client, admin_headers):
                 conn.execute(
                     """
                     insert into live_student_absences
-                        (student_id, absence_date, reason, scope, source)
-                    values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'parent')
+                        (student_id, absence_date, reason, scope, source, school_id)
+                    values (%s, (now() at time zone 'Africa/Nairobi')::date, %s, %s, 'parent',
+                            (select school_id from live_students where id = %s))
                     """,
-                    (student["id"], f"IT cancelled {scope} {marker}", scope),
+                    (student["id"], f"IT cancelled {scope} {marker}", scope, student["id"]),
                 )
         marked = client.post(
             "/api/students/absences",

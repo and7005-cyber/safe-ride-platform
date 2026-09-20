@@ -37,7 +37,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run, school_sandbox
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -77,8 +77,17 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT CR School", lat=-1.3, lng=36.8) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +122,18 @@ def signup_parent(client, marker: str, tag: str) -> dict:
     }
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 def _create_driver(client, admin_headers, marker: str) -> dict:
     """A throwaway driver with a known PIN (retry rare PIN collisions)."""
     for _ in range(5):
@@ -130,7 +151,7 @@ def _create_driver(client, admin_headers, marker: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     """Throwaway driver + bus + school + morning/afternoon routes, student s1
     linked to parents p1 AND p2 (both email slots), student s2 linked to p3
     (another household on the same bus), plus p4 with no children at all.
@@ -148,11 +169,7 @@ def fleet(client, admin_headers):
             json={"name": f"IT CR Bus {marker}", "driver_id": driver["id"]},
             headers=admin_headers,
         ).json()
-        school = client.post(
-            "/api/fleet/schools",
-            json={"name": f"IT CR School {marker}", "lat": -1.30, "lng": 36.80},
-            headers=admin_headers,
-        ).json()
+        school = {"id": sandbox["id"], "name": sandbox["name"]}
         morning = client.post(
             "/api/fleet/routes",
             json={"name": f"IT CR Morning {marker}", "type": "morning",
@@ -182,6 +199,10 @@ def fleet(client, admin_headers):
 
         s1 = make_student(1, -1.28, "06:30", p1["email"], email2=p2["email"])
         s2 = make_student(2, -1.29, "06:45", p3["email"])
+        # These accounts predate their students, so the staff-side links above
+        # are pending (U11) — each linked parent accepts to unlock the portal.
+        for parent in (p1, p2, p3):
+            accept_pending(client, parent["headers"])
 
         yield {
             "marker": marker,
@@ -199,13 +220,11 @@ def fleet(client, admin_headers):
         for route in (morning, afternoon):
             if route:
                 client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        if school:
-            client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
         if bus:
             client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
         for parent in (p1, p2, p3, p4):
-            client.delete(f"/api/accounts/parents/{parent['id']}", headers=admin_headers)
+            purge_accounts(parent['id'])
 
 
 # Helpers ----------------------------------------------------------------------
@@ -839,4 +858,4 @@ def test_rate_limited_after_20_calls_in_the_hour(client, admin_headers, fleet):
         shared = withdraw(client, limited, ghost, "afternoon")
         assert shared.status_code == 429, shared.text
     finally:
-        client.delete(f"/api/accounts/parents/{limited['id']}", headers=admin_headers)
+        purge_accounts(limited['id'])

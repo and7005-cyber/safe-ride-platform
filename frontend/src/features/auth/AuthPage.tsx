@@ -11,22 +11,19 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
 import { useAuth, type Role } from "@/lib/auth";
+import { TotpChallengePage } from "@/features/auth/TotpChallengePage";
 
 function homeFor(role: Role | null): string {
-  if (role === "admin") return "/";
+  // Staff access now comes from memberships, which the login response does
+  // not carry — so email logins land on "/" and ProtectedRoute bounces
+  // non-staff to their own surface once /me answers (staff-first for people
+  // who are both staff and parent). Driver PIN logins go straight to /driver.
   if (role === "driver") return "/driver";
-  return "/parent";
+  return "/";
 }
 
 export function AuthPage() {
@@ -40,13 +37,25 @@ export function AuthPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
-  const [role, setRole] = useState<"driver" | "parent">("parent");
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
+  // Provider two-step login (U13/AE19): the pre-auth token from the password
+  // step, held in COMPONENT STATE ONLY — a reload forgets it and returns to
+  // the password step. While set, the code screen replaces the card below.
+  const [preauth, setPreauth] = useState<string | null>(null);
+  // The distinct "too many wrong codes" notice shown back on the password
+  // step after the pre-auth token was voided (AE19).
+  const [loginNotice, setLoginNotice] = useState<string | null>(null);
 
   const finishAuth = (
     token: string,
-    user: { id: string; email: string; fullName?: string | null; role?: Role | null },
+    user: {
+      id: string;
+      email: string;
+      fullName?: string | null;
+      role?: Role | null;
+      mustChangePassword?: boolean;
+    },
   ) => {
     const resolved: Role | null = user.role ?? null;
     signIn(token, {
@@ -54,6 +63,9 @@ export function AuthPage() {
       email: user.email,
       fullName: user.fullName ?? null,
       role: resolved,
+      // Respected immediately (R30): the change screen renders off the login
+      // response, before /me — nothing else would answer anyway.
+      mustChangePassword: Boolean(user.mustChangePassword),
     });
     navigate(homeFor(resolved));
   };
@@ -63,6 +75,22 @@ export function AuthPage() {
     setLoading(true);
     try {
       const res = await api.post("/api/auth/login", { email, password });
+      if (res?.preauth) {
+        // A provider identity NEVER gets a session from the password alone
+        // (U13/AE19): the answer is a five-minute pre-auth token plus which
+        // second step comes next.
+        setLoginNotice(null);
+        if (res.totpEnrolmentRequired) {
+          // First sign-in: no code exists yet — exchange straight away; the
+          // session lands restricted to the enrolment allowlist and
+          // ProtectedRoute shows the enrolment screen.
+          const session = await api.post("/api/auth/totp", { token: res.preauth });
+          finishAuth(session.token, session.user);
+        } else {
+          setPreauth(res.preauth);
+        }
+        return;
+      }
       finishAuth(res.token, res.user);
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -75,7 +103,9 @@ export function AuthPage() {
     e.preventDefault();
     setLoading(true);
     try {
-      await api.post("/api/auth/signup", { email, password, fullName, role });
+      // Parent is the ONLY self-service role (U13): staff join through their
+      // school's offers and drivers are set up by the school office.
+      await api.post("/api/auth/signup", { email, password, fullName, role: "parent" });
       toast({
         title: "Account created!",
         description: "Please check your email to verify your account.",
@@ -135,6 +165,23 @@ export function AuthPage() {
           <p className="text-muted-foreground text-sm">School bus management platform</p>
         </div>
 
+        {preauth ? (
+          <TotpChallengePage
+            preauth={preauth}
+            email={email}
+            onSuccess={(token, user) => {
+              setPreauth(null);
+              finishAuth(token, user);
+            }}
+            onVoided={(message) => {
+              // AE19: the voided token's distinct message shows on the
+              // password step — the next attempt starts over there.
+              setPreauth(null);
+              setLoginNotice(message);
+            }}
+            onBack={() => setPreauth(null)}
+          />
+        ) : (
         <Card>
           <CardHeader className="text-center pb-2">
             <CardTitle className="font-heading">
@@ -145,7 +192,7 @@ export function AuthPage() {
                 ? "Enter your email to receive a reset link"
                 : isLogin
                   ? "Sign in to your account"
-                  : "Sign up for SafeRide"}
+                  : "Parent sign-up for SafeRide"}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -174,6 +221,14 @@ export function AuthPage() {
                 </TabsList>
                 <TabsContent value="email">
                   <form onSubmit={handleLogin} className="space-y-4">
+                    {loginNotice && (
+                      <p
+                        className="text-sm font-medium text-destructive"
+                        data-testid="login-notice"
+                      >
+                        {loginNotice}
+                      </p>
+                    )}
                     <div className="space-y-2">
                       <Label htmlFor="email">Email</Label>
                       <Input id="email" type="email" placeholder="you@example.com" required value={email} onChange={(e) => setEmail(e.target.value)} />
@@ -226,18 +281,13 @@ export function AuthPage() {
                   <Label htmlFor="password">Password</Label>
                   <Input id="password" type="password" placeholder="••••••••" required minLength={6} value={password} onChange={(e) => setPassword(e.target.value)} />
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="role">I am a</Label>
-                  <Select value={role} onValueChange={(v) => setRole(v as "driver" | "parent")}>
-                    <SelectTrigger id="role">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="parent">Parent</SelectItem>
-                      <SelectItem value="driver">Driver</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+                {/* Parent is the only self-service role (U13): school staff
+                    are invited by their school and drivers are set up by the
+                    school office — no role choice to make here. */}
+                <p className="text-xs text-muted-foreground">
+                  This creates a parent account. School staff and drivers get
+                  their access from their school — ask your school office.
+                </p>
                 <Button type="submit" className="w-full" disabled={loading}>
                   {loading ? "Please wait..." : "Create Account"}
                 </Button>
@@ -245,10 +295,11 @@ export function AuthPage() {
             )}
           </CardContent>
         </Card>
+        )}
 
-        {!showForgot && (
+        {!showForgot && !preauth && (
           <p className="text-center text-sm text-muted-foreground">
-            {isLogin ? "Don't have an account? " : "Already have an account? "}
+            {isLogin ? "New parent here? " : "Already have an account? "}
             <button type="button" className="text-primary font-medium hover:underline" onClick={() => setIsLogin(!isLogin)}>
               {isLogin ? "Sign up" : "Sign in"}
             </button>

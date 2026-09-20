@@ -1,12 +1,15 @@
 import logging
+import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from pydantic import BaseModel
 
 from app.api._helpers import safe_call
-from app.core.auth import require_role
+from app.core.auth import get_current_user
 from app.core.errors import BadRequestError, ConflictError, NotFoundError
+from app.core.permissions import require_parent_scope
 from app.core.rate_limit import SlidingWindowLimiter
+from app.core.scope import ParentScope
 from app.dao.absence_dao import AbsenceDao
 from app.dao.incident_dao import IncidentDao
 from app.dao.parent_live_dao import ParentLiveDao
@@ -19,7 +22,6 @@ dao = ParentLiveDao()
 absence_dao = AbsenceDao()
 incident_dao = IncidentDao()
 push_service = PushService()
-parent_only = require_role("parent")
 
 # Ownership is the sole boundary for both Cancel-a-Ride verbs and it evaluates
 # FIRST: non-existent and non-linked student ids get this identical 404
@@ -36,14 +38,17 @@ _CANCEL_LIMIT_MESSAGE = "Too many cancellation changes. Please try again later."
 
 
 @router.get("/children")
-def children(user: dict = Depends(parent_only)):
-    return safe_call(lambda: dao.list_children(user["id"]))
+def children(parent_scope: ParentScope = Depends(require_parent_scope)):
+    return safe_call(lambda: dao.list_children(parent_scope))
 
 
 @router.get("/track")
-def track(student_id: str = Query(...), user: dict = Depends(parent_only)):
+def track(
+    student_id: str = Query(...),
+    parent_scope: ParentScope = Depends(require_parent_scope),
+):
     def run():
-        result = dao.get_track(user["id"], student_id)
+        result = dao.get_track(parent_scope, student_id)
         if result is None:
             raise NotFoundError("Child not found for this parent")
         return result
@@ -56,7 +61,7 @@ def alerts(
     window_hours: int | None = Query(default=None, ge=1, le=8760),
     min_age_hours: int | None = Query(default=None, ge=1, le=8760),
     limit: int = Query(default=50, ge=1),
-    user: dict = Depends(parent_only),
+    parent_scope: ParentScope = Depends(require_parent_scope),
 ):
     """Incidents feed for the parent's buses, newest first.
 
@@ -70,14 +75,91 @@ def alerts(
     """
     return safe_call(
         lambda: dao.list_alerts(
-            user["id"], window_hours=window_hours, min_age_hours=min_age_hours, limit=limit
+            parent_scope,
+            window_hours=window_hours, min_age_hours=min_age_hours, limit=limit,
         )
     )
 
 
 @router.get("/profile")
-def profile(user: dict = Depends(parent_only)):
-    return safe_call(lambda: dao.get_profile(user["id"]))
+def profile(parent_scope: ParentScope = Depends(require_parent_scope)):
+    return safe_call(lambda: dao.get_profile(parent_scope))
+
+
+# Pending link cards (U11: R31/R32; AE10, AE21, AE22) ---------------------------
+
+# School-neutral by design: the parent-facing refusal names no school — the
+# pending card itself is the only place a not-yet-accepted school is named.
+_NO_PENDING = "No pending link found for this school"
+
+
+def _pending_school_id(school_id: str) -> str:
+    """Validate the path's school id; a malformed id behaves like a school
+    that does not exist (the R3 not-found contract, not a 400 hint)."""
+    try:
+        return str(uuid.UUID(str(school_id).strip()))
+    except (ValueError, AttributeError) as error:
+        raise NotFoundError(_NO_PENDING) from error
+
+
+def _widened_scope(parent_scope: ParentScope, school_id: str) -> ParentScope:
+    """The accept/decline working scope: the parent's accepted schools PLUS
+    the pending school — resolve_parent_scope carries accepted links only, so
+    the route widens it AFTER verifying a pending link really exists there
+    (has_pending_at); this is what lets the writes pass the database backstop
+    under row security (U14)."""
+    return ParentScope(
+        user_id=parent_scope.user_id,
+        school_ids=tuple(sorted({*parent_scope.school_ids, school_id})),
+    )
+
+
+@router.get("/pending")
+def pending(parent_scope: ParentScope = Depends(require_parent_scope)):
+    """The calling parent's pending links grouped by school — one card per
+    school ({schoolId, schoolName, offeredAt, linkCount}); NO student fields
+    of any kind (AE22)."""
+    return safe_call(lambda: dao.list_pending(parent_scope))
+
+
+@router.post("/pending/{school_id}/accept")
+def accept_pending(
+    school_id: str,
+    parent_scope: ParentScope = Depends(require_parent_scope),
+):
+    def run():
+        pending_school = _pending_school_id(school_id)
+        if not dao.has_pending_at(parent_scope, pending_school):
+            raise NotFoundError(_NO_PENDING)
+        accepted = dao.accept_pending(
+            _widened_scope(parent_scope, pending_school), pending_school
+        )
+        if accepted == 0:
+            raise NotFoundError(_NO_PENDING)  # raced away between check and write
+        return {"ok": True, "accepted": accepted}
+
+    return safe_call(run)
+
+
+@router.post("/pending/{school_id}/decline")
+def decline_pending(
+    school_id: str,
+    parent_scope: ParentScope = Depends(require_parent_scope),
+    user: dict = Depends(get_current_user),
+):
+    def run():
+        pending_school = _pending_school_id(school_id)
+        if not dao.has_pending_at(parent_scope, pending_school):
+            raise NotFoundError(_NO_PENDING)
+        declined = dao.decline_pending(
+            _widened_scope(parent_scope, pending_school), pending_school,
+            actor=user, email=user["email"],
+        )
+        if declined == 0:
+            raise NotFoundError(_NO_PENDING)  # raced away between check and write
+        return {"ok": True, "declined": declined}
+
+    return safe_call(run)
 
 
 # Cancel-a-Ride (U5: R14, R16–R19; AE4) ----------------------------------------
@@ -98,7 +180,9 @@ def _covered_types(scope: str) -> tuple[str, ...]:
     return ("morning", "afternoon") if scope == "day" else (scope,)
 
 
-def _record_cancellation_incident(user: dict, context: dict, scope: str) -> None:
+def _record_cancellation_incident(
+    user: dict, context: dict, scope: str, parent_scope: ParentScope
+) -> None:
     """School-side channel for a parent cancellation (R17): a student-stamped
     'cancellation' incident on the admin Alerts page, inserted DAO-direct.
     Never push_service.notify_incident — that fans out to every family on
@@ -118,6 +202,7 @@ def _record_cancellation_incident(user: dict, context: dict, scope: str) -> None
         }
         actor = f"{user.get('full_name') or 'Parent'} ({user.get('email')})"
         incident_dao.create_cancellation_incident(
+            parent_scope,
             student_id=str(student["id"]),
             description=f"{student['name']}: {labels[scope]} cancelled by parent — {actor}.",
             bus_id=str(bus["bus_id"]) if bus.get("bus_id") else None,
@@ -132,7 +217,8 @@ def _record_cancellation_incident(user: dict, context: dict, scope: str) -> None
 def cancel_ride(
     payload: CancelRidePayload,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(parent_only),
+    parent_scope: ParentScope = Depends(require_parent_scope),
+    user: dict = Depends(get_current_user),
 ):
     """Same-day scoped cancellation for a linked child (R14, R16, R17; AE4).
 
@@ -150,7 +236,7 @@ def cancel_ride(
     cancel_ride_limiter.check(str(user["id"]), _CANCEL_LIMIT_MESSAGE)
 
     def run() -> tuple[dict, str, dict]:
-        context = dao.cancel_ride_context(user["id"], payload.student_id)
+        context = dao.cancel_ride_context(parent_scope, payload.student_id)
         if context is None:
             raise NotFoundError(_CHILD_NOT_FOUND)
         _validate_cancel_scope(payload.scope)
@@ -185,7 +271,8 @@ def cancel_ride(
                 "cancelled. Please contact the school office or the driver."
             )
         result = absence_dao.set_scope(
-            payload.student_id, scope, user["id"], reason="Cancelled by parent"
+            payload.student_id, scope, user["id"], reason="Cancelled by parent",
+            parent_scope=parent_scope,
         )
         if result is None:
             raise ConflictError(
@@ -197,7 +284,7 @@ def cancel_ride(
     context, effective_scope, result = safe_call(run)
     if result["changed"]:
         background_tasks.add_task(
-            _record_cancellation_incident, user, context, effective_scope
+            _record_cancellation_incident, user, context, effective_scope, parent_scope
         )
         background_tasks.add_task(
             push_service.notify_ride_cancelled, context["student"], effective_scope
@@ -206,7 +293,11 @@ def cancel_ride(
 
 
 @router.delete("/cancel-ride")
-def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent_only)):
+def withdraw_cancel_ride(
+    payload: CancelRidePayload,
+    parent_scope: ParentScope = Depends(require_parent_scope),
+    user: dict = Depends(get_current_user),
+):
     """Withdraw a cancellation (R18): allowed on parent-sourced rows only,
     and only while NO covered-type run row exists today for the half being
     withdrawn — run-row EXISTENCE, not the active-run predicate, which would
@@ -221,7 +312,7 @@ def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent
     cancel_ride_limiter.check(str(user["id"]), _CANCEL_LIMIT_MESSAGE)
 
     def run() -> dict:
-        context = dao.cancel_ride_context(user["id"], payload.student_id)
+        context = dao.cancel_ride_context(parent_scope, payload.student_id)
         if context is None:
             raise NotFoundError(_CHILD_NOT_FOUND)
         _validate_cancel_scope(payload.scope)
@@ -276,7 +367,9 @@ def withdraw_cancel_ride(payload: CancelRidePayload, user: dict = Depends(parent
                 f"The {started} run has already started — {name}'s {started} "
                 "cancellation can no longer be withdrawn."
             )
-        result = absence_dao.withdraw_scope(payload.student_id, payload.scope, user["id"])
+        result = absence_dao.withdraw_scope(
+            payload.student_id, payload.scope, user["id"], parent_scope=parent_scope
+        )
         if result is None:
             # The atomic statement refused despite the pre-reads: a staff
             # escalation, a concurrent withdrawal, or a covered run starting

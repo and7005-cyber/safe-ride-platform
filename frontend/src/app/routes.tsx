@@ -9,7 +9,8 @@ import { FleetMapPage } from "@/features/admin/FleetMapPage";
 import { BusesPage } from "@/features/admin/BusesPage";
 import { RoutesPage } from "@/features/admin/RoutesPage";
 import { PlanReviewPage } from "@/features/admin/PlanReviewPage";
-import { SchoolsPage } from "@/features/admin/SchoolsPage";
+import { SchoolSettingsPage } from "@/features/admin/SchoolSettingsPage";
+import { StaffPage } from "@/features/admin/StaffPage";
 import { StudentsPage } from "@/features/admin/StudentsPage";
 import { RunsPage } from "@/features/admin/RunsPage";
 import { ParentsPage } from "@/features/admin/ParentsPage";
@@ -23,6 +24,10 @@ import { ParentHomePage } from "@/features/parent/ParentHomePage";
 import { ParentTrackPage } from "@/features/parent/ParentTrackPage";
 import { ParentAlertsPage } from "@/features/parent/ParentAlertsPage";
 import { ParentProfilePage } from "@/features/parent/ParentProfilePage";
+import { ProviderLayout } from "@/features/provider/ProviderLayout";
+import { SchoolsListPage } from "@/features/provider/SchoolsListPage";
+import { ProviderAccountsPage } from "@/features/provider/ProviderAccountsPage";
+import { ProviderAuditPage } from "@/features/provider/ProviderAuditPage";
 import { NotFoundPage } from "@/features/shared/NotFoundPage";
 
 function admin(node: ReactNode) {
@@ -41,6 +46,17 @@ function parent(node: ReactNode) {
   return <ProtectedRoute allowedRoles={["parent"]}>{node}</ProtectedRoute>;
 }
 
+// The provider console (U13): provider-only — staff, drivers and parents are
+// bounced to their own homes; a provider WITHOUT a live step-in never
+// reaches the admin surface (ProtectedRoute's admin gate).
+function provider(node: ReactNode) {
+  return (
+    <ProtectedRoute allowedRoles={["provider"]}>
+      <ProviderLayout>{node}</ProviderLayout>
+    </ProtectedRoute>
+  );
+}
+
 export const router = createBrowserRouter([
   { path: "/auth", element: <AuthPage /> },
   { path: "/reset-password", element: <ResetPasswordPage /> },
@@ -52,12 +68,23 @@ export const router = createBrowserRouter([
   { path: "/fleet-plan", element: admin(<PlanReviewPage />) },
   { path: "/students", element: admin(<StudentsPage />) },
   { path: "/runs", element: admin(<RunsPage />) },
-  { path: "/schools", element: admin(<SchoolsPage />) },
+  // School Settings replaces the Schools page (U12/R23): the console works
+  // inside ONE active school — no create/delete, no list. Old bookmarks land
+  // on the settings of whatever school the tab is in.
+  { path: "/settings", element: admin(<SchoolSettingsPage />) },
+  { path: "/schools", element: <Navigate to="/settings" replace /> },
+  // Staff management (U12/R5-R10) — the page itself bounces non-directors.
+  { path: "/staff", element: admin(<StaffPage />) },
   // Parent assignment now happens in the student form (R12); the old page is gone.
   { path: "/parent-assignments", element: <Navigate to="/students" replace /> },
   { path: "/parents", element: admin(<ParentsPage />) },
   { path: "/drivers", element: admin(<DriversPage />) },
   { path: "/alerts", element: admin(<AlertsPage />) },
+
+  // The provider console (U13): the schools health list is the home.
+  { path: "/provider", element: provider(<SchoolsListPage />) },
+  { path: "/provider/accounts", element: provider(<ProviderAccountsPage />) },
+  { path: "/provider/audit", element: provider(<ProviderAuditPage />) },
 
   { path: "/driver", element: driver(<DriverHomePage />) },
   { path: "/driver/run", element: driver(<DriverRunPage />) },

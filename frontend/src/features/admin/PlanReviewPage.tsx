@@ -5,13 +5,6 @@ import { AlertTriangle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { PageHeader } from "@/features/admin/components/PageHeader";
@@ -22,14 +15,16 @@ import { PlanReviewStep } from "@/features/admin/components/PlanReviewStep";
 import { api } from "@/lib/apiClient";
 import { PLAN_DEGRADED_MESSAGE, flattenUnplaceable } from "@/lib/planReview";
 import {
+  schoolKeyFor,
   useActiveRuns,
   useBuses,
   useFleetPlans,
   usePlanReview,
-  useRoutes,
-  useSchools,
+  useSchoolKey,
+  useSchoolSettings,
   useStudents,
 } from "@/lib/queries";
+import { useActiveSchoolId } from "@/lib/school";
 
 // U9 — the plan review surface (F1–F4): a stepper of fleet confirmation →
 // draft → review → apply over the U4–U7 endpoints. The Fleet Map planner
@@ -61,24 +56,21 @@ export function PlanReviewPage() {
   const confirm = useConfirm();
   const navigate = useNavigate();
 
-  const { data: schools = [] } = useSchools();
   const { data: buses = [] } = useBuses();
   const { data: students = [] } = useStudents();
-  const { data: routes = [] } = useRoutes();
   const { data: activeRuns = [] } = useActiveRuns();
 
-  // --- school scope ---------------------------------------------------------
-  const [schoolId, setSchoolId] = useState("");
-  useEffect(() => {
-    // A single-school deployment needs no selector round-trip.
-    if (!schoolId && (schools as any[]).length === 1) setSchoolId((schools as any[])[0].id);
-  }, [schools, schoolId]);
-  const school = (schools as any[]).find((s) => s.id === schoolId) ?? null;
+  // --- school scope (U12) ---------------------------------------------------
+  // The plan surface works inside the tab's ACTIVE school — the selector is
+  // gone; the request scope names the school on every call.
+  const schoolId = useActiveSchoolId() ?? "";
+  const schoolKey = useSchoolKey();
+  const { data: school = null } = useSchoolSettings();
 
-  const plansQ = useFleetPlans(schoolId || null);
+  const plansQ = useFleetPlans();
   const plans = plansQ.data;
   const draft = plans?.draft ?? null;
-  const reviewQ = usePlanReview(schoolId || null, Boolean(draft));
+  const reviewQ = usePlanReview(Boolean(draft));
   const review = reviewQ.data;
 
   // --- stepper --------------------------------------------------------------
@@ -120,12 +112,11 @@ export function PlanReviewPage() {
     setDrafting(true);
     try {
       const res = await api.post("/api/fleet-plans/draft", {
-        school_id: schoolId,
         seed: seed.trim() === "" ? null : Number(seed),
         supersede,
       });
-      await qc.invalidateQueries({ queryKey: ["fleet-plans"] });
-      await qc.invalidateQueries({ queryKey: ["fleet-plan-review"] });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plans") });
+      await qc.invalidateQueries({ queryKey: schoolKey("fleet-plan-review") });
       if (res.degraded) toast({ title: PLAN_DEGRADED_MESSAGE });
       setApplyResult(null);
       setStep("review");
@@ -146,14 +137,9 @@ export function PlanReviewPage() {
 
   const degraded = Boolean(review?.plan?.degraded ?? draft?.degraded);
 
-  // A run in progress for THIS school (System-Wide Impact): the admin runs
-  // list joined to routes the way other admin pages read it.
-  const runActive = useMemo(() => {
-    const routeSchool = new Map((routes as any[]).map((r) => [r.id, r.school_id]));
-    return (activeRuns as any[]).some(
-      (r) => r.route_id && routeSchool.get(r.route_id) === schoolId,
-    );
-  }, [routes, activeRuns, schoolId]);
+  // A run in progress for THIS school (System-Wide Impact): the runs list is
+  // already scoped to the active school by the request scope (U12).
+  const runActive = (activeRuns as any[]).length > 0;
 
   // --- slot-in proposals (U12) ----------------------------------------------
   // Stored on the school's APPLIED plan row and generated in the background
@@ -161,8 +147,8 @@ export function PlanReviewPage() {
   // Polled at the admin cadence so a fresh enrolment's proposal appears
   // without a reload; visible whenever the school has an applied plan.
   const slotInsQ = useQuery({
-    queryKey: ["slot-ins", schoolId],
-    queryFn: () => api.get("/api/fleet-plans/slot-ins", { school_id: schoolId }),
+    queryKey: schoolKeyFor(schoolId || null, "slot-ins"),
+    queryFn: ({ signal }) => api.get("/api/fleet-plans/slot-ins", undefined, { signal }),
     enabled: Boolean(schoolId) && Boolean(plans?.applied),
     refetchInterval: 15_000,
   });
@@ -173,7 +159,6 @@ export function PlanReviewPage() {
     setSlotInBusy(p.id);
     try {
       await api.post(`/api/fleet-plans/slot-ins/${verb}`, {
-        school_id: schoolId,
         proposal_id: p.id,
       });
       toast(
@@ -185,9 +170,9 @@ export function PlanReviewPage() {
             },
       );
       await Promise.all([
-        qc.invalidateQueries({ queryKey: ["slot-ins"] }),
-        qc.invalidateQueries({ queryKey: ["routes"] }),
-        qc.invalidateQueries({ queryKey: ["students"] }),
+        qc.invalidateQueries({ queryKey: schoolKey("slot-ins") }),
+        qc.invalidateQueries({ queryKey: schoolKey("routes") }),
+        qc.invalidateQueries({ queryKey: schoolKey("students") }),
       ]);
     } catch (err) {
       // 409/422 refusals verbatim (aged out, capacity, stale route).
@@ -215,22 +200,6 @@ export function PlanReviewPage() {
       />
 
       <div className="flex flex-wrap items-center gap-3">
-        {(schools as any[]).length > 1 && (
-          <div className="w-64">
-            <Select value={schoolId} onValueChange={(v) => setSchoolId(v)}>
-              <SelectTrigger data-testid="plan-school-select">
-                <SelectValue placeholder="Choose a school" />
-              </SelectTrigger>
-              <SelectContent>
-                {(schools as any[]).map((s) => (
-                  <SelectItem key={s.id} value={s.id}>
-                    {s.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
         <div className="flex gap-2">
           {STEPS.map((s) => (
             <Button
@@ -254,7 +223,7 @@ export function PlanReviewPage() {
 
       {!schoolId ? (
         <p className="text-sm text-muted-foreground">
-          Choose a school to plan for — every plan belongs to one school.
+          No active school in this tab.
         </p>
       ) : (
         <>
@@ -262,7 +231,6 @@ export function PlanReviewPage() {
           <PlanFleetStep
             active={step === "fleet"}
             schoolId={schoolId}
-            schools={schools as any[]}
             buses={buses as any[]}
             onConfirmed={() => setStep("draft")}
           />

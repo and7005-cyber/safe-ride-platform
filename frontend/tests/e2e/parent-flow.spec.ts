@@ -25,6 +25,12 @@ test("parent track page shows the route map with own stop highlighted", async ({
   await signInAs(page, PARENT);
   await page.goto("/parent/track");
 
+  // The multi-tenant seed links Amina across schools (F5): Ben Barasa at
+  // school B sorts first and becomes the default child, so pick Faith
+  // explicitly — the assertions below are about HER route and stop.
+  await page.getByRole("combobox").first().click();
+  await page.getByRole("option", { name: SEED.parentChild }).click();
+
   await expect(page.getByTestId("track-map")).toBeVisible();
   await expect(page.locator(".gm-style").first()).toBeVisible({ timeout: 15_000 });
   // Stops are now named by home address (#14); the parent's own stop is shown unmasked.

@@ -31,7 +31,10 @@ withdraw check the marking rather than using whole-day scope as its proxy.
 """
 from typing import Any
 
-from app.core.db import get_connection
+from app.core.db import UNSET, get_connection
+from app.core.errors import NotFoundError
+from app.core.scope import SchoolScope
+from app.dao.audit_dao import record_audit
 from app.dao.status_sql import scope_covers
 
 
@@ -66,24 +69,35 @@ def _validate_scope(scope: str) -> None:
 
 
 class AbsenceDao:
-    def list_absences(self, date: str | None = None) -> list[dict[str, Any]]:
-        with get_connection() as conn:
+    def list_absences(self, scope: SchoolScope, date: str | None = None) -> list[dict[str, Any]]:
+        # Scoped through the STUDENT's school (U6): the absence row's own
+        # school_id stays unfiltered because parent/driver writers stamp it
+        # only from U7 — filtering on it would hide their fresh rows.
+        with get_connection(scope) as conn:
             rows = conn.execute(
                 """
                 select a.id, a.student_id, a.absence_date, a.reason, a.created_at,
-                       a.scope, a.source, a.marked_period,
-                       s.name as student_name, s.grade
+                       a.scope, a.source, a.marked_period, a.marked_by,
+                       s.name as student_name, s.grade,
+                       case when a.marked_by is null then null
+                            when p.user_id is not null then 'SafeRide'
+                            else coalesce(u.full_name, u.email) end
+                           as marked_by_display
                 from live_student_absences a
-                join live_students s on s.id = a.student_id
+                join live_students s on s.id = a.student_id and s.school_id = %s
+                left join app_users u on u.id = a.marked_by
+                left join provider_accounts p
+                    on p.user_id = a.marked_by and p.removed_at is null
                 where %s::date is null or a.absence_date = %s::date
                 order by a.absence_date desc, s.name asc
                 """,
-                (date, date),
+                (scope.school_id, date, date),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def mark_absent(
-        self, student_id: str, date: str | None, reason: str | None, marked_by: str | None
+        self, scope: SchoolScope, student_id: str, date: str | None,
+        reason: str | None, *, actor: dict,
     ) -> dict[str, Any]:
         """Upsert an absence (date=None → today, Nairobi). A TODAY-dated mark
         also sets the live status to 'absent' and appends the run_absences
@@ -94,36 +108,49 @@ class AbsenceDao:
         Staff transition rule (U4): an admin mark is always a whole-day
         absence, so the conflict branch escalates any existing row — a
         parent's partial cancellation included — to scope='day' and stamps
-        source='admin' (the provenance ratchet's one-way direction)."""
-        with get_connection() as conn:
+        source='admin' (the provenance ratchet's one-way direction).
+
+        U6: another school's student → 404 up front; the row is stamped with
+        the school (healing any NULL left by pre-U7 parent/driver writers,
+        which is safe because the student's school was just verified)."""
+        with get_connection(scope) as conn:
+            student = conn.execute(
+                "select 1 from live_students where id = %s and school_id = %s",
+                (student_id, scope.school_id),
+            ).fetchone()
+            if not student:
+                raise NotFoundError("Student not found")
             row = conn.execute(
                 """
                 insert into live_student_absences
-                    (student_id, absence_date, reason, marked_by, scope, source)
+                    (student_id, absence_date, reason, marked_by, scope, source, school_id)
                 values (
                     %s,
                     coalesce(%s::date, (now() at time zone 'Africa/Nairobi')::date),
-                    %s, %s, 'day', 'admin'
+                    %s, %s, 'day', 'admin', %s
                 )
                 on conflict (student_id, absence_date)
                 do update set reason = excluded.reason, marked_by = excluded.marked_by,
-                              scope = 'day', source = 'admin'
+                              scope = 'day', source = 'admin',
+                              school_id = excluded.school_id
                 returning *,
                     (absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today
                 """,
-                (student_id, date, reason, marked_by),
+                (student_id, date, reason, actor["id"], scope.school_id),
             ).fetchone()
             if row["is_today"]:
                 conn.execute(
-                    "update live_students set status = 'absent' where id = %s",
-                    (student_id,),
+                    "update live_students set status = 'absent' "
+                    "where id = %s and school_id = %s",
+                    (student_id, scope.school_id),
                 )
                 conn.execute(
                     """
-                    insert into run_absences (run_id, student_id, student_name, reason, period)
-                    select r.id, s.id, s.name, %s, 'day'
+                    insert into run_absences (run_id, student_id, student_name, reason, period,
+                                              school_id)
+                    select r.id, s.id, s.name, %s, 'day', r.school_id
                     from live_runs r
-                    join live_students s on s.id = %s
+                    join live_students s on s.id = %s and s.school_id = %s
                     where r.status <> 'completed'
                       and r.date = (now() at time zone 'Africa/Nairobi')::date
                       and exists (
@@ -132,14 +159,20 @@ class AbsenceDao:
                       )
                     on conflict (run_id, student_id) do nothing
                     """,
-                    (reason, student_id),
+                    (reason, student_id, scope.school_id),
                 )
+            record_audit(
+                conn, action="absence-marked", actor=actor, scope=scope,
+                resource_type="absence", resource_id=row["id"],
+                detail={"student_id": str(student_id), "date": str(row["absence_date"])},
+            )
         result = dict(row)
         result.pop("is_today", None)
         return result
 
     def set_scope(
-        self, student_id: str, scope: str, actor_user_id: str, reason: str | None = None
+        self, student_id: str, scope: str, actor_user_id: str, reason: str | None = None,
+        *, parent_scope: object = UNSET,
     ) -> dict[str, Any] | None:
         """Parent transition (U4): upsert a TODAY absence at ``scope`` as ONE
         atomic statement. Merge rule in the DO UPDATE expression: same scope
@@ -174,9 +207,13 @@ class AbsenceDao:
         still expected, and the completed report must list who never
         boarded. Boarded children never reach this point — the API layer
         rejects an on-bus child on an active covered run (R16).
+
+        ``parent_scope`` (U11): the caller's ParentScope, threaded explicitly
+        into the connection seam like every converted DAO; UNSET keeps the
+        context-var fallback for legacy call sites.
         """
         _validate_scope(scope)
-        with get_connection() as conn:
+        with get_connection(parent_scope) as conn:
             row = conn.execute(
                 """
                 with prior as (
@@ -185,10 +222,12 @@ class AbsenceDao:
                       and absence_date = (now() at time zone 'Africa/Nairobi')::date
                 )
                 insert into live_student_absences as a
-                    (student_id, absence_date, reason, marked_by, scope, source)
+                    (student_id, absence_date, reason, marked_by, scope, source,
+                     school_id)
                 values (
                     %(student_id)s, (now() at time zone 'Africa/Nairobi')::date,
-                    %(reason)s, %(actor)s, %(scope)s, 'parent'
+                    %(reason)s, %(actor)s, %(scope)s, 'parent',
+                    (select school_id from live_students where id = %(student_id)s)
                 )
                 on conflict (student_id, absence_date) do update
                     set scope = case
@@ -221,8 +260,9 @@ class AbsenceDao:
                     )
                 conn.execute(
                     f"""
-                    insert into run_absences (run_id, student_id, student_name, reason, period)
-                    select r.id, s.id, s.name, %s, %s
+                    insert into run_absences (run_id, student_id, student_name, reason, period,
+                                              school_id)
+                    select r.id, s.id, s.name, %s, %s, r.school_id
                     from live_runs r
                     join live_students s on s.id = %s
                     where r.status <> 'completed'
@@ -239,7 +279,8 @@ class AbsenceDao:
         return result
 
     def withdraw_scope(
-        self, student_id: str, scope: str, actor_user_id: str
+        self, student_id: str, scope: str, actor_user_id: str,
+        *, parent_scope: object = UNSET,
     ) -> dict[str, Any] | None:
         """Parent withdrawal (U4), the same single-statement atomicity as
         set_scope: withdrawing one half of a merged 'day' downgrades the row
@@ -286,7 +327,7 @@ class AbsenceDao:
                                            and sr.student_id = a.student_id)
                             )
                       )"""
-        with get_connection() as conn:
+        with get_connection(parent_scope) as conn:
             row = conn.execute(
                 f"""
                 with downgraded as (
@@ -345,7 +386,7 @@ class AbsenceDao:
                 )
         return {"deleted": deleted_scope is not None, "scope": downgraded_to}
 
-    def clear_absence(self, absence_id: str) -> None:
+    def clear_absence(self, scope: SchoolScope, absence_id: str, *, actor: dict) -> None:
         """Delete an absence. Clearing a TODAY-dated absence is rejected while
         an active run of a COVERED type involves the student ('End the run
         first' — the run either contains their stop or excluded it at
@@ -360,22 +401,27 @@ class AbsenceDao:
         is no longer sufficient — a driver-marked afternoon absence would have
         been deleted while the child stayed 'absent' on every surface, with no
         row left to explain why.
+
+        U6: scoped through the student — another school's absence row answers
+        404 and is left untouched.
         """
         from app.core.errors import ConflictError
 
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
-                select a.student_id, a.scope, a.marked_period,
+                select a.student_id, a.scope, a.marked_period, a.absence_date,
                        (a.absence_date = (now() at time zone 'Africa/Nairobi')::date) as is_today,
                        s.status
                 from live_student_absences a
-                join live_students s on s.id = a.student_id
+                join live_students s on s.id = a.student_id and s.school_id = %s
                 where a.id = %s
                 """,
-                (absence_id,),
+                (scope.school_id, absence_id),
             ).fetchone()
-            if row and row["is_today"]:
+            if not row:
+                raise NotFoundError("Absence not found")
+            if row["is_today"]:
                 # Run-scoped guard (never the derived bus roster, which
                 # diverges for cross-bus afternoon riders): the student is
                 # mid-run when a non-completed run today of a type this
@@ -408,6 +454,14 @@ class AbsenceDao:
                         (row["student_id"],),
                     )
             conn.execute("delete from live_student_absences where id = %s", (absence_id,))
+            record_audit(
+                conn, action="absence-cleared", actor=actor, scope=scope,
+                resource_type="absence", resource_id=absence_id,
+                detail={
+                    "student_id": str(row["student_id"]),
+                    "date": str(row["absence_date"]),
+                },
+            )
 
     def reverse_driver_absence(self, conn, student_id: str, driver_id: str) -> bool:
         """Undo today's absence, but only the one this driver marked (U5).

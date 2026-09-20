@@ -58,7 +58,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN
+from conftest import purge_accounts, DSN, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -98,9 +98,28 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+# Post-U6 world provisioning: one sandbox school per module (its own single-
+# membership admin); per-test worlds share it and purge their plan rows.
+_SANDBOX: dict = {}
+
+
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    with school_sandbox(
+        "IT SI School", lat=SCHOOL_PT[0], lng=SCHOOL_PT[1],
+        morning_bell="07:30", afternoon_bell="15:30",
+    ) as sb:
+        _SANDBOX.clear()
+        _SANDBOX.update(sb)
+        try:
+            yield sb
+        finally:
+            _SANDBOX.clear()
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -145,15 +164,22 @@ def signup_parent(client, marker: str, tag: str) -> dict:
     }
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 def _make_school(client, headers, marker: str) -> dict:
-    created = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT SI School {marker}", "lat": SCHOOL_PT[0], "lng": SCHOOL_PT[1],
-              "morning_bell": "07:30", "afternoon_bell": "15:30"},
-        headers=headers,
-    )
-    assert created.status_code == 200, created.text
-    return created.json()
+    # Post-U6 there is ONE school per module — the sandbox (see apply suite).
+    assert _SANDBOX, "sandbox fixture not active"
+    return {"id": _SANDBOX["id"], "name": _SANDBOX["name"]}
 
 
 def _make_bus(client, headers, marker: str, *, capacity: int) -> dict:
@@ -234,10 +260,20 @@ def _teardown(client, headers, *, students=(), buses=(), schools=(), parents=())
             client.delete(f"/api/fleet/buses/{b['id']}", headers=headers)
     for sc in schools:
         if sc:
-            client.delete(f"/api/fleet/schools/{sc['id']}", headers=headers)
+            # The school is the module sandbox: sweep its plan/route/run and
+            # audit rows by SQL (the retired school DELETE used to cascade).
+            with psycopg.connect(DSN, autocommit=True) as pg:
+                for table in (
+                    "live_fleet_plans", "live_runs", "live_routes",
+                    "live_admin_audit",
+                ):
+                    pg.execute(
+                        f"delete from {table} where school_id = %s",  # noqa: S608
+                        (sc["id"],),
+                    )
     for p in parents:
         if p:
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=headers)
+            purge_accounts(p['id'])
 
 
 # --- readers / sanctioned psycopg ----------------------------------------------
@@ -346,6 +382,10 @@ def test_ae2_enrolment_proposal_text_accept_and_notifications(client, admin_head
             _make_student(client, admin_headers, marker, 3, school["id"], H_NEAR,
                           email=parents["near"]["email"]),
         ]
+        # The accounts predate their students, so the staff-side links above
+        # are pending (U11) — each parent accepts to become a recipient.
+        for tag in ("far1", "far2", "mid", "near"):
+            accept_pending(client, parents[tag]["headers"])
         _apply_fresh_plan(client, admin_headers, school["id"], [bus["id"]])
         for tag in ("far1", "far2", "mid", "near"):
             assert len(_plan_feed(client, parents[tag]["headers"])) == 1  # first apply
@@ -353,6 +393,8 @@ def test_ae2_enrolment_proposal_text_accept_and_notifications(client, admin_head
         # The trigger: a plannable enrolment lacking both legs.
         new_kid = _make_student(client, admin_headers, marker, 9, school["id"],
                                 NEW_HOME, email=parents["new"]["email"])
+        # Same U11 offer for the new child's pre-existing account.
+        accept_pending(client, parents["new"]["headers"])
         body = _wait_for_records(client, admin_headers, school["id"], new_kid["id"])
         assert body["unplaceable"] == []
         assert len(body["proposals"]) == 1
@@ -433,10 +475,13 @@ def test_ae2_enrolment_proposal_text_accept_and_notifications(client, admin_head
         assert len(_plan_feed(client, parents["mid"]["headers"])) == 1
         assert len(_plan_feed(client, parents["near"]["headers"])) == 1
 
-        # No audit row: accept rides the manual-edit notification path.
+        # Accept rides the manual-edit notification path: it may audit as a
+        # plan act (U7 adds slot-in-accepted, pinned by the in-process
+        # isolation suite) but must never masquerade as a route edit — no
+        # route-family audit row appears for the materialized insertion.
         assert _pg_all(
             "select 1 from live_admin_audit where school_id = %s "
-            "and action not in ('plan-applied')",
+            "and action in ('route-created', 'route-updated', 'route-deleted')",
             (school["id"],),
         ) == []
 

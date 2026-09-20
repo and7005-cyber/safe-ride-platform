@@ -23,7 +23,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -61,8 +61,25 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
+def seeded_admin_headers(client):
+    # The legacy platform admin: single membership at the SEEDED school, so
+    # the header fallback lands there — used only by the derived-status tests
+    # that drive the seeded fleet (driver PIN + Express routes).
     return login(client, ADMIN["email"], ADMIN["password"])
+
+
+@pytest.fixture(scope="module")
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT SP School", lat=-1.30, lng=36.82) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 def student_payload(marker: str, **overrides) -> dict:
@@ -177,17 +194,13 @@ def test_update_enforces_the_invariant_too(client, admin_headers):
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
 
 
-def test_bulk_row_missing_emails_errors_that_row_only(client, admin_headers):
+def test_bulk_row_missing_emails_errors_that_row_only(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
     good_name = f"IT BulkGood {marker}"
     bad_name = f"IT BulkBad {marker}"
     # The bulk payload is school-scoped since U10: every committed row is
     # stamped with the school so the draft basis and pin map can see it.
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", "lat": -1.30, "lng": 36.80},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     try:
         response = client.post(
             "/api/students/bulk",
@@ -209,7 +222,6 @@ def test_bulk_row_missing_emails_errors_that_row_only(client, admin_headers):
         for s in client.get("/api/students", headers=admin_headers).json():
             if s["name"] in (good_name, bad_name):
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 # Link sync (R11) ----------------------------------------------------------------
@@ -236,8 +248,8 @@ def test_email_change_swaps_the_link(client, admin_headers):
         assert student["name"] not in students_of_parent(client, admin_headers, email_a)
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_a}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_b}", headers=admin_headers)
+        purge_accounts(parent_a)
+        purge_accounts(parent_b)
 
 
 def test_unrelated_edit_preserves_drifted_link(client, admin_headers):
@@ -272,7 +284,7 @@ def test_unrelated_edit_preserves_drifted_link(client, admin_headers):
         assert student["name"] in students_of_parent(client, admin_headers, renamed_email)
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_same_email_in_both_slots_links_once(client, admin_headers):
@@ -288,7 +300,7 @@ def test_same_email_in_both_slots_links_once(client, admin_headers):
         assert names.count(student["name"]) == 1
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_signup_backfills_links_for_pending_parent(client, admin_headers):
@@ -320,7 +332,7 @@ def test_signup_backfills_links_for_pending_parent(client, admin_headers):
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
         if parent_id:
-            client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+            purge_accounts(parent_id)
 
 
 # Status is never written by admin edits (R7) -------------------------------------
@@ -409,7 +421,8 @@ def run_morning_and_end(client, driver_headers) -> None:
 
 
 @pytest.fixture()
-def clean_run_slate(client, admin_headers, driver_headers):
+def clean_run_slate(client, seeded_admin_headers, driver_headers):
+    admin_headers = seeded_admin_headers
     """A known-clean run slate around each run-lifecycle test: end the
     driver's active run and delete today's runs for their bus (a route runs
     once per day, so leftovers gate later starts). Teardown also runs a
@@ -454,6 +467,16 @@ def create_linked_student(client, admin_headers, marker: str, route_ids=None, **
         headers=admin_headers,
     )
     assert created.status_code == 200, created.text
+    # U11: the account signed up before the student existed, so its first link
+    # at this school is OFFERED, not granted — accept the pending card(s) so
+    # the tests exercise the accepted surface these fixtures always meant.
+    pending = client.get("/api/parent-portal/pending", headers=parent_headers)
+    for card in (pending.json() if pending.status_code == 200 else []):
+        accepted = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert accepted.status_code == 200, accepted.text
     return created.json(), parent_id, email, parent_headers
 
 
@@ -543,8 +566,9 @@ def force_student_status(student_id: str, status: str) -> None:
 
 
 def test_route_less_student_shows_unassigned_on_admin_list_only(
-    client, admin_headers, driver_headers
+    client, seeded_admin_headers, driver_headers
 ):
+    admin_headers = seeded_admin_headers
     """Covers AE1 (R1, R3): a student with zero route assignments displays
     'unassigned' on the admin list, overriding the stored status; assigning a
     route makes the live status appear. The wrap is admin-side only — the
@@ -577,12 +601,13 @@ def test_route_less_student_shows_unassigned_on_admin_list_only(
         )
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_on_bus_on_active_run_today_shows_on_bus(
-    client, admin_headers, driver_headers, clean_run_slate
+    client, seeded_admin_headers, driver_headers, clean_run_slate
 ):
+    admin_headers = seeded_admin_headers
     """R2: 'on-bus' is trusted while an active run today carries the student
     in run_stops. Afternoon runs auto-board their roster at start."""
     marker = uuid.uuid4().hex[:6]
@@ -608,12 +633,13 @@ def test_on_bus_on_active_run_today_shows_on_bus(
         if run_id:
             client.post("/api/runs/driver/end", json={"run_id": run_id}, headers=driver_headers)
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_today_absence_overrides_stored_on_bus_to_absent(
-    client, admin_headers, driver_headers, clean_run_slate
+    client, seeded_admin_headers, driver_headers, clean_run_slate
 ):
+    admin_headers = seeded_admin_headers
     """R2: a today-absence (marked via the admin endpoint — date defaults to
     today; scope defaults to 'day' once U4 lands) overrides everything, even
     a live 'on-bus' written after the mark when the child boards after all."""
@@ -662,10 +688,13 @@ def test_today_absence_overrides_stored_on_bus_to_absent(
         if absence_id:
             client.delete(f"/api/students/absences/{absence_id}", headers=admin_headers)
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
-def test_stale_on_bus_decays_to_at_home(client, admin_headers, driver_headers, clean_run_slate):
+def test_stale_on_bus_decays_to_at_home(
+    client, seeded_admin_headers, driver_headers, clean_run_slate
+):
+    admin_headers = seeded_admin_headers
     """R2: raw 'on-bus' is only trusted while a non-completed run today
     carries the student. The run is completed by SQL here — since U7 no API
     path completes a run without recording an outcome per child — which leaves
@@ -692,12 +721,13 @@ def test_stale_on_bus_decays_to_at_home(client, admin_headers, driver_headers, c
         # clean_run_slate's teardown deletes the completed run and restores
         # the seeded roster statuses via a morning start+end cycle.
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 def test_stale_dropped_off_decays_to_at_home(
-    client, admin_headers, driver_headers, clean_run_slate
+    client, seeded_admin_headers, driver_headers, clean_run_slate
 ):
+    admin_headers = seeded_admin_headers
     """R2: 'dropped-off' is only trusted while an afternoon run today contains
     the student; once no such run holds them the badge decays to at-home, and
     the raw status is never rewritten by the read."""
@@ -739,10 +769,11 @@ def test_stale_dropped_off_decays_to_at_home(
     finally:
         purge_run(run_id)
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
-def test_stale_absent_decays_to_at_home(client, admin_headers, driver_headers):
+def test_stale_absent_decays_to_at_home(client, seeded_admin_headers, driver_headers):
+    admin_headers = seeded_admin_headers
     """R2: raw 'absent' with no today-absence row displays at-home. Staged by
     SQL (force_student_status): every API writer of 'absent' also writes
     today's absence row and every clear path resets the status, so the stale
@@ -764,17 +795,13 @@ def test_stale_absent_decays_to_at_home(client, admin_headers, driver_headers):
         )
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
 
 
 # One-per-type allocation (U5, R21-R23) --------------------------------------------
 
-def _u5_school_and_route_factory(client, admin_headers, marker):
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT U5 School {marker}", "lat": -1.30, "lng": 36.82},
-        headers=admin_headers,
-    ).json()
+def _u5_school_and_route_factory(client, admin_headers, sandbox, marker):
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
 
     def make_route(name, rtype):
         r = client.post(
@@ -795,11 +822,11 @@ def _route_ids_of(client, admin_headers, student_id):
     return None
 
 
-def test_same_period_move_is_not_a_409(client, admin_headers):
+def test_same_period_move_is_not_a_409(client, admin_headers, sandbox):
     """U5/R22: moving a student from one morning route to another (delete-before
     -insert) succeeds — the deferrable backstop is never tripped by the move."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, sandbox, marker)
     m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
     created = []
     try:
@@ -821,14 +848,13 @@ def test_same_period_move_is_not_a_409(client, admin_headers):
             client.delete(f"/api/students/{st['id']}", headers=admin_headers)
         for r in (m_a, m_b):
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_two_same_period_routes_in_one_payload_is_a_friendly_409(client, admin_headers):
+def test_two_same_period_routes_in_one_payload_is_a_friendly_409(client, admin_headers, sandbox):
     """U5/R21: a payload naming two morning routes is refused with a friendly
     409, not a raw deferred-constraint 500."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, sandbox, marker)
     m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
     try:
         s = client.post(
@@ -840,14 +866,13 @@ def test_two_same_period_routes_in_one_payload_is_a_friendly_409(client, admin_h
     finally:
         for r in (m_a, m_b):
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_one_morning_and_one_afternoon_is_allowed(client, admin_headers):
+def test_one_morning_and_one_afternoon_is_allowed(client, admin_headers, sandbox):
     """U5/R23: the constraint is per-period — a student may hold one morning AND
     one afternoon route at once."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, sandbox, marker)
     m, a = make_route("Morning", "morning"), make_route("Afternoon", "afternoon")
     created = []
     try:
@@ -864,7 +889,6 @@ def test_one_morning_and_one_afternoon_is_allowed(client, admin_headers):
             client.delete(f"/api/students/{st['id']}", headers=admin_headers)
         for r in (m, a):
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_home_provenance_round_trips_on_create(client, admin_headers):
@@ -890,12 +914,12 @@ def test_home_provenance_round_trips_on_create(client, admin_headers):
             client.delete(f"/api/students/{st['id']}", headers=admin_headers)
 
 
-def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_headers):
+def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_headers, sandbox):
     """U2/U5 System-Wide Impact: flipping a route's type cascades route_type to
     its student links (the AFTER UPDATE trigger), so the student's morning slot
     is freed and a different morning route can be added without a phantom 409."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, sandbox, marker)
     m_a, m_b = make_route("MorningA", "morning"), make_route("MorningB", "morning")
     created = []
     try:
@@ -932,7 +956,6 @@ def test_route_type_flip_cascades_to_links_and_frees_the_period(client, admin_he
             client.delete(f"/api/students/{st['id']}", headers=admin_headers)
         for r in (m_a, m_b):
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 # Bulk-upload triage, duplicates, school binding, route-name retirement
@@ -989,18 +1012,14 @@ def _make_plan_bus(client, headers, name: str, capacity: int,
     return created.json()
 
 
-def test_bulk_ae8_triage_confirm_place_commit_and_draft_basis(client, admin_headers):
+def test_bulk_ae8_triage_confirm_place_commit_and_draft_basis(client, admin_headers, sandbox):
     """AE8/F5 end-to-end: 30 rows triage 27 resolved / 2 ambiguous / 1 failed;
     the two ambiguous are confirmed in one action each (the proposed pin is
     accepted as-is), the failed one is hand-placed (provenance 'picked'); the
     commit stamps school_id on every row; and the school's next draft basis
     carries all 30 as plannable — including the three repaired rows."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     bus_a = bus_b = None
     student_ids: list[str] = []
     try:
@@ -1105,20 +1124,15 @@ def test_bulk_ae8_triage_confirm_place_commit_and_draft_basis(client, admin_head
             if bus:
                 client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
         # Deleting the school cascades its plan rows (011 FK).
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_duplicate_flagged_skip_noops_update_overwrites(client, admin_headers):
+def test_bulk_duplicate_flagged_skip_noops_update_overwrites(client, admin_headers, sandbox):
     """U10 duplicates: validate flags a row matching an existing student on
     (name, school); committing with skip leaves the original untouched;
     with no choice the row errors (nothing silently doubles); with update the
     contacts and address are overwritten and the address re-triaged."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     name = f"IT Bulk Dup {marker}"
     original = _bulk_row(marker, 1, name=name, home_lat=-1.291, home_lng=36.812,
                          home_address="Old Lane")
@@ -1195,18 +1209,13 @@ def test_bulk_duplicate_flagged_skip_noops_update_overwrites(client, admin_heade
         for s in _student_rows(client, admin_headers):
             if s["name"] == name:
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_identical_reupload_all_skipped_creates_zero_students(client, admin_headers):
+def test_bulk_identical_reupload_all_skipped_creates_zero_students(client, admin_headers, sandbox):
     """U10: re-uploading an identical file with every duplicate skipped is a
     complete no-op — zero new students."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     rows = [
         _bulk_row(marker, i, home_lat=-1.29 - i * 0.002, home_lng=36.81 + i * 0.002)
         for i in range(2)
@@ -1232,15 +1241,14 @@ def test_bulk_identical_reupload_all_skipped_creates_zero_students(client, admin
         for s in _student_rows(client, admin_headers):
             if s["name"].startswith(f"IT Bulk {marker} "):
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_route_name_imports_without_assigning_and_notes_it(client, admin_headers):
+def test_bulk_route_name_imports_without_assigning_and_notes_it(client, admin_headers, sandbox):
     """R17 retirement: a row carrying route_name — even one naming a real
     route — still imports the student, assigns NO route, and surfaces the
     informational note per row, at validate and at commit."""
     marker = uuid.uuid4().hex[:6]
-    school, make_route = _u5_school_and_route_factory(client, admin_headers, marker)
+    school, make_route = _u5_school_and_route_factory(client, admin_headers, sandbox, marker)
     route = make_route("Express", "morning")
     name = f"IT Bulk RouteName {marker}"
     row = _bulk_row(marker, 1, name=name, home_lat=-1.3, home_lng=36.8,
@@ -1271,18 +1279,13 @@ def test_bulk_route_name_imports_without_assigning_and_notes_it(client, admin_he
             if s["name"] == name:
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_bulk_validate_commits_nothing(client, admin_headers):
+def test_bulk_validate_commits_nothing(client, admin_headers, sandbox):
     """U10/AE8: /bulk/validate is read-only — the student table is unchanged
     after a validate, row for row."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     try:
         count_before = len(_student_rows(client, admin_headers))
         validated = client.post(
@@ -1298,49 +1301,58 @@ def test_bulk_validate_commits_nothing(client, admin_headers):
         assert statuses == ["resolved", "failed"]
         assert len(_student_rows(client, admin_headers)) == count_before
     finally:
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+        pass  # read-only by contract; the module sandbox sweeps any residue
 
 
-def test_bulk_without_school_id_is_a_clear_refresh_400(client, admin_headers):
-    """Deploy-skew guard: a stale cached admin tab (backend deployed, CloudFront
-    invalidation still propagating) posts the pre-U10 shape with no school_id.
-    Both bulk endpoints answer with ONE clear 400 telling the operator to
-    refresh — not FastAPI's array-422, which the client degrades to a generic
-    message."""
+def test_bulk_school_id_is_ignored_and_the_scope_school_wins(client, admin_headers, sandbox):
+    """Tenancy U6 retired the payload's school_id: the upload belongs to the
+    request scope's school, a missing school_id is fine (the pre-U6 skew 400
+    is gone with the field's meaning), and a stray or unknown id is accepted
+    and IGNORED — the Release 4 stray-school-id rule — never honoured and
+    never a lookup miss."""
     marker = uuid.uuid4().hex[:6]
-    row = _bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8)
-    for path in ("/api/students/bulk/validate", "/api/students/bulk"):
-        response = client.post(path, json={"students": [row]}, headers=admin_headers)
-        assert response.status_code == 400, (path, response.text)
-        assert "refresh" in response.json()["detail"].lower(), (path, response.text)
+    created_ids: list[str] = []
+    try:
+        # No school_id at all: both endpoints answer 200 for the scope school.
+        row = _bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8)
+        validated = client.post(
+            "/api/students/bulk/validate", json={"students": [row]},
+            headers=admin_headers,
+        )
+        assert validated.status_code == 200, validated.text
+        committed = client.post(
+            "/api/students/bulk", json={"students": [row]}, headers=admin_headers
+        )
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["inserted"] == 1, committed.text
+
+        # A stray/unknown school id changes nothing: the scope school stamps.
+        row2 = _bulk_row(marker, 2, home_lat=-1.3, home_lng=36.8)
+        stray = client.post(
+            "/api/students/bulk",
+            json={"school_id": str(uuid.uuid4()), "students": [row2]},
+            headers=admin_headers,
+        )
+        assert stray.status_code == 200, stray.text
+        assert stray.json()["inserted"] == 1, stray.text
+
+        mine = [s for s in _student_rows(client, admin_headers)
+                if s["name"].startswith(f"IT Bulk {marker} ")]
+        created_ids.extend(s["id"] for s in mine)
+        assert len(mine) == 2
+        assert all(str(s["school_id"]) == str(sandbox["id"]) for s in mine)
+    finally:
+        for sid in created_ids:
+            client.delete(f"/api/students/{sid}", headers=admin_headers)
 
 
-def test_bulk_unknown_school_is_a_404(client, admin_headers):
-    """A school_id that is provided but matches no school is a lookup miss —
-    404, aligned with the fleet-plan endpoints' convention (the missing-field
-    skew case above stays a 400: malformed request, not a miss)."""
-    marker = uuid.uuid4().hex[:6]
-    response = client.post(
-        "/api/students/bulk",
-        json={"school_id": str(uuid.uuid4()),
-              "students": [_bulk_row(marker, 1, home_lat=-1.3, home_lng=36.8)]},
-        headers=admin_headers,
-    )
-    assert response.status_code == 404, response.text
-    assert "school not found" in response.json()["detail"].lower()
-
-
-def test_bulk_two_same_named_rows_share_one_duplicate_flag(client, admin_headers):
+def test_bulk_two_same_named_rows_share_one_duplicate_flag(client, admin_headers, sandbox):
     """Pins the batched duplicate lookup's dict behavior: two same-named rows
     in one upload (one a case/whitespace variant) both consult the same
     normalized-name entry — validate flags both against the same existing
     student, and a commit skipping both no-ops both."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT BulkSchool {marker}", **AE8_SCHOOL},
-        headers=admin_headers,
-    ).json()
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     name = f"IT Bulk Twin {marker}"
     try:
         seeded = client.post(
@@ -1383,7 +1395,6 @@ def test_bulk_two_same_named_rows_share_one_duplicate_flag(client, admin_headers
         for s in _student_rows(client, admin_headers):
             if name.lower() in s["name"].strip().lower():
                 client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
 def test_bulk_duplicate_update_regenerates_each_route_exactly_once(monkeypatch):

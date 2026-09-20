@@ -32,9 +32,12 @@ import uuid
 import httpx
 import pytest
 
+from conftest import purge_accounts
+
 from test_fleet_plan_apply import (
     AFTERNOON,
     ADMIN,
+    _SANDBOX,
     DEPOT_EAST,
     DEPOT_WEST,
     EAST_HOMES,
@@ -75,9 +78,12 @@ def client():
         yield c
 
 
+from test_fleet_plan_apply import sandbox  # noqa: F401 — module sandbox fixture
+
+
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -242,7 +248,7 @@ def test_toggle_restores_a_then_back_to_b_notifying_only_material_changes(client
         # detail, and the notified feed rows point at THIS act.
         audits = _restore_audits(school_id)
         assert len(audits) == 1
-        assert audits[0]["actor_email"] == ADMIN["email"]
+        assert audits[0]["actor_email"] == _SANDBOX["email"]
         detail = audits[0]["detail"]
         assert detail["plan_id"] == plan_a["id"]
         assert detail["displaced_plan_id"] == plan_b["id"]
@@ -273,7 +279,7 @@ def test_toggle_restores_a_then_back_to_b_notifying_only_material_changes(client
     finally:
         _teardown(client, admin_headers, fx)
         for p in parents.values():
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
+            purge_accounts(p['id'])
 
 
 # --- roster drift gates (departed + enrolled-after-capture) ---------------------
@@ -392,7 +398,7 @@ def test_departed_and_enrolled_after_capture_require_confirmation(client, admin_
         if enrolled:
             client.delete(f"/api/students/{enrolled['id']}", headers=admin_headers)
         _teardown(client, admin_headers, fx)
-        client.delete(f"/api/accounts/parents/{pe['id']}", headers=admin_headers)
+        purge_accounts(pe['id'])
 
 
 # --- fleet drift ----------------------------------------------------------------

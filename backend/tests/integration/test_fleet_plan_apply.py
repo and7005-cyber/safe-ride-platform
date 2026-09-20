@@ -48,7 +48,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, purge_run
+from conftest import purge_accounts, DSN, purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -88,9 +88,31 @@ def pin_login(client: httpx.Client, pin: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+# Post-U6 world provisioning: school creation left the staff API, so each
+# plan-suite module runs inside ONE sandbox school (its own single-membership
+# admin; header fallback lands there). Worlds built per test share it —
+# students/buses/plans are marker-scoped and purged per test, so drafting
+# still sees only the test's own roster.
+_SANDBOX: dict = {}
+
+
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    with school_sandbox(
+        "IT ApplySchool", lat=SCHOOL_LAT, lng=SCHOOL_LNG,
+        morning_bell="07:00", afternoon_bell="15:30",
+    ) as sb:
+        _SANDBOX.clear()
+        _SANDBOX.update(sb)
+        try:
+            yield sb
+        finally:
+            _SANDBOX.clear()
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 @pytest.fixture(scope="module")
@@ -101,21 +123,35 @@ def parent_headers(client):
 # --- builders -----------------------------------------------------------------
 
 def _make_school(client, headers, marker: str, **overrides) -> dict:
-    payload = {
-        "name": f"IT ApplySchool {marker}",
-        "lat": SCHOOL_LAT, "lng": SCHOOL_LNG,
-        "morning_bell": "07:00", "afternoon_bell": "15:30",
-    }
-    payload.update(overrides)
-    created = client.post("/api/fleet/schools", json=payload, headers=headers)
-    assert created.status_code == 200, created.text
-    return created.json()
+    # Post-U6 there is ONE school per module — the sandbox the module admin
+    # belongs to; scratch-school payloads (name overrides included) are
+    # retired with the endpoint that honoured them.
+    assert _SANDBOX, "sandbox fixture not active"
+    return {"id": _SANDBOX["id"], "name": _SANDBOX["name"]}
+
+
+def _purge_school_plan_world(school_id: str) -> None:
+    """Per-test sweep of the shared sandbox school: plan rows (the one-open-
+    draft rule would 409 the next test), materialized routes and leftover
+    runs. **Teardown only** — the product deliberately has no school-delete
+    API any more, so the cascade the old DELETE /schools/{id} provided drops
+    to SQL."""
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        for table in (
+            "live_fleet_plans", "live_runs", "live_routes", "live_admin_audit",
+        ):
+            pg.execute(
+                f"delete from {table} where school_id = %s", (school_id,)  # noqa: S608
+            )
 
 
 def _make_bus(client, headers, name: str, *, capacity: int = 45,
               depot: tuple[float, float] | None = None,
-              driver_id: str | None = None) -> dict:
+              driver_id: str | None = None,
+              availability: str | None = None) -> dict:
     payload: dict = {"name": name, "capacity": capacity}
+    if availability is not None:
+        payload["availability"] = availability
     if depot is not None:
         payload["depot_lat"], payload["depot_lng"] = depot
     if driver_id is not None:
@@ -387,9 +423,9 @@ def _teardown(client, headers, fx: dict) -> None:
         client.delete(f"/api/students/{s['id']}", headers=headers)
     for b in fx.get("buses", []):
         client.delete(f"/api/fleet/buses/{b['id']}", headers=headers)
-    # Deleting the school cascades its plan rows (011 FK); audit rows keep
-    # their denormalized identity with school_id SET NULL (append-only table).
-    client.delete(f"/api/fleet/schools/{fx['school']['id']}", headers=headers)
+    # The school is the module sandbox: sweep its plan rows, routes and runs
+    # by SQL (the retired school DELETE used to cascade these).
+    _purge_school_plan_world(fx["school"]["id"])
 
 
 # --- gates (R22 / R23 / fleet drift) ----------------------------------------------
@@ -573,7 +609,7 @@ def test_enrolled_after_draft_manual_placement_is_severed_cleanly(client, admin_
         if enrolled:
             client.delete(f"/api/students/{enrolled['id']}", headers=admin_headers)
         _teardown(client, admin_headers, fx)
-        client.delete(f"/api/accounts/parents/{pe['id']}", headers=admin_headers)
+        purge_accounts(pe['id'])
 
 
 # --- multi-trip drift gate ----------------------------------------------------------
@@ -682,7 +718,7 @@ def test_collapsed_stop_bodies_never_leak_sibling_names(client, admin_headers):
     finally:
         _teardown(client, admin_headers, fx)
         for p in (pa, pb):
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
+            purge_accounts(p['id'])
 
 
 # --- AE5 + reconcile + post-apply invariants ---------------------------------------
@@ -715,8 +751,13 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
                           capacity=8, depot=DEPOT_EAST)
         bus_b = _make_bus(client, admin_headers, f"IT ApplyBus B {marker}",
                           capacity=8, depot=DEPOT_WEST)
+        # Post-U6 a draft covers every IN-SERVICE bus of the school, so the
+        # old "unclaimed" bus C is expressed as out-of-service: its live
+        # route still runs (and gets retired as surplus), but the solver
+        # never drafts it — the original scenario's shape.
         bus_c = _make_bus(client, admin_headers, f"IT ApplyBus C {marker}",
-                          capacity=8, driver_id=driver["id"])
+                          capacity=8, driver_id=driver["id"],
+                          availability="out-of-service")
         bus_m = _make_bus(client, admin_headers, f"IT ApplyBus M {marker}", capacity=8)
         buses = [bus_a, bus_b, bus_c, bus_m]
 
@@ -749,9 +790,7 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         s4 = _make_student(client, admin_headers, marker, 3, school["id"], WEST_HOMES[1])
         sc = _make_student(client, admin_headers, marker, 4, school["id"], None,
                            email=pc["email"], route_ids=[route_c["id"]])
-        sx = _make_student(client, admin_headers, marker + "2", 0, school2["id"],
-                           EAST_HOMES[3], email=px["email"], route_ids=[chain_2["id"]])
-        students = [s1, s2, s3, s4, sc, sx]
+        students = [s1, s2, s3, s4, sc]
 
         # Freeze R_A's manual order so apply provably clears the freeze.
         r_a = next(r for r in _school_routes(client, admin_headers, school["id"])
@@ -768,6 +807,23 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         assert any(n["kind"] == "multi-trip-excluded" for n in confirmed["notices"])
 
         plan = _draft(client, admin_headers, school["id"], seed=3)
+        # The chain rider enrols AFTER drafting (post-U6 a same-school student
+        # created before the draft would be solver input): the document never
+        # knows sx, the R22 gate flags them enrolled, and the confirmed apply
+        # leaves their chain membership — and family — untouched, the AE5
+        # chain-exclusion shape. The chain link is staged by SQL: linking via
+        # the roster API would silently seed a communicated baseline, and a
+        # baseline for a leg the plan never serves reads as leg-removed to
+        # the diff — chains are out of plan scope, so the family must hear
+        # nothing at all.
+        sx = _make_student(client, admin_headers, marker + "2", 0, school2["id"],
+                           EAST_HOMES[3], email=px["email"])
+        _pg_exec(
+            "insert into live_student_routes (student_id, route_id, school_id) "
+            "values (%s, %s, (select school_id from live_routes where id = %s))",
+            (sx["id"], chain_2["id"], chain_2["id"]),
+        )
+        students.append(sx)
         narrowed = _edit(client, admin_headers, plan["id"], "pattern",
                          {"student_id": s4["id"], "pattern": "afternoon_only"})
         assert narrowed.status_code == 200, narrowed.text
@@ -784,7 +840,8 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         assert snapshot_before  # a real roster: s1 + sc stops
 
         applied = _apply(client, admin_headers, plan["id"],
-                         acknowledgments=_acks_for(review))
+                         acknowledgments=_acks_for(review),
+                         confirmations=[{"student_id": sx["id"], "kind": "enrolled"}])
         assert applied.status_code == 200, applied.text
         body = applied.json()
         assert body["routes_written"] == 4  # two drafted buses x two legs
@@ -872,7 +929,7 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         # Audit: one self-contained plan-applied record.
         audits = _audit_rows(school["id"])
         assert len(audits) == 1
-        assert audits[0]["actor_email"] == ADMIN["email"]
+        assert audits[0]["actor_email"] == _SANDBOX["email"]
         detail = audits[0]["detail"]
         assert detail["routes_written"] == 4
         assert detail["families_notified"] == 2
@@ -908,12 +965,11 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
             client.delete(f"/api/fleet/routes/{r['id']}", headers=admin_headers)
         for b in buses:
             client.delete(f"/api/fleet/buses/{b['id']}", headers=admin_headers)
-        for sch in (school, school2):
-            if sch:
-                client.delete(f"/api/fleet/schools/{sch['id']}", headers=admin_headers)
+        if school:
+            _purge_school_plan_world(school["id"])
         client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
         for p in (p1, pc, px):
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
+            purge_accounts(p['id'])
 
 
 # --- notifications, baselines, status lifecycle -------------------------------------
@@ -1103,7 +1159,7 @@ def test_notification_matrix_baselines_and_status_lifecycle(client, admin_header
     finally:
         _teardown(client, admin_headers, fx)
         for p in parents.values():
-            client.delete(f"/api/accounts/parents/{p['id']}", headers=admin_headers)
+            purge_accounts(p['id'])
 
 
 # --- atomicity ----------------------------------------------------------------------
@@ -1153,7 +1209,7 @@ def test_atomicity_forced_late_failure_rolls_back_everything(client, admin_heade
         assert len(_plan_feed(client, p1["headers"])) == 1
     finally:
         _teardown(client, admin_headers, fx)
-        client.delete(f"/api/accounts/parents/{p1['id']}", headers=admin_headers)
+        purge_accounts(p1['id'])
 
 
 # --- authorization --------------------------------------------------------------------

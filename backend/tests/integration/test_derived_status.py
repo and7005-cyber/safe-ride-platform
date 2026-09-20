@@ -20,7 +20,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -39,8 +39,20 @@ def client():
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    response = client.post("/api/auth/login", json=ADMIN)
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT DS School", lat=-1.29, lng=36.82) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    response = client.post(
+        "/api/auth/login",
+        json={"email": sandbox["email"], "password": sandbox["password"]},
+    )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -82,8 +94,20 @@ def mark_unaccounted(run_id: str, student_id: str) -> None:
         )
 
 
+def accept_pending(client, parent_headers):
+    """U11: a staff-side link to an already-registered account is OFFERED, not
+    granted — the parent accepts the school's pending card to gain access."""
+    cards = client.get("/api/parent-portal/pending", headers=parent_headers).json()
+    for card in cards:
+        r = client.post(
+            f"/api/parent-portal/pending/{card['schoolId']}/accept",
+            headers=parent_headers,
+        )
+        assert r.status_code == 200, r.text
+
+
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
     created: dict = {"marker": marker}
     pin = str(random.randint(100000, 999999))
@@ -104,11 +128,7 @@ def fleet(client, admin_headers):
         headers=admin_headers,
     ).json()
 
-    created["school"] = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT DS School {marker}", "lat": -1.29, "lng": 36.82},
-        headers=admin_headers,
-    ).json()
+    created["school"] = {"id": sandbox["id"], "name": sandbox["name"]}
 
     for period in ("morning", "afternoon"):
         created[period] = client.post(
@@ -134,6 +154,9 @@ def fleet(client, admin_headers):
               "route_ids": [created["morning"]["id"], created["afternoon"]["id"]]},
         headers=admin_headers,
     ).json()
+    # The account predates the student, so the staff-side link above is
+    # pending (U11) — the parent accepts to unlock the portal reads below.
+    accept_pending(client, created["parent_headers"])
 
     try:
         yield created
@@ -145,9 +168,8 @@ def fleet(client, admin_headers):
         for period in ("morning", "afternoon"):
             client.delete(f"/api/fleet/routes/{created[period]['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{created['bus']['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{created['school']['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{created['driver']['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{created['parent_id']}", headers=admin_headers)
+        purge_accounts(created['parent_id'])
 
 
 @pytest.fixture

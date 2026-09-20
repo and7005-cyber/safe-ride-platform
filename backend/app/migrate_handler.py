@@ -94,17 +94,171 @@ def _apply_dir(conn: psycopg.Connection, directory: Path, prefix: str) -> dict[s
 
 
 def handler(event=None, context=None) -> dict:
-    """Apply migrations then seeds. Idempotent; safe to re-invoke."""
+    """Apply migrations then seeds, then the tenancy post-steps. Idempotent."""
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         _ensure_marker_table(conn)
         migrations = _apply_dir(conn, MIGRATIONS_DIR, prefix="")
         seeds = _apply_dir(conn, SEEDS_DIR, prefix="seed:")
+        app_role = _sync_app_role(conn)
+        bootstrap_data = _fetch_bootstrap()
+        provider_bootstrap = (
+            _bootstrap_providers(conn, bootstrap_data)
+            if bootstrap_data is not None
+            else {"skipped": "PROVIDER_BOOTSTRAP_SSM not set"}
+        )
 
     return {
         "status": "ok",
         "migrations": migrations,
         "seeds": seeds,
+        "app_role": app_role,
+        "provider_bootstrap": provider_bootstrap,
     }
+
+
+
+
+# --- Tenancy post-steps (U2) -------------------------------------------------
+# The runtime application role and the provider bootstrap are handled here, in
+# Python, because their inputs (a role password, SSM-held account material)
+# cannot live in a committed SQL file. Both steps are idempotent and skip
+# cleanly when their inputs are absent (local runs, pre-tenancy stacks).
+
+
+def _sync_app_role(conn: psycopg.Connection) -> dict:
+    """Create/refresh the ``saferide_app`` runtime role and its grants."""
+    password = os.environ.get("DB_APP_PASSWORD")
+    if not password:
+        return {"skipped": "DB_APP_PASSWORD not set"}
+
+    from psycopg import sql
+
+    conn.execute(
+        sql.SQL(
+            """
+            do $$
+            begin
+              if not exists (select 1 from pg_roles where rolname = 'saferide_app') then
+                execute format('create role saferide_app login nobypassrls password %L', {pw});
+              else
+                execute format('alter role saferide_app with login nobypassrls password %L', {pw});
+              end if;
+            end
+            $$;
+            """
+        ).format(pw=sql.Literal(password))
+    )
+    conn.execute("grant usage on schema public to saferide_app")
+    conn.execute(
+        "grant select, insert, update, delete on all tables in schema public to saferide_app"
+    )
+    conn.execute("grant usage, select on all sequences in schema public to saferide_app")
+    conn.execute(
+        "alter default privileges in schema public "
+        "grant select, insert, update, delete on tables to saferide_app"
+    )
+    conn.execute(
+        "alter default privileges in schema public "
+        "grant usage, select on sequences to saferide_app"
+    )
+    # Membership so the verify Lambda (connecting as the master role) can
+    # SET ROLE saferide_app and prove the policies bind (tenancy-rls set).
+    conn.execute("grant saferide_app to current_user")
+    return {"role": "saferide_app", "synced": True}
+
+
+def _parse_bootstrap(raw: str) -> dict:
+    """Decode the provider-bootstrap SSM value: JSON, or base64url(JSON)."""
+    import base64
+    import json as _json
+
+    text = raw.strip()
+    if not text.startswith("{"):
+        pad = "=" * (-len(text) % 4)
+        text = base64.urlsafe_b64decode(text + pad).decode("utf-8")
+    data = _json.loads(text)
+    version = data.get("version")
+    providers = data.get("providers")
+    if not isinstance(version, int) or version < 1:
+        raise RuntimeError("provider bootstrap: 'version' must be a positive integer")
+    if not isinstance(providers, list) or not providers:
+        raise RuntimeError("provider bootstrap: 'providers' must be a non-empty list")
+    for entry in providers:
+        for key in ("email", "full_name", "password_hash"):
+            if not entry.get(key):
+                raise RuntimeError(f"provider bootstrap: provider missing {key!r}")
+        if not str(entry["password_hash"]).startswith("pbkdf2_sha256$"):
+            raise RuntimeError(
+                f"provider bootstrap: {entry['email']} password_hash is not a PBKDF2 hash"
+            )
+    return data
+
+
+def _fetch_bootstrap() -> dict | None:
+    """Read the bootstrap parameter named in the environment, if configured."""
+    param_name = os.environ.get("PROVIDER_BOOTSTRAP_SSM")
+    if not param_name:
+        return None
+    import boto3  # available in the Lambda runtime; unused locally
+
+    value = boto3.client("ssm").get_parameter(Name=param_name, WithDecryption=True)[
+        "Parameter"
+    ]["Value"]
+    return _parse_bootstrap(value)
+
+
+def _bootstrap_providers(conn: psycopg.Connection, data: dict) -> dict:
+    """Insert (or, on a version bump, re-key) the bootstrap provider accounts.
+
+    Runs only once per bootstrap ``version`` (marker table), and only when the
+    tenancy schema exists. An email that already belongs to a non-provider
+    identity fails the deploy naming the address — provider identities never
+    piggyback on parent or staff accounts.
+    """
+    if conn.execute("select to_regclass('public.provider_accounts')").fetchone()[0] is None:
+        return {"skipped": "provider_accounts table not present yet"}
+
+    marker = f"provider-bootstrap:v{data['version']}"
+    if _already_applied(conn, marker):
+        return {"skipped": f"{marker} already applied"}
+
+    import secrets
+
+    applied = []
+    for entry in data["providers"]:
+        email = entry["email"].strip().lower()
+        row = conn.execute(
+            "select u.id, (p.user_id is not null) as is_provider "
+            "from app_users u left join provider_accounts p on p.user_id = u.id "
+            "where lower(u.email) = %s",
+            (email,),
+        ).fetchone()
+        if row and not row[1]:
+            raise RuntimeError(
+                f"provider bootstrap: {email} already belongs to a non-provider identity"
+            )
+        if row:
+            conn.execute(
+                "update app_users set password_hash = %s, must_change_password = true "
+                "where id = %s",
+                (entry["password_hash"], row[0]),
+            )
+            applied.append(f"rekeyed:{email}")
+            continue
+        user_id = conn.execute(
+            "insert into app_users (email, password_hash, full_name, must_change_password) "
+            "values (%s, %s, %s, true) returning id",
+            (email, entry["password_hash"], entry["full_name"]),
+        ).fetchone()[0]
+        conn.execute(
+            "insert into provider_accounts (user_id, totp_salt) values (%s, %s)",
+            (user_id, secrets.token_hex(16)),
+        )
+        applied.append(f"created:{email}")
+
+    _mark_applied(conn, marker)
+    return {"marker": marker, "providers": applied}
+
 
 
 if __name__ == "__main__":  # local manual run against DATABASE_URL

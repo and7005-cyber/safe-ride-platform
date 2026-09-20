@@ -18,6 +18,43 @@ export function useChildren() {
   });
 }
 
+// Pending link cards (U13: R31/R32; AE22): one card per SCHOOL with a
+// pending link for the calling parent — {schoolId, schoolName, offeredAt,
+// linkCount} and deliberately NO student fields of any kind: until the
+// parent accepts, the school's claim discloses only that the school claims
+// a link. Accept turns the links accepted (children appear); decline
+// removes them, blanks the matching email slot school-side and raises the
+// school's mismatched-email alert.
+export interface PendingLink {
+  schoolId: string;
+  schoolName: string | null;
+  offeredAt: string | null;
+  linkCount: number;
+}
+
+export function usePendingLinks() {
+  return useQuery<PendingLink[]>({
+    queryKey: ["parent-pending"],
+    queryFn: () => api.get("/api/parent-portal/pending"),
+    // The live cadence: a link offered while the app is open shows without a
+    // reload, and an answered card clears on every device promptly.
+    refetchInterval: POLL_LIVE,
+  });
+}
+
+export function useAnswerPendingLink() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ schoolId, verb }: { schoolId: string; verb: "accept" | "decline" }) =>
+      api.post(`/api/parent-portal/pending/${schoolId}/${verb}`),
+    onSuccess: () => {
+      // Both ways the card goes; an accept also surfaces the children.
+      queryClient.invalidateQueries({ queryKey: ["parent-pending"] });
+      queryClient.invalidateQueries({ queryKey: ["parent-children"] });
+    },
+  });
+}
+
 // Cancel-a-Ride (R14–R18): each children row carries today's parent-sourced
 // cancellation as {scope, withdrawable} | null (staff-sourced absences are
 // not cancellations and come through as null). `withdrawable` mirrors the

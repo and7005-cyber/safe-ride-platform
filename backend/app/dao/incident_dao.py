@@ -1,6 +1,9 @@
 from typing import Any
 
 from app.core.db import get_connection
+from app.core.errors import NotFoundError
+from app.core.scope import ParentScope, SchoolScope
+from app.dao.audit_dao import actor_display, record_audit
 
 # One sentence shape for every run-lifecycle row: "<where>: <what>. <detail>".
 # The office reads this feed by scanning it, and four new event types arriving
@@ -16,10 +19,23 @@ _LIFECYCLE_HEADLINE = {
 
 
 class IncidentDao:
-    def list_incidents(self) -> list[dict[str, Any]]:
-        with get_connection() as conn:
+    def list_incidents(self, scope: SchoolScope) -> list[dict[str, Any]]:
+        with get_connection(scope) as conn:
             rows = conn.execute(
-                "select * from live_incidents order by created_at desc"
+                """
+                select i.*,
+                       case when i.acknowledged_by is null then null
+                            when p.user_id is not null then 'SafeRide'
+                            else coalesce(u.full_name, u.email) end
+                           as acknowledged_by_display
+                from live_incidents i
+                left join app_users u on u.id = i.acknowledged_by
+                left join provider_accounts p
+                    on p.user_id = i.acknowledged_by and p.removed_at is null
+                where i.school_id = %s
+                order by i.created_at desc
+                """,
+                (scope.school_id,),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -31,15 +47,17 @@ class IncidentDao:
     # meaning anything.
     _NOT_LIFECYCLE = "lifecycle = false"
 
-    def unacknowledged_count(self) -> int:
-        with get_connection() as conn:
+    def unacknowledged_count(self, scope: SchoolScope) -> int:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 f"select count(*) as n from live_incidents "
-                f"where acknowledged = false and {self._NOT_LIFECYCLE}"
+                f"where acknowledged = false and {self._NOT_LIFECYCLE} "
+                f"and school_id = %s",
+                (scope.school_id,),
             ).fetchone()
         return row["n"]
 
-    def today_count(self) -> int:
+    def today_count(self, scope: SchoolScope) -> int:
         """Incidents raised today, in Africa/Nairobi terms.
 
         Both sides are converted to a Nairobi date. Comparing the timestamptz
@@ -49,19 +67,22 @@ class IncidentDao:
         is 21:00-00:00 UTC the day before — fell outside "today" and the office's
         tile silently undercounted for three hours every night.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 f"""
                 select count(*) as n from live_incidents
                 where (created_at at time zone 'Africa/Nairobi')::date
                       = (now() at time zone 'Africa/Nairobi')::date
                   and {self._NOT_LIFECYCLE}
-                """
+                  and school_id = %s
+                """,
+                (scope.school_id,),
             ).fetchone()
         return row["n"]
 
     def create_lifecycle_incident(
         self,
+        scope: SchoolScope,
         run_id: str,
         incident_type: str,
         detail: str | None = None,
@@ -97,17 +118,17 @@ class IncidentDao:
         new one the office has not been told about. Keying on the run alone
         would report it once and then go quiet exactly as it got worse.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             run = conn.execute(
                 """
-                select r.id, r.driver_id, r.bus_id, r.type,
+                select r.id, r.driver_id, r.bus_id, r.type, r.school_id,
                        b.name as bus_name, b.driver_name, rt.name as route_name
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
-                where r.id = %s
+                where r.id = %s and r.school_id = %s
                 """,
-                (run_id,),
+                (run_id, scope.school_id),
             ).fetchone()
             if not run:
                 return None
@@ -132,37 +153,28 @@ class IncidentDao:
                 """
                 insert into live_incidents
                     (run_id, driver_id, driver_name, bus_id, bus_name, type, description,
-                     run_type, lifecycle, acknowledged)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true)
+                     run_type, lifecycle, acknowledged, school_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true, %s)
                 returning *
                 """,
                 (run["id"], run["driver_id"], run["driver_name"], run["bus_id"],
-                 run["bus_name"], incident_type, description, run["type"]),
+                 run["bus_name"], incident_type, description, run["type"],
+                 run["school_id"]),
             ).fetchone()
         return dict(row) if row else None
 
-    def create_incident(self, data: dict) -> dict[str, Any]:
-        with get_connection() as conn:
-            row = conn.execute(
-                """
-                insert into live_incidents (driver_id, driver_name, bus_id, bus_name, type, description)
-                values (%(driver_id)s, %(driver_name)s, %(bus_id)s, %(bus_name)s, %(type)s, %(description)s)
-                returning *
-                """,
-                data,
-            ).fetchone()
-        return dict(row)
-
     def create_driver_incident(
         self,
-        driver_id: str,
+        scope: SchoolScope,
         incident_type: str,
         description: str,
         run_id: str | None = None,
         run_type: str | None = None,
         student_id: str | None = None,
     ) -> dict[str, Any]:
-        """Insert an incident reported by a driver, stamped with run context.
+        """Insert an incident reported by a driver, stamped with run context
+        and the driver's school (U7 — the scope IS the driver, and the bus
+        resolves through their own school).
 
         run_type persists the period even after the run row is deleted
         (run_id is ON DELETE SET NULL). A non-null student_id marks a
@@ -171,9 +183,11 @@ class IncidentDao:
         this layer never fans out to parents, so callers of the absent flow
         insert directly here without notify_incident.
         """
-        with get_connection() as conn:
+        driver_id = scope.user_id
+        with get_connection(scope) as conn:
             bus = conn.execute(
-                "select * from live_buses where driver_id = %s limit 1", (driver_id,)
+                "select * from live_buses where driver_id = %s and school_id = %s limit 1",
+                (driver_id, scope.school_id),
             ).fetchone()
             driver = conn.execute(
                 "select full_name from app_users where id = %s", (driver_id,)
@@ -182,17 +196,19 @@ class IncidentDao:
                 """
                 insert into live_incidents
                     (driver_id, driver_name, bus_id, bus_name, type, description,
-                     run_id, run_type, student_id)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s) returning *
+                     run_id, run_type, student_id, school_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning *
                 """,
                 (driver_id, driver["full_name"] if driver else None,
                  bus["id"] if bus else None, bus["name"] if bus else None,
-                 incident_type, description, run_id, run_type, student_id),
+                 incident_type, description, run_id, run_type, student_id,
+                 scope.school_id),
             ).fetchone()
         return dict(row)
 
     def create_cancellation_incident(
         self,
+        scope: ParentScope,
         student_id: str,
         description: str,
         bus_id: str | None,
@@ -212,30 +228,64 @@ class IncidentDao:
         passes the covered route's bus and the driver columns stay NULL; the
         acting parent is named only in the description. run_id stays NULL
         (the cancellation precedes any run); run_type carries the period,
-        scope-mapped (whole-day → NULL).
+        scope-mapped (whole-day → NULL). school_id is derived from the child
+        (U7) so the alert lands on exactly one school's list. ``scope`` is the
+        acting parent's ParentScope, threaded explicitly (U11) — the child's
+        school is one of its accepted schools, so the armed GUC covers the
+        stamped row.
         """
-        with get_connection() as conn:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 """
                 insert into live_incidents
                     (driver_id, driver_name, bus_id, bus_name, type, description,
-                     run_id, run_type, student_id)
-                values (null, null, %s, %s, 'cancellation', %s, null, %s, %s)
+                     run_id, run_type, student_id, school_id)
+                values (null, null, %s, %s, 'cancellation', %s, null, %s, %s,
+                        (select school_id from live_students where id = %s))
                 returning *
                 """,
-                (bus_id, bus_name, description, run_type, student_id),
+                (bus_id, bus_name, description, run_type, student_id, student_id),
             ).fetchone()
         return dict(row)
 
-    def acknowledge(self, incident_id: str, admin_id: str) -> dict[str, Any] | None:
-        with get_connection() as conn:
+    def acknowledge(
+        self, scope: SchoolScope, incident_id: str, actor: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        with get_connection(scope) as conn:
             row = conn.execute(
                 "update live_incidents set acknowledged=true, acknowledged_at=now(), acknowledged_by=%s "
-                "where id=%s returning *",
-                (admin_id, incident_id),
+                "where id=%s and school_id=%s returning *",
+                (actor.get("id"), incident_id, scope.school_id),
             ).fetchone()
-        return dict(row) if row else None
+            if row:
+                record_audit(
+                    conn,
+                    action="incident-acknowledged",
+                    actor=actor,
+                    scope=scope,
+                    resource_type="incident",
+                    resource_id=str(incident_id),
+                )
+        if not row:
+            # Foreign and nonexistent are indistinguishable by design (R3).
+            raise NotFoundError("Incident not found")
+        result = dict(row)
+        result["acknowledged_by_display"] = actor_display(actor, scope)
+        return result
 
-    def delete_incident(self, incident_id: str) -> None:
-        with get_connection() as conn:
-            conn.execute("delete from live_incidents where id = %s", (incident_id,))
+    def delete_incident(
+        self, scope: SchoolScope, incident_id: str, actor: dict[str, Any]
+    ) -> None:
+        # Director-only at the router (R8: alerts are deletable by the
+        # director only); a foreign incident answers 404 with nothing gone.
+        with get_connection(scope) as conn:
+            row = conn.execute(
+                "delete from live_incidents where id = %s and school_id = %s returning id",
+                (incident_id, scope.school_id),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Incident not found")
+            record_audit(
+                conn, action="incident-deleted", actor=actor, scope=scope,
+                resource_type="incident", resource_id=str(incident_id), detail={},
+            )

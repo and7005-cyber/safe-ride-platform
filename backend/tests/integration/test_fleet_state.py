@@ -26,7 +26,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_run
+from conftest import purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -44,8 +44,20 @@ def client():
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    response = client.post("/api/auth/login", json=ADMIN)
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT Fleet School", lat=-1.29, lng=36.82) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    response = client.post(
+        "/api/auth/login",
+        json={"email": sandbox["email"], "password": sandbox["password"]},
+    )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -59,7 +71,7 @@ def _bus(client, admin_headers, bus_id: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     """Throwaway bus + driver + school + morning route with one student.
 
     Seeded data holds none of the interesting states, and a completed run
@@ -91,13 +103,7 @@ def fleet(client, admin_headers):
     assert response.status_code in (200, 201), response.text
     created["bus"] = response.json()
 
-    response = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT Fleet School {marker}", "lat": -1.29, "lng": 36.82},
-        headers=admin_headers,
-    )
-    assert response.status_code in (200, 201), response.text
-    created["school"] = response.json()
+    created["school"] = {"id": sandbox["id"], "name": sandbox["name"]}
 
     response = client.post(
         "/api/fleet/routes",
@@ -130,7 +136,6 @@ def fleet(client, admin_headers):
         client.delete(f"/api/students/{created['student']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{created['route']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{created['bus']['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{created['school']['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{created['driver']['id']}", headers=admin_headers)
 
 

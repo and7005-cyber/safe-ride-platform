@@ -21,6 +21,8 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from conftest import purge_accounts, school_sandbox
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -50,8 +52,17 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT PinMap School", lat=-1.30, lng=36.80) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    return login(client, sandbox["email"], sandbox["password"])
 
 
 def pin_map_audit_rows(school_id: str) -> list[dict]:
@@ -81,16 +92,6 @@ def purge_pin_map_audit(school_id: str) -> None:
         )
 
 
-def make_school(client, headers, marker: str, suffix: str = "") -> dict:
-    created = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT PinMap School {suffix}{marker}", "lat": -1.30, "lng": 36.80},
-        headers=headers,
-    )
-    assert created.status_code == 200, created.text
-    return created.json()
-
-
 def make_student(client, headers, marker: str, i: int, school_id: str, **overrides) -> dict:
     """One student satisfying the two-parent invariant, stamped to the school.
     Pass home_lat/home_lng (+ provenance) for a placed pin; omit them AND the
@@ -109,13 +110,13 @@ def make_student(client, headers, marker: str, i: int, school_id: str, **overrid
     return created.json()
 
 
-def test_pin_map_returns_school_pins_and_audits_every_call(client, admin_headers):
+def test_pin_map_returns_school_pins_and_audits_every_call(client, admin_headers, sandbox):
     """R19 core: the school's pins come back split placed/unresolved with
     identity + provenance, and each call writes exactly one audit row carrying
     the actor's denormalized identity, the school, and the pin counts —
     two calls, two rows."""
     marker = uuid.uuid4().hex[:6]
-    school = make_school(client, admin_headers, marker)
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     students: list[dict] = []
     try:
         students.append(make_student(
@@ -162,7 +163,7 @@ def test_pin_map_returns_school_pins_and_audits_every_call(client, admin_headers
         assert len(rows) == 1, rows
         row = rows[0]
         assert row["actor_id"] is not None
-        assert row["actor_email"] == ADMIN["email"]
+        assert row["actor_email"] == sandbox["email"]
         assert row["actor_name"]  # denormalized, never blank
         assert str(row["school_id"]) == str(school["id"])
         assert row["detail"] == {"pin_count": 2, "unresolved_count": 1}
@@ -180,50 +181,50 @@ def test_pin_map_returns_school_pins_and_audits_every_call(client, admin_headers
         for s in students:
             client.delete(f"/api/students/{s['id']}", headers=admin_headers)
         purge_pin_map_audit(school["id"])
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_pin_map_never_shows_another_schools_students(client, admin_headers):
+def test_pin_map_never_shows_another_schools_students(client, admin_headers, sandbox):
     """The aggregate is school-scoped: school B's child appears in neither
-    tier of school A's pin map, and vice versa."""
+    tier of school A's pin map, and vice versa. Each school is its own
+    sandbox with its own staff — the post-U6 shape of "another school"."""
     marker = uuid.uuid4().hex[:6]
-    school_a = make_school(client, admin_headers, marker, suffix="A ")
-    school_b = make_school(client, admin_headers, marker, suffix="B ")
-    students: list[dict] = []
-    try:
-        kid_a = make_student(
-            client, admin_headers, marker, 0, school_a["id"],
-            home_lat=-1.2900, home_lng=36.8100,
-        )
-        kid_b = make_student(
-            client, admin_headers, marker, 1, school_b["id"],
-            home_lat=-1.3100, home_lng=36.7800,
-        )
-        students.extend([kid_a, kid_b])
+    school_a = {"id": sandbox["id"], "name": sandbox["name"]}
+    with school_sandbox("IT PinMap School B", lat=-1.31, lng=36.78) as sandbox_b:
+        headers_b = login(client, sandbox_b["email"], sandbox_b["password"])
+        students: list[tuple[dict, dict]] = []
+        try:
+            kid_a = make_student(
+                client, admin_headers, marker, 0, school_a["id"],
+                home_lat=-1.2900, home_lng=36.8100,
+            )
+            kid_b = make_student(
+                client, headers_b, marker, 1, sandbox_b["id"],
+                home_lat=-1.3100, home_lng=36.7800,
+            )
+            students.extend([(kid_a, admin_headers), (kid_b, headers_b)])
 
-        response = client.get(
-            "/api/students/pin-map", params={"school_id": school_a["id"]},
-            headers=admin_headers,
-        )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        listed = {p["id"] for p in body["placed"]} | {u["id"] for u in body["unresolved"]}
-        assert listed == {str(kid_a["id"])}
-        assert str(kid_b["id"]) not in listed
-    finally:
-        for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        for school in (school_a, school_b):
-            purge_pin_map_audit(school["id"])
-            client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            response = client.get(
+                "/api/students/pin-map", params={"school_id": school_a["id"]},
+                headers=admin_headers,
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            listed = {p["id"] for p in body["placed"]} | {u["id"] for u in body["unresolved"]}
+            assert listed == {str(kid_a["id"])}
+            assert str(kid_b["id"]) not in listed
+        finally:
+            for s, headers in students:
+                client.delete(f"/api/students/{s['id']}", headers=headers)
+            for school_id in (school_a["id"], sandbox_b["id"]):
+                purge_pin_map_audit(school_id)
 
 
-def test_pin_map_non_admin_is_403_and_writes_no_audit_row(client, admin_headers):
+def test_pin_map_non_admin_is_403_and_writes_no_audit_row(client, admin_headers, sandbox):
     """A refused access is not an access: a parent gets 403 (and an anonymous
     caller 401) with ZERO audit rows written — the trail records views of the
     aggregate, not attempts bounced at the door."""
     marker = uuid.uuid4().hex[:6]
-    school = make_school(client, admin_headers, marker)
+    school = {"id": sandbox["id"], "name": sandbox["name"]}
     parent_email = f"it-pinmap-parent-{marker}@test.local"
     signup = client.post(
         "/api/auth/signup",
@@ -247,18 +248,31 @@ def test_pin_map_non_admin_is_403_and_writes_no_audit_row(client, admin_headers)
 
         assert pin_map_audit_rows(school["id"]) == []
     finally:
-        client.delete(f"/api/accounts/parents/{parent_id}", headers=admin_headers)
+        purge_accounts(parent_id)
         purge_pin_map_audit(school["id"])
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
 
 
-def test_pin_map_unknown_school_is_a_clean_404(client, admin_headers):
-    """A school id nothing matches is refused up front as a lookup miss — 404,
-    the fleet-plan endpoints' convention — not answered with an empty audited
-    view of nowhere."""
-    response = client.get(
-        "/api/students/pin-map", params={"school_id": str(uuid.uuid4())},
-        headers=admin_headers,
-    )
-    assert response.status_code == 404, response.text
-    assert "school" in response.json()["detail"].lower()
+def test_pin_map_inaccessible_school_answers_404_and_audits_nothing(
+    client, admin_headers, sandbox
+):
+    """Post-U6 the school comes from the request scope: the legacy school_id
+    query parameter is accepted and IGNORED (the stray-school-id rule), and
+    naming a school the caller cannot access via X-School-Id answers the
+    not-found contract with ZERO audit rows written."""
+    ghost = str(uuid.uuid4())
+    try:
+        ignored = client.get(
+            "/api/students/pin-map", params={"school_id": ghost},
+            headers=admin_headers,
+        )
+        assert ignored.status_code == 200, ignored.text
+        assert str(ignored.json()["school_id"]) == str(sandbox["id"])
+
+        refused = client.get(
+            "/api/students/pin-map",
+            headers={**admin_headers, "X-School-Id": ghost},
+        )
+        assert refused.status_code == 404, refused.text
+        assert pin_map_audit_rows(ghost) == []
+    finally:
+        purge_pin_map_audit(sandbox["id"])

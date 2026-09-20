@@ -27,7 +27,7 @@ export function MapPicker({
    * Fired only for direct map interactions (click / marker drag), after
    * `onPick` — not for internal search-box picks, where the address is
    * already known. Lets the parent reverse-geocode the point into its own
-   * address field (StudentsPage); optional so other consumers (SchoolsPage)
+   * address field (StudentsPage); optional so other consumers (SchoolSettingsPage)
    * are unchanged.
    */
   onMapPick?: (lat: number, lng: number) => void;

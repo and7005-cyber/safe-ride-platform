@@ -10,12 +10,14 @@ Your school registers your child in SafeRide and records your **name, phone numb
 
 1. Open `https://saferidelive.co.ke/auth` in your phone's browser.
 2. Tap **Sign up** at the bottom of the card.
-3. Fill in your **full name**, your **email — it must be exactly the email you gave the school** — and a password (at least 6 characters). Under **"I am a"**, choose **Parent**.
-4. Submit. You are signed in immediately, and every child whose record carries your email is linked to your account automatically.
+3. Fill in your **full name**, your **email — it must be exactly the email you gave the school** — and a password (at least 6 characters). Signing up always creates a **parent** account — school staff and drivers get their accounts from their school, so there is no role to choose.
+4. Submit. You are signed in immediately. If your email is on file at **one school**, every child there whose record carries it is linked to your account automatically. If it is on file at **more than one school**, nothing links by itself — each school appears as a card asking to connect, and you approve them one by one (see [A school wants to connect](#a-school-wants-to-connect) below).
 
 If the Home screen says **"No children are linked to your account yet."**, the email you signed up with does not match what the school has on file. Contact the school office to add or correct your email on the child's record.
 
 Up to **two parents** can have accounts linked to each child — the school records a "Parent 1" and an optional "Parent 2". Both receive the same notifications.
+
+**One account is all you need**, even with children at different schools: once each school's link is in place, all your children appear side by side on Home, each with their own bus, stop and alerts.
 
 **Signing in later:** use the **Email & Password** tab (ignore the **Driver PIN** tab — that is for drivers). If you forget your password, tap **"Forgot password?"** and follow the emailed link. Reset links work **once** and expire quickly, so use the newest email if you request more than one.
 
@@ -33,6 +35,19 @@ Four tabs sit at the bottom of the screen:
 | **Profile** | Your details, your children, the notifications switch, sign out |
 
 The screens refresh themselves every few seconds — no need to pull or reload.
+
+## A school wants to connect
+
+Sometimes a card appears at the top of **Home** naming a school — for example *"Sunrise Academy wants to connect a student record to your account."* It means that school has entered your email address on a student's record, and because your account isn't linked to that school yet, SafeRide asks **you** before connecting anything.
+
+The card deliberately shows **no child details** — only the school's name and how many records it wants to connect. Until you accept, that school shares nothing with your app and your app shares nothing with it.
+
+- **Accept** if this is your child's school. The child (or children) appears on your Home screen immediately, with their bus, stop and notifications like any other.
+- **Not my child** if it isn't. The link is cleared, your email is removed from that student's record, and the school is alerted to re-check its records. You never see anything about the child, and nothing more comes from that school.
+
+This is how children at **different schools** end up in one account: each school you are not yet connected to arrives as a card for you to approve. Within a school where you already have a child, new siblings still link automatically — no card.
+
+If you expected a card and none appears, or you accepted and see no child, contact that school's office — the email on the student record is usually the mismatch.
 
 ## Home — today at a glance
 
@@ -121,13 +136,16 @@ A few rules apply, and the app explains each one when it stops you:
 
 ## Profile
 
-The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. The only controls here are the push notifications switch and **Sign Out**.
+The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. With children at more than one school, each child's details are managed by **that child's** school. The only controls here are the push notifications switch and **Sign Out**.
 
 ## Quick fixes
 
 | Problem | What to do |
 | --- | --- |
 | "No children are linked to your account yet." | Your sign-up email doesn't match the school's records. Ask the office to correct the email on the child's profile. |
+| A card from a school you don't recognise | Tap **"Not my child"**. Nothing about any child was shown to you, and the school is told to re-check the email it entered. |
+| You declined a school's card by mistake | Ask that school's office to re-enter your email on the child's record — a fresh card will appear for you to accept. |
+| A child at a second school isn't showing | Check Home for a pending card from that school and accept it. No card? Ask that school's office to check the email on the child's record. |
 | No push notifications arriving | Check Profile → the button should read "Disable Push Notifications" (meaning push is on). On iPhone, make sure you opened the app from the home-screen icon. Check the phone's notification settings for your browser. |
 | Password reset link says "Reset link invalid" | Links are single-use and expire quickly. Tap "Request a new reset link" and use the newest email. |
 | The arrival estimate seems off | It's approximate. Rely on the Track tab's stop progress and the "Bus approaching" alert. |

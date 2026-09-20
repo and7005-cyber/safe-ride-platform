@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SafeRide Multi-Tenant Schools — Implementation Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5e6b63;
+      --line: #d8e0da;
+      --panel: #ffffff;
+      --soft: #f4f7f5;
+      --brand: #196742;
+      --brand-soft: #e5f3eb;
+      --warn: #8a4f08;
+      --warn-soft: #fff4dd;
+      --danger: #8f2d2d;
+      --danger-soft: #fbeaea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #eef3ef;
+      color: var(--ink);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+    header {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(135deg, #f8fbf9, #e4f2e9);
+      box-shadow: 0 14px 40px rgba(23, 33, 27, .06);
+    }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 0 0 10px; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.035em; }
+    h2 { margin: 40px 0 14px; font-size: 25px; letter-spacing: -.02em; }
+    h3 { margin: 24px 0 9px; font-size: 18px; }
+    p { margin: 8px 0 14px; }
+    code { padding: 2px 5px; border-radius: 5px; background: #edf1ee; font-size: .9em; }
+    pre {
+      margin: 12px 0;
+      padding: 16px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #19241e;
+      color: #eaf5ee;
+    }
+    a { color: var(--brand); }
+    ul, ol { padding-left: 24px; }
+    li { margin: 5px 0; }
+    .eyebrow { color: var(--brand); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .lede { max-width: 900px; font-size: 19px; color: #33483b; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+    .pill { padding: 5px 10px; border: 1px solid #b9cec0; border-radius: 999px; background: rgba(255,255,255,.7); font-size: 13px; }
+    .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 4px; }
+    .toc a { padding: 7px 10px; border-radius: 8px; background: var(--panel); text-decoration: none; border: 1px solid var(--line); }
+    .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }
+    .card { grid-column: span 6; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+    .card.third { grid-column: span 4; }
+    .card.full { grid-column: 1 / -1; }
+    .callout { padding: 16px 18px; border-left: 4px solid var(--brand); border-radius: 8px; background: var(--brand-soft); }
+    .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+    .callout.danger { border-color: var(--danger); background: var(--danger-soft); }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 18px; background: var(--panel); }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--soft); font-size: 13px; }
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; align-items: stretch; margin: 16px 0; }
+    .flow > div { position: relative; padding: 14px; border: 1px solid #bcd0c2; border-radius: 10px; background: var(--panel); text-align: center; }
+    .flow > div:not(:last-child)::after { content: "→"; position: absolute; right: -14px; top: 50%; z-index: 2; color: var(--brand); font-weight: 800; }
+    .phase { margin: 14px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+    .phase h3 { margin: 0; padding: 14px 18px; background: var(--soft); }
+    .phase .body { padding: 6px 18px 16px; }
+    .gate { color: var(--brand); font-weight: 750; }
+    .small { color: var(--muted); font-size: 13px; }
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li::before { content: "□"; margin-right: 8px; color: var(--brand); font-weight: 800; }
+    .feedback { width: 100%; min-height: 170px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); font: inherit; }
+    @media (max-width: 820px) {
+      main { padding: 18px 14px 60px; }
+      header { padding: 22px; }
+      .card, .card.third { grid-column: 1 / -1; }
+      .flow { grid-template-columns: 1fr; }
+      .flow > div:not(:last-child)::after { content: "↓"; right: auto; top: auto; bottom: -17px; left: 50%; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">SafeRide architecture proposal · 22 August 2026</div>
+    <h1>Multi-Tenant Schools</h1>
+    <p class="lede">Add a customer tenant above schools, keep operations inside one active school, and enforce isolation through a server-resolved session context, scoped DAOs, relational constraints, and a database backstop.</p>
+    <div class="meta">
+      <span class="pill">Status: proposed for review</span>
+      <span class="pill">No application code changed</span>
+      <span class="pill">Msingi Bora becomes tenant #1</span>
+      <span class="pill">Second tenant blocked until isolation certification</span>
+    </div>
+  </header>
+
+  <nav class="toc" aria-label="Plan sections">
+    <a href="#outcome">Outcome</a>
+    <a href="#evidence">Current-state evidence</a>
+    <a href="#model">Recommended model</a>
+    <a href="#access">Access contract</a>
+    <a href="#data">Data model</a>
+    <a href="#flows">Journeys</a>
+    <a href="#delivery">Delivery phases</a>
+    <a href="#validation">Validation</a>
+    <a href="#rollout">Rollout</a>
+    <a href="#questions">Open decisions</a>
+  </nav>
+
+  <section id="outcome">
+    <h2>1. Outcome and recommendation</h2>
+    <div class="callout">
+      <strong>Recommendation:</strong> use a separate <code>tenants</code> table above <code>live_schools</code>. A tenant is the customer/legal workspace and owns the fleet; a school is an operating site with its own students, routes, runs, gate, and bell times. Staff requests operate inside one active school. Kuumbai enters an audited support context instead of impersonating a customer identity.
+    </div>
+    <p>The proposed <code>tenant_id</code> is necessary, but it is not sufficient by itself. Isolation fails if one list query forgets its predicate, if a relationship connects records from different tenants, or if an authorization claim stays valid after a role is removed. The security boundary therefore needs four cooperating layers:</p>
+    <ol>
+      <li>A server-owned session context with active tenant, active school, actor, and effective permissions.</li>
+      <li>DAO interfaces that cannot be called without an explicit trusted scope.</li>
+      <li>Database constraints that reject cross-tenant and cross-school relationships.</li>
+      <li>PostgreSQL row-level security as a final backstop before the second tenant is enabled.</li>
+    </ol>
+    <h3>Constraints and assumptions</h3>
+    <ul>
+      <li>Production remains one FastAPI/Lambda deployment and one PostgreSQL database; isolation is logical, not deployment-per-customer.</li>
+      <li>Msingi Bora is the only live customer, its existing school is the canonical first school, and all current production operational data belongs to it. The migration aborts if preflight disproves this.</li>
+      <li>SafeRide's existing bearer-session authentication and driver PIN flow remain; Firebase continues to serve push messaging only.</li>
+      <li>A tenant may own several schools, but ordinary staff use one tenant and one active school at a time in this release.</li>
+      <li>Buses and drivers belong to a tenant and may be assigned to at most one school at a time; school operations remain unmerged.</li>
+      <li>Parents remain global identities whose access follows explicit child links across tenant boundaries.</li>
+      <li>Automated owner invitations require a production email transport and verified sender that do not yet exist in this repository.</li>
+    </ul>
+    <div class="grid">
+      <article class="card third"><h3>Tenant</h3><p>Customer boundary, contact details, lifecycle state, tenant owner, aggregate health, fleet.</p></article>
+      <article class="card third"><h3>School</h3><p>Operating boundary, gate and bell times, director/coordinator assignments, students, routes, runs.</p></article>
+      <article class="card third"><h3>Provider</h3><p>Exists outside tenants; provisions, audits, and enters one selected tenant/school support context.</p></article>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <h2>2. Repository evidence and constraints</h2>
+    <table>
+      <thead><tr><th>Current fact</th><th>Evidence</th><th>Planning consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Authentication is not Firebase Authentication.</td><td><code>backend/app/core/auth.py</code>, <code>backend/app/services/auth_service.py</code>, and <code>backend/app/dao/auth_dao.py</code> resolve SafeRide bearer tokens from <code>auth_sessions</code>. Firebase settings in <code>backend/app/core/config.py</code> are for push messaging.</td><td>Do not add Firebase custom claims merely to carry tenancy. Extend the current session and membership model.</td></tr>
+        <tr><td>One user currently has one global role.</td><td><code>app_user_roles.user_id</code> is the primary key and roles are <code>admin</code>, <code>driver</code>, or <code>parent</code>.</td><td>Replace the single-role authorization assumption with memberships and capabilities; do not overload the role column.</td></tr>
+        <tr><td>Admin authorization is global.</td><td>API modules use <code>require_role("admin")</code>; <code>get_current_user</code> returns no tenant or school context.</td><td>Introduce a request context and permission guard before converting endpoints.</td></tr>
+        <tr><td>Many DAO reads and writes are unscoped.</td><td><code>fleet_dao.py</code>, <code>run_dao.py</code>, <code>student_live_dao.py</code>, <code>incident_dao.py</code>, and account DAOs query IDs or whole tables without tenant predicates.</td><td>Make scope non-optional in staff DAOs and certify every registered endpoint.</td></tr>
+        <tr><td>School ownership is incomplete and nullable.</td><td><code>004_live_model.sql</code> gives nullable school IDs to routes, students, and runs; buses receive an optional school claim only in <code>011_fleet_plans.sql</code>.</td><td>Add tenant ownership everywhere relevant, backfill school ownership for school records, then enforce non-null and composite constraints.</td></tr>
+        <tr><td>The original Supabase design contains useful safeguards.</td><td><code>backend/supabase-legacy/migrations/0001_initial_schema.sql</code> uses direct scope columns, composite foreign keys, indexes, and RLS.</td><td>Reuse the integrity pattern, adapted to the current FastAPI sessions and tenant-above-school hierarchy.</td></tr>
+        <tr><td>The frontend assumes one role and one school label.</td><td><code>frontend/src/lib/auth.tsx</code> exposes a singular role; <code>AdminLayout.tsx</code> has a hard-coded school card and clears cached data only on sign-out.</td><td>Return available authorities plus active context from <code>/api/auth/me</code>; clear scoped queries during switching.</td></tr>
+        <tr><td>Production migration is a one-shot SQL-file runner.</td><td><code>backend/app/migrate_handler.py</code> applies ordered migration files; the backend deployment currently updates the application before invoking migrations.</td><td>Use separate expand/backfill, scoped-code, and constraint/RLS releases. Do not combine the point-of-no-return with tenant #2 onboarding.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="model">
+    <h2>3. Candidate approaches</h2>
+    <table>
+      <thead><tr><th>Approach</th><th>Advantages</th><th>Problems</th><th>Decision</th></tr></thead>
+      <tbody>
+        <tr><td>School is the tenant</td><td>Fewest new concepts; close to the original Supabase model.</td><td>Cannot naturally represent one customer owning several schools or a tenant-level fleet and owner.</td><td>Rejected for the chosen product model.</td></tr>
+        <tr><td>Tenant above schools; database-backed context</td><td>Matches the customer/operator hierarchy, supports several schools, immediate revocation, active-school operation, and provider support.</td><td>Requires membership refactor, systematic DAO work, migration discipline, and new UI states.</td><td><strong>Recommended.</strong></td></tr>
+        <tr><td>Tenant and role in Firebase custom claims</td><td>Token contains coarse identity metadata.</td><td>Firebase Auth is not currently used; a singular claim conflicts with switching; claims remain stale until token refresh; immediate revocation and database membership checks still remain necessary.</td><td>Rejected as the authorization source of truth.</td></tr>
+        <tr><td>True customer-user impersonation</td><td>Provider sees exactly what a named user sees.</td><td>Destroys actor attribution, complicates consent and incident review, and can accidentally leak customer identity or privileges.</td><td>Rejected; use audited support context.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Chosen hierarchy</h3>
+    <div class="flow" aria-label="Tenant hierarchy">
+      <div><strong>Global identity</strong><br><span class="small">One app user</span></div>
+      <div><strong>Tenant membership</strong><br><span class="small">Owner</span></div>
+      <div><strong>Active tenant</strong><br><span class="small">Customer boundary</span></div>
+      <div><strong>School membership</strong><br><span class="small">Director / coordinator</span></div>
+      <div><strong>Active school</strong><br><span class="small">Operational boundary</span></div>
+    </div>
+    <p>Parents are the deliberate exception to active-school navigation: their access follows explicit parent/student links across schools and tenants. Drivers follow their tenant fleet membership and current school assignment. Provider users remain outside tenant memberships until they enter a recorded support session.</p>
+  </section>
+
+  <section id="access">
+    <h2>4. Request and permission contract</h2>
+
+    <h3>Trusted request context</h3>
+    <p>Replace the current role-only dependency with an immutable context resolved for every authenticated request:</p>
+    <pre>RequestContext
+  actor_user_id
+  mode: provider | tenant_staff | driver | parent
+  active_tenant_id: UUID | null
+  active_school_id: UUID | null
+  tenant_role: owner | null
+  school_role: director | coordinator | null
+  support_session_id: UUID | null
+  permissions: frozen set</pre>
+    <div class="flow" aria-label="Request authorization flow">
+      <div><strong>Bearer token</strong><br><span class="small">Hash and resolve session</span></div>
+      <div><strong>Context resolver</strong><br><span class="small">Load active IDs</span></div>
+      <div><strong>Membership check</strong><br><span class="small">Every request</span></div>
+      <div><strong>Permission guard</strong><br><span class="small">Action-level</span></div>
+      <div><strong>Scoped DAO</strong><br><span class="small">Predicates + DB policy</span></div>
+    </div>
+    <ul>
+      <li>The client never supplies a trusted <code>tenant_id</code> or <code>school_id</code> for ordinary CRUD. Create operations stamp them from <code>RequestContext</code>.</li>
+      <li>A switch endpoint necessarily receives a requested school ID. It validates tenant ownership and membership, updates the server-side session, and returns the accepted context. Other endpoints ignore or reject scope fields in payloads.</li>
+      <li>Membership removal is effective on the next request because the context resolver checks active membership instead of trusting a long-lived role claim.</li>
+      <li>Cross-tenant reads use scoped predicates and return <code>404</code>, avoiding confirmation that the foreign record exists. Permission failures inside the correct context return <code>403</code>.</li>
+    </ul>
+
+    <h3>DAO rule</h3>
+    <p>Do not add an optional <code>tenant_id=None</code> argument to existing DAOs. Create scoped repositories that require a validated scope at construction or on every method. Keep global/provider aggregate DAOs and parent/driver DAOs separate so there is no generic “unscoped admin” escape hatch.</p>
+    <pre># Shape, not implementation
+students = SchoolStudentDao(scope=request_context.school_scope)
+students.get(student_id)  # WHERE id = ? AND tenant_id = ? AND school_id = ?
+students.create(payload)  # tenant_id/school_id stamped from scope
+
+ProviderTenantHealthDao() # approved aggregate fields only; no student roster method</pre>
+
+    <h3>Permission matrix</h3>
+    <table>
+      <thead><tr><th>Actor</th><th>Read operations</th><th>Create/edit</th><th>Delete</th><th>Staff / tenant administration</th></tr></thead>
+      <tbody>
+        <tr><td>Tenant owner</td><td>Active school plus tenant summaries</td><td>All active-school and tenant setup actions</td><td>Operational deletes; not tenant deletion</td><td>Tenant settings, schools, directors, coordinators</td></tr>
+        <tr><td>School director</td><td>Assigned active school</td><td>All assigned-school actions</td><td>Operational deletes; not school/tenant deletion</td><td>Assigned-school staff</td></tr>
+        <tr><td>Coordinator</td><td>Assigned active school</td><td>All daily operational edits, including absence, run closure, plans, and messaging</td><td>None of the protected operational entities</td><td>None</td></tr>
+        <tr><td>Provider outside support</td><td>Tenant/school health and private audit</td><td>Create tenant; manage first-owner invitation</td><td>No child-data delete; tenant/school deletion only after retention rules exist</td><td>Provider-owned provisioning</td></tr>
+        <tr><td>Provider in support</td><td>Selected tenant and active school</td><td>Director-equivalent actions</td><td>Director-equivalent operational deletes</td><td>May assist with setup; every request privately audited</td></tr>
+        <tr><td>Driver</td><td>Current school assignment, bus, routes, own runs</td><td>Existing driver run actions</td><td>None</td><td>None</td></tr>
+        <tr><td>Parent</td><td>Explicitly linked children across tenants/schools</td><td>Existing parent actions</td><td>None</td><td>None</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="data">
+    <h2>5. Data model and integrity blueprint</h2>
+
+    <h3>New authority and onboarding tables</h3>
+    <table>
+      <thead><tr><th>Table</th><th>Purpose and important fields</th><th>Key constraints</th></tr></thead>
+      <tbody>
+        <tr><td><code>tenants</code></td><td><code>id</code>, display/customer name, contact email, status (<code>pending-owner</code>, <code>setup-required</code>, <code>active</code>, <code>suspended</code>), timestamps.</td><td>Name is not the security key; all relationships use UUID. Tenant deletion is not exposed until retention rules are approved.</td></tr>
+        <tr><td><code>tenant_memberships</code></td><td>User-to-tenant authority; v1 uses <code>owner</code>.</td><td>Unique user/tenant/role; at least one active owner; ordinary staff creation limited to one tenant in v1 without making that a permanent schema restriction.</td></tr>
+        <tr><td><code>school_memberships</code></td><td>User-to-school role: <code>director</code> or <code>coordinator</code>.</td><td>School and membership tenant must match; last-director rule protected transactionally.</td></tr>
+        <tr><td><code>provider_users</code></td><td>Kuumbai-created global provider authority.</td><td>No in-app public signup; provisioned operationally and audited.</td></tr>
+        <tr><td><code>tenant_invitations</code></td><td>Tenant, normalized email, owner role, token hash, expiry, sent/accepted/revoked timestamps, inviter.</td><td>Raw token never stored; single use; resend revokes the preceding token; acceptance is transactional and idempotent.</td></tr>
+        <tr><td><code>provider_support_sessions</code></td><td>Provider actor, selected tenant/school, reason, start/end, source session.</td><td>Only one active support context per auth session; suspended tenants reject entry except explicitly approved recovery paths.</td></tr>
+        <tr><td><code>provider_audit_events</code></td><td>Provider actor, support session, tenant/school, method/action, resource type/id, result, timestamp.</td><td>Provider-only reads; no raw request bodies, passwords, invitation tokens, or unnecessary child details.</td></tr>
+        <tr><td><code>school_activity_events</code></td><td>Tenant, school, actor kind, staff actor when applicable, action, resource type/id, result, timestamp.</td><td>Supports individual accountability and provider health's “last activity.” Provider writes use the school-visible actor kind <code>SafeRide</code>; the real provider identity remains only in <code>provider_audit_events</code>.</td></tr>
+        <tr><td><code>email_outbox</code></td><td>Transactional invitation/reset delivery independent of the HTTP transaction.</td><td>Idempotency key, retry state, safe template variables; delivery failure does not duplicate tenant or membership.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Existing table scope</h3>
+    <table>
+      <thead><tr><th>Scope</th><th>Tables / records</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td>Platform-global</td><td><code>app_users</code>, password/reset credentials, device push subscriptions, auth identity</td><td>Do not blindly add tenant IDs. Identity must support provider and parents across boundaries.</td></tr>
+        <tr><td>Session context</td><td><code>auth_sessions</code></td><td>Add nullable active tenant, active school, and support-session references. Validate them on every request.</td></tr>
+        <tr><td>Tenant-owned</td><td><code>live_schools</code>, <code>live_buses</code>, driver profile/membership</td><td><code>tenant_id NOT NULL</code>. Bus/driver school assignment is nullable when unassigned but may point only to a school in the same tenant.</td></tr>
+        <tr><td>School-owned</td><td><code>live_routes</code>, <code>live_students</code>, <code>live_runs</code>, <code>live_fleet_plans</code>, <code>live_student_absences</code>, <code>live_incidents</code>, <code>live_notifications</code>, school audit records</td><td>Both <code>tenant_id</code> and <code>school_id</code> required. This makes filtering direct and integrity testable.</td></tr>
+        <tr><td>Derived child / join</td><td>Route stops, student routes, run stops, run absences, run participation, communicated stops, parent/student links</td><td>Carry tenant and school scope or use composite foreign keys that make cross-boundary links unrepresentable. Prefer direct scope on high-volume/queryable tables.</td></tr>
+        <tr><td>Parent cross-boundary</td><td><code>live_parent_students</code></td><td>Store the linked student's tenant/school for integrity and school-admin filtering; parent reads begin with <code>parent_id</code> and return only linked children across scopes.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Constraint pattern</h3>
+    <ul>
+      <li>Add unique keys such as <code>(id, tenant_id)</code> or <code>(id, tenant_id, school_id)</code> on owned records.</li>
+      <li>Use composite foreign keys for route-to-bus, student-to-route, run-to-route/bus/driver, plan-to-school, and all snapshot/join tables.</li>
+      <li>Index the exact scoping prefix used by lists, for example <code>(tenant_id, school_id, created_at DESC)</code>.</li>
+      <li>Use database triggers or serialized transactions for the “last owner” and “last director” invariants; an application count followed by delete is race-prone.</li>
+      <li>Reject reassignment of a bus or driver while an active run or incompatible school-owned route references it.</li>
+    </ul>
+
+    <h3>Database backstop</h3>
+    <p>RLS is worth adding because the data concerns children and the current regression originated from losing database-enforced scope. It should be staged after scoped application queries, not used as a substitute for them:</p>
+    <ol>
+      <li>Create a non-owner runtime database role; keep schema migrations on an owner role. The current runtime credentials appear to use the database owner/master path, which can bypass ordinary RLS.</li>
+      <li>Open a transaction and use <code>SET LOCAL</code> for actor/mode/tenant/school so pooled connections cannot retain one request's scope.</li>
+      <li>Apply and force policies on tenant/school data. Parent and driver policies use their dedicated relationships, not staff active-school rules.</li>
+      <li>Expose provider health through a narrow aggregate query/function. Never set “no tenant” to mean “all rows.”</li>
+    </ol>
+  </section>
+
+  <section id="flows">
+    <h2>6. Primary journeys and UI states</h2>
+
+    <div class="grid">
+      <article class="card">
+        <h3>Provider creates tenant</h3>
+        <ol>
+          <li>Provider enters customer name and first-owner email.</li>
+          <li>API creates tenant, pending invitation, and email-outbox row in one transaction.</li>
+          <li>Provider sees pending delivery and can resend or revoke.</li>
+          <li>Owner follows the single-use link and receives owner membership. A new user sets profile/password; an existing SafeRide identity keeps its password and gains the membership without duplication.</li>
+          <li>Owner lands in resumable first-school setup.</li>
+        </ol>
+      </article>
+      <article class="card">
+        <h3>Owner creates first school</h3>
+        <ol>
+          <li>Create school name, contact details, gate, and bell times.</li>
+          <li>Automatically make the owner a director of that school.</li>
+          <li>Set it as the server session's active school.</li>
+          <li>Reuse existing fleet, driver, student, route, and plan screens in guided order.</li>
+        </ol>
+      </article>
+      <article class="card">
+        <h3>Owner switches school</h3>
+        <ol>
+          <li>Cancel in-flight client queries and show a neutral switching state.</li>
+          <li>POST the requested school to the context endpoint.</li>
+          <li>Server validates access and stores the accepted active school.</li>
+          <li>Clear school-scoped query caches and fetch the new school.</li>
+          <li>Never render old and new school data together.</li>
+        </ol>
+      </article>
+      <article class="card">
+        <h3>Provider assists safely</h3>
+        <ol>
+          <li>Provider chooses a tenant, school, and support reason.</li>
+          <li>Server creates a support session and active scoped context.</li>
+          <li>Console shows a persistent support banner and explicit exit.</li>
+          <li>All reads and writes are scoped and privately audited with the provider actor.</li>
+          <li>School-facing activity displays <strong>SafeRide</strong>.</li>
+        </ol>
+      </article>
+    </div>
+
+    <h3>Proposed API surfaces</h3>
+    <table>
+      <thead><tr><th>Surface</th><th>Endpoints</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Identity/context</td><td><code>GET /api/auth/me</code>, <code>POST /api/context/school</code></td><td><code>/me</code> returns available authorities, tenant, accessible schools, active school, permissions, and support state.</td></tr>
+        <tr><td>Provider</td><td><code>GET/POST /api/provider/tenants</code>, invitation resend/revoke, support enter/exit, provider audit</td><td>Provider router is the only cross-tenant surface and returns approved health/metadata, never rosters.</td></tr>
+        <tr><td>Tenant/schools</td><td>Tenant settings, school creation/settings, tenant/school membership endpoints</td><td>Owner/director permission split; school deletion stays unavailable until retention is decided.</td></tr>
+        <tr><td>Existing CRUD</td><td>Fleet, students, runs, plans, incidents, accounts, notifications</td><td>Keep URLs where practical; replace role-only guards and remove payload scope authority.</td></tr>
+        <tr><td>Parent/driver</td><td>Existing parent portal and driver run APIs</td><td>Retain UX, but derive tenant/school from parent links or driver assignment.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Health definition:</strong> the tenant list shows setup state, active-school count, total students, tenant-fleet buses/drivers, today's runs, and the latest operational write. Opening a tenant shows students, assigned buses/drivers, today's runs, and latest operational write per school. Health excludes provider list reads and invitation-delivery retries.</p>
+  </section>
+
+  <section id="delivery">
+    <h2>7. Implementation phases</h2>
+    <p>Each phase is separately reviewable and reversible at the code level. Do not activate another tenant before all gates through Phase 7 pass.</p>
+
+    <article class="phase">
+      <h3>Phase 0 — Inventory and test harness</h3>
+      <div class="body">
+        <ul>
+          <li>Generate an inventory from FastAPI's registered routes and classify each as public, provider-global, tenant-scoped, school-scoped, driver-scoped, or parent-linked.</li>
+          <li>Add two tenants with two schools and deliberately overlapping names to local/integration fixtures.</li>
+          <li>Create an isolation coverage manifest test that fails when a new non-public endpoint lacks a scope classification/test.</li>
+          <li>Capture current production-safe preflight SQL for counts, nullable school ownership, orphan relationships, duplicate emails, and the existing admin identity without printing sensitive values.</li>
+        </ul>
+        <p class="gate">Gate: every API route and persistent table has an explicit scope owner before schema work begins.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 1 — Additive tenancy schema</h3>
+      <div class="body">
+        <ul>
+          <li>Add tenant, membership, invitation, support-session, provider-audit, and email-outbox tables.</li>
+          <li>Add nullable tenant/school scope columns and supporting indexes to existing live-model tables.</li>
+          <li>Add active context columns to <code>auth_sessions</code>.</li>
+          <li>Do not change current runtime behavior yet; this migration must remain compatible with the existing production code.</li>
+        </ul>
+        <p class="gate">Gate: current certification suite passes unchanged against the expanded schema.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 2 — Msingi Bora backfill and integrity checks</h3>
+      <div class="body">
+        <ul>
+          <li>Abort unless production preflight matches the documented one-customer assumptions.</li>
+          <li>Create Msingi Bora tenant #1 and attach the existing school.</li>
+          <li>Attach all buses and drivers to the tenant; attach all school-owned and derived records to the canonical Msingi Bora school.</li>
+          <li>Convert the existing admin identity into tenant owner and school director without changing its password.</li>
+          <li>Backfill active context lazily for existing sessions with exactly one eligible tenant/school.</li>
+          <li>Validate row counts, relationship counts, null scope, and cross-scope anomaly queries. Persist the evidence.</li>
+        </ul>
+        <p class="gate">Gate: before/after counts match, all required scope is populated, and the existing admin still signs in.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 3 — Context resolver and permission engine</h3>
+      <div class="body">
+        <ul>
+          <li>Implement <code>RequestContext</code>, membership resolution, active-school switching, and action-level permissions.</li>
+          <li>Replace singular <code>role</code> assumptions in auth responses while maintaining a temporary compatibility mapping for existing frontend routes.</li>
+          <li>Implement immediate revocation and last-owner/director invariants transactionally.</li>
+          <li>Add dedicated provider, parent, and driver context paths.</li>
+        </ul>
+        <p class="gate">Gate: auth tests cover stale sessions, revoked membership, provider support, parent cross-tenant links, and driver assignment.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 4 — Scoped DAO and API conversion</h3>
+      <div class="body">
+        <ul>
+          <li>Convert endpoint families in narrow slices: schools/fleet → accounts/students → routes/plans → runs/incidents → notifications/push.</li>
+          <li>For each slice, require scope at the DAO boundary, stamp scope on create, predicate every read/write, validate relationships, and add two-tenant tests before moving on.</li>
+          <li>Remove driver self-signup; retain parent self-signup and global email linking.</li>
+          <li>Return non-enumerating not-found responses for foreign tenant/school IDs.</li>
+        </ul>
+        <p class="gate">Gate: the endpoint manifest proves every data-returning and mutating route has an isolation classification and passing coverage.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 5 — Provider, invitation, staff, and switching UI</h3>
+      <div class="body">
+        <ul>
+          <li>Add provider tenant health/list, create-tenant, invitation state, and audited support entry/exit.</li>
+          <li>Add activation page and resumable first-school setup.</li>
+          <li>Add active-school display/switcher, tenant settings, staff management, coordinator capability hiding, and support banner.</li>
+          <li>Include tenant and school keys in query-cache keys; cancel and clear scoped queries during switching.</li>
+          <li>Replace the hard-coded school identity in <code>AdminLayout.tsx</code>.</li>
+        </ul>
+        <p class="gate">Gate: Playwright proves provider onboarding, owner setup, school switching with no stale data, coordinator restrictions, and support-mode labeling/audit.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 6 — Composite constraints and non-null enforcement</h3>
+      <div class="body">
+        <ul>
+          <li>Add same-tenant/same-school composite foreign keys as <code>NOT VALID</code> where useful, validate them, then make required scope columns non-null.</li>
+          <li>Add indexes matching tenant/school list and time-order predicates.</li>
+          <li>Reject future orphan scope in the database, including bulk import and plan materialization paths.</li>
+        </ul>
+        <p class="gate">Gate: deliberate cross-tenant SQL relationship writes fail and the full application suite remains green.</p>
+      </div>
+    </article>
+
+    <article class="phase">
+      <h3>Phase 7 — RLS hardening and tenant #2 readiness</h3>
+      <div class="body">
+        <ul>
+          <li>Separate migration-owner and runtime database roles.</li>
+          <li>Set request context transaction-locally on pooled connections; add forced RLS policies for tenant/school data.</li>
+          <li>Implement narrow provider-health aggregation without an unscoped record API.</li>
+          <li>Run the full isolation, browser, migration, and operational certification against a clean two-tenant environment.</li>
+        </ul>
+        <p class="gate">Gate: only after this phase may Kuumbai send the first production invitation to tenant #2.</p>
+      </div>
+    </article>
+  </section>
+
+  <section id="validation">
+    <h2>8. Acceptance and validation plan</h2>
+
+    <h3>Automated isolation matrix</h3>
+    <table>
+      <thead><tr><th>Test class</th><th>Required proof</th></tr></thead>
+      <tbody>
+        <tr><td>List endpoints</td><td>Tenant A never returns tenant B IDs, names, counts, coordinates, nested relations, or pagination metadata.</td></tr>
+        <tr><td>Object reads</td><td>Requesting a tenant B ID while scoped to tenant A returns non-enumerating <code>404</code>.</td></tr>
+        <tr><td>Create</td><td>Payload tenant/school fields are rejected or ignored; server context owns the inserted scope.</td></tr>
+        <tr><td>Update/delete</td><td>Both resource ID and trusted scope appear in the write predicate; wrong scope changes zero rows.</td></tr>
+        <tr><td>Relationships</td><td>Cross-tenant bus/route, student/route, run/driver, plan/school, and parent-link writes fail at application and database layers.</td></tr>
+        <tr><td>Permissions</td><td>Coordinator direct HTTP deletes and staff endpoints return <code>403</code>; operational edits listed in the requirements succeed.</td></tr>
+        <tr><td>Revocation</td><td>A removed membership rejects the next request from an existing session and clears the client.</td></tr>
+        <tr><td>Switching</td><td>No old-school data is rendered after switch begins; delayed responses from the old context cannot repopulate the UI.</td></tr>
+        <tr><td>Provider</td><td>Support access is scoped; every request is privately attributed; school-facing actor output says <code>SafeRide</code>.</td></tr>
+        <tr><td>Parent/driver</td><td>Parent sees only linked children across boundaries; driver sees only current school assignment and cannot probe another tenant's run.</td></tr>
+        <tr><td>Migration</td><td>Counts, ownership, composite relations, credentials, and operational smoke flows match before/after records.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Project-native commands</h3>
+    <pre>cd backend &amp;&amp; pytest -q
+cd backend &amp;&amp; RUN_INTEGRATION=1 pytest tests/integration
+cd frontend &amp;&amp; npm run typecheck
+cd frontend &amp;&amp; npm test
+cd frontend &amp;&amp; npm run build
+cd frontend &amp;&amp; npm run e2e
+scripts/certify.sh</pre>
+    <p>During implementation, run the narrow endpoint/DAO tests first after each converted slice. Run <code>scripts/certify.sh</code>, browser proof, migration verification, and an independent correctness/security review before tenant #2 readiness is declared.</p>
+
+    <h3>Definition of done</h3>
+    <ul class="checklist">
+      <li>Every registered route has a declared scope and a corresponding automated isolation test.</li>
+      <li>No staff DAO can execute without a validated scope.</li>
+      <li>No required operational row has a null tenant or school after migration.</li>
+      <li>Database constraints reject cross-boundary relationships.</li>
+      <li>RLS runs under a non-owner runtime role and survives pooled-connection tests.</li>
+      <li>Msingi Bora data counts and the existing login are preserved.</li>
+      <li>Provider invite, setup, support, audit, and neutral actor labeling pass end to end.</li>
+      <li>School switching has browser proof showing no stale data.</li>
+      <li>Coordinator direct-request tests prove destructive actions are refused.</li>
+      <li>The second tenant remains disabled until all gates pass.</li>
+    </ul>
+  </section>
+
+  <section id="rollout">
+    <h2>9. Production rollout and rollback</h2>
+    <ol>
+      <li><strong>Preflight:</strong> take a recoverable database snapshot; record table counts and anomaly queries; confirm the canonical Msingi Bora school and admin mapping.</li>
+      <li><strong>Expand release:</strong> deploy additive schema only. Current application remains compatible.</li>
+      <li><strong>Backfill release:</strong> create tenant #1, populate scope and memberships, and verify. Do not onboard tenant #2.</li>
+      <li><strong>Scoped application release:</strong> deploy server enforcement, then frontend context/provider/setup features. Existing one-school sessions default safely.</li>
+      <li><strong>Constraint/RLS release:</strong> enforce integrity and database backstop; rerun full certification.</li>
+      <li><strong>Pilot verification:</strong> Msingi Bora director signs in with existing credentials; separate coordinator account performs the daily flow; Kuumbai enters and exits support mode.</li>
+      <li><strong>Tenant #2:</strong> only now create and send the first production owner invitation.</li>
+    </ol>
+    <div class="callout danger">
+      <strong>Rollback boundary:</strong> additive tables/columns should remain in place during rollback. Before tenant #2 has data, code can roll back to the preceding one-tenant version if necessary. After any second-tenant data exists, an unscoped application version must never be redeployed; rollback may target only a previously certified tenant-aware version. This is the point of no return.
+    </div>
+  </section>
+
+  <section>
+    <h2>10. Risks and mitigations</h2>
+    <table>
+      <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>One forgotten DAO predicate leaks data.</td><td>Non-optional scoped DAO interfaces, endpoint coverage manifest, composite constraints, and RLS.</td></tr>
+        <tr><td>Pooled DB connection retains a preceding request's context.</td><td>Use transactions and <code>SET LOCAL</code>; test connection reuse across alternating tenants.</td></tr>
+        <tr><td>Frontend shows cached school A data after switching to B.</td><td>Cancel requests, clear scoped caches, include scope in query keys, and hold a neutral switching state until the server confirms.</td></tr>
+        <tr><td>Role removal does not affect an existing token.</td><td>Resolve membership on every request and revoke invalid active context; do not trust cached role claims.</td></tr>
+        <tr><td>Provider activity loses attribution.</td><td>Never mint a customer identity; retain provider actor and support-session IDs in private audit events.</td></tr>
+        <tr><td>Migration silently assigns orphan records incorrectly.</td><td>Preflight assertions, canonical-school mapping, abort-on-anomaly SQL, before/after counts, and snapshot rollback.</td></tr>
+        <tr><td>Old code is restored after multiple tenants exist.</td><td>Formal point-of-no-return gate and retain a known-good tenant-aware release artifact.</td></tr>
+        <tr><td>Email failure leaves onboarding inconsistent.</td><td>Create tenant/invitation/outbox atomically; make delivery retryable and invitation resend/revoke explicit.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="questions">
+    <h2>11. Remaining decisions before implementation</h2>
+    <div class="callout warn">
+      The product architecture is settled. These operational/compliance decisions should be answered before their corresponding implementation slices, and the first two before invitation/staff work starts.
+    </div>
+    <ol>
+      <li>Which production transactional-email transport and verified sender identity will send owner invitations?</li>
+      <li>Should school directors/coordinators retain the original temporary-password creation flow, or reuse the email invitation flow?</li>
+      <li>What are the tenant/school deletion, retention, export, and recovery rules? Until decided, destructive provider controls stay disabled.</li>
+      <li>How long are provider audit events retained, and must Kuumbai be able to export them?</li>
+    </ol>
+    <h3>Explicit non-goals for this release</h3>
+    <ul>
+      <li>Ordinary staff tenant switching or membership in several tenants through the UI.</li>
+      <li>Merged operational maps, rosters, or run views across schools or tenants.</li>
+      <li>Buses or drivers serving several schools concurrently.</li>
+      <li>Self-service tenant signup, billing, subscription enforcement, branding, organizations above tenants, or multi-campus school records.</li>
+      <li>Firebase Authentication migration.</li>
+      <li>True user impersonation.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>12. Feedback area</h2>
+    <p>Copy this block back into the task with corrections. Approval of the plan does not authorize push, deploy, migration, or production changes.</p>
+    <textarea class="feedback" aria-label="Feedback template">Decision: approve / revise
+
+Corrections:
+-
+
+Answers to remaining decisions:
+1. Email transport/sender:
+2. School staff onboarding:
+3. Deletion/retention:
+4. Provider audit retention/export:
+
+Implementation authorization, if any:
+-</textarea>
+  </section>
+</main>
+</body>
+</html>

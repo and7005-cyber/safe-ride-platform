@@ -18,6 +18,8 @@ import uuid
 import httpx
 import pytest
 
+from conftest import school_sandbox
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
@@ -189,34 +191,33 @@ def test_student_assignment_flips_flag_and_regenerates(client, admin_headers):
 
 # School updates ------------------------------------------------------------------
 
-def test_school_update_leaves_custom_stops_intact(client, admin_headers):
+def test_school_update_leaves_custom_stops_intact(client):
     """Editing a school regenerates its routes' stops — but a custom route is
-    skipped: saved stops, flag and polyline all survive (R18)."""
+    skipped: saved stops, flag and polyline all survive (R18). Runs in its
+    own sandbox school (post-U6 the settings PUT edits the ACTIVE school and
+    fans regeneration over every route of it — the seeded school must not be
+    renamed or moved by a test)."""
     marker = uuid.uuid4().hex[:6]
-    school = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT PlanSchool {marker}", "lat": -1.33, "lng": 36.83},
-        headers=admin_headers,
-    ).json()
-    route = _save_custom_route(client, admin_headers, marker, school_id=school["id"]).json()
-    try:
-        updated = client.put(
-            f"/api/fleet/schools/{school['id']}",
-            json={"name": f"IT PlanSchool {marker} v2", "lat": -1.34, "lng": 36.84},
-            headers=admin_headers,
-        )
-        assert updated.status_code == 200, updated.text
+    with school_sandbox(f"IT PlanSchool {marker}", lat=-1.33, lng=36.83) as sandbox:
+        headers = login(client, sandbox["email"], sandbox["password"])
+        route = _save_custom_route(client, headers, marker, school_id=sandbox["id"]).json()
+        try:
+            updated = client.put(
+                f"/api/fleet/schools/{sandbox['id']}",
+                json={"name": f"IT PlanSchool {marker} v2", "lat": -1.34, "lng": 36.84},
+                headers=headers,
+            )
+            assert updated.status_code == 200, updated.text
 
-        listed = _get_route(client, admin_headers, route["id"])
-        assert listed["custom_stops"] is True
-        assert listed["polyline"] == POLYLINE
-        assert [s["name"] for s in listed["route_stops"]] == [
-            f"IT Corner A {marker}", f"IT Corner B {marker}", f"IT Gate {marker}",
-        ]
-        assert all(s["student_id"] is None for s in listed["route_stops"])
-    finally:
-        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            listed = _get_route(client, headers, route["id"])
+            assert listed["custom_stops"] is True
+            assert listed["polyline"] == POLYLINE
+            assert [s["name"] for s in listed["route_stops"]] == [
+                f"IT Corner A {marker}", f"IT Corner B {marker}", f"IT Gate {marker}",
+            ]
+            assert all(s["student_id"] is None for s in listed["route_stops"])
+        finally:
+            client.delete(f"/api/fleet/routes/{route['id']}", headers=headers)
 
 
 # Stop-edit endpoints -------------------------------------------------------------

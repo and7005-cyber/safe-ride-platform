@@ -1,5 +1,6 @@
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +12,22 @@ const COMPOSE_FILE = "docker-compose.local.yml";
 export const ADMIN = { email: "admin@test.com", password: "test1234." };
 export const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
 export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "0322" };
+
+// Tenancy identities (U1): seeded staff/provider accounts for the
+// multi-tenant suites (backend/db/seeds/003_local_snapshot.sql tail).
+export const DIRECTOR_A = { email: "director.a@saferide.test", password: "Test1234" };
+export const COORDINATOR_A = { email: "coordinator.a@saferide.test", password: "Test1234" };
+export const DIRECTOR_B = { email: "director.b@saferide.test", password: "Test1234" };
+export const PROVIDER = { email: "provider@kuumbai.test", password: "Test1234" };
+export const DRIVER_B = { email: "driver.b@saferide.test", password: "Test1234", pin: "7391" };
+export const SCHOOL_A_ID = "5cae0000-0000-0000-0000-000000000001";
+export const SCHOOL_B_ID = "5cae0000-0000-0000-0000-000000000002";
+export const SEED_B = {
+  school: "IT Second School",
+  bus: "IT Bus B",
+  student: "Ben Barasa",
+  route: "IT B — Morning",
+};
 
 export const SEED = {
   school: "Greenfield Academy",
@@ -73,11 +90,20 @@ async function cachedToken(
 export async function signInAs(
   page: Page,
   account: { email: string; password: string },
+  schoolId?: string,
 ): Promise<void> {
   const token = await cachedToken(page.request, account.email, account.password);
   // Any app-origin document, so localStorage is writable before the app boots.
   await page.goto("/auth");
   await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  // Tenancy (U1/U12): the active school is per-tab, in sessionStorage. With
+  // no school given, clear any value a previous sign-in left in this tab so
+  // each signInAs starts the account's own first-landing flow.
+  if (schoolId) {
+    await page.evaluate((s) => sessionStorage.setItem("saferide-school", s), schoolId);
+  } else {
+    await page.evaluate(() => sessionStorage.removeItem("saferide-school"));
+  }
   await page.goto("/");
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }
@@ -87,6 +113,9 @@ export async function signInAsDriver(page: Page): Promise<void> {
   const token = await cachedDriverToken(page.request);
   await page.goto("/auth");
   await page.evaluate((t) => localStorage.setItem("saferide-token", t), token);
+  // Driver routes 403 the school header by design (U12): make sure no staff
+  // test's per-tab school survives into this driver session.
+  await page.evaluate(() => sessionStorage.removeItem("saferide-school"));
   await page.goto("/driver");
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }
@@ -145,6 +174,13 @@ export function authHeaders(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
+/** Staff-surface API calls carry the school scope explicitly (U12): with more
+ * than one membership the server refuses to guess, so fixture/setup requests
+ * name their school the same way the app does. */
+export function schoolHeaders(token: string, schoolId: string) {
+  return { Authorization: `Bearer ${token}`, "X-School-Id": schoolId };
+}
+
 /** End the demo driver's active run if one exists (idempotent cleanup). */
 /**
  * Delete a run out-of-band. **Teardown only** — never inside an assertion.
@@ -184,6 +220,78 @@ function psql(sql: string): void {
     ],
     { stdio: "ignore", cwd: REPO_ROOT },
   );
+}
+
+/** Like psql() but returns rows (tuples-only, unaligned; one row per line). */
+function psqlQuery(sql: string): string {
+  return execFileSync(
+    "docker",
+    [
+      "compose", "-f", COMPOSE_FILE, "exec", "-T", "db",
+      "psql", "-U", "saferide", "-d", "saferide", "-tA", "-c", sql,
+    ],
+    { encoding: "utf8", cwd: REPO_ROOT },
+  ).trim();
+}
+
+// Fixture schools in SQL (U12): the app can no longer create or delete a
+// school (creation moved to the provider console, deletion is out of scope),
+// so suites that need a disposable school — admin-plan.spec.ts applies whole
+// fleet plans and must never rewrite the seeded schools' routes — provision
+// one directly in the database, with a director membership for the acting
+// account, and drop it the same way. This mirrors purgeRun/backdateRun: the
+// tests must not get a product-level backdoor around a real product rule.
+
+/** Create a school row plus an active director membership for `email`. */
+export function sqlCreateSchool(name: string, email: string): { id: string; code: string } {
+  const id = crypto.randomUUID();
+  const code = `E2P-${id.slice(0, 8)}`;
+  psql(
+    `insert into live_schools (id, name, address, phone, lat, lng, morning_bell, afternoon_bell, code) ` +
+      `values ('${id}', '${name.replace(/'/g, "''")}', '1 Plan Lane, Nairobi', '+254700000001', ` +
+      `-1.3005, 36.8102, '07:30', '15:30', '${code}')`,
+  );
+  psql(
+    `insert into school_memberships (user_id, school_id, role, state, accepted_at) ` +
+      `select id, '${id}', 'director', 'active', now() from app_users ` +
+      `where lower(email) = lower('${email.replace(/'/g, "''")}')`,
+  );
+  return { id, code };
+}
+
+/** Drop a fixture school and every school-stamped row it still owns. */
+export function sqlDropSchool(schoolId: string): void {
+  const tables = [
+    "live_notifications",
+    "live_communicated_stops",
+    "live_incidents",
+    "live_student_absences",
+    "live_parent_students",
+    "live_student_routes",
+    "live_route_stops",
+    "run_stops",
+    "run_absences",
+    "run_participation",
+    "live_runs",
+    "live_routes",
+    "live_students",
+    "live_buses",
+    "school_memberships",
+    "provider_support_sessions",
+  ];
+  for (const table of tables) {
+    psql(`delete from ${table} where school_id = '${schoolId}'`);
+  }
+  // Fleet-plan documents cascade with the school row (011).
+  psql(`delete from live_schools where id = '${schoolId}'`);
+}
+
+/** Ids of fixture schools left behind by aborted runs (sweep support). */
+export function sqlListSchoolIdsByName(prefix: string): string[] {
+  const out = psqlQuery(
+    `select id from live_schools where name like '${prefix.replace(/'/g, "''")}%'`,
+  );
+  return out ? out.split("\n").map((line) => line.trim()).filter(Boolean) : [];
 }
 
 export async function endActiveRun(request: APIRequestContext): Promise<void> {
@@ -276,6 +384,104 @@ export async function clearCancellationState(
 
 export function uniqueName(prefix: string): string {
   return `${prefix} ${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`;
+}
+
+// TOTP for the provider suite (U13) ------------------------------------------
+//
+// RFC 6238 over the base32 key captured at the enrolment screen: 30-second
+// steps, HMAC-SHA1, 6 digits — exactly backend/app/core/totp.py. The server
+// accepts the current step ±1 and REFUSES any step at or below the last
+// accepted one (replay guard), so a burst of code-verified actions inside one
+// 30-second window would fail with "Invalid code". TotpMinter tracks the
+// last minted step and, when the next unconsumed step is still outside the
+// server's window, waits for the clock — tests must mint every code through
+// one shared minter instance.
+
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+export const TOTP_STEP_SECONDS = 30;
+
+export function base32Decode(input: string): Buffer {
+  const clean = input.toUpperCase().replace(/=+$/, "").replace(/\s+/g, "");
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const ch of clean) {
+    const index = BASE32_ALPHABET.indexOf(ch);
+    if (index === -1) throw new Error(`Invalid base32 character: ${ch}`);
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+/** The RFC 6238/4226 code for one step counter (SHA-1, 6 digits). */
+export function totpCodeAtStep(secretB32: string, step: number): string {
+  const message = Buffer.alloc(8);
+  message.writeBigUInt64BE(BigInt(step));
+  const digest = createHmac("sha1", base32Decode(secretB32)).update(message).digest();
+  const offset = digest[digest.length - 1]! & 0x0f;
+  const binary =
+    ((digest[offset]! & 0x7f) << 24) |
+    (digest[offset + 1]! << 16) |
+    (digest[offset + 2]! << 8) |
+    digest[offset + 3]!;
+  return String(binary % 1_000_000).padStart(6, "0");
+}
+
+export function currentTotpStep(atMs: number = Date.now()): number {
+  return Math.floor(atMs / 1000 / TOTP_STEP_SECONDS);
+}
+
+export class TotpMinter {
+  private lastStep = -1;
+
+  constructor(private readonly secretB32: string) {}
+
+  /** The next acceptable code: never re-mints a consumed step; waits out the
+   * clock when the next unconsumed step is still ahead of the ±1 window. */
+  async next(): Promise<string> {
+    for (;;) {
+      const now = currentTotpStep();
+      const target = Math.max(now, this.lastStep + 1);
+      if (target <= now + 1) {
+        this.lastStep = target;
+        return totpCodeAtStep(this.secretB32, target);
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+    }
+  }
+}
+
+// Provider seed-state restoration (U13). The seeded provider
+// (provider@kuumbai.test) ships UNENROLLED with a fixed salt; the provider
+// suite enrols it. The product path back is the reset-totp peer action —
+// provider.spec.ts ends by exercising exactly that — and these SQL helpers
+// are the crash-proof backstop (a run that dies mid-suite must not leave the
+// account enrolled under a secret nobody knows), the same philosophy as
+// purgeRun: idempotent restoration of seeded state, not a backdoor around a
+// product rule.
+
+const PROVIDER_USER_ID = "a0000000-0000-0000-0000-000000000014";
+
+/** Restore the seeded provider to its unenrolled seed state (fixed salt). */
+export function sqlResetProviderTotp(): void {
+  psql(
+    `update provider_accounts set totp_enrolled_at = null, totp_last_step = null, ` +
+      `totp_salt = '5eedab1e5a17c0ffee00000000000001', totp_pepper_key = null ` +
+      `where user_id = '${PROVIDER_USER_ID}'`,
+  );
+}
+
+/** Close any support session a crashed run left open for the seeded provider. */
+export function sqlEndProviderSupportSessions(): void {
+  psql(
+    `update provider_support_sessions set ended_at = now(), end_cause = 'revoked' ` +
+      `where provider_user_id = '${PROVIDER_USER_ID}' and ended_at is null`,
+  );
 }
 
 // Admin dialog forms render <Label>Text</Label><Input/> without htmlFor, so

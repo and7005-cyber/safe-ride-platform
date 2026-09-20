@@ -23,7 +23,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_accounts, purge_run, school_sandbox
 
 # Cross-module helper reuse, as the other integration suites do — parent
 # accounts are created through signup, not by naming an email on a student.
@@ -46,14 +46,26 @@ def client():
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    response = client.post("/api/auth/login", json=ADMIN)
+def sandbox():
+    # Post-U6 world provisioning: school creation left the staff API, so the
+    # throwaway school (plus its own single-membership admin, whose header
+    # fallback lands there) is provisioned by the conftest sandbox instead.
+    with school_sandbox("IT LC School", lat=-1.29, lng=36.82) as sb:
+        yield sb
+
+
+@pytest.fixture(scope="module")
+def admin_headers(client, sandbox):
+    response = client.post(
+        "/api/auth/login",
+        json={"email": sandbox["email"], "password": sandbox["password"]},
+    )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
 @pytest.fixture(scope="module")
-def fleet(client, admin_headers):
+def fleet(client, admin_headers, sandbox):
     """Throwaway bus + driver + school + morning route with one linked parent."""
     marker = uuid.uuid4().hex[:6]
     created: dict = {"marker": marker}
@@ -79,13 +91,7 @@ def fleet(client, admin_headers):
     assert response.status_code in (200, 201), response.text
     created["bus"] = response.json()
 
-    response = client.post(
-        "/api/fleet/schools",
-        json={"name": f"IT LC School {marker}", "lat": -1.29, "lng": 36.82},
-        headers=admin_headers,
-    )
-    assert response.status_code in (200, 201), response.text
-    created["school"] = response.json()
+    created["school"] = {"id": sandbox["id"], "name": sandbox["name"]}
 
     response = client.post(
         "/api/fleet/routes",
@@ -121,9 +127,8 @@ def fleet(client, admin_headers):
         client.delete(f"/api/students/{created['student']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/routes/{created['route']['id']}", headers=admin_headers)
         client.delete(f"/api/fleet/buses/{created['bus']['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{created['school']['id']}", headers=admin_headers)
         client.delete(f"/api/accounts/drivers/{created['driver']['id']}", headers=admin_headers)
-        client.delete(f"/api/accounts/parents/{created['parent_id']}", headers=admin_headers)
+        purge_accounts(created['parent_id'])
 
 
 def _driver_headers(client, fleet):
@@ -487,15 +492,19 @@ def test_the_today_counter_uses_the_nairobi_day(client, admin_headers, fleet):
     with psycopg.connect(DSN, autocommit=True) as pg:
         pg.execute(
             """
-            insert into live_incidents (bus_id, bus_name, type, description, created_at)
+            insert into live_incidents (bus_id, bus_name, type, description,
+                                        school_id, created_at)
             values (
                 %s, %s, 'other', 'IT nairobi-boundary probe',
+                -- U7: the tile is per school now, so the staged row must carry
+                -- the bus's school or it is invisible to the scoped count.
+                (select school_id from live_buses where id = %s),
                 -- 00:30 on today's Nairobi date, expressed as the instant it is.
                 ((now() at time zone 'Africa/Nairobi')::date + time '00:30')
                     at time zone 'Africa/Nairobi'
             )
             """,
-            (fleet["bus"]["id"], fleet["bus"]["name"]),
+            (fleet["bus"]["id"], fleet["bus"]["name"], fleet["bus"]["id"]),
         )
     try:
         after = client.get("/api/incidents/today-count", headers=admin_headers).json()["count"]

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 // `Map` aliased so the ES `Map` keeps its meaning (RouteMapPreview precedent).
 import { AdvancedMarker, Map as GoogleMap } from "@vis.gl/react-google-maps";
@@ -11,15 +11,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { api } from "@/lib/apiClient";
+import { schoolKeyFor } from "@/lib/queries";
+import { useActiveSchoolId } from "@/lib/school";
 
 // U11 — every home pin for a school on one map for eyeball QA (R19). The data
 // comes ONLY from the audited GET /api/students/pin-map: each fetch writes a
@@ -71,28 +65,22 @@ function PinFace({ pin }: { pin: PinMapPin }) {
 export function StudentsPinMap({
   open,
   onOpenChange,
-  schools,
-  initialSchoolId,
   onEditStudent,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  schools: Array<{ id: string; name: string }>;
-  /** The page's school filter, adopted each time the dialog opens. */
-  initialSchoolId: string | null;
   /** Deep-link to the student's normal edit dialog (PlacePicker inside) so a
    * mis-placed pin is fixed in the regular flow, not a parallel one. */
   onEditStudent: (studentId: string) => void;
 }) {
-  const [schoolId, setSchoolId] = useState<string>("none");
-  useEffect(() => {
-    if (open) setSchoolId(initialSchoolId ?? "none");
-  }, [open, initialSchoolId]);
+  // U12: the pins are the ACTIVE school's — the picker is gone and the
+  // request scope (X-School-Id) names the school.
+  const schoolId = useActiveSchoolId();
 
   const { data, isFetching, error } = useQuery({
-    queryKey: ["student-pin-map", schoolId],
-    queryFn: () => api.get("/api/students/pin-map", { school_id: schoolId }),
-    enabled: open && schoolId !== "none",
+    queryKey: schoolKeyFor(schoolId, "student-pin-map"),
+    queryFn: ({ signal }) => api.get("/api/students/pin-map", undefined, { signal }),
+    enabled: open && Boolean(schoolId),
     // Access is audit-logged server-side: staleTime 0 makes every open of the
     // dialog a fresh (audited) read, and window-focus refetches are off so no
     // audit row is ever written for a view nobody deliberately requested.
@@ -120,26 +108,9 @@ export function StudentsPinMap({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="max-w-xs space-y-2">
-          <Label>School</Label>
-          <Select value={schoolId} onValueChange={setSchoolId}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="none">— Pick a school —</SelectItem>
-              {schools.map((s) => (
-                <SelectItem key={s.id} value={s.id}>
-                  {s.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {schoolId === "none" ? (
+        {!schoolId ? (
           <p className="text-sm text-muted-foreground">
-            Pick a school to load its pins.
+            No active school in this tab.
           </p>
         ) : (
           <div className="space-y-2">

@@ -706,15 +706,16 @@ def _fleet_drift_problems(conn, school_id: str, loads: list[tuple[str, str, int]
 
     ``loads`` is ``[(bus_id, name_as_documented, planned_children)]``; the
     returned problem strings name the bus for: no longer exists, capacity
-    now below the planned load, out of service, re-claimed by another
-    school. Empty list = no drift."""
+    now below the planned load, out of service. Buses are school-owned since
+    U6 (no shared pool, no re-claiming), so the lookup is scoped by
+    ``school_id`` and a bus of another school simply "no longer exists" —
+    never naming anyone else. Empty list = no drift."""
     bus_rows: dict[str, dict] = {}
     if loads:
         for r in conn.execute(
-            "select b.*, s.name as claiming_school_name from live_buses b "
-            "left join live_schools s on s.id = b.school_id "
-            "where b.id = any(%s::uuid[])",
-            ([bid for bid, _name, _load in loads],),
+            "select b.* from live_buses b "
+            "where b.id = any(%s::uuid[]) and b.school_id = %s",
+            ([bid for bid, _name, _load in loads], school_id),
         ).fetchall():
             bus_rows[str(r["id"])] = r
     problems: list[str] = []
@@ -730,9 +731,6 @@ def _fleet_drift_problems(conn, school_id: str, loads: list[tuple[str, str, int]
             )
         if row["availability"] != "in-service":
             problems.append(f"bus {row['name']} is {row['availability']}")
-        if row["school_id"] is not None and str(row["school_id"]) != str(school_id):
-            claiming = row["claiming_school_name"] or "another school"
-            problems.append(f"bus {row['name']} was re-claimed by {claiming}")
     return problems
 
 

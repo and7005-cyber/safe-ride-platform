@@ -1,3 +1,5 @@
+import datetime as dt
+
 from app.core.config import get_settings
 from app.core.errors import BadRequestError, UnauthorizedError
 from app.core.security import (
@@ -11,7 +13,9 @@ from app.core.validation import clean_email
 from app.dao.account_dao import AccountDao
 from app.dao.auth_dao import AuthDao
 
-SIGNUP_ROLES = {"driver", "parent"}
+# U8: driver self-signup is retired — drivers are created by their school
+# (R5); the public form only ever creates parent accounts now.
+SIGNUP_ROLES = {"parent"}
 
 
 class AuthService:
@@ -32,6 +36,9 @@ class AuthService:
                 "email": user["email"],
                 "fullName": user.get("full_name"),
                 "role": user.get("role"),
+                # The client must know right away whether it may leave the
+                # change-password screen (R30); everything else comes from /me.
+                "mustChangePassword": bool(user.get("must_change_password")),
             },
         }
 
@@ -44,7 +51,7 @@ class AuthService:
 
     def signup(self, email: str, password: str, full_name: str, role: str) -> dict:
         if role not in SIGNUP_ROLES:
-            raise BadRequestError("Role must be driver or parent")
+            raise BadRequestError("Role must be parent")
         email = clean_email(email, required=True)
         if self.dao.get_user_by_email(email):
             raise BadRequestError("An account with this email already exists")
@@ -60,7 +67,21 @@ class AuthService:
         user = self.dao.get_user_by_email(email)
         if not user or not verify_password(password, user["password_hash"]):
             raise UnauthorizedError("Invalid email or password")
+        if user.get("disabled_at") is not None:
+            # Indistinguishable from a bad password: no account enumeration.
+            raise UnauthorizedError("Invalid email or password")
+        if user.get("must_change_password") and self._temporary_password_expired(user):
+            # An unused temporary password dies after 72 hours (R6); the same
+            # generic refusal — its holder asks the director for a new one.
+            raise UnauthorizedError("Invalid email or password")
         return self._issue_session(user)
+
+    @staticmethod
+    def _temporary_password_expired(user: dict) -> bool:
+        expires_at = user.get("temporary_password_expires_at")
+        if expires_at is None:
+            return False
+        return expires_at <= dt.datetime.now(dt.timezone.utc)
 
     def pin_login(self, pin: str) -> dict:
         matches = [
@@ -91,5 +112,20 @@ class AuthService:
         record = self.dao.consume_reset_token(hash_session_token(token))
         if not record:
             raise BadRequestError("Reset link is invalid or has expired")
-        self.dao.update_password(record["user_id"], hash_password(password))
+        # set_user_password also clears the temporary-password flag and voids
+        # any remaining reset/pre-auth tokens — a reset IS a user-set password.
+        self.dao.set_user_password(record["user_id"], hash_password(password))
         self.dao.revoke_all_sessions(record["user_id"])
+
+    def change_password(self, user: dict, current_password: str, new_password: str) -> None:
+        """Authenticated password change (R29): ALWAYS requires the correct
+        current password — a forced first change included — then rotates the
+        hash, clears the temporary flag/expiry, and revokes every session but
+        the calling one."""
+        credentials = self.dao.get_user_credentials(user["id"])
+        if not credentials or not verify_password(
+            current_password, credentials["password_hash"]
+        ):
+            raise BadRequestError("Current password is incorrect")
+        self.dao.set_user_password(user["id"], hash_password(new_password))
+        self.dao.revoke_other_sessions(user["id"], user["session_id"])

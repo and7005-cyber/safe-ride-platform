@@ -14,8 +14,11 @@ class FakePushDao:
         self.stops: list[dict] = []
         self.dedup_keys: set[tuple] = set()
 
+    # The fakes mirror the real DAO's post-U7 signatures: every school-owned
+    # read takes an optional threaded scope (ignored here — no DB), and the
+    # feed insert accepts the school stamp.
     def insert_notification(self, user_id, type, title, body, student_id=None, run_id=None,
-                            bus_id=None, run_type=None):
+                            bus_id=None, run_type=None, school_id=None, scope=None):
         if run_id is not None and student_id is not None:
             key = (user_id, run_id, student_id, type)
             if key in self.dedup_keys:
@@ -24,21 +27,21 @@ class FakePushDao:
         row = {
             "user_id": user_id, "type": type, "title": title, "body": body,
             "student_id": student_id, "run_id": run_id, "bus_id": bus_id,
-            "run_type": run_type,
+            "run_type": run_type, "school_id": school_id,
         }
         self.notifications.append(row)
         return row
 
-    def parents_of_students(self, student_ids):
+    def parents_of_students(self, student_ids, scope=None):
         out = []
         for sid in student_ids:
             out.extend(self.parents.get(sid, []))
         return out
 
-    def parents_of_bus(self, bus_id):
+    def parents_of_bus(self, bus_id, scope=None):
         return self.bus_parents
 
-    def students_on_run(self, run_id, include_absent=False):
+    def students_on_run(self, run_id, include_absent=False, scope=None):
         # Mirrors the real DAO since U3: recipients are filtered on the derived
         # status, not the stored column. A child the office recorded as
         # unaccounted must not receive run notifications — their parents hear
@@ -48,13 +51,13 @@ class FakePushDao:
         silent = {"absent", "unaccounted"}
         return [s for s in self.run_students if s["display_status"] not in silent]
 
-    def remaining_student_stops(self, run_id, stops_completed):
+    def remaining_student_stops(self, run_id, stops_completed, scope=None):
         return [s for s in self.stops if s["stop_order"] > stops_completed]
 
-    def students_at_stop(self, run_id, stop_order):
+    def students_at_stop(self, run_id, stop_order, scope=None):
         return [s for s in self.stops if s["stop_order"] == stop_order]
 
-    def bus_name(self, bus_id):
+    def bus_name(self, bus_id, scope=None):
         return "Kifaru Bus"
 
     def fcm_tokens_for_users(self, user_ids):

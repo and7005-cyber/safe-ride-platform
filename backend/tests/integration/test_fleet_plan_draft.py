@@ -1,42 +1,35 @@
-"""Fleet-plan drafting (U4): fleet confirmation, draft generation, one-open-
-draft, scrub-on-supersede/discard, and read-only-against-live-routes.
+"""Fleet-plan drafting (U4, rescoped by U6): fleet confirmation, draft
+generation, one-open-draft, scrub-on-supersede/discard, and
+read-only-against-live-routes.
 
-Run with the stack up (scripts/start-local.sh):
+Runs the real ``create_app()`` in-process (TestClient) against the local
+database — the U6 conversion under test lives in this working tree. Buses are
+school-owned since U6, so confirm-fleet no longer claims or releases
+anything: it validates that every selected bus is the active school's own
+(a foreign or unknown id answers 404) and reports per-bus notices
+(multi-trip excluded, depot-less proceeds).
 
-    RUN_INTEGRATION=1 ../.venv/bin/python -m pytest tests/integration/test_fleet_plan_draft.py -q
-
-Covers F1/AE1: confirm-fleet claims buses and reports per-bus notices
-(multi-trip excluded, depot-less proceeds); a cross-school claim 409s naming
-the bus and the claiming school; a draft yields mirrored AM/PM pairs with
-per-child ride seconds and a populated basis, flagged degraded on the keyless
-stack; drafting never touches live routes; a second draft 409s unless
-superseded, and superseding/discarding scrubs the old row's document/basis
-payloads (metadata kept — verified with a read-only SQL peek, since scrubbed
-rows deliberately have no API surface); a coordinate-less student is listed
-unplaceable with 'unresolved address'; non-admins are refused everywhere.
-
-Entities are 'IT '-prefixed and cleaned up in finally blocks — the tests
-create their own school/buses/students and never depend on seed data.
+The sandbox school comes from ``temp_school`` (SQL — school creation has no
+staff API surface any more) with the seeded director.a granted a director
+membership there; every request pins it via ``X-School-Id``. Entities are
+'IT '-prefixed and cleaned up in finally blocks; plan rows are purged per
+test (superseded/discarded rows have no API surface by design).
 """
 
 import os
 import uuid
 
-import httpx
 import psycopg
 import pytest
 
-from conftest import DSN
+from conftest import DIRECTOR_A, DSN, TEST_PASSWORD, temp_school
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
     reason="needs the local stack; set RUN_INTEGRATION=1",
 )
 
-BASE = os.environ.get("INTEGRATION_API_URL", "http://localhost:9001")
-
-ADMIN = {"email": "admin@test.com", "password": "test1234."}
-PARENT = {"email": "and7005@gmail.com", "password": "Test1234"}
+PARENT_EMAIL = "and7005@gmail.com"
 
 SCHOOL_LAT, SCHOOL_LNG = -1.3000, 36.8000
 # Two loose geographic clusters east and west of the school, so a two-bus
@@ -48,37 +41,40 @@ DEPOT_WEST = (-1.320, 36.770)
 
 
 @pytest.fixture(scope="module")
-def client():
-    with httpx.Client(base_url=BASE, timeout=30) as c:
-        yield c
+def client(in_process_db):
+    from fastapi.testclient import TestClient
 
+    from app.main import create_app
 
-def login(client: httpx.Client, email: str, password: str) -> dict:
-    response = client.post("/api/auth/login", json={"email": email, "password": password})
-    assert response.status_code == 200, response.text
-    token = response.json()["token"]
-    return {"Authorization": f"Bearer {token}"}
+    return TestClient(create_app())
 
 
 @pytest.fixture(scope="module")
-def admin_headers(client):
-    return login(client, ADMIN["email"], ADMIN["password"])
+def school(in_process_db):
+    marker = uuid.uuid4().hex[:6]
+    with temp_school(
+        f"IT PlanSchool {marker}", lat=SCHOOL_LAT, lng=SCHOOL_LNG
+    ) as school_id:
+        yield school_id
+
+
+def login(client, email: str, password: str = TEST_PASSWORD) -> dict:
+    response = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
+@pytest.fixture(scope="module")
+def staff_headers(client, school):
+    return {**login(client, DIRECTOR_A), "X-School-Id": school}
 
 
 @pytest.fixture(scope="module")
 def parent_headers(client):
-    return login(client, PARENT["email"], PARENT["password"])
+    return login(client, PARENT_EMAIL)
 
 
 # --- builders -----------------------------------------------------------------
-
-def _make_school(client, headers, marker: str, **overrides) -> dict:
-    payload = {"name": f"IT PlanSchool {marker}", "lat": SCHOOL_LAT, "lng": SCHOOL_LNG}
-    payload.update(overrides)
-    created = client.post("/api/fleet/schools", json=payload, headers=headers)
-    assert created.status_code == 200, created.text
-    return created.json()
-
 
 def _make_bus(client, headers, name: str, *, capacity: int | None = None,
               depot: tuple[float, float] | None = None) -> dict:
@@ -92,14 +88,14 @@ def _make_bus(client, headers, name: str, *, capacity: int | None = None,
     return created.json()
 
 
-def _make_student(client, headers, marker: str, i: int, school_id: str,
-                  home: tuple[float, float] | None, route_ids: list[str] | None = None) -> dict:
+def _make_student(client, headers, marker: str, i: int,
+                  home: tuple[float, float] | None,
+                  route_ids: list[str] | None = None) -> dict:
     payload = {
         "name": f"IT Plan Kid {marker} {i}",
         "parent_name": f"IT Plan Parent {marker} {i}",
         "parent_phone": f"+2547110001{i:02d}",
         "parent_email": f"it-fp-{marker}-{i}@test.local",
-        "school_id": school_id,
         "route_ids": route_ids or [],
     }
     if home is not None:
@@ -110,15 +106,13 @@ def _make_student(client, headers, marker: str, i: int, school_id: str,
     return created.json()
 
 
-def _confirm(client, headers, school_id: str, bus_ids: list[str]) -> httpx.Response:
+def _confirm(client, headers, bus_ids: list[str]):
     return client.post(
-        "/api/fleet-plans/confirm-fleet",
-        json={"school_id": school_id, "bus_ids": bus_ids},
-        headers=headers,
+        "/api/fleet-plans/confirm-fleet", json={"bus_ids": bus_ids}, headers=headers
     )
 
 
-def _draft(client, headers, school_id: str, **kw) -> httpx.Response:
+def _draft(client, headers, school_id: str, **kw):
     return client.post(
         "/api/fleet-plans/draft", json={"school_id": school_id, **kw}, headers=headers
     )
@@ -141,6 +135,13 @@ def _plan_db_row(plan_id: str) -> dict:
         ).fetchone()
 
 
+def _purge_plans(school_id: str) -> None:
+    """Teardown only: drop the sandbox school's plan rows so the next test's
+    one-open-draft rule starts clean."""
+    with psycopg.connect(DSN, autocommit=True) as pg:
+        pg.execute("delete from live_fleet_plans where school_id = %s", (school_id,))
+
+
 def _leg_student_ids(bus_doc: dict, leg: str) -> set[str]:
     return {
         s["id"] for stop in bus_doc["legs"][leg]["stops"] for s in stop["students"]
@@ -149,30 +150,31 @@ def _leg_student_ids(bus_doc: dict, leg: str) -> set[str]:
 
 # --- confirm-fleet ------------------------------------------------------------
 
-def test_confirm_fleet_claims_buses_and_reports_notices(client, admin_headers):
-    """Claiming sets live_buses.school_id; a depot-less bus proceeds with a
-    notice; a bus with a trip_index-2 route is claimed but excluded from
-    drafting with a named notice; deselecting releases the claim."""
+def test_confirm_fleet_validates_selection_and_reports_notices(
+    client, school, staff_headers
+):
+    """U6 contract: no claims, no releases — a depot-less bus proceeds with a
+    notice, a multi-trip bus is excluded from drafting with a named notice,
+    deselection changes nothing, and an id the school does not own (foreign
+    and nonexistent are indistinguishable) answers 404."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus_a = _make_bus(client, admin_headers, f"IT PlanBus A {marker}", depot=DEPOT_EAST)
-    bus_b = _make_bus(client, admin_headers, f"IT PlanBus B {marker}")  # no depot
-    bus_c = _make_bus(client, admin_headers, f"IT PlanBus C {marker}", depot=DEPOT_WEST)
+    bus_a = _make_bus(client, staff_headers, f"IT PlanBus A {marker}", depot=DEPOT_EAST)
+    bus_b = _make_bus(client, staff_headers, f"IT PlanBus B {marker}")  # no depot
+    bus_c = _make_bus(client, staff_headers, f"IT PlanBus C {marker}", depot=DEPOT_WEST)
     chain_route = client.post(
         "/api/fleet/routes",
         json={"name": f"IT Plan Chain {marker}", "type": "morning",
               "bus_id": bus_c["id"], "trip_index": 2},
-        headers=admin_headers,
+        headers=staff_headers,
     ).json()
     try:
         confirmed = _confirm(
-            client, admin_headers, school["id"], [bus_a["id"], bus_b["id"], bus_c["id"]]
+            client, staff_headers, [bus_a["id"], bus_b["id"], bus_c["id"]]
         )
         assert confirmed.status_code == 200, confirmed.text
         body = confirmed.json()
-
-        for bus in (bus_a, bus_b, bus_c):
-            assert _bus_row(client, admin_headers, bus["id"])["school_id"] == school["id"]
+        assert body["school_id"] == school
+        assert body["released"] == []
 
         by_id = {b["id"]: b for b in body["buses"]}
         assert by_id[bus_a["id"]]["excluded_from_drafting"] is False
@@ -186,70 +188,47 @@ def test_confirm_fleet_claims_buses_and_reports_notices(client, admin_headers):
         assert notices[bus_c["id"]]["kind"] == "multi-trip-excluded"
         assert bus_c["name"] in notices[bus_c["id"]]["message"]
 
-        # Deselecting B and C releases their claims; A keeps its own.
-        reconfirmed = _confirm(client, admin_headers, school["id"], [bus_a["id"]])
+        # Deselection releases nothing: ownership is creation-time now.
+        reconfirmed = _confirm(client, staff_headers, [bus_a["id"]])
         assert reconfirmed.status_code == 200, reconfirmed.text
-        assert set(reconfirmed.json()["released"]) == {bus_b["id"], bus_c["id"]}
-        assert _bus_row(client, admin_headers, bus_a["id"])["school_id"] == school["id"]
-        assert _bus_row(client, admin_headers, bus_b["id"])["school_id"] is None
-        assert _bus_row(client, admin_headers, bus_c["id"])["school_id"] is None
-    finally:
-        client.delete(f"/api/fleet/routes/{chain_route['id']}", headers=admin_headers)
+        assert reconfirmed.json()["released"] == []
         for bus in (bus_a, bus_b, bus_c):
-            client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            assert _bus_row(client, staff_headers, bus["id"])["school_id"] == school
 
-
-def test_confirm_fleet_cross_school_claim_conflicts(client, admin_headers):
-    """A bus claimed by school A refuses school B's confirm with a 409 naming
-    the bus and the claiming school."""
-    marker = uuid.uuid4().hex[:6]
-    school_a = _make_school(client, admin_headers, f"{marker}-A")
-    school_b = _make_school(client, admin_headers, f"{marker}-B")
-    bus = _make_bus(client, admin_headers, f"IT PlanBus X {marker}", depot=DEPOT_EAST)
-    try:
-        first = _confirm(client, admin_headers, school_a["id"], [bus["id"]])
-        assert first.status_code == 200, first.text
-
-        second = _confirm(client, admin_headers, school_b["id"], [bus["id"]])
-        assert second.status_code == 409, second.text
-        detail = second.json()["detail"]
-        assert bus["name"] in detail, detail
-        assert school_a["name"] in detail, detail
-        # The failed confirm changed nothing: the claim still belongs to A.
-        assert _bus_row(client, admin_headers, bus["id"])["school_id"] == school_a["id"]
+        # An id this school does not own: 404, whole selection refused.
+        phantom = str(uuid.uuid4())
+        refused = _confirm(client, staff_headers, [bus_a["id"], phantom])
+        assert refused.status_code == 404, refused.text
+        assert phantom in refused.json()["detail"]
     finally:
-        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school_a['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school_b['id']}", headers=admin_headers)
+        client.delete(f"/api/fleet/routes/{chain_route['id']}", headers=staff_headers)
+        for bus in (bus_a, bus_b, bus_c):
+            client.delete(f"/api/fleet/buses/{bus['id']}", headers=staff_headers)
 
 
 # --- draft generation ---------------------------------------------------------
 
-def test_draft_happy_path_two_mirrored_pairs(client, admin_headers):
+def test_draft_happy_path_two_mirrored_pairs(client, school, staff_headers):
     """AE1 shape: two capacity-legal mirrored pairs, per-child ride seconds
     present, basis snapshot populated, degraded flagged on the keyless stack."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus_a = _make_bus(client, admin_headers, f"IT PlanBus A {marker}",
+    bus_a = _make_bus(client, staff_headers, f"IT PlanBus A {marker}",
                       capacity=4, depot=DEPOT_EAST)
-    bus_b = _make_bus(client, admin_headers, f"IT PlanBus B {marker}",
+    bus_b = _make_bus(client, staff_headers, f"IT PlanBus B {marker}",
                       capacity=4, depot=DEPOT_WEST)
     students = []
     try:
         for i, home in enumerate(EAST_HOMES + WEST_HOMES):
-            students.append(
-                _make_student(client, admin_headers, marker, i, school["id"], home)
-            )
+            students.append(_make_student(client, staff_headers, marker, i, home))
         assert _confirm(
-            client, admin_headers, school["id"], [bus_a["id"], bus_b["id"]]
+            client, staff_headers, [bus_a["id"], bus_b["id"]]
         ).status_code == 200
 
-        drafted = _draft(client, admin_headers, school["id"], seed=42)
+        drafted = _draft(client, staff_headers, school, seed=42)
         assert drafted.status_code == 200, drafted.text
         plan = drafted.json()
         assert plan["status"] == "draft"
-        assert plan["school_id"] == school["id"]
+        assert plan["school_id"] == school
         assert plan["solver_seed"] == 42
         assert plan["degraded"] is True  # keyless stack: haversine matrix
 
@@ -280,7 +259,6 @@ def test_draft_happy_path_two_mirrored_pairs(client, admin_headers):
         assert seen_am == all_ids  # every child rides, exactly once per leg
 
         basis = plan["basis"]
-        assert basis["school"]["name"] == school["name"]
         assert {s["id"] for s in basis["students"]} == all_ids
         assert all(s["plannable"] for s in basis["students"])
         assert all(s["name"].startswith("IT Plan Kid") for s in basis["students"])
@@ -291,8 +269,8 @@ def test_draft_happy_path_two_mirrored_pairs(client, admin_headers):
 
         # GET current returns the stored draft as-is; no applied/previous yet.
         current = client.get(
-            "/api/fleet-plans/current", params={"school_id": school["id"]},
-            headers=admin_headers,
+            "/api/fleet-plans/current", params={"school_id": school},
+            headers=staff_headers,
         )
         assert current.status_code == 200, current.text
         assert current.json()["draft"]["id"] == plan["id"]
@@ -300,37 +278,35 @@ def test_draft_happy_path_two_mirrored_pairs(client, admin_headers):
         assert current.json()["previous"] is None
     finally:
         for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus_a['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus_b['id']}", headers=admin_headers)
-        # Deleting the school cascades its plan rows (011 FK).
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus_a['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus_b['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
-def test_draft_excludes_multi_trip_bus_and_keeps_depotless(client, admin_headers):
-    """A claimed multi-trip bus is absent from the drafted document and named
-    in the basis exclusion list; a depot-less bus drafts normally."""
+def test_draft_excludes_multi_trip_bus_and_keeps_depotless(
+    client, school, staff_headers
+):
+    """A multi-trip bus is absent from the drafted document and named in the
+    basis exclusion list; a depot-less bus drafts normally."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus_chain = _make_bus(client, admin_headers, f"IT PlanBus M {marker}", depot=DEPOT_EAST)
-    bus_plain = _make_bus(client, admin_headers, f"IT PlanBus N {marker}", capacity=10)
+    bus_chain = _make_bus(client, staff_headers, f"IT PlanBus M {marker}", depot=DEPOT_EAST)
+    bus_plain = _make_bus(client, staff_headers, f"IT PlanBus N {marker}", capacity=10)
     chain_route = client.post(
         "/api/fleet/routes",
         json={"name": f"IT Plan Chain {marker}", "type": "morning",
               "bus_id": bus_chain["id"], "trip_index": 2},
-        headers=admin_headers,
+        headers=staff_headers,
     ).json()
     students = []
     try:
         for i, home in enumerate(EAST_HOMES[:2]):
-            students.append(
-                _make_student(client, admin_headers, marker, i, school["id"], home)
-            )
+            students.append(_make_student(client, staff_headers, marker, i, home))
         assert _confirm(
-            client, admin_headers, school["id"], [bus_chain["id"], bus_plain["id"]]
+            client, staff_headers, [bus_chain["id"], bus_plain["id"]]
         ).status_code == 200
 
-        drafted = _draft(client, admin_headers, school["id"])
+        drafted = _draft(client, staff_headers, school)
         assert drafted.status_code == 200, drafted.text
         plan = drafted.json()
 
@@ -345,42 +321,41 @@ def test_draft_excludes_multi_trip_bus_and_keeps_depotless(client, admin_headers
         assert [b["id"] for b in plan["basis"]["fleet"]] == [bus_plain["id"]]
     finally:
         for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/routes/{chain_route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus_chain['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus_plain['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/routes/{chain_route['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus_chain['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus_plain['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
-def test_draft_is_read_only_against_live_routes(client, admin_headers):
+def test_draft_is_read_only_against_live_routes(client, school, staff_headers):
     """R8: generation never alters live routes — the school's route payload
     (rows, ordering, times, flags) is byte-identical before and after."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus = _make_bus(client, admin_headers, f"IT PlanBus L {marker}", depot=DEPOT_EAST)
+    bus = _make_bus(client, staff_headers, f"IT PlanBus L {marker}", depot=DEPOT_EAST)
     route = client.post(
         "/api/fleet/routes",
         json={"name": f"IT Plan Live {marker}", "type": "morning",
-              "bus_id": bus["id"], "school_id": school["id"]},
-        headers=admin_headers,
+              "bus_id": bus["id"], "school_id": school},
+        headers=staff_headers,
     ).json()
     students = []
     try:
         for i, home in enumerate(EAST_HOMES[:3]):
             students.append(
-                _make_student(client, admin_headers, marker, i, school["id"], home,
+                _make_student(client, staff_headers, marker, i, home,
                               route_ids=[route["id"]])
             )
-        assert _confirm(client, admin_headers, school["id"], [bus["id"]]).status_code == 200
+        assert _confirm(client, staff_headers, [bus["id"]]).status_code == 200
 
         def route_snapshot() -> dict:
-            routes = client.get("/api/fleet/routes", headers=admin_headers).json()
+            routes = client.get("/api/fleet/routes", headers=staff_headers).json()
             return next(r for r in routes if r["id"] == route["id"])
 
         before = route_snapshot()
         assert len(before["route_stops"]) > 0  # the baseline is a real route
 
-        drafted = _draft(client, admin_headers, school["id"])
+        drafted = _draft(client, staff_headers, school)
         assert drafted.status_code == 200, drafted.text
         document = drafted.json()["document"]
         assert any(_leg_student_ids(b, "morning") for b in document["buses"])
@@ -389,39 +364,36 @@ def test_draft_is_read_only_against_live_routes(client, admin_headers):
         assert after == before  # row count, ordering, times, flags — identical
     finally:
         for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/routes/{route['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/routes/{route['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
 # --- one-open-draft / scrub ---------------------------------------------------
 
-def test_second_draft_conflicts_then_supersede_scrubs(client, admin_headers):
+def test_second_draft_conflicts_then_supersede_scrubs(client, school, staff_headers):
     """One-open-draft: a second draft 409s naming the open one; with
     supersede the old row flips to superseded and its document/basis are
     scrubbed to NULL with metadata kept."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus = _make_bus(client, admin_headers, f"IT PlanBus S {marker}",
+    bus = _make_bus(client, staff_headers, f"IT PlanBus S {marker}",
                     capacity=4, depot=DEPOT_EAST)
     students = []
     try:
         for i, home in enumerate(EAST_HOMES[:2]):
-            students.append(
-                _make_student(client, admin_headers, marker, i, school["id"], home)
-            )
-        assert _confirm(client, admin_headers, school["id"], [bus["id"]]).status_code == 200
+            students.append(_make_student(client, staff_headers, marker, i, home))
+        assert _confirm(client, staff_headers, [bus["id"]]).status_code == 200
 
-        first = _draft(client, admin_headers, school["id"], seed=7)
+        first = _draft(client, staff_headers, school, seed=7)
         assert first.status_code == 200, first.text
         first_id = first.json()["id"]
 
-        blocked = _draft(client, admin_headers, school["id"])
+        blocked = _draft(client, staff_headers, school)
         assert blocked.status_code == 409, blocked.text
         assert first_id in blocked.json()["detail"]
 
-        superseded = _draft(client, admin_headers, school["id"], supersede=True)
+        superseded = _draft(client, staff_headers, school, supersede=True)
         assert superseded.status_code == 200, superseded.text
         second_id = superseded.json()["id"]
         assert second_id != first_id
@@ -434,37 +406,34 @@ def test_second_draft_conflicts_then_supersede_scrubs(client, admin_headers):
         assert old["created_at"] is not None
 
         current = client.get(
-            "/api/fleet-plans/current", params={"school_id": school["id"]},
-            headers=admin_headers,
+            "/api/fleet-plans/current", params={"school_id": school},
+            headers=staff_headers,
         ).json()
         assert current["draft"]["id"] == second_id
     finally:
         for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
-def test_discard_scrubs_draft(client, admin_headers):
+def test_discard_scrubs_draft(client, school, staff_headers):
     """Discard flips a draft to discarded and scrubs its payloads; a second
     discard 409s (draft only)."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus = _make_bus(client, admin_headers, f"IT PlanBus D {marker}",
+    bus = _make_bus(client, staff_headers, f"IT PlanBus D {marker}",
                     capacity=4, depot=DEPOT_WEST)
     students = []
     try:
         for i, home in enumerate(WEST_HOMES[:2]):
-            students.append(
-                _make_student(client, admin_headers, marker, i, school["id"], home)
-            )
-        assert _confirm(client, admin_headers, school["id"], [bus["id"]]).status_code == 200
-        drafted = _draft(client, admin_headers, school["id"], seed=3)
+            students.append(_make_student(client, staff_headers, marker, i, home))
+        assert _confirm(client, staff_headers, [bus["id"]]).status_code == 200
+        drafted = _draft(client, staff_headers, school, seed=3)
         assert drafted.status_code == 200, drafted.text
         plan_id = drafted.json()["id"]
 
         discarded = client.post(
-            f"/api/fleet-plans/{plan_id}/discard", headers=admin_headers
+            f"/api/fleet-plans/{plan_id}/discard", headers=staff_headers
         )
         assert discarded.status_code == 200, discarded.text
         assert discarded.json()["status"] == "discarded"
@@ -476,39 +445,40 @@ def test_discard_scrubs_draft(client, admin_headers):
         assert row["solver_seed"] == 3  # metadata kept
 
         current = client.get(
-            "/api/fleet-plans/current", params={"school_id": school["id"]},
-            headers=admin_headers,
+            "/api/fleet-plans/current", params={"school_id": school},
+            headers=staff_headers,
         ).json()
         assert current["draft"] is None
 
         again = client.post(
-            f"/api/fleet-plans/{plan_id}/discard", headers=admin_headers
+            f"/api/fleet-plans/{plan_id}/discard", headers=staff_headers
         )
         assert again.status_code == 409, again.text
     finally:
         for s in students:
-            client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+            client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
 # --- unresolved addresses -----------------------------------------------------
 
-def test_coordless_student_listed_unplaceable_unresolved_address(client, admin_headers):
+def test_coordless_student_listed_unplaceable_unresolved_address(
+    client, school, staff_headers
+):
     """A student without home coordinates is not solver input: they appear in
     the unplaceable list with constraint 'unresolved address' for each leg,
     and in the basis as non-plannable."""
     marker = uuid.uuid4().hex[:6]
-    school = _make_school(client, admin_headers, marker)
-    bus = _make_bus(client, admin_headers, f"IT PlanBus U {marker}",
+    bus = _make_bus(client, staff_headers, f"IT PlanBus U {marker}",
                     capacity=4, depot=DEPOT_EAST)
     placed = nogeo = None
     try:
-        placed = _make_student(client, admin_headers, marker, 0, school["id"], EAST_HOMES[0])
-        nogeo = _make_student(client, admin_headers, marker, 1, school["id"], None)
-        assert _confirm(client, admin_headers, school["id"], [bus["id"]]).status_code == 200
+        placed = _make_student(client, staff_headers, marker, 0, EAST_HOMES[0])
+        nogeo = _make_student(client, staff_headers, marker, 1, None)
+        assert _confirm(client, staff_headers, [bus["id"]]).status_code == 200
 
-        drafted = _draft(client, admin_headers, school["id"])
+        drafted = _draft(client, staff_headers, school)
         assert drafted.status_code == 200, drafted.text
         plan = drafted.json()
 
@@ -533,24 +503,34 @@ def test_coordless_student_listed_unplaceable_unresolved_address(client, admin_h
     finally:
         for s in (placed, nogeo):
             if s:
-                client.delete(f"/api/students/{s['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/buses/{bus['id']}", headers=admin_headers)
-        client.delete(f"/api/fleet/schools/{school['id']}", headers=admin_headers)
+                client.delete(f"/api/students/{s['id']}", headers=staff_headers)
+        client.delete(f"/api/fleet/buses/{bus['id']}", headers=staff_headers)
+        _purge_plans(school)
 
 
 # --- authorization ------------------------------------------------------------
 
-def test_non_admin_refused_on_every_endpoint(client, admin_headers, parent_headers):
-    """Every fleet-plan endpoint is admin-only: unauthenticated calls 401,
-    a parent session 403 — with no side effects."""
+def test_non_staff_refused_on_every_endpoint(client, school, parent_headers):
+    """Unauthenticated calls 401 everywhere. A parent session: 403 on the
+    school-scoped confirm-fleet (no membership, no header) and 404 when they
+    name a school they cannot access; 403 on the still-admin-guarded plan
+    endpoints (U7 converts those) — with no side effects."""
     phantom_school = str(uuid.uuid4())
     phantom_plan = str(uuid.uuid4())
-    calls = [
-        lambda h: client.post(
-            "/api/fleet-plans/confirm-fleet",
-            json={"school_id": phantom_school, "bus_ids": []},
-            headers=h,
-        ),
+
+    confirm = lambda h: client.post(  # noqa: E731
+        "/api/fleet-plans/confirm-fleet", json={"bus_ids": []}, headers=h
+    )
+    assert confirm(None).status_code == 401
+    assert confirm(parent_headers).status_code == 403
+    named = client.post(
+        "/api/fleet-plans/confirm-fleet",
+        json={"bus_ids": []},
+        headers={**parent_headers, "X-School-Id": school},
+    )
+    assert named.status_code == 404  # a school they cannot access: not found
+
+    for call in (
         lambda h: client.post(
             "/api/fleet-plans/draft", json={"school_id": phantom_school}, headers=h
         ),
@@ -558,7 +538,6 @@ def test_non_admin_refused_on_every_endpoint(client, admin_headers, parent_heade
             "/api/fleet-plans/current", params={"school_id": phantom_school}, headers=h
         ),
         lambda h: client.post(f"/api/fleet-plans/{phantom_plan}/discard", headers=h),
-    ]
-    for call in calls:
+    ):
         assert call(None).status_code == 401
         assert call(parent_headers).status_code == 403

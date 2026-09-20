@@ -1,8 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getToken, setToken, onUnauthorized } from "@/lib/apiClient";
+import {
+  ApiError,
+  getToken,
+  setToken,
+  onUnauthorized,
+  onSchoolScoped403,
+  onSchoolScoped404,
+  onTotpEnrolmentRequired,
+  sendsSchoolHeader,
+} from "@/lib/apiClient";
+import { clearActiveSchoolId, setActiveSchoolId } from "@/lib/school";
 
 afterEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
+  onSchoolScoped404(null);
+  onSchoolScoped403(null);
+  onTotpEnrolmentRequired(null);
 });
 
 describe("apiClient token storage", () => {
@@ -93,6 +107,272 @@ describe("apiClient 401 handling", () => {
     // A failed login must not nuke an existing session or trigger sign-out.
     expect(getToken()).toBe("still-valid");
     expect(handler).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+});
+
+// U12 — the school scope header, request cancellation, and the centralized
+// membership-lost detection.
+
+function okFetchMock() {
+  return vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValue(new Response('{"ok": true}', { status: 200 }));
+}
+
+describe("apiClient X-School-Id header", () => {
+  it("attaches the header on staff-surface calls when a school is active", async () => {
+    setActiveSchoolId("school-a");
+    const fetchMock = okFetchMock();
+
+    const { api } = await import("@/lib/apiClient");
+    await api.get("/api/students");
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect((init?.headers as Record<string, string>)["X-School-Id"]).toBe("school-a");
+    fetchMock.mockRestore();
+  });
+
+  it("sends no header when the store is cleared", async () => {
+    setActiveSchoolId("school-a");
+    clearActiveSchoolId();
+    const fetchMock = okFetchMock();
+
+    const { api } = await import("@/lib/apiClient");
+    await api.get("/api/students");
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.headers as Record<string, string>).not.toHaveProperty("X-School-Id");
+    fetchMock.mockRestore();
+  });
+
+  it("never sends the header to auth, driver, parent-portal, push or provider routes", async () => {
+    // Driver routes 403 the header by design; the auth surface (offers
+    // included) is account-level; the parent portal and push registration
+    // resolve their own scope; the provider console (U13) lives OUTSIDE any
+    // school — a stepped-in tab's store must not leak onto console calls.
+    expect(sendsSchoolHeader("/api/runs/driver/context")).toBe(false);
+    expect(sendsSchoolHeader("/api/incidents/driver")).toBe(false);
+    expect(sendsSchoolHeader("/api/auth/offers/x/accept")).toBe(false);
+    expect(sendsSchoolHeader("/api/parent-portal/children")).toBe(false);
+    expect(sendsSchoolHeader("/api/push/subscribe")).toBe(false);
+    expect(sendsSchoolHeader("/api/provider/schools")).toBe(false);
+    expect(sendsSchoolHeader("/api/provider/step-out")).toBe(false);
+    expect(sendsSchoolHeader("/api/provider/accounts/u1/reset-totp")).toBe(false);
+    expect(sendsSchoolHeader("/api/students")).toBe(true);
+    expect(sendsSchoolHeader("/api/staff")).toBe(true);
+
+    setActiveSchoolId("school-a");
+    const fetchMock = okFetchMock();
+    const { api } = await import("@/lib/apiClient");
+    await api.get("/api/runs/driver/context");
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.headers as Record<string, string>).not.toHaveProperty("X-School-Id");
+    fetchMock.mockRestore();
+  });
+});
+
+describe("apiClient AbortSignal passthrough", () => {
+  it("passes the caller's signal to fetch", async () => {
+    const fetchMock = okFetchMock();
+    const controller = new AbortController();
+
+    const { api } = await import("@/lib/apiClient");
+    await api.get("/api/students", undefined, { signal: controller.signal });
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.signal).toBe(controller.signal);
+    fetchMock.mockRestore();
+  });
+
+  it("rejects when the signal is already aborted (cancellation works end to end)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch"); // real fetch honours signals
+    fetchMock.mockImplementation((_url, init) => {
+      if (init?.signal?.aborted) {
+        return Promise.reject(new DOMException("Aborted", "AbortError"));
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(
+      api.get("/api/students", undefined, { signal: controller.signal }),
+    ).rejects.toThrow(/abort/i);
+    fetchMock.mockRestore();
+  });
+});
+
+describe("apiClient membership-lost detection", () => {
+  it("notifies the handler on a 404 from a school-scoped call", async () => {
+    setActiveSchoolId("school-a");
+    const handler = vi.fn();
+    onSchoolScoped404(handler);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
+      );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/students")).rejects.toThrow("Not found");
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith("school-a");
+    fetchMock.mockRestore();
+  });
+
+  it("stays quiet on a 404 without an active school (nothing school-scoped)", async () => {
+    clearActiveSchoolId();
+    const handler = vi.fn();
+    onSchoolScoped404(handler);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
+      );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/students")).rejects.toThrow("Not found");
+
+    expect(handler).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+
+  it("stays quiet on a 404 from a non-school path even with a school active", async () => {
+    setActiveSchoolId("school-a");
+    const handler = vi.fn();
+    onSchoolScoped404(handler);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
+      );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.post("/api/auth/offers/gone/accept")).rejects.toThrow("Not found");
+
+    expect(handler).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+});
+
+describe("apiClient structured error details", () => {
+  it("surfaces the message of an object detail (password-change-required 409)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: {
+            code: "password-change-required",
+            message: "You must change your temporary password first",
+          },
+        }),
+        { status: 409 },
+      ),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/students")).rejects.toThrow(
+      "You must change your temporary password first",
+    );
+    fetchMock.mockRestore();
+  });
+
+  it("exposes the machine code on the thrown ApiError (U13)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: { code: "preauth-voided", message: "Too many wrong codes. Sign in again." },
+        }),
+        { status: 401 },
+      ),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    const error = await api
+      .post("/api/auth/totp", { token: "t", code: "000000" })
+      .then(() => null, (e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("preauth-voided");
+    expect((error as ApiError).status).toBe(401);
+    expect((error as ApiError).message).toBe("Too many wrong codes. Sign in again.");
+    fetchMock.mockRestore();
+  });
+});
+
+// U13 — the provider second factor's client seams.
+
+describe("apiClient provider auth seams", () => {
+  it("treats a 401 from /api/auth/totp as a credential refusal, not session expiry", async () => {
+    // A wrong code must NOT clear a token or fire the sign-out flow: at the
+    // challenge there is no session yet, and the message must be the server's.
+    setToken("some-other-session");
+    const handler = vi.fn();
+    onUnauthorized(handler);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Invalid code" }), { status: 401 }),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.post("/api/auth/totp", { token: "t", code: "1" })).rejects.toThrow(
+      "Invalid code",
+    );
+    expect(getToken()).toBe("some-other-session");
+    expect(handler).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+
+  it("notifies the 403 handler on a school-scoped refusal (step-in ended)", async () => {
+    setActiveSchoolId("school-a");
+    const handler = vi.fn();
+    onSchoolScoped403(handler);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ detail: "An active support session is required for this school" }),
+        { status: 403 },
+      ),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/students")).rejects.toThrow(/active support session/);
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith("school-a");
+    fetchMock.mockRestore();
+  });
+
+  it("keeps the 403 handler quiet on unscoped calls", async () => {
+    setActiveSchoolId("school-a");
+    const handler = vi.fn();
+    onSchoolScoped403(handler);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ detail: "You do not have access" }), { status: 403 }),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/provider/schools")).rejects.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    fetchMock.mockRestore();
+  });
+
+  it("fires the enrolment handler on any totp-enrolment-required 409", async () => {
+    const handler = vi.fn();
+    onTotpEnrolmentRequired(handler);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: {
+            code: "totp-enrolment-required",
+            message: "You must enrol your second factor first",
+          },
+        }),
+        { status: 409 },
+      ),
+    );
+
+    const { api } = await import("@/lib/apiClient");
+    await expect(api.get("/api/provider/schools")).rejects.toThrow(/enrol your second factor/);
+    expect(handler).toHaveBeenCalledOnce();
     fetchMock.mockRestore();
   });
 });
