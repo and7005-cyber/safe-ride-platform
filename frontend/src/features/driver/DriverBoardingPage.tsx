@@ -8,8 +8,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { useToast } from "@/components/ui/use-toast";
-import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
-import { DRIVER_NAV } from "@/features/driver/DriverHomePage";
+import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { useDriverContext } from "@/features/driver/driverHooks";
 import { api } from "@/lib/apiClient";
 // The driver board had no label map at all and rendered raw slugs like
@@ -184,7 +183,7 @@ export function DriverBoardingPage() {
   };
 
   return (
-    <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title={afternoon ? "Student Drop-off" : "Student Boarding"}>
+    <DriverLayout title={afternoon ? "Student Drop-off" : "Student Boarding"}>
       <div className="space-y-4">
         <div className="grid grid-cols-2 gap-3">
           <Card>
@@ -305,6 +304,6 @@ export function DriverBoardingPage() {
           </div>
         )}
       </div>
-    </RoleMobileLayout>
+    </DriverLayout>
   );
 }

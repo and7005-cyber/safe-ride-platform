@@ -14,8 +14,9 @@ import {
 } from "@/components/ui/select";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { useToast } from "@/components/ui/use-toast";
-import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
-import { DRIVER_NAV } from "@/features/driver/DriverHomePage";
+import { DriverLayout } from "@/features/driver/components/DriverLayout";
+import { nudgeStore } from "@/features/driver/components/nudgeStore";
+import { unlockAttentionAudio } from "@/features/driver/components/useAttentionCue";
 import { useDriverContext } from "@/features/driver/driverHooks";
 import { api } from "@/lib/apiClient";
 
@@ -46,6 +47,10 @@ export function DriverRunPage() {
   const refresh = () => qc.invalidateQueries({ queryKey: ["driver-context"] });
 
   const start = async () => {
+    // Inside the tap, before any await: this is the one user gesture every
+    // run is guaranteed to have, and the prompt tone (GPS plan U3) can only
+    // play later if the audio element was activated by one.
+    unlockAttentionAudio();
     setBusy(true);
     try {
       await api.post("/api/runs/driver/start", { route_id: routeId });
@@ -63,7 +68,11 @@ export function DriverRunPage() {
     if (!activeRun) return;
     setBusy(true);
     try {
-      await api.post("/api/runs/driver/arrive", { run_id: activeRun.id });
+      const result = await api.post("/api/runs/driver/arrive", { run_id: activeRun.id });
+      // Prompts this Arrive raised go straight to the queue (GPS plan U3):
+      // the card shows on this response, not one poll later; the poll then
+      // owns them like any other pending prompt.
+      nudgeStore.ingest(result?.prompts, "response");
       await refresh();
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
@@ -113,7 +122,7 @@ export function DriverRunPage() {
   }, []);
 
   return (
-    <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title="Active Run">
+    <DriverLayout title="Active Run">
       {!activeRun ? (
         <Card>
           <CardHeader><CardTitle className="text-lg">Start a run</CardTitle></CardHeader>
@@ -220,6 +229,6 @@ export function DriverRunPage() {
           </div>
         </div>
       )}
-    </RoleMobileLayout>
+    </DriverLayout>
   );
 }

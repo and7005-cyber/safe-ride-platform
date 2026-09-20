@@ -824,7 +824,9 @@ def test_undoing_a_resolving_outcome_reopens_the_exception_on_read(client, admin
 
         # A reopen is a read-time fact, never a second exception: the run
         # carries on past the next (resolved) stop and writes nothing new —
-        # one row, one pending event, one incident.
+        # one row, the same ledger (the prompt answered by the two drop-offs,
+        # one resolution per child — U3's membership rule — and nothing
+        # pending), one incident.
         by_order = _students_by_order(fleet, layout)
         for kid in by_order.get(shared + 1, []):
             assert _dropoff(client, fleet["driver_headers"], kid["id"]).status_code == 200
@@ -832,7 +834,11 @@ def test_undoing_a_resolving_outcome_reopens_the_exception_on_read(client, admin
         assert onward["run"]["stops_completed"] == shared + 2
         assert onward["prompts"] == []
         assert len(_exception_rows(run_id)) == 1
-        assert len(_pending_events(exception_id)) == 1
+        assert _pending_events(exception_id) == []
+        ledger = _ledger(exception_id)
+        assert [e["response"] for e in ledger] == ["resolution", "resolution", "resolution"]
+        assert ledger[0]["prompt_state"] == "answered"
+        assert {str(e["student_id"]) for e in ledger[1:]} == {fleet["d"]["id"], fleet["e"]["id"]}
         time.sleep(0.5)
         assert len(_incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
     finally:
@@ -1054,6 +1060,516 @@ def test_parents_track_children_and_alerts_never_carry_exceptions_or_the_office_
         assert all(fleet["d"]["name"] not in (row.get("description") or "") for row in feed)
     finally:
         purge_run(run_id)
+
+
+# Driver prompts: delivery, answers, resolution taps, auto-resolution (U3) --------
+#
+# R23, R34, F3 (prompt half). The prompt is the pending event: the context poll
+# re-delivers it (delivered_at stamped once), the card's mount stamps shown_at
+# once, the respond route answers it by event id with machine-readable
+# conflicts, outcome taps that carry the event id attach as its resolution, and
+# Arrive / End Run / force-close close what each is allowed to close.
+
+PROMPT_KEYS = {
+    "event_id", "exception_id", "kind", "stop_order", "stop_name", "student_id",
+    "students", "answers", "created_at", "delivered_at", "shown_at",
+}
+
+
+def _context(client, headers) -> dict:
+    response = client.get("/api/runs/driver/context", headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _pending(client, headers) -> list[dict]:
+    return _context(client, headers)["pending_prompts"]
+
+
+def _respond(client, headers, event_id: str, answer: str) -> httpx.Response:
+    return client.post(
+        f"/api/runs/driver/prompts/{event_id}/respond", json={"answer": answer}, headers=headers
+    )
+
+
+def _shown(client, headers, event_id: str) -> httpx.Response:
+    return client.post(f"/api/runs/driver/prompts/{event_id}/shown", headers=headers)
+
+
+def _event(event_id: str) -> dict:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_exception_events where id = %s", (event_id,)
+        ).fetchone()
+
+
+def _ledger(exception_id: str) -> list[dict]:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_exception_events where exception_id = %s "
+            "order by created_at, id",
+            (exception_id,),
+        ).fetchall()
+
+
+def _board_via(client, headers, student_id: str, event_id: str | None) -> httpx.Response:
+    return client.post(
+        "/api/runs/driver/boarding",
+        json={"student_id": student_id, "on_bus": True, "event_id": event_id},
+        headers=headers,
+    )
+
+
+def _absent_via(client, headers, student_id: str, event_id: str | None) -> httpx.Response:
+    return client.post(
+        "/api/runs/driver/absent", json={"student_id": student_id, "event_id": event_id},
+        headers=headers,
+    )
+
+
+def _raise_at_stop_of(client, fleet, run_id: str, kid: dict) -> dict:
+    """Morning: Arrive to the child's stop, record nobody, Arrive one past it.
+    Returns the prompt the passing Arrive carried."""
+    layout = _layout(run_id)
+    order = layout["by_student"][kid["id"]]
+    _arrive_until(client, fleet["driver_headers"], run_id, order)
+    responses = _arrive_until(client, fleet["driver_headers"], run_id, order + 1)
+    prompts = responses[-1]["prompts"]
+    assert len(prompts) == 1 and prompts[0]["stop_order"] == order, responses
+    return prompts[0]
+
+
+def _insert_prompt(run_id: str, school_id: str, kind: str, student_id: str, *, shown: bool):
+    """A pending prompt of a kind nothing produces yet (U9/U10), written the way
+    those units will write it, so the by-kind rules can be exercised now."""
+    with db() as conn:
+        exception_id = conn.execute(
+            "insert into run_exceptions (school_id, run_id, student_id, kind) "
+            "values (%s, %s, %s, %s) returning id",
+            (school_id, run_id, student_id, kind),
+        ).fetchone()["id"]
+        event_id = conn.execute(
+            "insert into run_exception_events "
+            "(exception_id, school_id, run_id, student_id, prompt_state, shown_at) "
+            "values (%s, %s, %s, %s, 'pending', case when %s then now() end) returning id",
+            (exception_id, school_id, run_id, student_id, shown),
+        ).fetchone()["id"]
+    return {"exception_id": str(exception_id), "event_id": str(event_id)}
+
+
+def test_context_delivers_pending_prompts_and_stamps_delivered_once(client, fleet):
+    """R34: the prompt the Arrive response carried comes back from the context
+    poll in the same shape, safety copy inputs included; the first read stamps
+    delivered_at, the second leaves it alone."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        drive = _drive_to_shared_stop(client, fleet, run_id)
+        prompt = drive["responses"][-1]["prompts"][0]
+        assert set(prompt) == PROMPT_KEYS, prompt
+        assert prompt["answers"] == ["dismissed"]
+        assert prompt["student_id"] is None and prompt["created_at"]
+        assert prompt["delivered_at"] is None and prompt["shown_at"] is None
+        assert _event(prompt["event_id"])["delivered_at"] is None
+
+        first = _pending(client, fleet["driver_headers"])
+        assert len(first) == 1, first
+        delivered = first[0]
+        assert set(delivered) == PROMPT_KEYS
+        assert delivered["event_id"] == prompt["event_id"]
+        assert delivered["exception_id"] == prompt["exception_id"]
+        assert delivered["kind"] == STOP_BYPASSED
+        assert delivered["stop_order"] == drive["shared"]
+        assert delivered["stop_name"] == drive["layout"]["names"][drive["shared"]]
+        assert _names(delivered["students"]) == _names(fleet["shared"])
+        assert delivered["delivered_at"] is not None and delivered["shown_at"] is None
+        stamped = _event(prompt["event_id"])["delivered_at"]
+        assert stamped is not None
+
+        second = _pending(client, fleet["driver_headers"])
+        assert second[0]["delivered_at"] == delivered["delivered_at"]
+        assert _event(prompt["event_id"])["delivered_at"] == stamped, "a repeat read moved the stamp"
+    finally:
+        purge_run(run_id)
+
+
+def test_no_bus_context_carries_an_empty_prompts_block(client, admin_headers, fleet):
+    """The early-return shape (no bus assigned) still has the block, empty, so
+    the client never branches on its absence."""
+    driver = _create_driver(client, admin_headers, fleet["marker"], 3)
+    try:
+        context = _context(client, pin_login(client, driver["pin"]))
+        assert context["bus"] is None
+        assert context["pending_prompts"] == []
+        assert context["blocking"] == [] and context["run_stops"] == []
+    finally:
+        client.delete(f"/api/accounts/drivers/{driver['id']}", headers=admin_headers)
+
+
+def test_shown_acknowledgement_stamps_once(client, fleet):
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        prompt = _raise_at_stop_of(client, fleet, run_id, fleet["a"])
+        first = _shown(client, fleet["driver_headers"], prompt["event_id"])
+        assert first.status_code == 200, first.text
+        assert first.json()["event_id"] == prompt["event_id"]
+        assert first.json()["prompt_state"] == "pending"
+        stamp = first.json()["shown_at"]
+        assert stamp
+        second = _shown(client, fleet["driver_headers"], prompt["event_id"])
+        assert second.status_code == 200 and second.json()["shown_at"] == stamp
+        assert _event(prompt["event_id"])["shown_at"] is not None
+        assert _pending(client, fleet["driver_headers"])[0]["shown_at"] == stamp
+    finally:
+        purge_run(run_id)
+
+
+def test_respond_records_once_replays_and_conflicts(client, admin_headers, fleet):
+    """Dismiss answers the prompt (one event row, no duplicate); the same answer
+    replays 200; a different one is 409 prompt-already-answered carrying the
+    recorded state; an answer the kind does not take is 400 while pending;
+    dismissing does not resolve the exception, only removes the prompt."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        rows = _raise_every_stop(client, fleet, run_id)
+        pending = _pending(client, fleet["driver_headers"])
+        assert [p["stop_order"] for p in pending] == sorted(r["stop_order"] for r in rows), (
+            "same priority: creation order, i.e. stop order"
+        )
+        target, other = pending[0], pending[1]
+
+        bad = _respond(client, fleet["driver_headers"], target["event_id"], "confirmed")
+        assert bad.status_code == 400, bad.text
+        assert _event(target["event_id"])["prompt_state"] == "pending"
+
+        answered = _respond(client, fleet["driver_headers"], target["event_id"], "dismissed")
+        assert answered.status_code == 200, answered.text
+        body = answered.json()
+        assert body["prompt_state"] == "answered" and body["response"] == "dismissed"
+        assert body["event_id"] == target["event_id"]
+
+        replay = _respond(client, fleet["driver_headers"], target["event_id"], "dismissed")
+        assert replay.status_code == 200 and replay.json() == body
+
+        conflict = _respond(client, fleet["driver_headers"], target["event_id"], "confirmed")
+        assert conflict.status_code == 409, conflict.text
+        detail = conflict.json()["detail"]
+        assert detail["code"] == "prompt-already-answered"
+        assert detail["prompt_state"] == "answered" and detail["response"] == "dismissed"
+        assert detail["message"]
+
+        assert len(_ledger(target["exception_id"])) == 1, "answers never add events"
+        listed = next(x for x in _bypassed(client, admin_headers, run_id) if x["id"] == target["exception_id"])
+        assert listed["status"] == "open", "a dismissed prompt leaves the exception open"
+        assert listed["events"][0]["response"] == "dismissed"
+
+        remaining = _pending(client, fleet["driver_headers"])
+        assert target["event_id"] not in {p["event_id"] for p in remaining}
+        assert remaining[0]["event_id"] == other["event_id"]
+    finally:
+        purge_run(run_id)
+
+
+def test_outcomes_from_the_board_page_answer_the_prompt_by_membership(client, admin_headers, fleet):
+    """The plan's key: a Board or Absent for a child listed on an open
+    bypassed-stop exception of this run is its resolution whether or not the
+    card is on screen. No event id anywhere: boarding D from the board page
+    leaves the prompt pending and shorter (E only) with D on the ledger;
+    marking E absent answers it as `resolution`; the office reads resolved."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        drive = _drive_to_shared_stop(client, fleet, run_id)
+        prompt = drive["responses"][-1]["prompts"][0]
+        event_id, exception_id = prompt["event_id"], prompt["exception_id"]
+
+        assert _board(client, fleet["driver_headers"], fleet["d"]["id"]).status_code == 200
+        assert _event(event_id)["prompt_state"] == "pending"
+        ledger = _ledger(exception_id)
+        assert [e["response"] for e in ledger] == [None, "resolution"]
+        assert str(ledger[1]["student_id"]) == fleet["d"]["id"]
+        shorter = _pending(client, fleet["driver_headers"])
+        assert len(shorter) == 1 and _names(shorter[0]["students"]) == [fleet["e"]["name"]]
+
+        assert _absent(client, fleet["driver_headers"], fleet["e"]["id"]).status_code == 200
+        closed = _event(event_id)
+        assert closed["prompt_state"] == "answered" and closed["response"] == "resolution"
+        ledger = _ledger(exception_id)
+        assert [e["response"] for e in ledger] == ["resolution", "resolution", "resolution"]
+        assert {str(e["student_id"]) for e in ledger[1:]} == {fleet["d"]["id"], fleet["e"]["id"]}
+        assert _pending(client, fleet["driver_headers"]) == []
+        assert _bypassed(client, admin_headers, run_id)[0]["status"] == "resolved"
+    finally:
+        purge_run(run_id)
+        _clear_absences_for(client, admin_headers, fleet["e"]["id"])
+
+
+def test_resolution_taps_through_the_card_attach_to_the_prompt(client, admin_headers, fleet):
+    """F3/R15, the card's path: the same taps carrying the card's event id.
+    Boarding D through the card leaves the two-child prompt pending and
+    shorter (E only) with D on the ledger as a resolution; marking E absent
+    through it answers the prompt as `resolution` and resolves the exception.
+    Custody exemption for these taps is U9's assertion — placeholder here."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        drive = _drive_to_shared_stop(client, fleet, run_id)
+        prompt = drive["responses"][-1]["prompts"][0]
+        event_id, exception_id = prompt["event_id"], prompt["exception_id"]
+
+        assert _board_via(client, fleet["driver_headers"], fleet["d"]["id"], event_id).status_code == 200
+        assert _event(event_id)["prompt_state"] == "pending"
+        ledger = _ledger(exception_id)
+        assert [e["response"] for e in ledger] == [None, "resolution"]
+        assert str(ledger[1]["student_id"]) == fleet["d"]["id"]
+        assert ledger[1]["prompt_state"] is None, "a resolution tap is a ledger row, not a prompt"
+        shorter = _pending(client, fleet["driver_headers"])
+        assert len(shorter) == 1 and _names(shorter[0]["students"]) == [fleet["e"]["name"]]
+
+        assert _absent_via(client, fleet["driver_headers"], fleet["e"]["id"], event_id).status_code == 200
+        closed = _event(event_id)
+        assert closed["prompt_state"] == "answered" and closed["response"] == "resolution"
+        ledger = _ledger(exception_id)
+        assert [e["response"] for e in ledger] == ["resolution", "resolution", "resolution"]
+        assert {str(e["student_id"]) for e in ledger[1:]} == {fleet["d"]["id"], fleet["e"]["id"]}
+        assert _pending(client, fleet["driver_headers"]) == []
+        done = _bypassed(client, admin_headers, run_id)[0]
+        assert done["status"] == "resolved"
+        # U9 placeholder: a resolution tap is exempt from the custody check.
+        # Nothing raises custody-away until U9 lands; the assertion is named
+        # here so U9 turns it into the real one.
+        assert all(x["kind"] != "custody-away" for x in _exceptions(client, admin_headers, run_id).json())
+
+        # The prompt is answered: a spoken answer now is a conflict.
+        late = _respond(client, fleet["driver_headers"], event_id, "dismissed")
+        assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-already-answered"
+        assert late.json()["detail"]["response"] == "resolution"
+    finally:
+        purge_run(run_id)
+        _clear_absences_for(client, admin_headers, fleet["e"]["id"])
+
+
+def test_the_event_id_is_a_hint_and_membership_selects_the_prompt(client, admin_headers, fleet):
+    """R23 and the plan's key: an unknown id, the id of a prompt for another
+    stop, or the id of a prompt already answered — the tap completes every
+    time, and it is the child's own stop that decides which prompt (if any)
+    records the resolution, never the id."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        rows = _raise_every_stop(client, fleet, run_id)
+        by_order = {r["stop_order"]: str(r["id"]) for r in rows}
+        pending = {p["exception_id"]: p for p in _pending(client, fleet["driver_headers"])}
+        layout = _layout(run_id)
+        a_order = layout["by_student"][fleet["a"]["id"]]
+        b_order = layout["by_student"][fleet["b"]["id"]]
+        c_order = layout["by_student"][fleet["c"]["id"]]
+        a_prompt = pending[by_order[a_order]]
+        b_prompt = pending[by_order[b_order]]
+        c_prompt = pending[by_order[c_order]]
+
+        # An unknown id: A's own stop's prompt takes the resolution.
+        unknown = _board_via(client, fleet["driver_headers"], fleet["a"]["id"], str(uuid.uuid4()))
+        assert unknown.status_code == 200, unknown.text
+        a_event = _event(a_prompt["event_id"])
+        assert a_event["prompt_state"] == "answered" and a_event["response"] == "resolution"
+        a_ledger = _ledger(a_prompt["exception_id"])
+        assert [e["response"] for e in a_ledger] == ["resolution", "resolution"]
+        assert str(a_ledger[1]["student_id"]) == fleet["a"]["id"]
+
+        # C's id on B's boarding: B's stop decides — B's prompt answers, C's
+        # is untouched.
+        wrong_stop = _board_via(client, fleet["driver_headers"], fleet["b"]["id"], c_prompt["event_id"])
+        assert wrong_stop.status_code == 200, wrong_stop.text
+        b_event = _event(b_prompt["event_id"])
+        assert b_event["prompt_state"] == "answered" and b_event["response"] == "resolution"
+        assert str(_ledger(b_prompt["exception_id"])[1]["student_id"]) == fleet["b"]["id"]
+        assert len(_ledger(c_prompt["exception_id"])) == 1
+        assert _event(c_prompt["event_id"])["prompt_state"] == "pending"
+
+        # C's prompt dismissed, then C boarded naming it: the tap stands; with
+        # no pending prompt at C's stop nothing is attached, the dismissed
+        # answer stays.
+        assert _respond(client, fleet["driver_headers"], c_prompt["event_id"], "dismissed").status_code == 200
+        answered_id = _board_via(client, fleet["driver_headers"], fleet["c"]["id"], c_prompt["event_id"])
+        assert answered_id.status_code == 200, answered_id.text
+        assert len(_ledger(c_prompt["exception_id"])) == 1
+        assert _event(c_prompt["event_id"])["response"] == "dismissed"
+        assert _at_stop(run_id, "morning", c_order) == []
+    finally:
+        purge_run(run_id)
+
+
+def test_arrive_closes_only_shown_remote_absents_and_board_closes_nothing(client, fleet, sandbox):
+    """R17/R34 by kind: a pending bypassed-stop prompt survives the next Arrive
+    and a Board; a shown remote-absent prompt closes as unanswered on Arrive;
+    an unshown one stays pending. Context order: safety kinds by creation
+    time, the custody confirm after them."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        layout = _layout(run_id)
+        bypassed = _raise_at_stop_of(client, fleet, run_id, fleet["a"])
+        b_order = layout["by_student"][fleet["b"]["id"]]
+        assert layout["by_student"][fleet["a"]["id"]] + 1 == b_order
+        shown = _insert_prompt(run_id, sandbox["id"], "absent-remote", fleet["c"]["id"], shown=True)
+        unshown = _insert_prompt(run_id, sandbox["id"], "absent-remote", fleet["d"]["id"], shown=False)
+        custody = _insert_prompt(run_id, sandbox["id"], "custody-away", fleet["e"]["id"], shown=False)
+
+        order = [(p["kind"], p["event_id"]) for p in _pending(client, fleet["driver_headers"])]
+        assert order == [
+            (STOP_BYPASSED, bypassed["event_id"]),
+            ("absent-remote", shown["event_id"]),
+            ("absent-remote", unshown["event_id"]),
+            ("custody-away", custody["event_id"]),
+        ], order
+        by_id = {p["event_id"]: p for p in _pending(client, fleet["driver_headers"])}
+        assert by_id[shown["event_id"]]["student_id"] == fleet["c"]["id"]
+        assert _names(by_id[shown["event_id"]]["students"]) == [fleet["c"]["name"]]
+        assert by_id[custody["event_id"]]["answers"] == []
+
+        # A Board of a child at another stop (B's, not the bypassed A's) while
+        # everything is pending closes nothing — no auto-resolution, and no
+        # membership match.
+        assert _board(client, fleet["driver_headers"], fleet["b"]["id"]).status_code == 200
+        for event_id in (bypassed["event_id"], shown["event_id"], unshown["event_id"], custody["event_id"]):
+            assert _event(event_id)["prompt_state"] == "pending", event_id
+
+        # Arrive past B (recorded, so no new prompt): only the shown
+        # remote-absent closes.
+        onward = _arrive(client, fleet["driver_headers"], run_id)
+        assert onward["run"]["stops_completed"] == b_order + 1 and onward["prompts"] == []
+        assert "auto_resolved" not in onward
+        assert _event(shown["event_id"])["prompt_state"] == "unanswered"
+        assert _event(shown["event_id"])["response"] is None
+        assert _event(unshown["event_id"])["prompt_state"] == "pending"
+        assert _event(bypassed["event_id"])["prompt_state"] == "pending"
+        assert _event(custody["event_id"])["prompt_state"] == "pending"
+        remaining = {p["event_id"] for p in _pending(client, fleet["driver_headers"])}
+        assert remaining == {bypassed["event_id"], unshown["event_id"], custody["event_id"]}
+
+        closed = _respond(client, fleet["driver_headers"], shown["event_id"], "dismissed")
+        assert closed.status_code == 409 and closed.json()["detail"]["code"] == "prompt-resolved"
+        assert closed.json()["detail"]["prompt_state"] == "unanswered"
+    finally:
+        purge_run(run_id)
+
+
+def test_end_run_closes_every_pending_prompt_and_later_answers_conflict(client, admin_headers, fleet):
+    """R17/R34: the office records A absent mid-run, so A's stop names nobody
+    without any driver tap — the prompt stays pending on the ledger but out of
+    delivery (nothing left to ask); End Run closes it as unanswered; a spoken
+    answer after that is 409 prompt-resolved. The shown ack still stamps — it
+    is a fact about the screen, not an answer."""
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        layout = _layout(run_id)
+        prompt = _raise_at_stop_of(client, fleet, run_id, fleet["a"])
+        office = client.post(
+            "/api/students/absences",
+            json={"student_id": fleet["a"]["id"], "reason": "IT RX office"},
+            headers=admin_headers,
+        )
+        assert office.status_code == 200, office.text
+        assert _event(prompt["event_id"])["prompt_state"] == "pending"
+        assert len(_ledger(prompt["exception_id"])) == 1, "an office absence is no driver tap"
+        assert _pending(client, fleet["driver_headers"]) == [], "an empty question is not delivered"
+
+        by_order = _students_by_order(fleet, layout)
+        for order in layout["orders"]:
+            if order == layout["gate"]:
+                continue
+            _arrive_until(client, fleet["driver_headers"], run_id, order)
+            for kid in by_order.get(order, []):
+                if kid["id"] != fleet["a"]["id"]:
+                    assert _board(client, fleet["driver_headers"], kid["id"]).status_code == 200
+        _arrive_until(client, fleet["driver_headers"], run_id, layout["last"])
+        ended = client.post(
+            "/api/runs/driver/end", json={"run_id": run_id}, headers=fleet["driver_headers"]
+        )
+        assert ended.status_code == 200, ended.text
+        assert "auto_resolved" not in ended.json()
+        assert _event(prompt["event_id"])["prompt_state"] == "unanswered"
+
+        late = _respond(client, fleet["driver_headers"], prompt["event_id"], "dismissed")
+        assert late.status_code == 409, late.text
+        assert late.json()["detail"]["code"] == "prompt-resolved"
+        assert late.json()["detail"]["prompt_state"] == "unanswered"
+        ack = _shown(client, fleet["driver_headers"], prompt["event_id"])
+        assert ack.status_code == 200 and ack.json()["prompt_state"] == "unanswered"
+    finally:
+        purge_run(run_id)
+        _clear_absences_for(client, admin_headers, fleet["a"]["id"])
+
+
+def test_force_close_closes_pending_prompts(client, admin_headers, fleet):
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        prompt = _raise_at_stop_of(client, fleet, run_id, fleet["a"])
+        closed = client.post(f"/api/runs/{run_id}/force-close", headers=admin_headers)
+        assert closed.status_code == 200, closed.text
+        assert "auto_resolved" not in closed.json()
+        assert _event(prompt["event_id"])["prompt_state"] == "unanswered"
+        late = _respond(client, fleet["driver_headers"], prompt["event_id"], "dismissed")
+        assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-resolved"
+    finally:
+        purge_run(run_id)
+
+
+def test_prompt_routes_follow_ownership_roles_and_school_scoping(client, admin_headers, sandbox, fleet):
+    """Another driver of the same school: 403. A driver of another school:
+    404 (RLS). Parents and staff: 403 (driver scope). Unknown ids and ledger
+    rows that were never prompts: 404. None of it moves the prompt."""
+    from conftest import DRIVER_B_PIN
+
+    run = _start(client, fleet["driver_headers"], fleet["morning"]["id"])
+    run_id = run["id"]
+    try:
+        drive = _drive_to_shared_stop(client, fleet, run_id)
+        prompt = drive["responses"][-1]["prompts"][0]
+        event_id = prompt["event_id"]
+
+        other_driver = fleet["driver2_headers"]
+        assert _respond(client, other_driver, event_id, "dismissed").status_code == 403
+        assert _shown(client, other_driver, event_id).status_code == 403
+
+        driver_b = pin_login(client, DRIVER_B_PIN)
+        assert _respond(client, driver_b, event_id, "dismissed").status_code == 404
+        assert _shown(client, driver_b, event_id).status_code == 404
+
+        assert _respond(client, fleet["parent_headers"], event_id, "dismissed").status_code == 403
+        assert _shown(client, fleet["parent_headers"], event_id).status_code == 403
+        assert _respond(client, admin_headers, event_id, "dismissed").status_code == 403
+        assert _shown(client, admin_headers, event_id).status_code == 403
+        assert _respond(
+            client, school_headers(fleet["driver_headers"], sandbox["id"]), event_id, "dismissed"
+        ).status_code == 403, "driver routes refuse the school header"
+
+        assert _respond(client, fleet["driver_headers"], str(uuid.uuid4()), "dismissed").status_code == 404
+        assert _shown(client, fleet["driver_headers"], str(uuid.uuid4())).status_code == 404
+
+        row = _event(event_id)
+        assert row["prompt_state"] == "pending" and row["shown_at"] is None
+
+        # A resolution ledger row is not a prompt.
+        assert _board_via(client, fleet["driver_headers"], fleet["d"]["id"], event_id).status_code == 200
+        ledger_row = _ledger(prompt["exception_id"])[1]
+        assert ledger_row["prompt_state"] is None
+        assert _respond(client, fleet["driver_headers"], str(ledger_row["id"]), "dismissed").status_code == 404
+        assert _shown(client, fleet["driver_headers"], str(ledger_row["id"])).status_code == 404
+    finally:
+        purge_run(run_id)
+
+
+def test_prompt_routes_are_classified_driver_scoped_in_the_manifest():
+    from tests.scope_manifest import MANIFEST
+
+    assert MANIFEST[("POST", "/api/runs/driver/prompts/{event_id}/shown")] == "driver-scoped"
+    assert MANIFEST[("POST", "/api/runs/driver/prompts/{event_id}/respond")] == "driver-scoped"
 
 
 # Provider helpers (the seeded provider signs in with password + TOTP) -----------

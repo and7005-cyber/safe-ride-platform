@@ -85,6 +85,8 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("GET", "/api/runs/{run_id}/exceptions"): "school-scoped",
     ("POST", "/api/runs/{run_id}/exceptions/{exception_id}/review"): "school-scoped",
     ("GET", "/api/runs/driver/context"): "driver-scoped",
+    ("POST", "/api/runs/driver/prompts/{event_id}/shown"): "driver-scoped",
+    ("POST", "/api/runs/driver/prompts/{event_id}/respond"): "driver-scoped",
     ("POST", "/api/runs/driver/start"): "driver-scoped",
     ("POST", "/api/runs/driver/arrive"): "driver-scoped",
     ("POST", "/api/runs/driver/end"): "driver-scoped",

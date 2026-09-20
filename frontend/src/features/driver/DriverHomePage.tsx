@@ -1,17 +1,10 @@
 import { useNavigate } from "react-router-dom";
-import { Bus, Clock, Home, MapPin, PlayCircle, TriangleAlert, Users } from "lucide-react";
+import { Clock, MapPin, PlayCircle, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
+import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { useDriverContext } from "@/features/driver/driverHooks";
 import { useAuth } from "@/lib/auth";
-
-export const DRIVER_NAV = [
-  { to: "/driver", label: "Home", icon: Home, end: true },
-  { to: "/driver/run", label: "Run", icon: MapPin },
-  { to: "/driver/boarding", label: "Board", icon: Bus },
-  { to: "/driver/incident", label: "Incident", icon: TriangleAlert },
-];
 
 function StatTile({ value, label, icon: Icon }: { value: string | number; label: string; icon: any }) {
   return (
@@ -37,7 +30,7 @@ export function DriverHomePage() {
   const students = data?.students ?? [];
 
   return (
-    <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title="SafeRide Driver">
+    <DriverLayout title="SafeRide Driver">
       {isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : !bus ? (
@@ -76,6 +69,6 @@ export function DriverHomePage() {
           )}
         </div>
       )}
-    </RoleMobileLayout>
+    </DriverLayout>
   );
 }
