@@ -18,7 +18,18 @@ pytestmark = pytest.mark.skipif(
     reason="needs the local stack; set RUN_INTEGRATION=1",
 )
 
-MIGRATION = Path(__file__).resolve().parents[2] / "db/migrations/013_tenancy_schema.sql"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "db/migrations"
+MIGRATION = MIGRATIONS_DIR / "013_tenancy_schema.sql"
+# 013 recreates constraints that later files widen (016 recreates the audit
+# action CHECK as 013's list plus its own value), so re-applying 013 alone
+# would leave the shared local database behind the current schema for every
+# suite that runs after this one. Every later idempotent file is re-applied in
+# order afterwards; 014 is the one-shot data move and is rehearsed on its own
+# scratch database (test_data_move_rehearsal.py).
+LATER_MIGRATIONS = [
+    path for path in sorted(MIGRATIONS_DIR.glob("*.sql"))
+    if path.name > MIGRATION.name and not path.name.startswith("014_")
+]
 
 from app.core.tenancy import SCHOOL_OWNED_TABLES
 
@@ -55,9 +66,11 @@ def test_tenancy_objects_exist(conn):
 
 
 def test_double_apply_is_a_noop(conn):
-    # House rule: rehearse by re-applying to the populated database.
-    conn.pgconn.exec_(MIGRATION.read_text().encode())
-    assert conn.pgconn.error_message == b"" or not conn.pgconn.error_message
+    # House rule: rehearse by re-applying to the populated database, then the
+    # later files so the database ends at the current schema.
+    for path in (MIGRATION, *LATER_MIGRATIONS):
+        conn.pgconn.exec_(path.read_text().encode())
+        assert not conn.pgconn.error_message, (path.name, conn.pgconn.error_message)
 
 
 def test_existing_parent_links_defaulted_to_accepted(conn):
