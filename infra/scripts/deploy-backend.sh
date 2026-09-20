@@ -103,6 +103,21 @@ if [ -z "$FIREBASE_SA_JSON" ] && [ -z "$VAPID_PRIV" ]; then
   echo "WARN: no push credentials in SSM or backend/.env — push delivery stays simulated (feed still works)." >&2
 fi
 
+# Refuse to package migration/seed files git does not track: sam bundles the
+# DIRECTORY, and a stray editor or file-sync duplicate ("015_… 2.sql") would
+# apply to production as an unmarked migration. Idempotent files survive that
+# by design — anything else must never get the chance.
+for dir in "$REPO_DIR/backend/db/migrations" "$REPO_DIR/backend/db/seeds"; do
+  strays="$(cd "$REPO_DIR" && comm -13 \
+    <(git ls-files "${dir#"$REPO_DIR"/}" | xargs -n1 basename | sort) \
+    <(ls "$dir" | sort))"
+  if [ -n "$strays" ]; then
+    echo "ERROR: untracked files in $dir would deploy as migrations/seeds:" >&2
+    echo "$strays" >&2
+    exit 1
+  fi
+done
+
 cd "$INFRA_DIR/backend"
 
 echo "==> sam build (containerized arm64)"
