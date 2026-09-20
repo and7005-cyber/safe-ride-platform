@@ -68,7 +68,7 @@ The left sidebar lists the sections of the console (everything scoped to your ac
 | **Drivers** | Driver accounts and PINs |
 | **Alerts** | Incident feed from drivers and parent cancellations |
 | **Staff** | Staff accounts and role offers — **directors only** |
-| **Settings** | The school's own record: name, contact, bell times, gate location |
+| **Settings** | The school's own record: name, contact, bell times, gate location; the **Tracking** card for the GPS thresholds |
 
 (The old **Schools** page is gone: the console works inside one school, so its record lives under **Settings** — see [School Settings](#school-settings).)
 
@@ -95,6 +95,22 @@ The **Settings** page holds your school's own record: **Name**, **Address**, **P
 The page also shows your **school code** (e.g. `MSB-001`). It is assigned by SafeRide when the school is created and cannot be changed — use it to identify the school in support requests and role offers.
 
 There is no way to create or delete a school from the console: schools are set up by SafeRide (Kuumbai Kenya), and a school created by mistake is removed by them operationally.
+
+### Tracking
+
+The **Tracking** card holds the five numbers that decide how the driver app's GPS fixes are judged for your school. Every field starts **empty**, which means the system default shown beside it applies; type a number to override it for your school, or click **Use default** to go back. Either staff role can edit them, and **every change is recorded in the audit log with the old and new values**, so a threshold that was loosened is always visible.
+
+| Field | Default | Allowed | What it does |
+| --- | --- | --- | --- |
+| **Custody distance** | 150 m | 25–2000 m | A Board or Drop-off further than this from the child's stop, after the phone's accuracy is subtracted, asks the driver to confirm (a **Tap far from the stop** exception) |
+| **Stop vicinity** | 100 m | 25–2000 m | A phone fix this close to a stop counts as the bus being at it — an Absent marked here needs no follow-up, and the run report reads "seen at stop" |
+| **Accuracy cap** | 200 m | 25–2000 m | A fix wider than this is too coarse to check a tap against; it is recorded but neither raises nor clears a question (**Check not verified — fix too coarse**) |
+| **Position retention** | 90 days | 7–365 days | How long the bus position trail is kept before it is purged. Exceptions keep their decision record longer, without the coordinates |
+| **Ping interval** | 10 s | 5–60 s | How often the driver app sends the bus position between stops once live pings are enabled. Not in use yet — today the position moves at each tap |
+
+Two related numbers are **system-wide, not per school**, and do not appear on the card: how old a position must be before the maps call it stale (**90 seconds**), and how long a tap waits for a fix before going through without one (**5 seconds**).
+
+Leave the defaults alone for the first weeks and read the run reports before changing anything. Phone accuracy in Nairobi is often worse than the phone claims, which is why the defaults are generous; tightening them makes the driver's prompts more frequent, loosening them switches checks off.
 
 ## Staff (director only)
 
@@ -127,7 +143,7 @@ PINs are **unique across drivers** — if you pick one that's taken you'll see "
 
 A driver **belongs to your school**: they are created here, sign in by PIN, and only ever see your school's buses, routes and runs. There is no driver self-signup. If you see "That email is already in use", the address already has a SafeRide account — use a different email for the driver.
 
-The table shows each driver's PIN state (**Set** / **None**) and assigned bus. Deleting a driver (director only) removes the account and unassigns their bus.
+The table shows each driver's PIN state (**Set** / **None**) and assigned bus. Deleting a driver (director only) removes the account and unassigns their bus. **It does not delete their runs:** past runs stay in Run History, and each run's position trail stays with it until your school's **Position retention** period has passed, then it is purged like any other. The run stops naming the driver.
 
 ## Buses
 
@@ -205,7 +221,19 @@ The megaphone button (**Message parents**) on a route card sends a one-off notic
 
 ## Fleet Map
 
-The map shows a colored bus marker for every bus currently on an active run — position advances as the driver taps "Arrive Next Stop" at each stop. Click a marker for the bus's name, driver and plate. Buses with no active run don't appear.
+The map shows a colored bus marker for every bus currently on an active run. Buses with no active run don't appear, and a bus disappears again at End Run or when you force-close its run — nothing is shown outside a run.
+
+**Where the position comes from.** Since the GPS release, every driver tap — Arrive, Board, Drop-off, Absent, Off-route, End Run — carries the driver's phone position, and that position becomes the bus's. When a tap carries no fix (location off, no signal, a fix that took too long), the bus is placed at the **planned stop** of the last Arrive instead, as it always was. Start Run is the exception: its fix is recorded but the bus stays at the school gate until the first tap on the road, so a run started from the driver's home never puts their home on the map.
+
+Click a marker for the bus's name, driver and plate, plus three lines about the position:
+
+- **Source** — **Phone GPS (tap)** for a fix from the driver's phone, **Planned stop** for a checkpoint, **Checkpoint (older app)** for a position written by a driver app that predates the GPS release (**Phone GPS (live)** is reserved for interval pings, not in use yet). A fix also shows its claimed accuracy, e.g. `±25 m`.
+- **Freshness** — **updated 12 s ago** while the position is recent; **last seen 4 min ago** once it is older than the staleness threshold (90 seconds). A stale bus is drawn faded and never hidden: the office should see that it has gone quiet, not lose it.
+- **GPS state** — **Phone GPS off since the last tap** (dashed red ring on the marker) when the run's latest tap carried no fix for a device reason; **No GPS for this run — checkpoint positions only** when the run has taps and none of them carried a fix. Both clear on their own at the next tap that does.
+
+Around a fix the map draws a faint **accuracy circle** — the radius the phone claimed, capped at 300 m so a kilometre-wide approximate fix cannot swallow the map. A wide circle means "somewhere around here", not "exactly here".
+
+The **Buses** card beside the map lists the same buses with the same freshness line, so the card and the marker never disagree.
 
 ### Route planner
 
@@ -260,21 +288,49 @@ A stop exception is the app noticing that a driver's taps and the bus's position
 
 Each exception shows its kind, the stop, the children concerned, what the driver's phone reported, the driver's answer to the prompt, and who in the office has reviewed it.
 
-| Kind | What it means |
+| Kind | What it means | Status |
+| --- | --- | --- |
+| **Stop passed without outcomes** | The driver tapped Arrive at a later stop while a child at this stop still had no outcome — not boarded, dropped off, absent or handed over. The driver is prompted with a tone to record them. An undo reopens it. This one also arrives on the Alerts page | **Open** until every listed child has an outcome, **Resolved** after |
+| **Absent marked away from the stop** | The driver marked a child absent from well outside the stop. The prompt asked whether a parent or the office had told them the child was not coming. The family received the standard absent notice at the tap; if the answer was **No — I wasn't at the stop**, or the driver dismissed the prompt or left it unanswered until the next Arrive, the family also received the **Call the office now** notice. This one also arrives on the Alerts page. Call the family if they have not called you | **Open** while the prompt is unanswered; **Attested by driver** after **Yes — they told me** (the row then reads **Absent attested by the driver**, below); **Uncorroborated** after a no, a dismiss or an unanswered prompt; **Retracted** if the driver undid the mark |
+| **Absent attested by the driver** | The driver marked a child absent away from the stop and answered that a parent or the office had told them. Kept for history only; no alert and no call-now notice | **Attested by driver** |
+| **Tap far from the stop** | A Board or Drop-off was tapped further from the child's stop than the school's **Custody distance** allows, after the phone's accuracy is subtracted. The driver was asked to confirm or undo, silently, and the answer is recorded. Several children tapped far from one stop share one row, each with its own prompt. **Bus seen at stop: yes** means some fix on the run did place the bus within the **Stop vicinity** of that stop — a driver who pulled away before tapping. **No** means nothing placed the bus there | **Open** while any prompt is unanswered, **Confirmed by driver** once any tap was confirmed, **Retracted** only when every tap was undone |
+| **Check not verified** | The location check for a tap could not be made, with the reason: **no fix for this action**, **fix too coarse** (wider than the **Accuracy cap**), **stop position unverified** (the stop has no usable coordinates — fix the pin on the route; listed once per run), **fix flagged implausible** (see the next row) or **fix could not be read**. No prompt, no alert | — |
+| **Implausible movement** | A fix on the run moved further or faster than a bus can, or reported an accuracy that cannot be trusted. One row per run lists every flagged fix; a flagged fix neither raises nor clears any other check, and is never "bus seen at stop" | — |
+
+**What the flags on an Implausible movement row mean.** Each flagged fix names the rule it broke, in plain words:
+
+| Flag | Meaning |
 | --- | --- |
-| **Stop passed without outcomes** | The driver tapped Arrive at a later stop while a child at this stop still had no outcome — not boarded, dropped off, absent or handed over. The driver is prompted with a tone to record them. The row stays **Open** until every listed child has an outcome and reads **Resolved** after; an undo reopens it. This one also arrives on the Alerts page |
-| **Absent marked away from the stop** | The driver marked a child absent from well outside the stop and did not say that a parent or the office had told them the child was not coming. The family received the standard absent notice **and** a call-now notice asking them to ring the school. This one also arrives on the Alerts page. Call the family if they have not called you |
-| **Absent attested by the driver** | The driver marked a child absent away from the stop and answered that a parent or the office had told them. Kept for history only; no alert and no call-now notice |
-| **Tap far from the stop** | A Board or Drop-off was tapped further from the child's stop than the school's threshold allows. The driver was asked to confirm or undo, and the answer is recorded. **Bus seen at stop: yes** means some fix on the run did place the bus at that stop — a driver who pulled away before tapping. **No** means nothing placed the bus there |
-| **Check not verified** | The location check for a tap could not be made, with the reason: no fix for this action, fix too coarse, or stop position unverified (the stop's pin needs fixing on the route). No prompt, no alert |
-| **Implausible movement** | A fix on the run moved further or faster than a bus can, or reported an accuracy that cannot be trusted. Listed once per run for you to look at |
+| **capture time ahead of the server clock** | The phone's clock said the fix was taken in the future |
+| **implausible jump between fixes** | More than a kilometre from the previous fix in under 30 seconds |
+| **implied speed too high for a bus** | Over 40 m/s (about 144 km/h) since the previous fix |
+| **accuracy reported as zero** | A real GPS never claims to be exact |
+| **same coordinates as the previous fix** | The exact same point twice — a frozen or replayed feed |
+| **fix exactly on a planned stop's pin** | Within two metres of a stop's pin, which a phone on a bus does not do by chance |
+
+Identical **accuracy** on consecutive fixes is deliberately *not* a flag: iPhones report accuracy in fixed steps (5, 10, 35, 65 m …), so two fixes with the same accuracy are the normal case on an iPhone, and flagging them would switch the checks off for every iPhone driver.
+
+**Reading the phone's line.** Under the kind, a row shows what the phone reported, e.g. **"Phone reported within 20 m at 07:14 · 1.8 km from the stop · Bus seen at stop: no"**:
+
+- **Phone reported within N m at HH:MM** — the fix's claimed accuracy and the time the phone took it. It says what the phone claimed, not where the bus was.
+- **N m from the stop** (or **Moved N km between fixes** on an implausible-movement row) — the straight-line distance the check used.
+- **Bus seen at stop: yes / no** — whether any fix on the whole run placed the bus within the stop's vicinity. Informational only; it never closes or downgrades a row.
+
+Below that, the row's ledger lists each tap and prompt in order — *prompt shown to the driver at 07:15, not yet answered*, *prompt answered: confirmed by the driver*, *prompt closed unanswered*, *call-now notice sent to the family at 07:21* — so you can see what the driver was asked, when, and what they said. Once a run is older than the school's **Position retention**, the coordinates on its exceptions are removed; the kind, distance, answers and review state stay.
 
 Two things to keep apart when you read one:
 
-- **Open / Resolved** is about the children: it says whether the situation still stands, and the app works it out from the run's current records. You cannot change it here.
+- **Open / Resolved** (and the other statuses in the table) is about the children and the driver's answers: it says whether the situation still stands, and the app works it out from the run's current records. You cannot change it here.
 - **Reviewed** is about you: it means a director or coordinator has looked at the row. Click **Mark reviewed** once you have — the row stays in the report with your name and the time, and stops counting on the **N to review** flag. Reviewing an exception that is still **Open** is normal; it means you have seen it, not that it is settled.
 
 > **A phone's position corroborates; it does not prove.** "Phone reported within 20 m" is what the driver's phone claimed, with the accuracy it claimed. It is good evidence, not a verdict. Read the exception alongside the driver's answer and, when it matters, a phone call.
+
+**The call-now notice and the two office alerts.** Two kinds are loud enough to reach beyond the run report:
+
+- **Stop passed without outcomes** raises an alert on the Alerts page, once per stop per run — a catch-up Arrive or a reopened row does not raise it again.
+- **Absent marked away from the stop**, once it is **Uncorroborated**, raises an alert on the Alerts page (once per child per run) and sends the family the **Call the office now** notice: *"{child} was marked absent away from their stop. If {child} should be on the bus, please call the school office now."* That notice goes **at most once per child per run** and is **never retracted** — an undo of the absent mark withdraws the ordinary absent notice with a neutral correction, but a family that was asked to call is not told to stand down by the app. Expect the call, and make it yourself if it does not come. No call-now is sent when the prompt is still open at End Run or a force-close: the closure gate already has that child in hand.
+
+**Neutral corrections.** When a driver undoes a mark, the family receives one message that says only that the mark was withdrawn — **Boarding mark withdrawn**, **Absent mark withdrawn** or **Drop-off mark withdrawn** — and that the driver will record what happens at the stop. It no longer claims the child is on the bus: an undone morning absence returns the child to "nothing recorded", an undone boarding likewise, and an undone afternoon absence restores "Expected on bus". You see the same undo as a **Driver correction** alert.
 
 ### Ending a run the driver cannot finish
 
@@ -339,6 +395,8 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Run | In progress, Delayed, Completed |
 | Route/run type | Morning, Afternoon |
 | Student (today) | At home, On bus, Expected on bus, At school, Dropped off, Absent today / Absent (AM) / Absent (PM), Unaccounted, Unassigned |
+| Stop exception | Open, Resolved, Confirmed by driver, Retracted, Attested by driver, Uncorroborated (plus the **Reviewed** stamp) |
+| Bus position source (Fleet Map) | Planned stop, Phone GPS (tap), Phone GPS (live), Checkpoint (older app) |
 | Parent account | Registered, Awaiting signup (plus the **Shared** mark) |
 | Driver PIN | Set, None |
 | Staff | Active, Offered |
@@ -360,7 +418,9 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: "No routes assigned to this bus yet" | Create a route with that bus assigned (Routes). |
 | Driver: "No students are assigned to this route yet" | Assign students to the route (Students → edit → Morning/Afternoon route). |
 | Driver: route shows "Completed today" but needs to run again | Delete the erroneous run in Run History. |
-| Driver: boarded/absented the wrong student | Drivers can't undo these (parents were already notified). Correct the record from the office and inform the affected parent. |
+| Driver: boarded/absented the wrong student | While the run is open the driver can **Undo** their own entry (on the Board tab, or on the far-from-stop prompt); the family gets a neutral "mark withdrawn" message. After the run has closed, correct the record from the office and inform the affected parent. |
+| Driver: yellow **Location off** or **Turn on precise location** banner | Their phone refused location, or is sharing a rough one. Taps still work; the map shows planned stops instead of the bus. The banner's **How to turn it on** lists the steps per phone (also in the Driver Guide). |
+| Driver: "the app keeps asking me to confirm" | Taps made further than the **Custody distance** from the child's stop, after accuracy. Check the stop pins on the route and the phone's accuracy on the run report before loosening the threshold in Settings → Tracking. |
 | Driver forgot their PIN | Drivers → edit → Reset PIN; the new PIN shows once. |
 | Staff member locked out of their account | A director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
 | A director is locked out and there is no other director | Contact SafeRide support — they can step in and issue the reset. |
@@ -369,4 +429,6 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Alerts: "mismatched email" from a parent decline | A parent answered your link with "Not my child". The email was removed from the student's record — verify the address with the family and re-enter it. |
 | Parent: wants name/phone/address changed | Edit it on the Students or Parents page — parents can't self-edit. |
 | Parent: no notifications | Check they've registered (Parents page shows "Registered"), and that they enabled push in their Profile tab; otherwise alerts still appear in their in-app feed. |
-| Bus missing from Fleet Map | The bus only appears during an active run, and only advances as the driver taps "Arrive Next Stop". |
+| Bus missing from Fleet Map | The bus only appears during an active run. Its position moves at each of the driver's taps (phone GPS), or to the planned stop when a tap carried no fix. |
+| Fleet Map: bus faded, "last seen N min ago" | No tap with a position for longer than the staleness threshold (90 s). Normal between stops that are far apart; call the driver if it persists. |
+| Fleet Map: "No GPS for this run — checkpoint positions only" | None of the run's taps carried a position — location is off on the driver's phone. The run is fine; ask the driver to turn location on (Driver Guide). |

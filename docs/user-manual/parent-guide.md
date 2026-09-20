@@ -72,10 +72,12 @@ Two quick actions sit under the cards: **Alerts** (opens the Alerts tab) and **C
 Open **Track** and, if you have more than one child, pick the child from the selector at the top.
 
 - The **map** shows the route's stops joined by a green line. Stops turn **green as the bus completes them**; upcoming stops stay grey.
-- While the bus is transmitting, a pulsing **"{Bus} is live"** badge appears under the map. The map shows progress stop by stop rather than a continuously moving bus icon.
+- While your child's run is in progress, a **green bus marker** shows where the bus last reported from, and a pulsing **"{Bus} is live"** badge appears under the map with the time beside it — **"updated 12 s ago"**. The position comes from the driver's phone each time the driver taps in the app (arriving at a stop, boarding or dropping off a child), so the marker moves at those moments rather than continuously. When a tap carries no phone position, the bus is shown at the planned stop instead.
+- If the bus has not reported for a while, the marker fades and the label changes to **"last seen 4 min ago"**. That means the app has heard nothing recently — usually a long gap between stops or a phone without signal — not that anything is wrong. The marker is never hidden while the run is on.
+- The marker disappears when the run ends. Outside a run there is no bus position to show.
 - Below the map, the **stop list** shows every stop in order, ticking off completed ones. Your child's stop carries a green **"Your stop"** badge; the school is marked **"School"**.
 
-**Privacy:** you see your own child's name and your own stop's full address, but other families' stops are anonymised (house numbers removed) and other children's names are never shown. Other parents see your stop the same way.
+**Privacy:** you see your own child's name and your own stop's full address, but other families' stops are anonymised (house numbers removed) and other children's names are never shown. Other parents see your stop the same way. About the bus itself you see **only its position and when it was reported** — never the driver's phone details (its accuracy, its device, what it recorded between taps), and never the app's internal checks on the driver's taps. Those are between the driver and the school office.
 
 ## Notifications
 
@@ -90,7 +92,10 @@ SafeRide records an alert for every meaningful moment of your child's trip:
 | **On the way home** | The afternoon run home has started |
 | **Dropped off** | Your child left the bus. Usually at their own stop; if it was somewhere else, the message says where and who met them |
 | **Marked absent** | The driver marked your child absent. The message says **which trip** — the morning pickup or the ride home — and says nothing about the other one |
-| **Correction** | The driver corrected something they had recorded by mistake. The earlier message no longer applies; this one does |
+| **Call the office now** | The driver marked your child absent **away from your stop**, and could not say that you or the office had told them. See [If you receive "Call the office now"](#if-you-receive-call-the-office-now) — it asks you to do one thing |
+| **Boarding mark withdrawn** | The driver had marked your child as boarded by mistake and withdrew it. The earlier "Boarded the bus" no longer applies; the driver will record what happens at the stop |
+| **Absent mark withdrawn** | The driver had marked your child absent by mistake and withdrew it. The earlier "Marked absent" no longer applies; the driver will record what happens at the stop |
+| **Drop-off mark withdrawn** | The driver had marked your child as dropped off by mistake. Your child is still on the bus; the driver will confirm when they get off |
 | **Incident** | The driver reported a breakdown, accident or delay on the bus |
 | **School notice** | The school office sent a message to your route |
 | **Ride cancelled** | A parent on the account cancelled a ride (both parents are told) |
@@ -100,6 +105,21 @@ All of these always appear in the **Alerts** tab. Push notifications — the one
 **One deliberate silence.** If the school ends up not knowing where your child is, you get **no automated message** — your child's card reads **"Being confirmed"** and a person from the office phones you. That is on purpose: a push notification is the wrong way to hear that news, and the office would rather tell you themselves.
 
 **And one thing the app will never do:** claim your child arrived somewhere nobody confirmed. If the driver did not record your child boarding, you will not get an "Arrived at school" message about them — the absence of a message is not the same as nothing having happened, so if you are unsure, call the office.
+
+**Corrections say only that a mark is gone.** A "mark withdrawn" message never tells you where your child is — it tells you the earlier message was a mistake and that the driver will record what really happens. If a withdrawn message leaves you unsure, the Track tab and the office are the places to look.
+
+### If you receive "Call the office now"
+
+The message reads: *"{child} was marked absent away from their stop. If {child} should be on the bus, please call the school office now."*
+
+**What it means.** The driver marked your child absent while the bus was well away from your stop, and did not say that a parent or the office had told them your child was not coming. From the app's side, a stop that was skipped looks exactly like a child who was not at the stop — so instead of guessing, the app asks you. You will already have received the ordinary **Marked absent** message; this one comes after it.
+
+**What to do.**
+
+- **If your child should be on the bus** — they were at the stop, or should have been picked up — **call the school office now**. Do not wait for the office to call you.
+- **If your child is genuinely not travelling** — you kept them home, or you already told the driver or the office — nothing is wrong. A quick call to the office still helps, because they follow up on every one of these until someone confirms.
+
+You receive this message **at most once per trip**, and it is not withdrawn afterwards: if the driver later corrects the absent mark you get an **Absent mark withdrawn** message, but the request to call stands — the office would rather hear from you once too often than not at all.
 
 ### Turning on push notifications
 
@@ -149,5 +169,7 @@ The Profile tab shows your name, email and phone, and a card for each linked chi
 | No push notifications arriving | Check Profile → the button should read "Disable Push Notifications" (meaning push is on). On iPhone, make sure you opened the app from the home-screen icon. Check the phone's notification settings for your browser. |
 | Password reset link says "Reset link invalid" | Links are single-use and expire quickly. Tap "Request a new reset link" and use the newest email. |
 | The arrival estimate seems off | It's approximate. Rely on the Track tab's stop progress and the "Bus approaching" alert. |
+| The bus marker is faded and says "last seen …" | The bus has not reported a position for a while — a long gap between stops, or the driver's phone has no signal. It reappears fresh at the driver's next tap. If it stays that way, call the office. |
+| You received "Call the office now" | If your child should be on the bus, call the school office straight away. See [If you receive "Call the office now"](#if-you-receive-call-the-office-now). |
 | "Too many cancellation changes." | There's an hourly limit on cancelling/withdrawing. Wait a while, or call the office. |
 | Wrong phone, address or stop shown | Contact the school office — parents can't edit these in the app. |
