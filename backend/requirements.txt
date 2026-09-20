@@ -1,9 +1,19 @@
-fastapi
-uvicorn[standard]
-psycopg[binary,pool]
-pydantic-settings
-pytest
-httpx
-firebase-admin
-pywebpush
-mangum
+# Pinned to the versions the last containerized `sam build` resolved
+# (infra/backend/.aws-sam/build/*/**.dist-info, 2026-09-20, tenancy
+# Release 5), so the local venv, the API container and the Lambdas run the
+# same code. Refresh deliberately: sam build, read the new dist-info versions
+# from the build directory, update these lines, re-run scripts/certify.sh.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+psycopg[binary,pool]==3.3.6
+pydantic-settings==2.15.0
+pytest==9.1.1
+httpx==0.28.1
+firebase-admin==7.6.0
+pywebpush==2.5.0
+mangum==0.22.0
+# Transitive, pinned explicitly because request routing, validation and the
+# connection pool depend on them directly (same SAM build resolution).
+starlette==1.6.0
+pydantic==2.13.5
+psycopg-pool==3.3.2
