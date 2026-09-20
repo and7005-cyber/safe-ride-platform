@@ -37,7 +37,9 @@ password parameter path — fixed in `2656fe1` before the successful run.
 - **null-scope-counts:** 0 on live_buses / live_routes / live_students / live_runs.
 - **school-references:** buses → Msingi 2; routes → Msingi 4; fleet plans →
   Msingi 4, **Greenfield 1**; runs → Msingi 19, **Greenfield 14**;
-  **live_students: zero rows at either school (the table is empty)**.
+  students → **Msingi 32**. *(Correction 2026-09-20: this record first claimed
+  live_students was empty — a truncated display of the check output, not the
+  data. The full row set always carried Msingi's 32 students.)*
 - **audit-by-school:** Msingi 2 (audit is excluded from the move pins).
 - **demo-identities present:** `admin@test.com`, `and7005@yahoo.it` (neither
   drives a live bus). `and7005@gmail.com`, `francis@saferide.test`,
@@ -57,10 +59,8 @@ committed would abort in production** (correct behavior — abort, not guess):
 2. **Greenfield is not empty:** 14 runs and 1 fleet plan reference it; the
    zero-references pin (audit excluded) fails. Needs a decision: delete the
    demo school's run history and plan, or move them — before Release 3.
-3. **"Target has students" is false:** live_students is empty at both
-   schools. The pin fails; the move itself is still sound (nothing to stamp),
-   but the pin must be reconciled with reality, and the pilot's student
-   roster story checked with the school.
+3. *(Withdrawn — see the correction above: Msingi has 32 students and the
+   "target has students" pin holds as written.)*
 4. **Identity inventory:** only 2 of the 5 pinned seed identities exist; the
    five-identity assertion and the four-email disable list must shrink to
    the observed set.
