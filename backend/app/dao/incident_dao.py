@@ -15,6 +15,7 @@ _LIFECYCLE_HEADLINE = {
     "force-closed": "the office force-closed the run.",
     "handover-recorded": "a child left the bus away from their stop.",
     "action-reversed": "the driver corrected their own entry.",
+    "stop-bypassed": "a stop was passed without outcomes.",
 }
 
 

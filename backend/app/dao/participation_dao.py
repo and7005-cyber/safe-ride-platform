@@ -182,11 +182,42 @@ def unaccounted_on_run(conn, run_id: str, run_type: str) -> list[dict[str, Any]]
     Returns the blocking children with their names, so the driver and the office
     alert can both name them rather than showing a generic failure.
     """
+    return _unaccounted(conn, run_id, run_type)
+
+
+def unaccounted_at_stop(
+    conn, run_id: str, run_type: str, stop_order: int
+) -> list[dict[str, Any]]:
+    """The closure gate's set, narrowed to one stop order (GPS plan U2/R15).
+
+    The bypassed-stop check asks "did the bus just leave children unrecorded at
+    the stop it passed?", and the only honest answer is the gate's own: the same
+    five arms, filtered to the rows of that stop. It is literally the same
+    query with one more predicate, so the two can never disagree — a check that
+    used a looser rule would flag every cross-bus rider and every covered
+    absence the gate lets through, every day.
+
+    An order with no student rows (the school gate, an unknown order) returns
+    an empty list. Ordered by name like the gate.
+    """
+    return _unaccounted(conn, run_id, run_type, stop_order=stop_order)
+
+
+def _unaccounted(
+    conn, run_id: str, run_type: str, stop_order: int | None = None
+) -> list[dict[str, Any]]:
+    """The one "no outcome" query behind the gate and the per-stop check.
+
+    ``stop_order`` None is the whole run (the gate); an integer narrows the
+    roster rows to that stop. Every arm is shared by construction: outcome by
+    period, covering absence, and confirmed aboard another run of the period.
+    """
     outcome = (
         "(p.dropped_off_at is not null or p.handover_at is not null)"
         if run_type == "afternoon"
         else "p.boarded_at is not null"
     )
+    stop_filter = "and rs.stop_order = %(stop_order)s" if stop_order is not None else ""
     rows = conn.execute(
         f"""
         select distinct s.id, s.name
@@ -196,6 +227,7 @@ def unaccounted_on_run(conn, run_id: str, run_type: str) -> list[dict[str, Any]]
             on p.run_id = rs.run_id and p.student_id = rs.student_id
         where rs.run_id = %(run_id)s
           and rs.student_id is not null
+          {stop_filter}
           and not ({outcome})
           and not exists (
               select 1 from live_student_absences a
@@ -219,7 +251,7 @@ def unaccounted_on_run(conn, run_id: str, run_type: str) -> list[dict[str, Any]]
           )
         order by s.name asc
         """,
-        {"run_id": run_id, "run_type": run_type},
+        {"run_id": run_id, "run_type": run_type, "stop_order": stop_order},
     ).fetchall()
     return [dict(r) for r in rows]
 

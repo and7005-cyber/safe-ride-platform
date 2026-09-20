@@ -8,6 +8,7 @@ from app.core.auth import get_current_user
 from app.core.errors import ClosureRefusedError
 from app.core.permissions import require_driver_scope, require_school, require_staff
 from app.core.scope import STAFF_ROLES, SchoolScope
+from app.dao.exception_dao import ExceptionDao
 from app.dao.incident_dao import IncidentDao
 from app.dao.run_dao import RunDao
 from app.services.push_service import PushService
@@ -17,6 +18,7 @@ logger = logging.getLogger("saferide.runs")
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 dao = RunDao()
 incident_dao = IncidentDao()
+exception_dao = ExceptionDao()
 push_service = PushService()
 # The runs list serves two surfaces (U7): staff read their school's runs; a
 # driver token resolves to their own school and the DAO narrows to their
@@ -160,8 +162,33 @@ def record_parent_contact(
 @router.get("/{run_id}/report")
 def run_report(run_id: str, scope: SchoolScope = Depends(require_staff)):
     """Post-run report (R14-R16): the run row + bus/route/driver names + the
-    absent_students snapshot (approximate=true on the legacy fallback)."""
+    absent_students snapshot (approximate=true on the legacy fallback) + the
+    run's stop exceptions with derived status (GPS plan U2)."""
     return safe_call(lambda: dao.run_report(scope, run_id))
+
+
+@router.get("/{run_id}/exceptions")
+def list_run_exceptions(run_id: str, scope: SchoolScope = Depends(require_staff)):
+    """A run's stop exceptions (GPS plan U2/R21): kind, stop, the children
+    still without an outcome, derived open/resolved status, review state and
+    the prompt/response ledger. Staff of the active school only; a run of
+    another school is 404 through RLS. Parents have no route to this (R22)."""
+    return safe_call(lambda: exception_dao.list_for_run(scope, run_id))
+
+
+@router.post("/{run_id}/exceptions/{exception_id}/review")
+def review_run_exception(
+    run_id: str,
+    exception_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    """Mark an exception reviewed (R21): director or coordinator, the provider
+    stepped in as director. Idempotent; the first review writes one
+    exception-reviewed audit row carrying the exception id only."""
+    return safe_call(
+        lambda: exception_dao.mark_reviewed(scope, run_id, exception_id, actor=user)
+    )
 
 
 # Driver run lifecycle (U7: driver-scoped — school derived, header refused) ----
@@ -192,6 +219,21 @@ def arrive(
         background_tasks.add_task(push_service.notify_reached_school, result["run"], scope=scope)
     # Arriving a stop means the next stop's children should get ready.
     background_tasks.add_task(push_service.notify_bus_approaching, result["run"], scope=scope)
+    # A newly raised bypassed-stop exception reaches the office through the
+    # lifecycle feed (GPS plan U2/R15, R21): post-commit, DAO-direct, never the
+    # parent fan-out, and marked lifecycle so the parent alerts reader excludes
+    # it. Raised only when the exception row itself was inserted, which is the
+    # dedup on (run, stop order): a catch-up Arrive or a reopen finds the row
+    # already there and stays quiet. The text names the stop and the children,
+    # never a coordinate.
+    bypassed = result.pop("bypassed_stop", None)
+    if bypassed:
+        names = ", ".join(s["name"] for s in bypassed["students"])
+        background_tasks.add_task(
+            _record_lifecycle_alert, scope, str(result["run"]["id"]), "stop-bypassed",
+            f"Stop {bypassed['stop_order']} ({bypassed['stop_name']}): "
+            f"no record yet for {names}.",
+        )
     return result
 
 

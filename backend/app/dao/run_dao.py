@@ -1,11 +1,14 @@
+import logging
 from typing import Any
 
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
-from app.dao import participation_dao
+from app.dao import exception_dao, participation_dao
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
+
+logger = logging.getLogger("saferide.runs")
 
 
 class RunDao:
@@ -374,10 +377,14 @@ class RunDao:
             # office can reopen a force-closed run days later and still see who
             # was never accounted for and whether anyone rang their family.
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+            # Stop exceptions with their derived status (GPS plan U2/R21): the
+            # same read the staff list route serves, on this connection.
+            exceptions = exception_dao.list_exceptions(conn, dict(run))
         report = dict(run)
         report["absent_students"] = [dict(a) for a in absent]
         report["unaccounted"] = outstanding
         report["approximate"] = approximate
+        report["exceptions"] = exceptions
         return report
 
     # --- driver context ----------------------------------------------------
@@ -850,8 +857,46 @@ class RunDao:
                         "update live_runs set incidents = incidents + 1 where id = %s", (run_id,)
                     )
                     arrival_incident = dict(inc)
+            # Bypassed-stop check (GPS plan U2/R15). Progress moved to N, so the
+            # stop the bus just left behind is N−1, and the closure gate's own
+            # per-stop predicate decides whether anyone there is unrecorded.
+            #
+            # The check, the exception upsert and the prompt event run in a
+            # savepoint on this same connection (psycopg opens one because the
+            # transaction is already in progress). Everything above is the
+            # atomic core and commits exactly as before; a failure in here rolls
+            # back to the savepoint, is logged with the run and stop order only
+            # — never a coordinate — and swallowed, so a prompt-side bug can
+            # never block a driver's tap (R23, R40). No trail row exists yet
+            # (U7), so 'classification-failed' is this log line for now.
+            bypassed = None
+            passed_order = new_completed - 1
+            try:
+                with conn.transaction():
+                    bypassed = exception_dao.evaluate_bypassed_stop(
+                        conn, dict(run), passed_order
+                    )
+            except Exception:
+                logger.exception(
+                    "stop-bypassed evaluation failed; the Arrive still commits "
+                    "(run=%s stop_order=%s)",
+                    run_id, passed_order,
+                )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
-        return {"run": dict(updated), "arrival_incident": arrival_incident}
+        result: dict[str, Any] = {
+            "run": dict(updated), "arrival_incident": arrival_incident, "prompts": [],
+        }
+        if bypassed:
+            if bypassed["prompt"]:
+                result["prompts"].append(bypassed["prompt"])
+            if bypassed["raised"]:
+                # For the router's office alert only; it pops this before the
+                # response leaves.
+                result["bypassed_stop"] = {
+                    key: bypassed[key]
+                    for key in ("exception_id", "stop_order", "stop_name", "students")
+                }
+        return result
 
     def end_run(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
         """Complete a run — refused while any roster child is unaccounted (U4).
