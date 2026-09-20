@@ -322,7 +322,11 @@ Resources:
       Environment:
         Variables:
           APP_ENV: production
-          DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+          DATABASE_URL: !Sub "postgresql://saferide_app:${DbAppPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+          # Release 5: the API runs under the LOGIN NOBYPASSRLS runtime
+          # role so migration 015's policies bind every query, and the
+          # school header becomes mandatory on the staff surface.
+          SCOPE_HEADER_REQUIRED: "true"
           CORS_ORIGINS: !Ref CorsOrigins
           PIN_PEPPER: !Ref PinPepper
           APP_BASE_URL: !Ref AppBaseUrl
