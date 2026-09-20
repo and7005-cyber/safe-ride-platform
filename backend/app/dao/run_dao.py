@@ -3,13 +3,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from app.core.config import GPS_CLOCK_SKEW_TOLERANCE_S, GPS_FIX_ACCURACY_CAP_M
+from app.core.config import GPS_CLOCK_SKEW_TOLERANCE_S
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
 from app.dao import exception_dao, idempotency_dao, participation_dao, position_dao
 from app.dao.idempotency_dao import ActionEnvelope
+from app.dao.school_thresholds import SchoolThresholds, resolve_school_thresholds
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
 from app.services.position_rules import (
     FLAG_CLASSIFICATION_FAILED,
@@ -24,8 +25,10 @@ logger = logging.getLogger("saferide.runs")
 class _Tap:
     """One tapped action's envelope state inside its transaction (GPS plan
     U7): the action kind, the claimed key (or None), the normalised fix, the
-    diagnostic device id, who and where, and — once written — the trail row
-    the savepoint tier may flag."""
+    diagnostic device id, who and where, the school's thresholds resolved
+    once for this tap (U11 — the cap the fix was normalised against and the
+    radii the savepoint tier classifies with), and — once written — the
+    trail row the savepoint tier may flag."""
 
     action: str
     key: str | None
@@ -34,6 +37,7 @@ class _Tap:
     school_id: str
     driver_id: str
     session_id: str | None
+    thresholds: SchoolThresholds
     trail_row_id: str | None = None
 
 
@@ -448,6 +452,11 @@ class RunDao:
     def get_driver_context(self, scope: SchoolScope) -> dict[str, Any]:
         driver_id = scope.user_id
         with get_connection(scope) as conn:
+            # The school's resolved tracking config (GPS plan U11), served on
+            # every poll — with or without a bus — so the app never hard-codes
+            # the fix-wait budget, the accuracy cap or the ping interval and a
+            # change in School Settings reaches the phone on the next poll.
+            config = resolve_school_thresholds(conn, str(scope.school_id)).driver_config()
             bus = conn.execute(
                 "select * from live_buses where driver_id = %s and school_id = %s "
                 "order by name asc limit 1",
@@ -457,7 +466,7 @@ class RunDao:
                 return {
                     "bus": None, "routes": [], "active_run": None, "run_stops": [],
                     "students": [], "blocking": [], "completed_route_ids_today": [],
-                    "pending_prompts": [],
+                    "pending_prompts": [], "config": config,
                 }
             routes = conn.execute(
                 "select * from live_routes where bus_id = %s order by type asc", (bus["id"],)
@@ -616,6 +625,7 @@ class RunDao:
             "blocking": [{"id": str(b["id"]), "name": b["name"]} for b in blocking],
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
             "pending_prompts": pending_prompts,
+            "config": config,
         }
 
     def _assert_service_day(self, conn, run: dict) -> None:
@@ -686,11 +696,14 @@ class RunDao:
         action: str, run_id: str | None, identity: dict[str, Any],
     ) -> _Tap:
         envelope = envelope or ActionEnvelope()
-        # U11 resolves the school's own cap here; the system default until then.
+        # The school's own thresholds, once per tap (U11): the accuracy cap
+        # decides `coarse` here, and the same resolved set reaches the
+        # savepoint tier's custody and absent checks.
+        thresholds = resolve_school_thresholds(conn, str(scope.school_id))
         fix = normalise_fix(
             envelope.fix,
             now=datetime.now(timezone.utc),
-            accuracy_cap_m=GPS_FIX_ACCURACY_CAP_M,
+            accuracy_cap_m=thresholds.fix_accuracy_cap_m,
             skew_tolerance_s=GPS_CLOCK_SKEW_TOLERANCE_S,
         )
         tap = _Tap(
@@ -701,6 +714,7 @@ class RunDao:
             school_id=str(scope.school_id),
             driver_id=str(scope.user_id),
             session_id=scope.session_id,
+            thresholds=thresholds,
         )
         if tap.key:
             idempotency_dao.claim(
@@ -1452,6 +1466,8 @@ class RunDao:
                 return exception_dao.record_custody_check(
                     conn, dict(run), stop=dict(stop), student_id=str(student_id),
                     student_name=student_name, fix=tap.fix, action_key=tap.key,
+                    custody_threshold_m=tap.thresholds.custody_threshold_m,
+                    accuracy_cap_m=tap.thresholds.fix_accuracy_cap_m,
                 )
         except Exception:
             logger.exception(
@@ -1531,6 +1547,8 @@ class RunDao:
                     conn, dict(run), stop=dict(stop), school=school,
                     student_id=str(student_id), student_name=student_name, fix=tap.fix,
                     action_key=tap.key, prior_absence_covers=prior_absence_covers,
+                    vicinity_m=tap.thresholds.vicinity_radius_m,
+                    accuracy_cap_m=tap.thresholds.fix_accuracy_cap_m,
                 )
         except Exception:
             logger.exception(

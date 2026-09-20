@@ -19,11 +19,14 @@ export interface DriverContext {
   /** The open run's pending prompts, safety kinds first (GPS plan U3/R34).
    * Present and empty with no bus or no run. */
   pending_prompts: NudgePrompt[];
-  /** The school's resolved tracking thresholds (GPS plan U11). Absent until
-   * U11 ships; the client falls back to the system defaults. */
+  /** The school's resolved tracking config (GPS plan U11): the fix-wait
+   * budget, the accuracy cap and the ping interval, resolved per school on
+   * every poll — a School Settings change reaches the phone on the next one.
+   * Optional only for an older server; the client then keeps its defaults. */
   config?: {
     fix_wait_budget_s?: number;
     fix_accuracy_cap_m?: number;
+    ping_interval_s?: number;
     [key: string]: unknown;
   } | null;
 }

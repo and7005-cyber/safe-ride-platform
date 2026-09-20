@@ -81,11 +81,6 @@ row after an answer, history kept) and never touches the call-now stamps.
 import logging
 from typing import Any
 
-from app.core.config import (
-    GPS_CUSTODY_THRESHOLD_M,
-    GPS_FIX_ACCURACY_CAP_M,
-    GPS_VICINITY_RADIUS_M,
-)
 from app.core.db import get_connection
 from app.core.errors import (
     BadRequestError,
@@ -96,6 +91,7 @@ from app.core.errors import (
 from app.core.scope import SchoolScope
 from app.dao import participation_dao, position_dao
 from app.dao.audit_dao import masked_display_sql, record_audit
+from app.dao.school_thresholds import resolve_school_thresholds
 from app.services.position_rules import (
     CUSTODY_WITHIN,
     REASON_STOP_UNVERIFIED,
@@ -587,8 +583,8 @@ def record_custody_check(
     student_name: str,
     fix: NormalisedFix,
     action_key: str | None,
-    custody_threshold_m: float = GPS_CUSTODY_THRESHOLD_M,
-    accuracy_cap_m: float = GPS_FIX_ACCURACY_CAP_M,
+    custody_threshold_m: float | None = None,
+    accuracy_cap_m: float | None = None,
 ) -> dict[str, Any]:
     """Classify one Board or Drop-off against the child's stop and record the
     verdict (R14, R20; AE3, AE4, AE17).
@@ -597,8 +593,9 @@ def record_custody_check(
     savepoint, after the outcome and the trail row are written and only when
     the tap was not a bypassed-stop resolution (those are exempt, R14).
     ``stop`` is the child's ``run_stops`` row on this run — the snapshot's
-    coordinates, never the live route's. Thresholds default to the system
-    values; U11 resolves the school's own.
+    coordinates, never the live route's. The thresholds are the school's own
+    (U11): the action DAO passes the ones it resolved for the tap; a caller
+    that passes none has them resolved here from ``run["school_id"]``.
 
     - ``within``: nothing written.
     - ``away``: the per-stop ``custody-away`` row (created by the first far
@@ -612,6 +609,12 @@ def record_custody_check(
     Returns ``{"classification", "reason", "distance_m", "exception_id",
     "prompt"}``. Never logs a coordinate.
     """
+    if custody_threshold_m is None or accuracy_cap_m is None:
+        thresholds = resolve_school_thresholds(conn, str(run["school_id"]))
+        custody_threshold_m = (
+            thresholds.custody_threshold_m if custody_threshold_m is None else custody_threshold_m
+        )
+        accuracy_cap_m = thresholds.fix_accuracy_cap_m if accuracy_cap_m is None else accuracy_cap_m
     verdict = classify_custody(
         fix.fix, (stop.get("lat"), stop.get("lng")),
         custody_threshold_m=custody_threshold_m, accuracy_cap_m=accuracy_cap_m,
@@ -723,8 +726,8 @@ def record_absent_check(
     fix: NormalisedFix,
     action_key: str | None,
     prior_absence_covers: bool,
-    vicinity_m: float = GPS_VICINITY_RADIUS_M,
-    accuracy_cap_m: float = GPS_FIX_ACCURACY_CAP_M,
+    vicinity_m: float | None = None,
+    accuracy_cap_m: float | None = None,
 ) -> dict[str, Any]:
     """Classify one Absent mark and record the verdict (R16, R17, R20; AE6,
     AE7, AE8, AE16).
@@ -734,8 +737,10 @@ def record_absent_check(
     held back (R17, R23). ``stop`` is the child's ``run_stops`` row on this
     run; ``school`` the run's gate coordinates (or the school's pin);
     ``prior_absence_covers`` whether a parent or office absence covered this
-    trip *before* the driver's upsert. Thresholds default to the system
-    values; U11 resolves the school's own.
+    trip *before* the driver's upsert. The vicinity radius and accuracy cap
+    are the school's own (U11): the action DAO passes the ones it resolved
+    for the tap; a caller that passes none has them resolved here from
+    ``run["school_id"]``.
 
     - ``corroborated``: nothing written — the standard notice already went
       out and the trail row carries the fix.
@@ -752,6 +757,10 @@ def record_absent_check(
     Returns ``{"classification", "reason", "corroborated_by", "distance_m",
     "exception_id", "prompt"}``. Never logs a coordinate.
     """
+    if vicinity_m is None or accuracy_cap_m is None:
+        thresholds = resolve_school_thresholds(conn, str(run["school_id"]))
+        vicinity_m = thresholds.vicinity_radius_m if vicinity_m is None else vicinity_m
+        accuracy_cap_m = thresholds.fix_accuracy_cap_m if accuracy_cap_m is None else accuracy_cap_m
     verdict = classify_absent(
         fix.fix, (stop.get("lat"), stop.get("lng")),
         school=school, run_type=run["type"], stop_order=stop.get("stop_order"),
@@ -1229,7 +1238,11 @@ def list_exceptions(
     ledger: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         ledger.setdefault(str(event["exception_id"]), []).append(dict(event))
-    fixes: list[StoredFix] | None = None  # read once, only when a custody row needs it
+    # Read once, only when a custody row needs them: the run's fixes and the
+    # school's vicinity radius and accuracy cap (U11) that "seen at stop"
+    # is derived against.
+    fixes: list[StoredFix] | None = None
+    thresholds = None
 
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -1253,7 +1266,13 @@ def list_exceptions(
         if item["kind"] == CUSTODY_AWAY:
             if fixes is None:
                 fixes = position_dao.run_fixes(conn, run_id)
-            seen = _seen_at_stop(fixes, stop_point)
+            if thresholds is None:
+                thresholds = resolve_school_thresholds(conn, _school_id_of(conn, run))
+            seen = _seen_at_stop(
+                fixes, stop_point,
+                vicinity_m=thresholds.vicinity_radius_m,
+                accuracy_cap_m=thresholds.fix_accuracy_cap_m,
+            )
             if seen is not None:
                 item["seen_at_stop"] = seen
         # The event shape stays the ledger row's; the name served the
@@ -1314,16 +1333,26 @@ def _absent_status(events: list[dict[str, Any]]) -> str | None:
     return "uncorroborated"
 
 
-def _seen_at_stop(fixes: list[StoredFix], stop: tuple[Any, Any]) -> bool | None:
-    """Did any phone fix on the run place the bus at this stop? None when the
-    trail carries no fix or the stop has no coordinates (the stored column
-    then stands)."""
+def _school_id_of(conn, run: dict[str, Any]) -> str:
+    """The run's school: from the dict when the caller's query carried it,
+    else one read — ``list_exceptions`` only promises ``id`` and ``type``."""
+    if run.get("school_id"):
+        return str(run["school_id"])
+    row = conn.execute("select school_id from live_runs where id = %s", (run["id"],)).fetchone()
+    return str(row["school_id"]) if row else ""
+
+
+def _seen_at_stop(
+    fixes: list[StoredFix], stop: tuple[Any, Any], *, vicinity_m: float, accuracy_cap_m: float
+) -> bool | None:
+    """Did any phone fix on the run place the bus at this stop, by the
+    school's vicinity radius and accuracy cap (U11)? None when the trail
+    carries no fix or the stop has no coordinates (the stored column then
+    stands)."""
     if not fixes or stop[0] is None or stop[1] is None:
         return None
     return any(
-        within_vicinity(
-            fix, stop, vicinity_m=GPS_VICINITY_RADIUS_M, accuracy_cap_m=GPS_FIX_ACCURACY_CAP_M,
-        )
+        within_vicinity(fix, stop, vicinity_m=vicinity_m, accuracy_cap_m=accuracy_cap_m)
         for fix in fixes
     )
 

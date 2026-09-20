@@ -465,8 +465,11 @@ def test_taps_without_fixes_derive_no_gps_and_gps_off_and_the_first_fix_clears_b
 def test_a_position_older_than_the_threshold_reads_stale_and_a_new_fix_clears_it(
     client, admin_headers, fleet,
 ):
-    from app.core.config import GPS_STALE_AFTER_S
+    from app.core.config import get_settings
 
+    # The staleness threshold is a system default (Settings, GPS plan U11),
+    # never per school; the stack under test runs the default.
+    GPS_STALE_AFTER_S = get_settings().gps_stale_after_s
     assert GPS_STALE_AFTER_S == 90
     h = fleet["driver_headers"]
     bus_id = fleet["bus1"]["id"]

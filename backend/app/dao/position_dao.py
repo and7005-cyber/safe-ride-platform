@@ -33,9 +33,9 @@ from psycopg import sql
 
 from app.core.config import (
     GPS_ACTION_KEY_TTL_DAYS,
-    GPS_POSITION_RETENTION_DAYS,
     GPS_PURGE_BATCH_ROWS,
     GPS_PURGE_STATEMENT_TIMEOUT_MS,
+    get_settings,
 )
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
@@ -113,7 +113,7 @@ def add_flag(conn, row_id: str, flag: str) -> None:
 
 
 def run_fixes(
-    conn, run_id: str, *, default_retention_days: int = GPS_POSITION_RETENTION_DAYS
+    conn, run_id: str, *, default_retention_days: int | None = None
 ) -> list[StoredFix]:
     """Every phone fix on a run's trail inside the school's retention, oldest
     first — the read behind "bus seen at stop" (U9, R13).
@@ -122,8 +122,11 @@ def run_fixes(
     by a fix-less Arrive, and counting it would make every stop "seen" by
     construction — the fabricated corroboration the plan warns about. Rows
     past retention are never served (R12), so a purge that has not run yet
-    is invisible here too.
+    is invisible here too. The school's own retention applies; the default
+    beneath it is Settings' (U11), read per call.
     """
+    if default_retention_days is None:
+        default_retention_days = int(get_settings().gps_position_retention_days)
     rows = conn.execute(
         """
         select p.lat, p.lng, p.accuracy_m, p.captured_at
@@ -202,7 +205,7 @@ def purge_batch(
     batch_rows: int = GPS_PURGE_BATCH_ROWS,
     key_ttl_days: int = GPS_ACTION_KEY_TTL_DAYS,
     statement_timeout_ms: int = GPS_PURGE_STATEMENT_TIMEOUT_MS,
-    default_retention_days: int = GPS_POSITION_RETENTION_DAYS,
+    default_retention_days: int | None = None,
 ) -> dict[str, Any] | None:
     """One bounded retention pass for one school, on the caller's transaction.
 
@@ -214,8 +217,11 @@ def purge_batch(
     deletes at most ``batch_rows`` idempotency keys older than
     ``key_ttl_days``. Returns the counts. The advisory lock and the SET LOCAL
     end with the caller's transaction; a timeout raises and aborts it, which
-    the callers treat as "skipped".
+    the callers treat as "skipped". The retention is the school's own, else
+    Settings' default (U11), read per call.
     """
+    if default_retention_days is None:
+        default_retention_days = int(get_settings().gps_position_retention_days)
     locked = conn.execute(
         "select pg_try_advisory_xact_lock(%s, hashtext(%s)) as locked",
         (PURGE_LOCK_CLASS, str(school_id)),

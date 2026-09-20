@@ -3,10 +3,13 @@ import logging
 import re
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
+
 from app.core.db import get_connection
 from app.core.errors import BadRequestError, ConflictError, NotFoundError, SafeRideError
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import record_audit
+from app.dao.school_thresholds import PER_SCHOOL_KNOBS, system_defaults
 from app.dao.status_sql import (
     RAW_POSITION_COLUMNS,
     bus_position_columns,
@@ -1175,6 +1178,18 @@ class FleetDao:
 
     # --- schools -----------------------------------------------------------
 
+    # The settings columns update_school writes from the payload's base fields
+    # (U6). The five per-school tracking knobs (GPS plan U11) are written only
+    # when present in `tracking` — see update_school.
+    _SCHOOL_BASE_COLUMNS = ("name", "address", "phone", "lat", "lng", "morning_bell", "afternoon_bell")
+
+    @staticmethod
+    def _with_tracking_defaults(row: dict[str, Any]) -> dict[str, Any]:
+        """The settings row plus ``tracking_defaults`` — the system default
+        for each per-school knob (GPS plan U11), so the Settings page can show
+        it beside the stored value (null when unset)."""
+        return {**row, "tracking_defaults": system_defaults()}
+
     def get_school(self, scope: SchoolScope) -> dict[str, Any]:
         """The active school's settings row (R4): the scope IS the id."""
         with get_connection(scope) as conn:
@@ -1183,24 +1198,53 @@ class FleetDao:
             ).fetchone()
         if not row:
             raise NotFoundError("School not found")
-        return dict(row)
+        return self._with_tracking_defaults(dict(row))
 
-    def update_school(self, scope: SchoolScope, data: dict, actor: dict) -> dict[str, Any]:
+    def update_school(
+        self, scope: SchoolScope, data: dict, actor: dict, *, tracking: dict | None = None
+    ) -> dict[str, Any]:
         """Update the ACTIVE school's settings (U6): the router already pinned
-        the path id to scope.school_id, and the predicate repeats it."""
+        the path id to scope.school_id, and the predicate repeats it.
+
+        ``data`` carries the base columns, always written. ``tracking`` is
+        the subset of the five per-school knobs the payload actually named
+        (GPS plan U11/R38): a knob absent from it keeps its stored value, an
+        explicit None clears it to the system default — so an older Settings
+        page that does not know the knobs cannot wipe them. Bounds were
+        enforced at the API boundary; the column CHECKs are the last line.
+
+        One ``school-updated`` audit row per save that changed something,
+        with ``detail.changes`` mapping each changed column to its old and
+        new value (the settings page's school facts and thresholds — never a
+        child's data); a save that changes nothing writes no audit row.
+        """
+        tracking = dict(tracking or {})
+        unknown = set(tracking) - set(PER_SCHOOL_KNOBS)
+        if unknown:
+            raise ValueError(f"unknown tracking fields: {sorted(unknown)}")
+        columns = [*self._SCHOOL_BASE_COLUMNS, *tracking]
         with get_connection(scope) as conn:
-            row = conn.execute(
-                "update live_schools set name=%(name)s, address=%(address)s, phone=%(phone)s, "
-                "lat=%(lat)s, lng=%(lng)s, morning_bell=%(morning_bell)s, "
-                "afternoon_bell=%(afternoon_bell)s where id=%(id)s returning *",
-                {**data, "id": scope.school_id},
+            before = conn.execute(
+                "select * from live_schools where id = %s for update", (scope.school_id,)
             ).fetchone()
-            if not row:
+            if not before:
                 raise NotFoundError("School not found")
-            record_audit(
-                conn, action="school-updated", actor=actor, scope=scope,
-                resource_type="school", resource_id=scope.school_id, detail={},
-            )
+            assignments = ", ".join(f"{column}=%({column})s" for column in columns)
+            row = conn.execute(
+                f"update live_schools set {assignments} where id=%(id)s returning *",  # noqa: S608
+                {**data, **tracking, "id": scope.school_id},
+            ).fetchone()
+            changes = {
+                column: {"old": before[column], "new": row[column]}
+                for column in columns
+                if before[column] != row[column]
+            }
+            if changes:
+                record_audit(
+                    conn, action="school-updated", actor=actor, scope=scope,
+                    resource_type="school", resource_id=scope.school_id,
+                    detail={"changes": jsonable_encoder(changes)},
+                )
             # order by id: the global route-lock order (student_live_dao's
             # _sync_routes) — concurrent multi-route writers cannot deadlock.
             route_ids = [
@@ -1218,7 +1262,7 @@ class FleetDao:
         for route_id in route_ids:
             with get_connection(scope) as conn:
                 regenerate_route_stops(conn, route_id)
-        return dict(row)
+        return self._with_tracking_defaults(dict(row))
 
     # --- routes ------------------------------------------------------------
 

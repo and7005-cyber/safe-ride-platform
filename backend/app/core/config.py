@@ -8,20 +8,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger("saferide.config")
 
-# GPS tracking system defaults (GPS plan U7). Module constants, deliberately
-# NOT Settings fields yet: U11 makes each env-overridable and threads it
-# through the SAM template per the live-parity rule, and adds the per-school
-# resolver on top. Until then every reader takes these.
-GPS_POSITION_RETENTION_DAYS = 90     # trail retention when the school has none set
+# GPS tracking operational constants (GPS plan U7): the purge's bounds, the
+# idempotency key TTL and lock wait, and the clock-skew tolerance. Not knobs —
+# they bound a Lambda invocation, not a school's geometry. The geometry and
+# cadence defaults (custody threshold, vicinity radius, accuracy cap, retention,
+# staleness, ping interval, fix-wait budget) are `Settings` fields below (U11):
+# env-overridable, mirrored in infra/backend/template.yaml, and resolved per
+# school by app.dao.school_thresholds.
 GPS_PURGE_BATCH_ROWS = 2000          # trail rows deleted per Start Run purge pass
 GPS_PURGE_STATEMENT_TIMEOUT_MS = 2000
 GPS_ACTION_KEY_TTL_DAYS = 7          # idempotency keys purged after this
 GPS_KEY_LOCK_TIMEOUT_MS = 2000       # wait on an in-flight duplicate before 409
-GPS_FIX_ACCURACY_CAP_M = 200.0       # accuracy above this is `coarse`
 GPS_CLOCK_SKEW_TOLERANCE_S = 30      # capture time this far ahead of receipt is skew
-GPS_STALE_AFTER_S = 90               # a served position older than this reads stale (U8)
-GPS_CUSTODY_THRESHOLD_M = 150.0      # Board/Drop-off further than this (less accuracy) is `away` (U9)
-GPS_VICINITY_RADIUS_M = 100.0        # a fix this close (less accuracy) counts as "at the stop" (U9)
 
 
 def _maybe_b64_json(value: str) -> str:
@@ -77,6 +75,34 @@ class Settings(BaseSettings):
     # run's account churn fits a single budget window; the default of 1 is the
     # production posture. Per-account and PIN budgets never scale.
     auth_ip_rate_multiplier: int = Field(default=1, alias="AUTH_IP_RATE_MULTIPLIER")
+    # GPS tracking system defaults (GPS plan U11: R26, R31, R38). The first
+    # five are per-school knobs: a school's own value on `live_schools`
+    # (migration 016) overrides these inside the same bounds the columns'
+    # CHECKs state, resolved by app.dao.school_thresholds. Staleness and the
+    # fix-wait budget have no per-school column — system-wide only. Every one
+    # is mirrored as a parameter + env in infra/backend/template.yaml (the
+    # live-parity rule; tests/core/test_gps_settings.py keeps them in step).
+    gps_custody_threshold_m: int = Field(
+        default=150, ge=25, le=2000, alias="GPS_CUSTODY_THRESHOLD_M"
+    )  # Board/Drop-off further than this (less accuracy) is `away` (U9)
+    gps_vicinity_radius_m: int = Field(
+        default=100, ge=25, le=2000, alias="GPS_VICINITY_RADIUS_M"
+    )  # a fix this close (less accuracy) counts as "at the stop" (U9, U10)
+    gps_fix_accuracy_cap_m: int = Field(
+        default=200, ge=25, le=2000, alias="GPS_FIX_ACCURACY_CAP_M"
+    )  # accuracy above this is `coarse` (U7); the client drops such fixes too
+    gps_position_retention_days: int = Field(
+        default=90, ge=7, le=365, alias="GPS_POSITION_RETENTION_DAYS"
+    )  # trail retention when the school has none set (U7, R12)
+    gps_ping_interval_s: int = Field(
+        default=10, ge=5, le=60, alias="GPS_PING_INTERVAL_S"
+    )  # Phase 2 ping cadence, served to the driver app (U14)
+    gps_stale_after_s: int = Field(
+        default=90, ge=10, le=3600, alias="GPS_STALE_AFTER_S"
+    )  # a served position older than this reads stale (U8)
+    gps_fix_wait_budget_s: int = Field(
+        default=5, ge=1, le=30, alias="GPS_FIX_WAIT_BUDGET_S"
+    )  # how long a tap waits for a cold fix before posting without one (U6)
     # Maps provider for geocoding + route optimisation (#4, #9). When neither
     # key is set the app falls back to free OSM Nominatim geocoding and an
     # offline nearest-neighbour optimiser.

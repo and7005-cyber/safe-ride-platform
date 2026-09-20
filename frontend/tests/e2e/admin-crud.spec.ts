@@ -127,6 +127,68 @@ test("admin edits the active school's settings (no create or delete, U12/R23)", 
   await expect(page.getByText("School settings saved").first()).toBeVisible();
 });
 
+test("admin sets and clears a per-school tracking threshold (GPS U11/R38)", async ({
+  page,
+  request,
+}) => {
+  // The Tracking card: each knob shows its system default as the placeholder
+  // and in its help text; a number stores it, "Use default" clears it (an
+  // explicit null to the API), an out-of-range value never leaves the page.
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const headers = schoolHeaders(token, SCHOOL_A_ID);
+  const school = () => request.get(`${API_URL}/api/fleet/school`, { headers }).then((r) => r.json());
+  const before = await school();
+  const defaultCustody = String(before.tracking_defaults.custody_threshold_m);
+
+  await adminLogin(page);
+  await page.goto("/settings");
+  const card = page.getByTestId("tracking-card");
+  await expect(card.getByRole("heading", { name: "Tracking" })).toBeVisible();
+  const custody = page.getByTestId("tracking-custody_threshold_m");
+  await expect(custody).toHaveAttribute("placeholder", defaultCustody);
+  await expect(card.getByText(`Default ${defaultCustody} m.`, { exact: false })).toBeVisible();
+  await expect(custody).toHaveValue(before.custody_threshold_m == null ? "" : String(before.custody_threshold_m));
+
+  // Out of range: named inline, Save disabled — the server is never asked.
+  await custody.fill("24");
+  await expect(page.getByTestId("tracking-custody_threshold_m-error")).toHaveText("Between 25 and 2000 m");
+  await expect(page.getByRole("button", { name: "Save" })).toBeDisabled();
+
+  // In range: stored for this knob only; the others stay as they were.
+  await custody.fill("300");
+  await expect(page.getByTestId("tracking-custody_threshold_m-error")).toHaveCount(0);
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("School settings saved").first()).toBeVisible();
+  await expect.poll(async () => (await school()).custody_threshold_m).toBe(300);
+  const after = await school();
+  expect(after.vicinity_radius_m).toBe(before.vicinity_radius_m);
+  expect(after.position_retention_days).toBe(before.position_retention_days);
+
+  // "Use default" empties the field; saving clears the stored value.
+  await page.getByTestId("tracking-default-custody_threshold_m").click();
+  await expect(custody).toHaveValue("");
+  await expect(page.getByTestId("tracking-default-custody_threshold_m")).toBeDisabled();
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect.poll(async () => (await school()).custody_threshold_m).toBeNull();
+
+  // Restore the seeded value (null for the seeded school) via the API so the
+  // spec leaves the school exactly as it found it whatever the seed holds.
+  const restore = await request.put(`${API_URL}/api/fleet/schools/${SCHOOL_A_ID}`, {
+    headers,
+    data: {
+      name: before.name,
+      address: before.address,
+      phone: before.phone,
+      lat: before.lat,
+      lng: before.lng,
+      morning_bell: before.morning_bell,
+      afternoon_bell: before.afternoon_bell,
+      custody_threshold_m: before.custody_threshold_m ?? null,
+    },
+  });
+  expect(restore.ok()).toBeTruthy();
+});
+
 test("admin can create and delete a route attached to a bus and school", async ({ page, request }) => {
   const name = uniqueName("E2E Route");
   // Seeded buses already hold a route of each type; a same-type route on one

@@ -42,7 +42,7 @@ The admin students list wraps this expression with its own 'unassigned' rule
 wrap is admin-side only and lives in student_live_dao.
 """
 
-from app.core.config import GPS_POSITION_RETENTION_DAYS, GPS_STALE_AFTER_S
+from app.core.config import get_settings
 
 
 def scope_covers(scope_sql: str, run_type_sql: str) -> str:
@@ -214,17 +214,18 @@ def no_progress_case(run: str) -> str:
 # - a non-null pair with a NULL source is a checkpoint of unknown age — the
 #   legacy-writer and rollback shape — and is never stale;
 # - `stale` = the source is known and the position is older than the staleness
-#   threshold (GPS_STALE_AFTER_S; U11 makes it per-school). It applies to
-#   checkpoints and fixes alike: a stop reached four minutes ago IS four minutes
-#   old, and R27 wants that said rather than hidden;
+#   threshold (Settings.gps_stale_after_s — a system default with no per-school
+#   column, read at call time so an env override is never baked in at import;
+#   U11). It applies to checkpoints and fixes alike: a stop reached four
+#   minutes ago IS four minutes old, and R27 wants that said rather than hidden;
 # - `gps_off` = the bus's in-progress run's LATEST action row inside retention
 #   carries no fix for a device reason (denied / unavailable / timeout /
 #   invalid). A fix on the next tap clears it with no write (F5, AE2);
 # - `no_gps_for_run` = the in-progress run has action rows inside retention and
 #   none of them carries coordinates (R20's derived "no GPS for this run");
 # - trail reads filter by the school's retention (`position_retention_days`,
-#   default GPS_POSITION_RETENTION_DAYS) by `received_at`, the purge's own
-#   cutoff expression, so a lagging purge is invisible (R12);
+#   default Settings.gps_position_retention_days) by `received_at`, the purge's
+#   own cutoff expression, so a lagging purge is invisible (R12);
 # - the label is one rule for every surface: a fix reads "Phone GPS"; a
 #   checkpoint reads where the run is — starting at the school, at the school,
 #   or at the stop it last reached (the retired Python loop's wording).
@@ -248,12 +249,13 @@ _RUN_TODAY_SQL = """(
 # `now()` minus retention in SECONDS (position_dao.RETENTION_CUTOFF_SQL's
 # form, restated here because this module imports nothing from app.dao): an
 # interval's day field is calendar arithmetic in the session time zone.
+# {retention_days} is the system default, filled per call from Settings.
 _RETENTION_CUTOFF_SQL = (
-    "now() - make_interval(secs => (select coalesce(sc.position_retention_days, %d) "
-    "from live_schools sc where sc.id = {bus}.school_id) * 86400)"
-    % GPS_POSITION_RETENTION_DAYS
+    "now() - make_interval(secs => (select coalesce(sc.position_retention_days, "
+    "{retention_days}) from live_schools sc where sc.id = {bus}.school_id) * 86400)"
 )
 
+# {stale_s} and {no_fix_reasons} are filled per call alongside the aliases.
 _BUS_POSITION_COLUMNS = """{bus}.current_lat as pos_lat,
     {bus}.current_lng as pos_lng,
     case when {served} then {bus}.position_source end as pos_source,
@@ -265,11 +267,11 @@ _BUS_POSITION_COLUMNS = """{bus}.current_lat as pos_lat,
     coalesce(
         {served}
         and {bus}.position_source is not null
-        and {bus}.position_at < now() - make_interval(secs => %d),
+        and {bus}.position_at < now() - make_interval(secs => {stale_s}),
         false
     ) as pos_stale,
     coalesce((
-        select p.fix_reason in %s
+        select p.fix_reason in {no_fix_reasons}
         from run_positions p
         where p.run_id = {run}
           and p.source = 'action'
@@ -308,7 +310,7 @@ _BUS_POSITION_COLUMNS = """{bus}.current_lat as pos_lat,
               and r.status <> 'completed'
             order by r.created_at desc limit 1
         )
-    end as pos_label""" % (GPS_STALE_AFTER_S, _NO_FIX_REASONS)
+    end as pos_label"""
 
 
 def bus_position_columns(bus: str) -> str:
@@ -316,13 +318,23 @@ def bus_position_columns(bus: str) -> str:
     comma) of ``pos_*`` columns, parameterized by the consuming query's
     ``live_buses`` table alias. Subquery aliases (r, rs, n, s, p, sc) are
     fragment-local. Consumers hand the fetched row to :func:`pop_position`.
+
+    The staleness threshold and the retention default are read from Settings
+    on every call (U11): both are ints from validated fields, interpolated as
+    literals because the fragment is spliced into queries that bind their own
+    parameters.
     """
+    settings = get_settings()
     served = f"({bus}.current_lat is not null and {bus}.current_lng is not null)"
     return _BUS_POSITION_COLUMNS.format(
         bus=bus,
         served=served,
         run=_RUN_TODAY_SQL.format(bus=bus),
-        cutoff=_RETENTION_CUTOFF_SQL.format(bus=bus),
+        cutoff=_RETENTION_CUTOFF_SQL.format(
+            bus=bus, retention_days=int(settings.gps_position_retention_days)
+        ),
+        stale_s=int(settings.gps_stale_after_s),
+        no_fix_reasons=_NO_FIX_REASONS,
     )
 
 
