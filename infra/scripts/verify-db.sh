@@ -8,6 +8,7 @@
 #   infra/scripts/verify-db.sh migration-011
 #   infra/scripts/verify-db.sh baseline   <school-uuid>
 #   infra/scripts/verify-db.sh post-apply <school-uuid>
+#   infra/scripts/verify-db.sh gps
 #
 # Expected values per check live in the deployment checklists:
 # docs/work/validation/2026-08-20-fleet-plan-drafting.md and the plan's
@@ -18,7 +19,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 CHECKS="${1:-}"
 SCHOOL_ID="${2:-}"
 if [ -z "$CHECKS" ]; then
-  echo "usage: $0 <migrations|migration-011|baseline|post-apply> [school-uuid]" >&2
+  echo "usage: $0 <migrations|migration-011|baseline|post-apply|gps> [school-uuid]" >&2
   exit 2
 fi
 

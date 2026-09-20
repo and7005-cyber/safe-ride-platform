@@ -139,15 +139,17 @@ begin
         raise exception 'post-seed: % % rows with NULL school_id', n, t;
       end if;
     end loop;
-    -- U14: the second 015 pass must have armed row security everywhere...
+    -- U14: the second 015 pass must have armed row security everywhere, and
+    -- migration 016 lands the four GPS tracking tables already scoped...
     select count(*) into n from pg_class c
     where c.relrowsecurity and c.relname in (
       'live_buses','live_routes','live_students','live_runs','live_fleet_plans',
       'live_incidents','live_student_absences','live_communicated_stops',
       'live_student_routes','live_route_stops','run_stops','run_absences',
-      'run_participation','live_admin_audit');
-    if n <> 14 then
-      raise exception 'post-seed: row security enabled on % tables, expected 14', n;
+      'run_participation','live_admin_audit',
+      'run_positions','run_exceptions','run_exception_events','driver_action_keys');
+    if n <> 18 then
+      raise exception 'post-seed: row security enabled on % tables, expected 18', n;
     end if;
     -- ...and the runtime role must hold its grants.
     if not has_table_privilege('saferide_app', 'public.live_students', 'select') then

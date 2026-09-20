@@ -27,7 +27,10 @@ def purge_run(run_id: str | None) -> None:
     middle of the day. That refusal is a real guarantee and tests must not have
     a product-level backdoor around it, so cleanup drops to SQL instead.
 
-    run_stops, run_absences and run_participation all cascade on the run row.
+    run_stops, run_absences and run_participation all cascade on the run row,
+    as do the 016 run children (run_positions, run_exceptions,
+    run_exception_events); a driver_action_keys row keeps its school and
+    loses its run reference (SET NULL) so a replay still short-circuits.
     """
     if not run_id:
         return
@@ -144,9 +147,13 @@ def temp_school(
                 (school_id,),
             )
             for table in (
+                # 016 run children before the run (they cascade anyway; the
+                # explicit order keeps the sweep independent of the FK shape),
+                # the key table before the school row it references.
+                "run_exception_events", "run_exceptions", "run_positions",
                 "live_runs", "live_students", "live_routes", "live_buses",
                 "live_fleet_plans", "live_incidents", "live_admin_audit",
-                "school_memberships",
+                "driver_action_keys", "school_memberships",
             ):
                 pg.execute(
                     f"delete from {table} where school_id = %s", (school_id,)  # noqa: S608
@@ -244,9 +251,12 @@ def school_sandbox(
                 (school_id,),
             )
             for table in (
+                # Same order as temp_school: 016 run children, the run, the
+                # rest, then the key table before the school row.
+                "run_exception_events", "run_exceptions", "run_positions",
                 "live_runs", "live_students", "live_routes", "live_buses",
                 "live_fleet_plans", "live_incidents", "live_admin_audit",
-                "school_memberships",
+                "driver_action_keys", "school_memberships",
             ):
                 pg.execute(
                     f"delete from {table} where school_id = %s", (school_id,)  # noqa: S608
