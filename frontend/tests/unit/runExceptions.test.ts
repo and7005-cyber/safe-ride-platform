@@ -225,11 +225,14 @@ describe("a custody tap's row", () => {
     expect(statusBadge("resolved")).toEqual({ label: "Resolved", variant: "success" });
     expect(statusBadge("confirmed")).toEqual({ label: "Confirmed by driver", variant: "success" });
     expect(statusBadge("retracted")).toEqual({ label: "Retracted", variant: "secondary" });
+    // The remote absent's settled classes (GPS plan U10/R17).
+    expect(statusBadge("attested")).toEqual({ label: "Attested by driver", variant: "secondary" });
+    expect(statusBadge("uncorroborated")).toEqual({ label: "Uncorroborated", variant: "warning" });
     expect(statusBadge(null)).toBeNull();
   });
 
   it("wordings are sentence case with no raw slug", () => {
-    for (const status of ["open", "resolved", "confirmed", "retracted"] as const) {
+    for (const status of ["open", "resolved", "confirmed", "retracted", "attested", "uncorroborated"] as const) {
       const label = statusBadge(status)!.label;
       expect(label[0]).toBe(label[0]!.toUpperCase());
       expect(label).not.toMatch(/[a-z]-[a-z]/);

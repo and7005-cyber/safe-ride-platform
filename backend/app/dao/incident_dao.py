@@ -16,6 +16,7 @@ _LIFECYCLE_HEADLINE = {
     "handover-recorded": "a child left the bus away from their stop.",
     "action-reversed": "the driver corrected their own entry.",
     "stop-bypassed": "a stop was passed without outcomes.",
+    "absent-remote": "a child was marked absent away from their stop.",
 }
 
 
@@ -89,6 +90,7 @@ class IncidentDao:
         detail: str | None = None,
         *,
         dedup: bool = False,
+        student_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Record a run-lifecycle event on the office feed.
 
@@ -118,6 +120,12 @@ class IncidentDao:
         is one situation, while a run still stuck after partial progress is a
         new one the office has not been told about. Keying on the run alone
         would report it once and then go quiet exactly as it got worse.
+
+        ``student_id`` (GPS plan U10) stamps the row with the child it is
+        about and dedups on (run, type, child) instead: an uncorroborated
+        remote absent is one situation per child per run however many times
+        the driver marks, undoes and marks again. Student-stamped rows never
+        reach a parent feed; lifecycle rows never did either.
         """
         with get_connection(scope) as conn:
             run = conn.execute(
@@ -139,7 +147,18 @@ class IncidentDao:
             description = f"{where}: {headline}"
             if detail:
                 description = f"{description} {detail}"
-            if dedup:
+            if student_id is not None:
+                existing = conn.execute(
+                    """
+                    select 1 from live_incidents
+                    where run_id = %s and type = %s and student_id = %s
+                    limit 1
+                    """,
+                    (run["id"], incident_type, student_id),
+                ).fetchone()
+                if existing:
+                    return None
+            elif dedup:
                 existing = conn.execute(
                     """
                     select 1 from live_incidents
@@ -154,13 +173,13 @@ class IncidentDao:
                 """
                 insert into live_incidents
                     (run_id, driver_id, driver_name, bus_id, bus_name, type, description,
-                     run_type, lifecycle, acknowledged, school_id)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true, %s)
+                     run_type, lifecycle, acknowledged, school_id, student_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true, %s, %s)
                 returning *
                 """,
                 (run["id"], run["driver_id"], run["driver_name"], run["bus_id"],
                  run["bus_name"], incident_type, description, run["type"],
-                 run["school_id"]),
+                 run["school_id"], student_id),
             ).fetchone()
         return dict(row) if row else None
 

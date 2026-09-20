@@ -1,5 +1,5 @@
-"""Position rules: fix validation (GPS plan U7) and the custody geometry (U9);
-U10 adds the absent arms, U12 fills the plausibility hook.
+"""Position rules: fix validation (GPS plan U7), the custody geometry (U9) and
+the absent classification (U10); U12 fills the plausibility hook.
 
 Pure: no I/O and no clock of its own — ``normalise_fix`` takes ``now`` — so
 the whole boundary is unit-testable and the DAO calls it inside the action
@@ -19,6 +19,13 @@ fix can never fake "within"; plausibility before distance, so a flagged fix
 never clears a check (R32); and among the reasons a check cannot run for,
 the fixed precedence stop-unverified > implausible > no-fix > too-coarse
 (R20), so the office reads the cause it can act on first (a pin to fix).
+
+The absent classification (``classify_absent``, R16) shares the unverified
+reasons and their precedence, then asks what corroborates the mark: an
+absence a parent or the office recorded before the tap, the phone at the
+child's stop, or — on an afternoon run — the phone at the school while the
+child's stop is still ahead. Anything else is ``remote``, and the driver's
+attestation decides it (R17).
 """
 
 from __future__ import annotations
@@ -271,6 +278,28 @@ def classify_custody(
     """
     point = _usable_point(stop)
     distance = haversine_m((fix.lat, fix.lng), point) if fix is not None and point else None
+    reason = _unverified_reason(fix, point, accuracy_cap_m=accuracy_cap_m, flags=flags)
+    if reason is not None:
+        return CustodyCheck(
+            classification=CUSTODY_UNVERIFIED, reason=reason,
+            distance_m=distance if reason != REASON_STOP_UNVERIFIED else None,
+        )
+    assert fix is not None and distance is not None
+    if distance - fix.accuracy_m > custody_threshold_m:
+        return CustodyCheck(classification=CUSTODY_AWAY, reason=None, distance_m=distance)
+    return CustodyCheck(classification=CUSTODY_WITHIN, reason=None, distance_m=distance)
+
+
+def _unverified_reason(
+    fix: StoredFix | None,
+    point: tuple[float, float] | None,
+    *,
+    accuracy_cap_m: float,
+    flags: Iterable[str],
+) -> str | None:
+    """The one reason a check cannot run for, in R20's precedence — or None
+    when it can. Shared by the custody check and the absent classification so
+    the two can never rank the same tap differently."""
     reasons: list[str] = []
     if point is None:
         reasons.append(REASON_STOP_UNVERIFIED)
@@ -281,16 +310,9 @@ def classify_custody(
             reasons.append(REASON_IMPLAUSIBLE)
         if fix.accuracy_m > accuracy_cap_m:
             reasons.append(REASON_TOO_COARSE)
-    if reasons:
-        reason = next(r for r in UNVERIFIED_REASONS if r in reasons)
-        return CustodyCheck(
-            classification=CUSTODY_UNVERIFIED, reason=reason,
-            distance_m=distance if reason != REASON_STOP_UNVERIFIED else None,
-        )
-    assert fix is not None and distance is not None
-    if distance - fix.accuracy_m > custody_threshold_m:
-        return CustodyCheck(classification=CUSTODY_AWAY, reason=None, distance_m=distance)
-    return CustodyCheck(classification=CUSTODY_WITHIN, reason=None, distance_m=distance)
+    if not reasons:
+        return None
+    return next(r for r in UNVERIFIED_REASONS if r in reasons)
 
 
 def within_vicinity(
@@ -309,3 +331,107 @@ def within_vicinity(
     if fix is None or point is None or fix.accuracy_m > accuracy_cap_m:
         return False
     return haversine_m((fix.lat, fix.lng), point) - fix.accuracy_m <= vicinity_m
+
+
+# --- the absent classification (U10: R16, R17, R20) -----------------------------
+
+ABSENT_CORROBORATED = "corroborated"
+ABSENT_REMOTE = "remote"
+ABSENT_UNVERIFIED = "unverified"
+
+# What corroborated the mark, when something did (R16), in the order tested.
+CORROBORATED_BY_ABSENCE = "absence"   # a parent or office absence already covered this trip
+CORROBORATED_BY_STOP = "stop"         # the phone was within the child's stop vicinity
+CORROBORATED_BY_SCHOOL = "school"     # afternoon: at the school, the child's stop still ahead
+
+
+@dataclass(frozen=True)
+class AbsentCheck:
+    """The verdict on one Absent mark. ``distance_m`` is the great-circle
+    distance from the fix to the child's stop whenever both exist — reported
+    for the office and for the prompt's copy whatever the verdict."""
+
+    classification: str
+    reason: str | None
+    corroborated_by: str | None
+    distance_m: float | None
+
+    @property
+    def remote(self) -> bool:
+        return self.classification == ABSENT_REMOTE
+
+    @property
+    def unverified(self) -> bool:
+        return self.classification == ABSENT_UNVERIFIED
+
+    @property
+    def corroborated(self) -> bool:
+        return self.classification == ABSENT_CORROBORATED
+
+
+def classify_absent(
+    fix: StoredFix | None,
+    stop: tuple[Any, Any] | None,
+    *,
+    school: tuple[Any, Any] | None,
+    run_type: str,
+    stop_order: int | None,
+    stops_completed: int,
+    prior_absence_covers: bool,
+    vicinity_m: float,
+    accuracy_cap_m: float,
+    flags: Iterable[str] = (),
+) -> AbsentCheck:
+    """Classify an Absent mark against the child's stop (R16, R20).
+
+    In order:
+
+    - the reasons a check cannot run for, with R20's precedence exactly as
+      the custody check ranks them (stop-unverified > implausible > no-fix >
+      too-coarse) → ``unverified`` with that reason;
+    - a parent or office absence already covered this trip before the tap
+      (``prior_absence_covers``, read by the caller before its own upsert)
+      → ``corroborated`` by ``absence``;
+    - the fix within the stop's vicinity — the same geometry as "bus seen at
+      stop": cap first, then ``distance − accuracy`` inside ``vicinity_m``
+      → ``corroborated`` by ``stop``;
+    - an afternoon run, the child's stop order beyond ``stops_completed``
+      and the fix within the school's vicinity (R16 as amended: the child did
+      not board at the gate) → ``corroborated`` by ``school``;
+    - otherwise ``remote`` — the driver's attestation decides (R17).
+
+    ``school`` is the run's own gate coordinates, or the school's pin when the
+    snapshot has none; without either the school arm simply does not apply.
+    """
+    point = _usable_point(stop)
+    distance = haversine_m((fix.lat, fix.lng), point) if fix is not None and point else None
+    reason = _unverified_reason(fix, point, accuracy_cap_m=accuracy_cap_m, flags=flags)
+    if reason is not None:
+        return AbsentCheck(
+            classification=ABSENT_UNVERIFIED, reason=reason, corroborated_by=None,
+            distance_m=distance if reason != REASON_STOP_UNVERIFIED else None,
+        )
+    assert fix is not None and distance is not None
+    if prior_absence_covers:
+        return AbsentCheck(
+            classification=ABSENT_CORROBORATED, reason=None,
+            corroborated_by=CORROBORATED_BY_ABSENCE, distance_m=distance,
+        )
+    if within_vicinity(fix, point, vicinity_m=vicinity_m, accuracy_cap_m=accuracy_cap_m):
+        return AbsentCheck(
+            classification=ABSENT_CORROBORATED, reason=None,
+            corroborated_by=CORROBORATED_BY_STOP, distance_m=distance,
+        )
+    if (
+        run_type == "afternoon"
+        and stop_order is not None
+        and stop_order > stops_completed
+        and within_vicinity(fix, school, vicinity_m=vicinity_m, accuracy_cap_m=accuracy_cap_m)
+    ):
+        return AbsentCheck(
+            classification=ABSENT_CORROBORATED, reason=None,
+            corroborated_by=CORROBORATED_BY_SCHOOL, distance_m=distance,
+        )
+    return AbsentCheck(
+        classification=ABSENT_REMOTE, reason=None, corroborated_by=None, distance_m=distance,
+    )

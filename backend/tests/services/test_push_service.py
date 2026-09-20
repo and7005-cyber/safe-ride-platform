@@ -676,5 +676,104 @@ def test_the_other_correction_arms_keep_their_types_and_retractions(
     assert [n["type"] for n in dao.notifications] == [
         "absence-corrected", "dropoff-corrected",
     ], "the hand-over undo on the same run is dedup-suppressed as the same correction"
-    assert dao.notifications[0]["title"] == "Correction: not absent"
+    assert dao.notifications[0]["title"] == "Correction: absent mark withdrawn"
     assert dao.notifications[1]["title"] == "Correction: not dropped off"
+
+
+# --- the remote absent's messages (GPS plan U10/R18, R35) --------------------------
+
+
+def _absent(service: PushService, dao: FakePushDao, run: dict = RUN) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila"), link("p2", "s1", "Leila")]}
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, {**run, "absence_period": run["type"]})
+    assert [n["type"] for n in dao.notifications] == ["student-absent", "student-absent"]
+
+
+def test_call_now_is_its_own_type_additional_to_the_standard_notice_and_asks_for_a_call(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    _absent(service, dao)
+
+    assert service.notify_absent_call_now({"id": "s1", "name": "Leila"}, RUN) is True
+
+    # The standard notice stays; one call-now per linked parent on top of it.
+    assert [n["type"] for n in dao.notifications] == [
+        "student-absent", "student-absent", "absent-call-now", "absent-call-now",
+    ]
+    assert {n["user_id"] for n in dao.notifications if n["type"] == "absent-call-now"} == {"p1", "p2"}
+    note = next(n for n in dao.notifications if n["type"] == "absent-call-now")
+    assert note["title"] == "Call the office now"
+    assert note["body"] == (
+        "Leila was marked absent away from their stop. If Leila should be on the bus, "
+        "please call the school office now."
+    )
+    assert note["run_id"] == "run-1" and note["student_id"] == "s1" and note["run_type"] == "morning"
+    # No stop, no distance, no coordinate: it asks for a phone call, nothing else.
+    assert "km" not in note["body"]
+    assert not any(ch.isdigit() for ch in note["body"])
+
+
+def test_call_now_is_run_scoped_so_a_retried_drain_sends_nothing_twice(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+    assert service.notify_absent_call_now({"id": "s1", "name": "Leila"}, RUN) is True
+    assert service.notify_absent_call_now({"id": "s1", "name": "Leila"}, RUN) is True
+    assert [n["type"] for n in dao.notifications] == ["absent-call-now"]
+
+
+def test_call_now_reports_a_failed_fan_out_instead_of_swallowing_it(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    dao.parents = {"s1": [link("p1", "s1", "Leila")]}
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    dao.insert_notification = boom  # type: ignore[method-assign]
+    # False, never an exception: the outbox drain leaves the row due on False.
+    assert service.notify_absent_call_now({"id": "s1", "name": "Leila"}, RUN) is False
+
+
+def test_the_absence_correction_is_neutral_retracts_student_absent_only_and_never_call_now(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    _absent(service, dao)
+    service.notify_absent_call_now({"id": "s1", "name": "Leila"}, RUN)
+
+    service.notify_correction({"id": "s1", "name": "Leila"}, RUN, "absence")
+
+    # student-absent gone, call-now kept, one neutral correction per parent.
+    assert dao.retracted == [{"run_id": "run-1", "student_id": "s1", "types": ["student-absent"]}]
+    assert [n["type"] for n in dao.notifications] == [
+        "absent-call-now", "absent-call-now", "absence-corrected", "absence-corrected",
+    ]
+    note = dao.notifications[-1]
+    assert note["title"] == "Correction: absent mark withdrawn"
+    assert note["body"] == (
+        "Leila was marked absent by mistake; that mark has been withdrawn. "
+        "The driver will record what happens at the stop."
+    )
+    # Neutral (R35): the family is told nothing about where the child is now.
+    assert "on the bus" not in note["body"].lower()
+    assert "not absent" not in note["body"].lower()
+    assert "at home" not in note["body"].lower()
+
+
+def test_an_absent_mark_after_the_correction_is_delivered_again(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    _absent(service, dao)
+    service.notify_correction({"id": "s1", "name": "Leila"}, RUN, "absence")
+    service.notify_student_absent({"id": "s1", "name": "Leila"}, {**RUN, "absence_period": "morning"})
+    assert [n["type"] for n in dao.notifications].count("student-absent") == 2
+
+
+def test_the_afternoon_absence_correction_carries_the_same_neutral_copy(
+    service: PushService, dao: FakePushDao,
+) -> None:
+    _absent(service, dao, AFTERNOON_RUN)
+    service.notify_correction({"id": "s1", "name": "Leila"}, AFTERNOON_RUN, "absence")
+    note = dao.notifications[-1]
+    assert note["type"] == "absence-corrected" and note["run_type"] == "afternoon"
+    assert "withdrawn" in note["body"] and "on the bus" not in note["body"].lower()

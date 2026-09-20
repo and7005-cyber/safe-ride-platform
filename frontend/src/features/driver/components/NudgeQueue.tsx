@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { BellRing, Check, MapPin, Undo2, UserX, X } from "lucide-react";
+import { BellRing, Check, MapPin, PhoneOff, Undo2, UserX, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
 import { useDriverContext } from "@/features/driver/driverHooks";
@@ -15,11 +15,14 @@ import {
 import { useAttentionCue } from "./useAttentionCue";
 
 // One non-modal card above the page content, on every driver tab (GPS plan
-// U3: R13, R15, R23, R34; U9: R14). Fed by the context poll here and by the
-// action responses on the pages (Arrive today); the store decides which
-// prompt shows. Two cards exist: the bypassed stop (safety cue, outcome
-// shortcuts, dismiss) and the custody confirm (silent, Confirm or Undo, no
-// dismiss — undo is the answer that takes the tap back).
+// U3: R13, R15, R23, R34; U9: R14; U10: R17). Fed by the context poll here and
+// by the action responses on the pages (Arrive today); the store decides which
+// prompt shows. Three cards exist: the bypassed stop (safety cue, outcome
+// shortcuts, dismiss), the custody confirm (silent, Confirm or Undo, no
+// dismiss — undo is the answer that takes the tap back) and the remote-absent
+// attestation (safety cue; "they told me", "I wasn't at the stop", dismiss —
+// the dismiss counts as "not at the stop"; the undo of the mark is the board
+// page's Undo, the same reverse path as every other correction).
 //
 // Deliberately not a dialog and not a shadcn Card: nothing overlays the page
 // (a tap outside changes nothing — only the card's own dismiss dismisses), and
@@ -92,6 +95,20 @@ export function custodyCopy(prompt: NudgePrompt, afternoon: boolean): {
   return {
     title: prompt.stop_name ? `${stop}: ${prompt.stop_name}` : stop,
     body: `You marked ${name} ${outcome} about ${aboutDistance(prompt.distance_m)} from their stop. Confirm, or undo?`,
+  };
+}
+
+/** Driver-facing copy for an absent marked away from the stop (F4): the
+ * child, the distance, and the one question that decides the class. */
+export function remoteAbsentCopy(prompt: NudgePrompt): {
+  title: string;
+  body: string;
+} {
+  const name = prompt.students[0]?.name ?? "this child";
+  const stop = prompt.stop_order != null ? `Stop ${prompt.stop_order}` : "Stop";
+  return {
+    title: prompt.stop_name ? `${stop}: ${prompt.stop_name}` : stop,
+    body: `You marked ${name} absent about ${aboutDistance(prompt.distance_m)} from their stop. Did a parent or the office tell you ${name} isn't coming?`,
   };
 }
 
@@ -235,6 +252,65 @@ function NudgeCard({
             onClick={() => respond("confirmed")}
           >
             <Check className="h-4 w-4" /> Confirm
+          </Button>
+        </div>
+      </section>
+    );
+  }
+
+  if (prompt.kind === "absent-remote") {
+    // The attestation (U10/R17): told-me attests the absence (history only);
+    // not-at-stop and the card's own dismiss both leave it uncorroborated —
+    // the server sends the family the call-now notice and alerts the office.
+    // The mark itself stands either way (R23); the board page's Undo takes
+    // it back.
+    const copy = remoteAbsentCopy(prompt);
+    return (
+      <section
+        role="region"
+        aria-label="Driver prompt"
+        aria-live="polite"
+        data-testid="nudge-card"
+        data-event-id={prompt.event_id}
+        data-kind={prompt.kind}
+        className="mb-4 rounded-lg border border-amber-500/60 bg-amber-50 p-4 shadow-sm dark:bg-amber-950/30"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <PhoneOff className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
+            <div>
+              <p className="font-semibold leading-tight">{copy.title}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{copy.body}</p>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label="Dismiss prompt"
+            data-testid="nudge-dismiss"
+            disabled={busy}
+            onClick={() => respond("dismissed")}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="mt-3 flex flex-wrap justify-end gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            data-testid="nudge-not-at-stop"
+            disabled={busy}
+            onClick={() => respond("not-at-stop")}
+          >
+            No — I wasn't at the stop
+          </Button>
+          <Button
+            size="sm"
+            data-testid="nudge-told-me"
+            disabled={busy}
+            onClick={() => respond("told-me")}
+          >
+            <Check className="h-4 w-4" /> Yes — they told me
           </Button>
         </div>
       </section>

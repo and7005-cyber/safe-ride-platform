@@ -42,16 +42,32 @@ never checked; a coordinate-less stop and a GPS-denied run each yield one
 unverified row; un-boarding stays refused; an afternoon drop-off behaves
 like Board.
 
+The absent classification (U10: R16, R17, R18, R20, R35; F4; AE6, AE7, AE8,
+AE16) is the third part: an absent within the stop's vicinity, at the school
+on an afternoon run for a stop still ahead, or already covered by an office
+absence is corroborated with no prompt; a remote one raises the per-child
+absent-remote row with a three-way prompt — told-me attests it (history
+only), not-at-stop, dismiss or unanswered-on-Arrive keep it uncorroborated
+with one call-now notice per child per run and one office alert; a Board
+leaves the prompt pending and End Run closes it silently; the undo clears a
+morning mark to no outcome and restores the afternoon presumption, sends
+one neutral correction and never retracts call-now; a fan-out lost between
+commit and send is sent once by the next context poll; a coarse fix at a
+coordinate-less stop is one stop-unverified row, never two prompts; no log
+line, incident or push body carries a coordinate.
+
 Isolation: an own throwaway school (school_sandbox) with two drivers, two
 buses, a morning and an afternoon route on bus 1, a morning route on bus 2,
 three students at their own stops (A's parent is a real signed-up account
 with an accepted link, for the notification assertions) and five students
 sharing one stop. Every run a test starts is purged in a finally block; the
-second sandbox the purge test opens sweeps itself.
+second sandbox the purge test opens sweeps itself; every absence a test
+marks is cleared after the run is purged.
 """
 
 import os
 import random
+import subprocess
 import threading
 import time
 import uuid
@@ -1877,3 +1893,797 @@ def test_an_afternoon_dropoff_far_from_the_stop_behaves_like_board_and_its_undo_
         assert custody_prompts() == []
     finally:
         purge_run(run_id)
+
+
+# --- the absent classification (GPS plan U10: R16, R17, R18, R20, R35; F4) ---------
+#
+# AE6, AE7, AE8, AE16. The same geometry helpers as the custody half; the
+# absent-specific ones read the exception ledger, the absence rows, the
+# run's snapshot and the family's feed directly.
+
+ABSENT_REMOTE = "absent-remote"
+ABSENT_ATTESTED = "absent-attested"
+ABSENT_KINDS = (ABSENT_REMOTE, ABSENT_ATTESTED)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def absent(client, headers, student_id: str, fix_body, *, event_id=None) -> httpx.Response:
+    body = {"student_id": student_id}
+    if event_id:
+        body["event_id"] = event_id
+    return action(client, headers, "/api/runs/driver/absent", body, fix_body=fix_body)
+
+
+def shown(client, headers, event_id: str) -> httpx.Response:
+    return client.post(f"/api/runs/driver/prompts/{event_id}/shown", headers=headers)
+
+
+def prompts_of_kind(client, headers, kind: str) -> list[dict]:
+    return [p for p in pending(client, headers) if p["kind"] == kind]
+
+
+def absent_rows(client, admin_headers, run_id: str) -> list[dict]:
+    return [x for x in exceptions(client, admin_headers, run_id) if x["kind"] in ABSENT_KINDS]
+
+
+def event_row(event_id: str) -> dict:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_exception_events where id = %s", (event_id,)
+        ).fetchone()
+
+
+def absence_today(student_id: str) -> dict | None:
+    with db() as conn:
+        return conn.execute(
+            "select * from live_student_absences where student_id = %s "
+            "and absence_date = (now() at time zone 'Africa/Nairobi')::date",
+            (student_id,),
+        ).fetchone()
+
+
+def snapshot_row(run_id: str, student_id: str) -> dict | None:
+    with db() as conn:
+        return conn.execute(
+            "select * from run_absences where run_id = %s and student_id = %s",
+            (run_id, student_id),
+        ).fetchone()
+
+
+def absent_notices(parent_id: str, run_id: str, student_id: str) -> list[str]:
+    """The family's absent-related feed rows for this run and child, in
+    order — the run-level notices (run-started, on-way-home) left out."""
+    return [
+        t for t in notification_types(parent_id, run_id, student_id)
+        if t in ("student-absent", "absent-call-now", "absence-corrected")
+    ]
+
+
+def notification_rows(parent_id: str, run_id: str, student_id: str, type_: str) -> list[dict]:
+    with db() as conn:
+        return conn.execute(
+            "select title, body from live_notifications where user_id = %s and run_id = %s "
+            "and student_id = %s and type = %s order by created_at, id",
+            (parent_id, run_id, student_id, type_),
+        ).fetchall()
+
+
+def api_log_tail(lines: int = 600) -> str:
+    """The API container's recent log lines (the stack is compose-run; the
+    conftest and the e2e helpers go through compose too)."""
+    return subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.local.yml", "logs", "--no-log-prefix",
+         "--tail", str(lines), "api"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    ).stdout
+
+
+def coordinate_needles(*fixes: dict) -> list[str]:
+    """Digit strings that identify these fixes' coordinates in any text."""
+    out: list[str] = []
+    for sent in fixes:
+        for value in (sent["lat"], sent["lng"]):
+            out.append(f"{value:.5f}".lstrip("-"))
+    return out
+
+
+def inject_sent_stamp_failure() -> None:
+    """A trigger that refuses to stamp call_now_sent_at — the fault between
+    the deciding commit and the fan-out's own bookkeeping."""
+    with db() as conn:
+        conn.execute(
+            "create or replace function it_gps_refuse_sent() returns trigger "
+            "language plpgsql as $$ begin "
+            "if new.call_now_sent_at is not null and old.call_now_sent_at is null then "
+            "raise exception 'injected: sent stamp refused'; end if; return new; end $$"
+        )
+        conn.execute("drop trigger if exists it_gps_refuse_sent on run_exception_events")
+        conn.execute(
+            "create trigger it_gps_refuse_sent before update on run_exception_events "
+            "for each row execute function it_gps_refuse_sent()"
+        )
+
+
+def clear_sent_stamp_failure() -> None:
+    with db() as conn:
+        conn.execute("drop trigger if exists it_gps_refuse_sent on run_exception_events")
+        conn.execute("drop function if exists it_gps_refuse_sent()")
+
+
+def test_ae8_an_absent_within_the_stops_vicinity_or_covered_by_an_office_absence_is_corroborated(
+    client, admin_headers, fleet,
+):
+    """AE8: the driver waits at the stop, the child does not appear, the mark
+    is made within the vicinity — corroborated by location: the standard
+    notice only, no prompt, no exception row. The office arm: an absence the
+    office recorded mid-run covers the trip before the driver's mark, so a
+    mark made kilometres away is corroborated too."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+
+        marked = absent(client, h, a_id, near_stop(a_stop, north_m=40))
+        assert marked.status_code == 200, marked.text
+        assert marked.json()["id"] == a_id
+        assert absence_today(a_id)["source"] == "driver"
+        assert snapshot_row(run_id, a_id) is not None
+        assert participation(run_id, a_id) is None
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+        assert exceptions(client, admin_headers, run_id, UNVERIFIED) == []
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+        time.sleep(0.5)
+        assert absent_notices(parent_id, run_id, a_id) == ["student-absent"]
+
+        # The office records B absent while the run is open: B stays on the
+        # run's snapshot, and the driver's later mark — 3 km from B's stop —
+        # is corroborated by that row, not questioned.
+        office = client.post(
+            "/api/students/absences", json={"student_id": b_id, "reason": "IT GPS office"},
+            headers=admin_headers,
+        )
+        assert office.status_code == 200, office.text
+        b_order = plan["by_student"][b_id]
+        arrive_until(client, h, run_id, b_order)
+        far = absent(client, h, b_id, near_stop(plan["coords"][b_order], north_m=3000))
+        assert far.status_code == 200, far.text
+        assert absence_today(b_id)["source"] == "admin", "the office's attribution is kept"
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id, b_id)
+
+
+def test_ae7_a_remote_absent_answered_not_at_stop_sends_call_now_once_and_alerts_the_office(
+    client, admin_headers, fleet, in_process_db, caplog,
+):
+    """AE7: absent 3 km before the stop, "not at the stop" — the standard
+    notice at tap time, the three-way prompt, then the live exception, one
+    call-now to the family, one office alert; a replayed answer changes
+    nothing; no log line, incident or push body carries a coordinate."""
+    import logging
+
+    from app.api import runs_live
+    from app.core.db import get_connection
+    from app.core.scope import SchoolScope
+    from app.dao import exception_dao
+    from app.services.position_rules import normalise_fix
+
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_until(client, h, run_id, a_order - 1)
+        far = near_stop(a_stop, north_m=3000)
+        marked = absent(client, h, a_id, far)
+        assert marked.status_code == 200, marked.text
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+
+        prompts = prompts_of_kind(client, h, ABSENT_REMOTE)
+        assert len(prompts) == 1, prompts
+        prompt = prompts[0]
+        assert prompt["student_id"] == a_id
+        assert [s["name"] for s in prompt["students"]] == [fleet["a"]["name"]]
+        assert prompt["answers"] == ["told-me", "not-at-stop", "dismissed"]
+        assert prompt["stop_order"] == a_order and prompt["stop_name"]
+        assert prompt["distance_m"] == pytest.approx(3000, abs=5)
+
+        rows = absent_rows(client, admin_headers, run_id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["kind"] == ABSENT_REMOTE and row["id"] == prompt["exception_id"]
+        assert row["student_id"] == a_id and row["stop_order"] == a_order
+        assert row["status"] == "open"
+        assert row["distance_m"] == pytest.approx(3000, abs=5)
+        assert (row["fix_lat"], row["fix_lng"], row["fix_accuracy_m"]) == (far["lat"], far["lng"], 12.0)
+        assert [(e["prompt_state"], e["response"], e["student_id"]) for e in row["events"]] == [
+            ("pending", None, a_id),
+        ]
+        assert row["events"][0]["call_now_due_at"] is None
+        assert str(ledger(row["id"])[0]["action_key"]) == key_of(marked)
+        # Nothing but the standard notice yet: the tap is not the decision.
+        assert absent_notices(parent_id, run_id, a_id) == ["student-absent"]
+        assert incidents(client, admin_headers, run_id, ABSENT_REMOTE) == []
+
+        # The custody answer is not this prompt's.
+        assert respond(client, h, prompt["event_id"], "confirmed").status_code == 400
+        answered = respond(client, h, prompt["event_id"], "not-at-stop")
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["prompt_state"] == "answered"
+        assert answered.json()["response"] == "not-at-stop"
+        assert "call_now_due" not in answered.json() and "uncorroborated" not in answered.json()
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+
+        event = event_row(prompt["event_id"])
+        assert event["call_now_due_at"] is not None
+        assert _wait_for(lambda: event_row(prompt["event_id"])["call_now_sent_at"] is not None)
+        assert _wait_for(lambda: "absent-call-now" in notification_types(parent_id, run_id, a_id))
+        row = absent_rows(client, admin_headers, run_id)[0]
+        assert row["kind"] == ABSENT_REMOTE and row["status"] == "uncorroborated"
+        assert row["events"][0]["call_now_sent_at"] is not None
+
+        # The family: the standard notice stays, one call-now on top.
+        types = absent_notices(parent_id, run_id, a_id)
+        assert types == ["student-absent", "absent-call-now"], types
+        call_now = notification_rows(parent_id, run_id, a_id, "absent-call-now")[0]
+        assert call_now["title"] == "Call the office now"
+        assert "marked absent away from their stop" in call_now["body"]
+        assert "call the school office now" in call_now["body"]
+        # The office: one absent-remote alert naming the child and the stop.
+        alerts = _wait_for(lambda: incidents(client, admin_headers, run_id, ABSENT_REMOTE))
+        assert len(alerts) == 1, alerts
+        assert fleet["a"]["name"] in alerts[0]["description"]
+        assert f"stop {a_order}" in alerts[0]["description"]
+        assert alerts[0]["lifecycle"] is True and alerts[0]["acknowledged"] is True
+
+        # A replay of the same answer: 200, and nothing sent or raised again.
+        assert respond(client, h, prompt["event_id"], "not-at-stop").status_code == 200
+        other = respond(client, h, prompt["event_id"], "told-me")
+        assert other.status_code == 409 and other.json()["detail"]["code"] == "prompt-already-answered"
+        time.sleep(1.0)
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+        assert len(incidents(client, admin_headers, run_id, ABSENT_REMOTE)) == 1
+        # Another poll drains nothing more.
+        assert pending(client, h) is not None
+        time.sleep(0.5)
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+
+        # No coordinate anywhere a person reads: the office feed, the
+        # family's feed, the container's log, and — in-process, at INFO,
+        # where the classification's and the router helpers' own lines are
+        # captured — the log lines this path writes.
+        needles = coordinate_needles(far)
+        for needle in needles:
+            assert needle not in api_log_tail(), needle
+            assert needle not in alerts[0]["description"]
+            for note in notification_rows(parent_id, run_id, a_id, "absent-call-now") + \
+                    notification_rows(parent_id, run_id, a_id, "student-absent"):
+                assert needle not in note["body"] and needle not in note["title"]
+        assert "km" not in call_now["body"]
+
+        scope = SchoolScope(
+            user_id=fleet["driver1"]["id"], school_id=fleet["school_id"], role="driver",
+            actor_kind="driver",
+        )
+        b_order = plan["by_student"][b_id]
+        b_far = near_stop(plan["coords"][b_order], north_m=3000)
+        with caplog.at_level(logging.INFO):
+            with get_connection(scope) as conn:
+                run = dict(conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone())
+                stop = dict(conn.execute(
+                    "select * from run_stops where run_id = %s and student_id = %s", (run_id, b_id),
+                ).fetchone())
+                # Rolled back: the classification's log lines, not its rows.
+                with conn.transaction(force_rollback=True):
+                    outcome = exception_dao.record_absent_check(
+                        conn, run, stop=stop, school=(SCHOOL_LAT, SCHOOL_LNG),
+                        student_id=b_id, student_name=fleet["b"]["name"],
+                        fix=normalise_fix(b_far, now=datetime.now(timezone.utc), accuracy_cap_m=200.0),
+                        action_key=None, prior_absence_covers=False,
+                    )
+                    assert outcome["classification"] == "remote" and outcome["prompt"]
+                    assert exception_dao.stamp_call_now_due(
+                        conn, event_id=outcome["prompt"]["event_id"], run_id=run_id, student_id=b_id,
+                    )
+            runs_live._record_absent_remote_alert(scope, {
+                "run_id": run_id, "student_id": a_id, "student_name": fleet["a"]["name"],
+                "stop_order": a_order, "stop_name": prompt["stop_name"],
+            })
+            runs_live._send_due_call_now(scope)
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("absent-remote recorded" in m for m in messages), messages
+        for message in messages:
+            for needle in needles + coordinate_needles(b_far):
+                assert needle not in message, message
+        assert len(incidents(client, admin_headers, run_id, ABSENT_REMOTE)) == 1, "deduped per child"
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)
+
+
+def test_ae6_told_me_attests_the_absence_with_no_live_row_incident_or_call_now(
+    client, admin_headers, fleet,
+):
+    """AE6: a phoned-in absence marked from the road, "told me" — the row
+    flips to absent-attested (history only): no call-now, no office alert,
+    the standard notice only. A later remote mark on the same child asks
+    again on the same row."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        far = near_stop(plan["coords"][a_order], north_m=3000)
+        assert absent(client, h, a_id, far).status_code == 200
+        first = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        told = respond(client, h, first["event_id"], "told-me")
+        assert told.status_code == 200, told.text
+        assert told.json()["response"] == "told-me"
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+
+        rows = absent_rows(client, admin_headers, run_id)
+        assert len(rows) == 1
+        assert rows[0]["kind"] == ABSENT_ATTESTED and rows[0]["status"] == "attested"
+        assert rows[0]["id"] == first["exception_id"]
+        assert [(e["prompt_state"], e["response"]) for e in rows[0]["events"]] == [
+            ("answered", "told-me"),
+        ]
+        assert rows[0]["events"][0]["call_now_due_at"] is None
+        assert (rows[0]["fix_lat"], rows[0]["fix_lng"]) == (far["lat"], far["lng"])
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+        time.sleep(1.0)
+        assert absent_notices(parent_id, run_id, a_id) == ["student-absent"]
+        assert incidents(client, admin_headers, run_id, ABSENT_REMOTE) == []
+        assert respond(client, h, first["event_id"], "told-me").status_code == 200
+
+        # Undo, then mark remotely again: the attested row is a live question
+        # again (absent-remote) until answered; told-me attests it once more.
+        assert reverse(client, h, a_id).status_code == 200
+        row = absent_rows(client, admin_headers, run_id)[0]
+        assert row["kind"] == ABSENT_ATTESTED and row["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"]) for e in row["events"]] == [
+            ("answered", "told-me"), (None, "undo"),
+        ]
+        assert absent(client, h, a_id, far).status_code == 200
+        second = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert second["exception_id"] == first["exception_id"]
+        assert second["event_id"] != first["event_id"]
+        row = absent_rows(client, admin_headers, run_id)[0]
+        assert row["kind"] == ABSENT_REMOTE and row["status"] == "open"
+        assert respond(client, h, second["event_id"], "told-me").status_code == 200
+        row = absent_rows(client, admin_headers, run_id)[0]
+        assert row["kind"] == ABSENT_ATTESTED and row["status"] == "attested"
+        assert len(absent_rows(client, admin_headers, run_id)) == 1
+        assert incidents(client, admin_headers, run_id, ABSENT_REMOTE) == []
+        assert "absent-call-now" not in notification_types(parent_id, run_id, a_id)
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)
+
+
+def test_ae16_an_afternoon_absent_at_the_school_for_a_stop_still_ahead_is_corroborated(
+    client, admin_headers, fleet,
+):
+    """AE16 (amended): afternoon run, Arrive at the gate, the child marked
+    absent there because they did not board while their own stop is further
+    along — corroborated by the school: no prompt, no exception, the
+    standard notice only. The same mark once the child's stop is reached is
+    remote."""
+    h = fleet["driver_headers"]
+    a_id, c_id = fleet["a"]["id"], fleet["c"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["afternoon"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        gate_order = plan["gate"]
+        assert gate_order is not None
+        gate = plan["coords"][gate_order]
+        a_order, c_order = plan["by_student"][a_id], plan["by_student"][c_id]
+        assert a_order > gate_order and c_order > gate_order, plan
+        arrive_until(client, h, run_id, gate_order - 1)
+        at_gate = arrive(client, h, run_id, expected=gate_order, fix_body=near_stop(gate, north_m=10))
+        assert at_gate.status_code == 200, at_gate.text
+        assert progress(run_id) == gate_order
+
+        marked = absent(client, h, a_id, near_stop(gate, north_m=20))
+        assert marked.status_code == 200, marked.text
+        assert participation(run_id, a_id) is None, "the presumed boarding is retracted"
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+        assert exceptions(client, admin_headers, run_id, UNVERIFIED) == []
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+        time.sleep(0.5)
+        assert absent_notices(parent_id, run_id, a_id) == ["student-absent"]
+
+        # Drive on to C's stop, then mark C absent from back at the school:
+        # C's stop is no longer ahead, so the school does not explain it.
+        arrive_until(client, h, run_id, c_order)
+        assert absent(client, h, c_id, near_stop(gate, north_m=20)).status_code == 200
+        prompts = prompts_of_kind(client, h, ABSENT_REMOTE)
+        assert len(prompts) == 1 and prompts[0]["student_id"] == c_id
+        rows = absent_rows(client, admin_headers, run_id)
+        assert [(x["kind"], x["student_id"], x["status"]) for x in rows] == [(ABSENT_REMOTE, c_id, "open")]
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id, c_id)
+
+
+def test_dismiss_and_unanswered_on_arrive_each_send_call_now_once_a_board_leaves_it_pending_and_end_run_sends_nothing(
+    client, admin_headers, fleet,
+):
+    """R17/R18 by outcome, on the five children who share one stop: a shown
+    prompt left pending across the next Arrive counts as not-at-stop
+    (call-now due, sent, office alert); a Board in between leaves it pending;
+    the card's dismiss counts the same; a prompt still pending at End Run is
+    recorded unanswered with no call-now and no alert."""
+    h = fleet["driver_headers"]
+    f1, f2, f3, f4, f5 = [kid["id"] for kid in fleet["five"]]
+    names = {kid["id"]: kid["name"] for kid in fleet["five"]}
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        order = plan["by_student"][f1]
+        coords = plan["coords"][order]
+        arrive_until(client, h, run_id, order)
+        far = near_stop(coords, north_m=3000)
+
+        # F1: remote, shown, then a Board of F2 at the stop — still pending.
+        assert absent(client, h, f1, far).status_code == 200
+        p1 = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert p1["student_id"] == f1
+        assert shown(client, h, p1["event_id"]).status_code == 200
+        assert board(client, h, f2, near_stop(coords, north_m=20)).status_code == 200
+        assert event_row(p1["event_id"])["prompt_state"] == "pending"
+        assert [p["event_id"] for p in prompts_of_kind(client, h, ABSENT_REMOTE)] == [p1["event_id"]]
+        assert event_row(p1["event_id"])["call_now_due_at"] is None
+
+        # The next Arrive closes the shown prompt as unanswered: due, sent, alerted.
+        onward = arrive(client, h, run_id, expected=order + 1)
+        assert onward.status_code == 200, onward.text
+        assert "auto_resolved" not in onward.json() and "call_now_due" not in onward.json()
+        closed = event_row(p1["event_id"])
+        assert closed["prompt_state"] == "unanswered" and closed["response"] is None
+        assert closed["call_now_due_at"] is not None
+        assert _wait_for(lambda: event_row(p1["event_id"])["call_now_sent_at"] is not None)
+        assert _wait_for(lambda: incidents(client, admin_headers, run_id, ABSENT_REMOTE))
+        assert [
+            x["status"] for x in absent_rows(client, admin_headers, run_id) if x["student_id"] == f1
+        ] == ["uncorroborated"]
+        late = respond(client, h, p1["event_id"], "told-me")
+        assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-resolved"
+
+        # F3: remote (a catch-up mark on the passed stop), dismissed from the card.
+        assert absent(client, h, f3, far).status_code == 200
+        p3 = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert p3["student_id"] == f3
+        assert p3["exception_id"] != p1["exception_id"], "one row per child"
+        dismissed = respond(client, h, p3["event_id"], "dismissed")
+        assert dismissed.status_code == 200, dismissed.text
+        assert event_row(p3["event_id"])["call_now_due_at"] is not None
+        assert _wait_for(lambda: event_row(p3["event_id"])["call_now_sent_at"] is not None)
+        assert _wait_for(lambda: len(incidents(client, admin_headers, run_id, ABSENT_REMOTE)) == 2)
+        alerts = incidents(client, admin_headers, run_id, ABSENT_REMOTE)
+        assert {names[f1], names[f3]} <= {
+            n for a in alerts for n in names.values() if n in a["description"]
+        }
+
+        # F4: remote, never shown, still pending at End Run: unanswered,
+        # nothing due, no alert.
+        assert absent(client, h, f4, far).status_code == 200
+        p4 = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert p4["student_id"] == f4
+        ended = end_run(client, h, run_id)
+        assert ended.status_code == 200, ended.text
+        assert "auto_resolved" not in ended.json()
+        after = event_row(p4["event_id"])
+        assert after["prompt_state"] == "unanswered"
+        assert after["call_now_due_at"] is None and after["call_now_sent_at"] is None
+        time.sleep(1.0)
+        assert len(incidents(client, admin_headers, run_id, ABSENT_REMOTE)) == 2
+        assert not any(names[f4] in a["description"] for a in incidents(client, admin_headers, run_id, ABSENT_REMOTE))
+        by_child = {x["student_id"]: x["status"] for x in absent_rows(client, admin_headers, run_id)}
+        assert by_child == {f1: "uncorroborated", f3: "uncorroborated", f4: "uncorroborated"}
+        assert participation(run_id, f5)["boarded_at"] is not None
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, f1, f3, f4)
+
+
+def test_undo_of_a_morning_remote_absent_clears_to_no_outcome_sends_one_neutral_correction_and_never_rearms_call_now(
+    client, admin_headers, fleet,
+):
+    """R35 (absent half) and R18: the morning undo — from the card with the
+    event id, or from the board page without — returns the child to no
+    outcome (no confirmed boarding), removes the snapshot and the absence,
+    answers the prompt `undo`, retracts `student-absent` only and sends one
+    neutral `absence-corrected`. Mark, not-at-stop, undo, mark again on the
+    same child: one exception, one call-now, one office alert."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        a_stop = plan["coords"][a_order]
+        arrive_at_stop(client, h, run_id, a_order, a_stop)
+        far = near_stop(a_stop, north_m=3000)
+
+        assert absent(client, h, a_id, far).status_code == 200
+        row = roster_row(client, h, a_id)
+        assert row["display_status"] == "absent" and row["absent"] is True and row["can_undo"] is True
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+        first = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+
+        # Undo from the card (the event id travels as a hint).
+        undone = reverse(client, h, a_id, event_id=first["event_id"])
+        assert undone.status_code == 200, undone.text
+        assert participation(run_id, a_id) is None, "no outcome — never a confirmed boarding"
+        assert snapshot_row(run_id, a_id) is None
+        assert absence_today(a_id) is None
+        assert run_row(run_id)["students_boarded"] == 0
+        row = roster_row(client, h, a_id)
+        assert row["display_status"] == "at-home", row
+        assert row["absent"] is False and row["can_undo"] is False
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        rows = absent_rows(client, admin_headers, run_id)
+        assert len(rows) == 1 and rows[0]["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"]) for e in rows[0]["events"]] == [("answered", "undo")]
+        late = respond(client, h, first["event_id"], "not-at-stop")
+        assert late.status_code == 409 and late.json()["detail"]["code"] == "prompt-already-answered"
+        assert late.json()["detail"]["response"] == "undo"
+        # The family: the absent notice is gone, one neutral correction, no call-now.
+        assert _wait_for(lambda: "absence-corrected" in notification_types(parent_id, run_id, a_id))
+        types = notification_types(parent_id, run_id, a_id)
+        assert "student-absent" not in types and "absent-call-now" not in types
+        assert types.count("absence-corrected") == 1
+        correction = notification_rows(parent_id, run_id, a_id, "absence-corrected")[0]
+        assert correction["title"] == "Correction: absent mark withdrawn"
+        assert "withdrawn" in correction["body"] and "record what happens at the stop" in correction["body"]
+        assert "on the bus" not in correction["body"].lower()
+        # The office: the lifecycle alert names the absence mark.
+        assert _wait_for(lambda: incidents(client, admin_headers, run_id, "action-reversed"))
+        assert any(
+            "absence mark was retracted" in (i.get("description") or "")
+            for i in incidents(client, admin_headers, run_id, "action-reversed")
+        )
+        assert incidents(client, admin_headers, run_id, ABSENT_REMOTE) == []
+
+        # Mark again, far: a new pending prompt on the same row; not-at-stop
+        # arms call-now (the first time for this child) and the alert.
+        assert absent(client, h, a_id, far).status_code == 200
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id)), \
+            "the retraction lets the genuine second notice through"
+        second = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert second["exception_id"] == first["exception_id"]
+        assert second["event_id"] != first["event_id"]
+        assert len(absent_rows(client, admin_headers, run_id)) == 1
+        assert absent_rows(client, admin_headers, run_id)[0]["status"] == "open"
+        assert respond(client, h, second["event_id"], "not-at-stop").status_code == 200
+        assert event_row(second["event_id"])["call_now_due_at"] is not None
+        assert _wait_for(lambda: event_row(second["event_id"])["call_now_sent_at"] is not None)
+        assert _wait_for(lambda: "absent-call-now" in notification_types(parent_id, run_id, a_id))
+        assert _wait_for(lambda: incidents(client, admin_headers, run_id, ABSENT_REMOTE))
+        assert absent_rows(client, admin_headers, run_id)[0]["status"] == "uncorroborated"
+
+        # Undo from the board page (no hint): the answer stays on the record
+        # and an `undo` row is appended; call-now is never retracted.
+        assert reverse(client, h, a_id).status_code == 200
+        final = absent_rows(client, admin_headers, run_id)[0]
+        assert final["status"] == "retracted"
+        assert [(e["prompt_state"], e["response"]) for e in final["events"]] == [
+            ("answered", "undo"), ("answered", "not-at-stop"), (None, "undo"),
+        ]
+        assert final["events"][1]["id"] == second["event_id"]
+        assert final["events"][1]["call_now_sent_at"] is not None
+        assert final["events"][2]["fix_lat"] is None and final["events"][2]["distance_m"] is None
+        assert participation(run_id, a_id) is None and absence_today(a_id) is None
+        time.sleep(0.5)
+        types = notification_types(parent_id, run_id, a_id)
+        assert types.count("absent-call-now") == 1 and "student-absent" not in types
+
+        # Mark a third time and answer not-at-stop again: once per child per
+        # run — no new due stamp, no second call-now, no second alert.
+        assert absent(client, h, a_id, far).status_code == 200
+        third = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert third["exception_id"] == first["exception_id"]
+        assert respond(client, h, third["event_id"], "not-at-stop").status_code == 200
+        assert event_row(third["event_id"])["call_now_due_at"] is None
+        assert event_row(third["event_id"])["call_now_sent_at"] is None
+        time.sleep(1.0)
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+        assert len(incidents(client, admin_headers, run_id, ABSENT_REMOTE)) == 1
+        final = absent_rows(client, admin_headers, run_id)[0]
+        assert final["status"] == "uncorroborated" and len(final["events"]) == 4
+        assert len(absent_rows(client, admin_headers, run_id)) == 1
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)
+
+
+def test_undo_of_an_afternoon_absent_restores_the_presumed_boarding_and_drops_the_snapshot(
+    client, admin_headers, fleet,
+):
+    """R35 (afternoon arm): the undo puts the auto-board's presumption back —
+    presumed, never confirmed — removes the snapshot and the absence, and
+    sends the same neutral correction."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["afternoon"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        gate = plan["coords"][plan["gate"]]
+        arrive_until(client, h, run_id, plan["gate"])
+        assert participation(run_id, a_id)["boarded_presumed"] is True
+        # At the school, A's stop ahead: corroborated, no prompt (AE16).
+        assert absent(client, h, a_id, near_stop(gate, north_m=20)).status_code == 200
+        assert participation(run_id, a_id) is None
+        assert snapshot_row(run_id, a_id) is not None
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+
+        assert reverse(client, h, a_id).status_code == 200
+        record = participation(run_id, a_id)
+        assert record["boarded_at"] is not None and record["boarded_presumed"] is True
+        assert record["dropped_off_at"] is None
+        assert snapshot_row(run_id, a_id) is None and absence_today(a_id) is None
+        assert roster_row(client, h, a_id)["display_status"] == "expected-on-bus"
+        assert _wait_for(lambda: "absence-corrected" in notification_types(parent_id, run_id, a_id))
+        types = notification_types(parent_id, run_id, a_id)
+        assert "student-absent" not in types and "absent-call-now" not in types
+        correction = notification_rows(parent_id, run_id, a_id, "absence-corrected")[0]
+        assert "withdrawn" in correction["body"] and "on the bus" not in correction["body"].lower()
+        assert absent_rows(client, admin_headers, run_id) == []
+        # And the drop-off is confirmable again once the stop is reached.
+        arrive_until(client, h, run_id, plan["by_student"][a_id])
+        assert dropoff(client, h, a_id, near_stop(plan["coords"][plan["by_student"][a_id]], north_m=20)).status_code == 200
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)
+
+
+def test_a_fan_out_lost_between_commit_and_send_is_sent_exactly_once_by_the_next_context_poll(
+    client, admin_headers, fleet,
+):
+    """R18's durability: with the sent stamp made to fail, the deciding
+    answer leaves the notice due-but-unsent — the family's row already landed
+    (send first, stamp second) — and once the fault clears the next context
+    poll stamps it sent while the dedup index keeps the family at one row."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    inject_sent_stamp_failure()
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        far = near_stop(plan["coords"][a_order], north_m=3000)
+        assert absent(client, h, a_id, far).status_code == 200
+        prompt = prompts_of_kind(client, h, ABSENT_REMOTE)[0]
+        assert respond(client, h, prompt["event_id"], "not-at-stop").status_code == 200
+        assert event_row(prompt["event_id"])["call_now_due_at"] is not None
+        assert _wait_for(lambda: "absent-call-now" in notification_types(parent_id, run_id, a_id))
+        time.sleep(1.5)
+        assert event_row(prompt["event_id"])["call_now_sent_at"] is None, "the fault held"
+        # Every later poll re-attempts and keeps failing while the fault is in.
+        assert pending(client, h) == []
+        time.sleep(1.0)
+        assert event_row(prompt["event_id"])["call_now_sent_at"] is None
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+        row = absent_rows(client, admin_headers, run_id)[0]
+        assert row["events"][0]["call_now_due_at"] is not None and row["events"][0]["call_now_sent_at"] is None
+
+        clear_sent_stamp_failure()
+        assert pending(client, h) == []  # the next context poll drains
+        assert _wait_for(lambda: event_row(prompt["event_id"])["call_now_sent_at"] is not None)
+        time.sleep(0.5)
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+        assert pending(client, h) == []
+        time.sleep(0.5)
+        assert notification_types(parent_id, run_id, a_id).count("absent-call-now") == 1
+    finally:
+        clear_sent_stamp_failure()
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)
+
+
+def test_an_absent_with_a_coarse_fix_at_a_coordinateless_stop_is_one_stop_unverified_row_and_no_prompt(
+    client, admin_headers, fleet,
+):
+    """R20/F5: the unverified reasons run first with the custody check's
+    precedence — a coarse fix at a coordinate-less stop is one
+    `stop-unverified` row (never a too-coarse row too, never a remote
+    prompt); a usable fix at that stop is the same row; a mark with no fix
+    at a pinned stop is the run's `no-fix` row. No absent-remote row anywhere."""
+    h = fleet["driver_headers"]
+    a_id, b_id = fleet["a"]["id"], fleet["b"]["id"]
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        with db() as conn:
+            conn.execute(
+                "update run_stops set lat = null, lng = null where run_id = %s and stop_order = %s",
+                (run_id, a_order),
+            )
+        arrive_until(client, h, run_id, a_order)
+        coarse = absent(client, h, a_id, near_stop(plan["coords"][a_order], north_m=3000, accuracy=900))
+        assert coarse.status_code == 200, coarse.text
+        assert trail(run_id)[-1]["fix_reason"] == "coarse"
+        assert tuple(trail(run_id)[-1]["flags"]) == ()
+        rows = exceptions(client, admin_headers, run_id)
+        assert [(x["kind"], x["reason"], x["stop_order"]) for x in rows if x["kind"] != "stop-bypassed"] == [
+            (UNVERIFIED, "stop-unverified", a_order),
+        ]
+        unverified = next(x for x in rows if x["kind"] == UNVERIFIED)
+        assert len(unverified["events"]) == 1 and unverified["events"][0]["prompt_state"] is None
+        assert unverified["events"][0]["student_id"] == a_id
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+
+        # Undo and mark again with a usable fix: the same row, a second event.
+        assert reverse(client, h, a_id).status_code == 200
+        assert absent(client, h, a_id, near_stop(plan["coords"][a_order], north_m=3000)).status_code == 200
+        rows = [x for x in exceptions(client, admin_headers, run_id) if x["kind"] == UNVERIFIED]
+        assert len(rows) == 1 and rows[0]["id"] == unverified["id"]
+        assert [e["student_id"] for e in rows[0]["events"]] == [a_id, a_id]
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+
+        # B at a pinned stop, marked with a denied fix: the run's no-fix row.
+        b_order = plan["by_student"][b_id]
+        arrive_until(client, h, run_id, b_order)
+        assert absent(client, h, b_id, {"reason": "denied"}).status_code == 200
+        rows = [x for x in exceptions(client, admin_headers, run_id) if x["kind"] == UNVERIFIED]
+        assert sorted(x["reason"] for x in rows) == ["no-fix", "stop-unverified"]
+        assert prompts_of_kind(client, h, ABSENT_REMOTE) == []
+        assert absent_rows(client, admin_headers, run_id) == []
+    finally:
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id, b_id)
+
+
+def test_a_forced_classification_error_leaves_the_absent_mark_committed_and_flags_the_trail_row(
+    client, admin_headers, fleet,
+):
+    """R23/R40 for the absent arm: with every run_exceptions insert made to
+    fail, a remote mark still commits — absence, snapshot and notice — with
+    the trail row flagged `classification-failed`, no row and no prompt."""
+    h = fleet["driver_headers"]
+    a_id = fleet["a"]["id"]
+    parent_id = fleet["parent_id"]
+    inject_exception_insert_failure()
+    run_id = start(client, h, fleet["morning"]["id"], fix_body=fix()).json()["id"]
+    try:
+        plan = layout(run_id)
+        a_order = plan["by_student"][a_id]
+        arrive_until(client, h, run_id, a_order)
+        marked = absent(client, h, a_id, near_stop(plan["coords"][a_order], north_m=3000))
+        assert marked.status_code == 200, marked.text
+        assert absence_today(a_id) is not None and snapshot_row(run_id, a_id) is not None
+        last = trail(run_id)[-1]
+        assert last["action_kind"] == "absent"
+        assert tuple(last["flags"]) == ("classification-failed",)
+        assert exceptions(client, admin_headers, run_id) == []
+        assert pending(client, h) == []
+        assert _wait_for(lambda: "student-absent" in notification_types(parent_id, run_id, a_id))
+    finally:
+        clear_injected_failure()
+        purge_run(run_id)
+        _clear_absences(client, admin_headers, a_id)

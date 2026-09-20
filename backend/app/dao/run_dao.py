@@ -1477,6 +1477,70 @@ class RunDao:
                 "custody prompt retraction failed; the undo still commits (run=%s)", run["id"]
             )
 
+    @staticmethod
+    def _retract_absent_prompts(
+        conn, run: dict[str, Any], student_id: str, event_id: str | None
+    ) -> None:
+        """The undo's answer on the child's absent prompt (GPS plan U10/R17):
+        `undo` on a pending prompt, an appended `undo` row after an answer;
+        in a savepoint so a ledger fault never blocks the correction itself."""
+        try:
+            with conn.transaction():
+                exception_dao.retract_absent_prompts(
+                    conn, dict(run), str(student_id), event_id=event_id
+                )
+        except Exception:
+            logger.exception(
+                "absent prompt retraction failed; the undo still commits (run=%s)", run["id"]
+            )
+
+    def _check_absent(
+        self, conn, run: dict[str, Any], stop: dict[str, Any], student_id: str,
+        student_name: str, tap: _Tap, *, prior_absence_covers: bool,
+    ) -> dict[str, Any] | None:
+        """The absent classification (GPS plan U10/R16, R17, R20), in its own
+        savepoint after the absence, the snapshot, the trail row and the
+        served position are written: a remote mark raises the child's
+        absent-remote exception and its three-way prompt, an untestable one
+        records an unverified row, a corroborated one writes nothing. The
+        school's coordinates are the run's own gate stop, or the school's pin
+        when the snapshot has none. A failure rolls back to the savepoint,
+        flags the trail row `classification-failed` and is logged with the
+        run and stop order only — never a coordinate — so the mark still
+        commits with no prompt (R23, R40).
+        """
+        try:
+            with conn.transaction():
+                gate = conn.execute(
+                    """
+                    select coalesce(g.lat, sc.lat) as lat, coalesce(g.lng, sc.lng) as lng
+                    from live_runs r
+                    left join live_schools sc on sc.id = r.school_id
+                    left join lateral (
+                        select lat, lng from run_stops rs
+                        where rs.run_id = r.id and rs.is_school_gate
+                          and rs.lat is not null and rs.lng is not null
+                        order by rs.stop_order asc limit 1
+                    ) g on true
+                    where r.id = %s
+                    """,
+                    (run["id"],),
+                ).fetchone()
+                school = (gate["lat"], gate["lng"]) if gate else None
+                return exception_dao.record_absent_check(
+                    conn, dict(run), stop=dict(stop), school=school,
+                    student_id=str(student_id), student_name=student_name, fix=tap.fix,
+                    action_key=tap.key, prior_absence_covers=prior_absence_covers,
+                )
+        except Exception:
+            logger.exception(
+                "absent classification not recorded; the mark still commits "
+                "(run=%s stop_order=%s)",
+                run["id"], stop["stop_order"],
+            )
+            self._flag_classification_failed(conn, tap)
+            return None
+
     def record_parent_contact(
         self, scope: SchoolScope, run_id: str, student_id: str
     ) -> dict[str, Any]:
@@ -1734,6 +1798,13 @@ class RunDao:
         also answers the child's custody prompts on this run `retracted`;
         ``event_id`` is the card's hint for that ledger, never the key.
 
+        The absence arm (U10, R35) withdraws this login's own driver-sourced
+        absence of today together with the run's snapshot of it: on a morning
+        run the child returns to no outcome; on an afternoon run the presumed
+        boarding the mark had retracted is restored. It answers the child's
+        absent prompt on this run `undo` (history kept) and never touches the
+        call-now stamps.
+
         Scope is deliberately narrow: this driver's account, this run, still
         open. The driver assistant shares the login, so "their own action" means
         this login's action — enough to correct a mis-tap, not an audit trail.
@@ -1756,6 +1827,7 @@ class RunDao:
             record = participation_dao.get_for_student(conn, str(run["id"]), student_id)
             reversed_what: str | None = None
             retract_custody = False
+            retract_absent = False
 
             if record and (record["dropped_off_at"] or record["handover_at"]):
                 if str(record["acting_driver_id"] or "") != str(driver_id):
@@ -1793,15 +1865,29 @@ class RunDao:
                 retract_custody = True
             elif AbsenceDao().reverse_driver_absence(conn, student_id, str(driver_id)):
                 reversed_what = "absence"
-                # Back onto the run as boarded: the child was aboard, which is
-                # why the driver could mark them absent from this run at all.
-                name = conn.execute(
-                    "select name from live_students where id = %s", (student_id,)
-                ).fetchone()
-                participation_dao.record_boarding(
-                    conn, str(run["id"]), student_id, name["name"], str(driver_id),
-                    presumed=(run["type"] == "afternoon"),
+                # The absent mark is withdrawn: the run's snapshot of it goes
+                # too, so the report stops listing a child the driver un-marked.
+                conn.execute(
+                    "delete from run_absences where run_id = %s and student_id = %s",
+                    (run["id"], student_id),
                 )
+                if run["type"] == "afternoon":
+                    # The afternoon arm restores the presumed boarding (R35):
+                    # the auto-board's assumption the mark had retracted, still
+                    # an assumption — nobody observed the child aboard.
+                    name = conn.execute(
+                        "select name from live_students where id = %s", (student_id,)
+                    ).fetchone()
+                    participation_dao.record_boarding(
+                        conn, str(run["id"]), student_id, name["name"], str(driver_id),
+                        presumed=True,
+                    )
+                # The morning arm clears to no outcome (GPS plan U10/R35): the
+                # child is neither aboard nor absent, and the driver will
+                # record what happens at the stop. It used to write a confirmed
+                # boarding — an "on the bus" claim manufactured from a tap that
+                # may have been made kilometres from the stop.
+                retract_absent = True
 
             if not reversed_what:
                 raise ConflictError(
@@ -1809,6 +1895,8 @@ class RunDao:
                 )
             if retract_custody:
                 self._retract_custody_prompts(conn, run, student_id, event_id)
+            if retract_absent:
+                self._retract_absent_prompts(conn, run, student_id, event_id)
 
             counted = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))
@@ -1861,6 +1949,14 @@ class RunDao:
 
         marked_by follows source rather than the last write: it is the row's
         actor, and reverse_driver_absence keys on the pair.
+
+        After the mark is written the tap is classified in the savepoint tier
+        (GPS plan U10/R16): unverified, corroborated — by a parent or office
+        absence that covered the trip before this upsert, by the phone at the
+        stop, or on an afternoon run by the phone at the school with the
+        child's stop still ahead — or remote, which raises the child's
+        absent-remote exception and its three-way prompt for the context
+        poll. The mark, the snapshot and the standard notice never wait on it.
         """
         from app.core.errors import ForbiddenError
 
@@ -1872,7 +1968,7 @@ class RunDao:
             if not run or str(run["driver_id"]) != str(driver_id):
                 raise ForbiddenError("No active run for this driver")
             stop = conn.execute(
-                "select stop_order from run_stops where run_id = %s and student_id = %s "
+                "select * from run_stops where run_id = %s and student_id = %s "
                 "order by stop_order asc limit 1",
                 (run["id"], student_id),
             ).fetchone()
@@ -1885,6 +1981,22 @@ class RunDao:
             # Read before the absence lands (U3/R15): membership on an open
             # bypassed-stop exception makes this mark its resolution.
             listed_before = self._listed_on_open_bypass(conn, run, stop["stop_order"], student_id)
+            # Read before the upsert too (GPS plan U10/R16): a parent or office
+            # absence already covering this trip corroborates the mark. After
+            # the upsert the row exists whatever happened, and the precedence
+            # ratchet keeps the office's attribution — so only the row as it
+            # stood before the tap can answer "did someone else say so first".
+            prior = conn.execute(
+                f"""
+                select 1 from live_student_absences a
+                where a.student_id = %s
+                  and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                  and a.source in ('admin', 'parent')
+                  and {scope_covers("a.scope", "%s")}
+                """,
+                (student_id, run["type"]),
+            ).fetchone()
+            prior_absence_covers = prior is not None
             period = "day" if whole_day else run["type"]
             # school_id stamped from the driver's scope (U7) — the roster
             # check above proved the student rides this school's run.
@@ -1957,6 +2069,14 @@ class RunDao:
             self._attach_resolution_tap(
                 conn, run, event_id, student_id, "absent mark", tap=tap,
                 listed_before=listed_before,
+            )
+            # Every absent mark is classified (GPS plan U10/R16) — a resolution
+            # tap included: a stop the bus already passed is exactly where a
+            # remote mark needs the driver's word, and the queue shows one
+            # prompt at a time either way.
+            self._check_absent(
+                conn, run, stop, student_id, student["name"], tap,
+                prior_absence_covers=prior_absence_covers,
             )
             boarded_count = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))

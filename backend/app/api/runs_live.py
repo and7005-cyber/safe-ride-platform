@@ -260,12 +260,19 @@ def review_run_exception(
 # Driver run lifecycle (U7: driver-scoped — school derived, header refused) ----
 
 @router.get("/driver/context")
-def driver_context(scope: SchoolScope = Depends(require_driver_scope)):
+def driver_context(
+    background_tasks: BackgroundTasks, scope: SchoolScope = Depends(require_driver_scope),
+):
     """The driver's bus, routes, active run, roster, blocking set and — GPS
     plan U3/R34 — `pending_prompts`: the open run's pending prompts, safety
     kinds first, each with its event id, copy inputs and allowed answers.
-    Polled every 5 s, so a reload or a second device re-shows them."""
-    return safe_call(lambda: dao.get_driver_context(scope))
+    Polled every 5 s, so a reload or a second device re-shows them. Each poll
+    also drains the school's call-now outbox (GPS plan U10/R18): a notice
+    decided but not yet sent — a fan-out lost between commit and send — goes
+    out on the next poll, once."""
+    context = safe_call(lambda: dao.get_driver_context(scope))
+    background_tasks.add_task(_send_due_call_now, scope)
+    return context
 
 
 @router.post("/driver/prompts/{event_id}/shown")
@@ -278,7 +285,7 @@ def acknowledge_prompt_shown(event_id: str, scope: SchoolScope = Depends(require
 
 @router.post("/driver/prompts/{event_id}/respond")
 def respond_to_prompt(
-    event_id: str, payload: PromptAnswerPayload,
+    event_id: str, payload: PromptAnswerPayload, background_tasks: BackgroundTasks,
     scope: SchoolScope = Depends(require_driver_scope),
 ):
     """Record the driver's answer to a prompt (GPS plan U3/R23, R34).
@@ -287,8 +294,21 @@ def respond_to_prompt(
     recorded: 409 `prompt-already-answered`; any answer after Arrive, End Run
     or force-close closed it: 409 `prompt-resolved` — both carry the recorded
     state in `detail`, and the client drops the card and refreshes on either.
+
+    A remote-absent answer decides more inside the DAO's transaction (GPS
+    plan U10/R17, R18): `told-me` attests the absence and nothing follows;
+    `not-at-stop` or `dismissed` stamps the call-now notice due (once per
+    child per run) and the router fans out from the return value — the
+    outbox drain sends it and the office gets the `absent-remote` alert,
+    deduplicated per child. A replayed answer carries neither key.
     """
-    return safe_call(lambda: exception_dao.respond(scope, event_id, payload.answer))
+    result = safe_call(lambda: exception_dao.respond(scope, event_id, payload.answer))
+    result.pop("call_now_due", None)
+    uncorroborated = result.pop("uncorroborated", None)
+    if uncorroborated:
+        background_tasks.add_task(_record_absent_remote_alert, scope, uncorroborated)
+    background_tasks.add_task(_send_due_call_now, scope)
+    return result
 
 
 @router.post("/driver/start")
@@ -310,6 +330,7 @@ def start_run(
     background_tasks.add_task(push_service.notify_run_started, run, scope=scope)
     background_tasks.add_task(_record_lifecycle_alert, scope, str(run["id"]), "run-started")
     background_tasks.add_task(_purge_after_start, scope)
+    background_tasks.add_task(_send_due_call_now, scope)
     return run
 
 
@@ -331,11 +352,19 @@ def arrive(
     )
     if replayed:
         return result
-    # Prompts this Arrive closed as unanswered (GPS plan U3): U10 decides the
-    # call-now notice from them here; until then they stay off the response.
-    result.pop("auto_resolved", None)
+    # Prompts this Arrive closed as unanswered (GPS plan U3/U10): a shown
+    # remote-absent prompt left unanswered counts as "not at the stop" — the
+    # DAO stamped its call-now due inside the transaction; the router drains
+    # the outbox and raises the office alert from that return value alone.
+    # Never on the response.
+    auto_resolved = result.pop("auto_resolved", None) or []
+    # A recorded no-op is still a driver action: the outbox drain rides it.
+    background_tasks.add_task(_send_due_call_now, scope)
     if result.get("noop"):
         return result
+    for closed in auto_resolved:
+        if closed.get("kind") == "absent-remote" and closed.get("student_id"):
+            background_tasks.add_task(_record_absent_remote_alert, scope, closed)
     if result.get("arrival_incident"):
         background_tasks.add_task(push_service.notify_reached_school, result["run"], scope=scope)
     # Arriving a stop means the next stop's children should get ready.
@@ -381,6 +410,7 @@ def end_run(
     run.pop("auto_resolved", None)  # GPS plan U3: closed prompts, no call-now at End Run
     background_tasks.add_task(push_service.notify_run_ended, run, scope=scope)
     background_tasks.add_task(_record_lifecycle_alert, scope, str(run["id"]), "run-completed")
+    background_tasks.add_task(_send_due_call_now, scope)
     return run
 
 
@@ -404,6 +434,7 @@ def toggle_boarding(
     background_tasks.add_task(
         push_service.notify_student_boarded, run, payload.student_id, scope=scope
     )
+    background_tasks.add_task(_send_due_call_now, scope)
     return student
 
 
@@ -428,6 +459,7 @@ def dropoff_student(
     background_tasks.add_task(
         push_service.notify_student_dropped_off, student, run, scope=scope
     )
+    background_tasks.add_task(_send_due_call_now, scope)
     return student
 
 
@@ -463,6 +495,7 @@ def record_handover(
         _record_lifecycle_alert, scope, str(run["id"]), "handover-recorded",
         f"{student['name']} — driver's note: {payload.note}",
     )
+    background_tasks.add_task(_send_due_call_now, scope)
     return student
 
 
@@ -496,6 +529,9 @@ def reverse_own_action(
         _record_lifecycle_alert, scope, str(run["id"]), "action-reversed",
         f"{student['name']} — the {retracted} was retracted.",
     )
+    # Never a retraction of call-now (GPS plan U10/R18): the outbox is only
+    # drained, so a notice already due still goes out after an undo.
+    background_tasks.add_task(_send_due_call_now, scope)
     return student
 
 
@@ -516,6 +552,52 @@ def _record_lifecycle_alert(
         incident_dao.create_lifecycle_incident(scope, run_id, incident_type, detail)
     except Exception:
         logger.exception("recording %s lifecycle alert failed", incident_type)
+
+
+def _send_due_call_now(scope: SchoolScope) -> None:
+    """Drain the school's call-now outbox (GPS plan U10/R18): every notice a
+    transaction stamped due and no task has yet stamped sent goes to the
+    family now, once. Dispatched after every driver action, every prompt
+    answer and every context poll, wrapped like the other post-commit helpers
+    so a failure here never reaches the driver's response. The log line
+    carries the school id and a count, never a child or a coordinate."""
+    try:
+        sent = exception_dao.send_due_call_now(
+            scope,
+            lambda student, run: push_service.notify_absent_call_now(student, run, scope=scope),
+        )
+    except Exception:
+        logger.exception("call-now drain failed (school=%s)", scope.school_id)
+        return
+    if sent:
+        logger.info("call-now drain sent %s notice(s) (school=%s)", sent, scope.school_id)
+
+
+def _record_absent_remote_alert(scope: SchoolScope, decided: dict) -> None:
+    """Office-only alert for an uncorroborated remote absent (GPS plan
+    U10/R17, R21): raised when the driver answers not-at-stop or dismisses,
+    or when a shown prompt is left unanswered until the next Arrive; never at
+    End Run or force-close. Deduplicated per (run, child) on the incident row
+    itself, so a mark / undo / mark cycle is one alert. The text names the
+    child and the stop, never a coordinate or a distance."""
+    stop = decided.get("stop_order")
+    where = (
+        f" at stop {stop} ({decided['stop_name']})" if stop and decided.get("stop_name")
+        else f" at stop {stop}" if stop
+        else ""
+    )
+    detail = (
+        f"{decided.get('student_name') or 'A child'} was marked absent away from their "
+        f"stop{where} and nothing corroborated it; the family has been asked to call the "
+        "office if the child should be on the bus."
+    )
+    try:
+        incident_dao.create_lifecycle_incident(
+            scope, str(decided["run_id"]), "absent-remote", detail,
+            student_id=str(decided["student_id"]),
+        )
+    except Exception:
+        logger.exception("recording absent-remote lifecycle alert failed")
 
 
 def _purge_after_start(scope: SchoolScope) -> None:
@@ -610,4 +692,8 @@ def mark_student_absent(
     # has no such index, so only a NEWLY recorded absence raises one.
     if run.get("newly_recorded"):
         background_tasks.add_task(_record_absent_incident, scope, student, run)
+    # The classification (GPS plan U10) ran inside the DAO's transaction; a
+    # remote mark's prompt reaches the driver through the context poll, and
+    # nothing about it is decided here. The outbox drain rides every action.
+    background_tasks.add_task(_send_due_call_now, scope)
     return student

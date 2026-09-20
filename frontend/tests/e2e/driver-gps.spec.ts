@@ -2,12 +2,15 @@ import { expect, test, type APIRequestContext, type BrowserContext, type Page, t
 import {
   ADMIN,
   API_URL,
+  PARENT,
   SEED,
   apiDriverToken,
   apiToken,
   authHeaders,
+  clearCancellationState,
   endActiveRun,
   purgeRun,
+  signInAs,
   signInAsDriver,
 } from "./helpers";
 
@@ -611,4 +614,146 @@ test("custody: a Board 1.8 km from the stop raises the silent confirm card with 
   expect(lavington.status).toBe("retracted");
   expect(lavington.events.map((e: any) => e.response)).toEqual(["retracted", "retracted"]);
   expect(rows.filter((x: any) => x.kind === "custody-away")).toHaveLength(2);
+});
+
+// --- the remote absent (GPS plan U10: R16, R17, R18, R35; F4; AE6, AE7) -----------
+//
+// Same seeded route. The driver arrives at Kilimani, pulls 3 km away and marks
+// Faith absent: the attestation card. "No — I wasn't at the stop" leaves the
+// mark uncorroborated — the family gets the call-now notice once, the office
+// its alert. Then Happiness at Lavington, "Yes — they told me": attested,
+// history only.
+
+async function absentFromRow(page: Page, studentId: string): Promise<Captured> {
+  const row = page.getByTestId(`student-row-${studentId}`);
+  await expect(row.getByTestId(`absent-${studentId}`)).toBeEnabled();
+  await row.getByTestId(`absent-${studentId}`).click();
+  const captured = await captureAction(page, "/api/runs/driver/absent", () =>
+    page.getByRole("dialog").getByRole("button", { name: "Mark absent", exact: true }).click(),
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  return captured;
+}
+
+async function adminIncidents(request: APIRequestContext, runId: string, type: string) {
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const response = await request.get(`${API_URL}/api/incidents`, { headers: authHeaders(token) });
+  expect(response.ok()).toBeTruthy();
+  return (await response.json()).filter((i: any) => i.run_id === runId && i.type === type);
+}
+
+test("remote absent: an Absent 3 km from the stop raises the attestation card with tone and vibration; No — I wasn't at the stop sends call-now once and alerts the office; Yes — they told me attests the next one", async ({ page, context, request }) => {
+  await page.addInitScript(FIX_LOG);
+  await page.addInitScript(CUE_SPY);
+  await context.setGeolocation(KILIMANI);
+  await signInAsDriver(page);
+  await startMorningRun(page);
+  const ctx = await driverContext(request);
+  const runId: string = ctx.active_run.id;
+  const faith = ctx.students.find((s: any) => s.name === SEED.parentChild);
+  const happiness = ctx.students.find((s: any) => s.name === SEED.afternoonRideMate);
+  expect(faith && happiness).toBeTruthy();
+  try {
+    // Arrive at Kilimani with the phone at the stop; nothing to ask yet.
+    await moveTo(page, context, KILIMANI);
+    await page.getByRole("button", { name: "Arrive Next Stop" }).click();
+    await expect(page.getByText(/^1\/\d+ stops completed$/)).toBeVisible();
+    await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+
+    // AE7: 3 km on, the driver marks Faith absent from the board page.
+    await page.goto("/driver/boarding");
+    await moveTo(page, context, northOf(KILIMANI, 3000));
+    const marked = await absentFromRow(page, faith.id);
+    expect(marked.body.fix.lat).toBeCloseTo(northOf(KILIMANI, 3000).latitude, 5);
+
+    const card = page.getByTestId("nudge-card");
+    await expect(card).toBeVisible();
+    await expect(card).toHaveAttribute("data-kind", "absent-remote");
+    await expect(card).toContainText("Kilimani");
+    await expect(card).toContainText(
+      `You marked ${SEED.parentChild} absent about 3.0 km from their stop. `
+        + `Did a parent or the office tell you ${SEED.parentChild} isn't coming?`,
+    );
+    await expect(card.getByTestId("nudge-told-me")).toBeVisible();
+    await expect(card.getByTestId("nudge-not-at-stop")).toBeVisible();
+    await expect(card.getByTestId("nudge-dismiss")).toBeVisible();
+    // The tap completed regardless (R23): the row reads Absent today and offers Undo.
+    const faithRow = page.getByTestId(`student-row-${faith.id}`);
+    await expect(faithRow.getByText("Absent today")).toBeVisible();
+    await expect(faithRow.getByTestId(`undo-${faith.id}`)).toBeVisible();
+    // A safety prompt (F4): tone and vibration.
+    await expect
+      .poll(async () => (await page.evaluate(() => (window as any).__cues)).plays.filter((p: any) => !p.muted).length)
+      .toBe(1);
+    expect((await page.evaluate(() => (window as any).__cues)).vibrations).toEqual([[200, 100, 200]]);
+
+    await card.getByTestId("nudge-not-at-stop").click();
+    await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+    let rows = await adminExceptions(request, runId);
+    const remote = rows.filter((x: any) => x.kind === "absent-remote");
+    expect(remote).toHaveLength(1);
+    expect(remote[0].student_id).toBe(faith.id);
+    expect(remote[0].stop_order).toBe(1);
+    expect(remote[0].status).toBe("uncorroborated");
+    expect(remote[0].distance_m).toBeGreaterThan(2900);
+    expect(remote[0].distance_m).toBeLessThan(3100);
+    expect(remote[0].events.map((e: any) => [e.prompt_state, e.response, e.student_id])).toEqual([
+      ["answered", "not-at-stop", faith.id],
+    ]);
+    expect(remote[0].events[0].shown_at).not.toBeNull();
+    expect(remote[0].events[0].call_now_due_at).not.toBeNull();
+    // Sent once: the drain rides the answer and every poll.
+    await expect
+      .poll(async () => {
+        const again = await adminExceptions(request, runId);
+        return again.find((x: any) => x.kind === "absent-remote")?.events[0]?.call_now_sent_at ?? null;
+      }, { timeout: 15_000 })
+      .not.toBeNull();
+    // The office: one absent-remote alert naming Faith and the stop, no coordinate.
+    await expect.poll(async () => (await adminIncidents(request, runId, "absent-remote")).length, { timeout: 15_000 }).toBe(1);
+    const alert = (await adminIncidents(request, runId, "absent-remote"))[0];
+    expect(alert.description).toContain(SEED.parentChild);
+    expect(alert.description).toContain("stop 1");
+    expect(alert.description).not.toMatch(/-?1\.2\d{3,}/);
+
+    // The family: the standard notice and the call-now, each once, in the feed.
+    await signInAs(page, PARENT);
+    await page.goto("/parent/alerts");
+    await expect(page.getByText("Call the office now").first()).toBeVisible();
+    await expect(page.getByText(/call the school office now/).first()).toBeVisible();
+    await expect(page.getByText("Marked absent").first()).toBeVisible();
+    const feedCards = page.locator("div[class*='bg-card']");
+    expect(await feedCards.filter({ hasText: "call the school office now" }).count()).toBe(1);
+
+    // AE6: back as the driver, Happiness at Lavington, marked from 3 km away,
+    // "Yes — they told me": attested, no second alert.
+    await signInAsDriver(page);
+    await page.goto("/driver/run");
+    await moveTo(page, context, LAVINGTON);
+    await page.getByRole("button", { name: "Arrive Next Stop" }).click();
+    await expect(page.getByText(/^2\/\d+ stops completed$/)).toBeVisible();
+    await page.goto("/driver/boarding");
+    await moveTo(page, context, northOf(LAVINGTON, 3000));
+    await absentFromRow(page, happiness.id);
+    await expect(card).toHaveAttribute("data-kind", "absent-remote");
+    await expect(card).toContainText(SEED.afternoonRideMate);
+    await card.getByTestId("nudge-told-me").click();
+    await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+    rows = await adminExceptions(request, runId);
+    const attested = rows.find((x: any) => x.kind === "absent-attested");
+    expect(attested).toBeTruthy();
+    expect(attested.student_id).toBe(happiness.id);
+    expect(attested.status).toBe("attested");
+    expect(attested.events.map((e: any) => [e.prompt_state, e.response])).toEqual([["answered", "told-me"]]);
+    expect(attested.events[0].call_now_due_at).toBeNull();
+    expect(rows.filter((x: any) => x.kind === "absent-remote")).toHaveLength(1);
+    expect(await adminIncidents(request, runId, "absent-remote")).toHaveLength(1);
+  } finally {
+    // The marks outlive the run: clear them so later specs still find both
+    // children on the route (the admin clear is refused while a covered run
+    // is open, hence the run first).
+    await endActiveRun(request);
+    await clearCancellationState(request, SEED.parentChild);
+    await clearCancellationState(request, SEED.afternoonRideMate);
+  }
 });

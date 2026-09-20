@@ -1,15 +1,23 @@
-"""Fix validation at the action boundary (GPS plan U7: R2, R40) and the
-custody geometry (U9: R14, R20, R32 hook). Pure tests over
-``position_rules``: every shape a client can send becomes a value — stored
-fix or None, one reason, flags — and never an exception; every custody check
-is one of ``within``, ``away`` or ``unverified`` with a reason, decided cap
-first, then plausibility, then distance less accuracy."""
+"""Fix validation at the action boundary (GPS plan U7: R2, R40), the
+custody geometry (U9: R14, R20, R32 hook) and the absent classification
+(U10: R16, R20). Pure tests over ``position_rules``: every shape a client can
+send becomes a value — stored fix or None, one reason, flags — and never an
+exception; every custody check is one of ``within``, ``away`` or
+``unverified`` with a reason, decided cap first, then plausibility, then
+distance less accuracy; every absent mark is ``unverified``, ``corroborated``
+(by an earlier absence, the stop or the school) or ``remote``."""
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.services.position_rules import (
+    ABSENT_CORROBORATED,
+    ABSENT_REMOTE,
+    ABSENT_UNVERIFIED,
+    CORROBORATED_BY_ABSENCE,
+    CORROBORATED_BY_SCHOOL,
+    CORROBORATED_BY_STOP,
     CUSTODY_AWAY,
     CUSTODY_UNVERIFIED,
     CUSTODY_WITHIN,
@@ -20,9 +28,11 @@ from app.services.position_rules import (
     REASON_STOP_UNVERIFIED,
     REASON_TOO_COARSE,
     UNVERIFIED_REASONS,
+    AbsentCheck,
     CustodyCheck,
     NormalisedFix,
     StoredFix,
+    classify_absent,
     classify_custody,
     normalise_fix,
     plausibility_flags,
@@ -375,3 +385,128 @@ def test_within_vicinity_uses_the_cap_then_distance_less_accuracy():
     # A stop without coordinates is never "seen".
     assert not within_vicinity(fix_at(0), None, **kwargs)
     assert not within_vicinity(fix_at(0), (None, 36.7823), **kwargs)
+
+
+# --- the absent classification (U10: R16, R20; AE6, AE7, AE8, AE16) ---------------
+#
+# The school sits 3 km north of the stop, so a fix "at the school" is
+# unambiguously away from the stop and a fix at the stop is away from the school.
+
+VICINITY = 100.0
+SCHOOL = (STOP[0] + 3000 * METRE, STOP[1])
+
+
+def school_fix(metres_north: float = 0.0, accuracy: float = 12.0) -> StoredFix:
+    return StoredFix(
+        lat=SCHOOL[0] + metres_north * METRE, lng=SCHOOL[1], accuracy_m=accuracy,
+        captured_at=CAPTURED,
+    )
+
+
+def absent(
+    fix, stop=STOP, *, school=SCHOOL, run_type="morning", stop_order=3, stops_completed=3,
+    prior=False, vicinity=VICINITY, cap=CAP, flags=(),
+):
+    return classify_absent(
+        fix, stop, school=school, run_type=run_type, stop_order=stop_order,
+        stops_completed=stops_completed, prior_absence_covers=prior,
+        vicinity_m=vicinity, accuracy_cap_m=cap, flags=flags,
+    )
+
+
+def test_ae8_an_absent_within_the_stops_vicinity_is_corroborated_by_the_stop():
+    result = absent(fix_at(40))
+    assert result == AbsentCheck(
+        classification=ABSENT_CORROBORATED, reason=None, corroborated_by=CORROBORATED_BY_STOP,
+        distance_m=pytest.approx(40, abs=1),
+    )
+    assert result.corroborated and not result.remote and not result.unverified
+    # The same geometry as "bus seen at stop": 120 m away but 25 m wide is in.
+    assert absent(fix_at(120, accuracy=25)).corroborated_by == CORROBORATED_BY_STOP
+    # 120 m away and 12 m wide is not: 108 m net, past 100.
+    assert absent(fix_at(120, accuracy=12)).classification == ABSENT_REMOTE
+
+
+def test_ae7_an_absent_three_kilometres_from_the_stop_is_remote_with_its_distance():
+    result = absent(fix_at(-3000))
+    assert result.classification == ABSENT_REMOTE
+    assert result.reason is None and result.corroborated_by is None
+    assert result.distance_m == pytest.approx(3000, abs=3)
+    assert result.remote
+
+
+def test_ae6_a_remote_absent_stays_remote_here_the_attestation_is_the_ledgers():
+    # Nothing in the geometry distinguishes a phoned-in absence from a skipped
+    # stop: both are `remote`, and the driver's answer (told-me / not-at-stop)
+    # is recorded on the exception, not decided here.
+    assert absent(fix_at(-3000)).remote
+    assert absent(fix_at(-3000), prior=False).remote
+
+
+def test_a_parent_or_office_absence_before_the_tap_corroborates_the_mark():
+    result = absent(fix_at(-3000), prior=True)
+    assert result.classification == ABSENT_CORROBORATED
+    assert result.corroborated_by == CORROBORATED_BY_ABSENCE
+    # Still reported for the office.
+    assert result.distance_m == pytest.approx(3000, abs=3)
+    # ...but never ahead of the unverified reasons (R16's order): a prior
+    # absence with an untestable fix is an unverified check.
+    assert absent(None, prior=True) == AbsentCheck(
+        classification=ABSENT_UNVERIFIED, reason=REASON_NO_FIX, corroborated_by=None, distance_m=None,
+    )
+    assert absent(fix_at(-3000, accuracy=900), prior=True).reason == REASON_TOO_COARSE
+
+
+def test_ae16_an_afternoon_absent_at_the_school_for_a_stop_still_ahead_is_corroborated():
+    # Arrived at the gate (stop 1); the child's stop is 6, further along.
+    result = absent(school_fix(20), run_type="afternoon", stop_order=6, stops_completed=1)
+    assert result.classification == ABSENT_CORROBORATED
+    assert result.corroborated_by == CORROBORATED_BY_SCHOOL
+    assert result.distance_m == pytest.approx(3000, abs=25), "distance is to the child's stop"
+    # Before the gate Arrive (progress 0) the stop is still ahead: corroborated.
+    assert absent(school_fix(), run_type="afternoon", stop_order=6, stops_completed=0).corroborated
+    # Once the child's stop has been reached, "at the school" no longer explains
+    # the mark: remote.
+    assert absent(school_fix(), run_type="afternoon", stop_order=6, stops_completed=6).remote
+    assert absent(school_fix(), run_type="afternoon", stop_order=1, stops_completed=1).remote
+    # A morning run has no such arm: at the school, stop ahead, still remote.
+    assert absent(school_fix(), run_type="morning", stop_order=6, stops_completed=1).remote
+    # The school arm needs the school's coordinates and the same geometry.
+    assert absent(school_fix(), run_type="afternoon", stop_order=6, stops_completed=1, school=None).remote
+    assert absent(
+        school_fix(300), run_type="afternoon", stop_order=6, stops_completed=1,
+    ).remote, "300 m from the gate is not at the school"
+    assert absent(
+        school_fix(0, accuracy=900), run_type="afternoon", stop_order=6, stops_completed=1,
+    ).reason == REASON_TOO_COARSE, "a coarse fix at the school vouches for nothing"
+
+
+def test_the_unverified_reasons_and_their_precedence_are_the_custody_checks():
+    assert absent(None).reason == REASON_NO_FIX
+    assert absent(fix_at(40, accuracy=900)).reason == REASON_TOO_COARSE
+    assert absent(fix_at(40), flags=("implausible-jump",)).reason == REASON_IMPLAUSIBLE
+    assert absent(fix_at(40, accuracy=900), flags=("accuracy-zero",)).reason == REASON_IMPLAUSIBLE
+    # A coordinate-less stop wins over every other reason and over every
+    # corroboration, the fix at the school included; no distance is reported.
+    for fix, kwargs in (
+        (fix_at(40), {}), (None, {}), (fix_at(40, accuracy=900), {}),
+        (fix_at(40), {"flags": ("implausible-jump",)}), (fix_at(40), {"prior": True}),
+        (school_fix(), {"run_type": "afternoon", "stop_order": 6, "stops_completed": 1}),
+    ):
+        result = absent(fix, (None, None), **kwargs)
+        assert result.classification == ABSENT_UNVERIFIED, (fix, kwargs)
+        assert result.reason == REASON_STOP_UNVERIFIED
+        assert result.distance_m is None
+    # The other unverified verdicts keep the distance for the office.
+    assert absent(fix_at(800, accuracy=900)).distance_m == pytest.approx(800, abs=1)
+    assert absent(fix_at(40), flags=("implausible-jump",)).distance_m == pytest.approx(40, abs=1)
+    # A flagged fix never corroborates, however close (R32).
+    assert absent(fix_at(10), flags=("implausible-jump",)).unverified
+
+
+def test_per_school_vicinity_and_cap_change_the_absent_verdict():
+    # U11's knobs: a 200 m vicinity corroborates the 150 m mark a 100 m one does not.
+    assert absent(fix_at(150)).remote
+    assert absent(fix_at(150), vicinity=200).corroborated
+    assert absent(fix_at(40, accuracy=250)).reason == REASON_TOO_COARSE
+    assert absent(fix_at(40, accuracy=250), cap=300).corroborated

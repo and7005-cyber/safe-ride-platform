@@ -125,7 +125,7 @@ export interface RunException {
   /** Derived by the server: open/resolved for a bypassed stop (current
    * outcomes), open/confirmed/retracted for a custody tap (its prompt
    * answers); null for the kinds that define none. */
-  status: "open" | "resolved" | "confirmed" | "retracted" | null;
+  status: "open" | "resolved" | "confirmed" | "retracted" | "attested" | "uncorroborated" | null;
   created_at: string;
   reviewed_at: string | null;
   reviewed_by_display: string | null;
@@ -218,6 +218,12 @@ export function statusBadge(status: RunException["status"]): { label: string; va
       return { label: "Confirmed by driver", variant: "success" };
     case "retracted":
       return { label: "Retracted", variant: "secondary" };
+    // The remote absent's two settled classes (GPS plan U10/R17): attested is
+    // history, uncorroborated is the live one the office phones about.
+    case "attested":
+      return { label: "Attested by driver", variant: "secondary" };
+    case "uncorroborated":
+      return { label: "Uncorroborated", variant: "warning" };
     default:
       return null;
   }

@@ -7,6 +7,7 @@ import {
   aboutDistance,
   bypassedStopCopy,
   custodyCopy,
+  remoteAbsentCopy,
 } from "@/features/driver/components/NudgeQueue";
 import {
   NudgeStore,
@@ -127,12 +128,12 @@ describe("NudgeStore", () => {
   it("admits only kinds this client renders", () => {
     const store = new NudgeStore();
     store.ingest(
-      [prompt({ event_id: "a", kind: "absent-remote" }), prompt({ event_id: "b" })],
+      [prompt({ event_id: "a", kind: "unknown-kind" }), prompt({ event_id: "b" })],
       "context",
     );
     expect(store.all().map((p) => p.event_id)).toEqual(["b"]);
     const wider = new NudgeStore(ALL_KINDS);
-    wider.ingest([prompt({ event_id: "a", kind: "absent-remote" })], "context");
+    wider.ingest([prompt({ event_id: "a", kind: "unknown-kind" })], "context");
     expect(wider.size()).toBe(1);
   });
 
@@ -289,13 +290,58 @@ describe("custodyCopy", () => {
   });
 
   it("renders in the queue: the custody kind is renderable, after a safety prompt", () => {
-    expect([...RENDERABLE_KINDS].sort()).toEqual(["custody-away", "stop-bypassed"]);
+    expect([...RENDERABLE_KINDS].sort()).toEqual(["absent-remote", "custody-away", "stop-bypassed"]);
     const store = new NudgeStore();
     const bypassed = prompt({ event_id: "b1", created_at: "2026-09-20T06:31:00+00:00" });
     store.ingest([far, bypassed], "context");
     expect(store.size()).toBe(2);
     expect(store.head()?.event_id).toBe("b1");
     store.settle("b1");
+    expect(store.head()?.event_id).toBe("c1");
+  });
+});
+
+// --- the remote-absent attestation (GPS plan U10: R17, F4) -----------------------
+
+describe("remoteAbsentCopy", () => {
+  const remote = prompt({
+    event_id: "r1",
+    kind: "absent-remote",
+    stop_order: 3,
+    stop_name: "Karen",
+    student_id: "s1",
+    students: [{ id: "s1", name: "Brian" }],
+    answers: ["told-me", "not-at-stop", "dismissed"],
+    distance_m: 3000,
+    created_at: "2026-09-20T06:40:00+00:00",
+  });
+
+  it("names the child, the distance and asks the one question that decides the class", () => {
+    expect(remoteAbsentCopy(remote)).toEqual({
+      title: "Stop 3: Karen",
+      body: "You marked Brian absent about 3.0 km from their stop. Did a parent or the office tell you Brian isn't coming?",
+    });
+  });
+
+  it("copes with a prompt missing its stop name, distance or child", () => {
+    const bare = remoteAbsentCopy(prompt({ ...remote, stop_name: null, students: [], distance_m: null }));
+    expect(bare.title).toBe("Stop 3");
+    expect(bare.body).toBe(
+      "You marked this child absent about some way from their stop. Did a parent or the office tell you this child isn't coming?",
+    );
+  });
+
+  it("is a safety prompt: renderable, cued, and ahead of the custody confirm in the queue", () => {
+    expect(RENDERABLE_KINDS.has("absent-remote")).toBe(true);
+    expect(cuePolicy("absent-remote")).toEqual({ tone: true, vibrate: true });
+    const store = new NudgeStore();
+    const custody = prompt({
+      event_id: "c1", kind: "custody-away", created_at: "2026-09-20T06:30:00+00:00",
+    });
+    store.ingest([custody, remote], "context");
+    expect(store.size()).toBe(2);
+    expect(store.head()?.event_id).toBe("r1");
+    store.settle("r1");
     expect(store.head()?.event_id).toBe("c1");
   });
 });
