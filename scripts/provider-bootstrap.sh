@@ -33,9 +33,11 @@ fi
 
 # 2. Bootstrap payload: bump the version so the migrate Lambda re-keys the
 # bootstrap accounts on the next deploy (the lockout-recovery path).
-prev_version="$(aws ssm get-parameter --name /saferide/provider-bootstrap \
-  --region "$BACKEND_REGION" --with-decryption --query Parameter.Value --output text 2>/dev/null \
-  | "$PY" -c "
+# Captured in two steps: under pipefail, a missing parameter would fail the
+# whole pipeline and the || fallback would APPEND its 0 to python's 0.
+raw_bootstrap="$(aws ssm get-parameter --name /saferide/provider-bootstrap \
+  --region "$BACKEND_REGION" --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
+prev_version="$(printf '%s' "$raw_bootstrap" | "$PY" -c "
 import base64, json, sys
 raw = sys.stdin.read().strip()
 if not raw or raw == 'None':
@@ -55,10 +57,14 @@ for pair in "$1|$2" "$3|$4"; do
 from app.core.security import hash_password
 print(hash_password('$password'))
 ")"
-  aws ssm put-parameter --name "/saferide/provider-initial-password/$email" \
+  # SSM parameter names allow only letters, digits and .-_ per path segment,
+  # so the email is slugged for the NAME only; the bootstrap JSON keeps the
+  # real address. The exact name is printed — copy it from here.
+  email_slug="$(printf '%s' "$email" | sed 's/[^A-Za-z0-9._-]/-/g')"
+  aws ssm put-parameter --name "/saferide/provider-initial-password/$email_slug" \
     --type SecureString --value "$password" --overwrite >/dev/null
   payload="$payload{\"email\": \"$email\", \"full_name\": \"$name\", \"password_hash\": \"$hash\"},"
-  echo "==> Initial password stored at SSM /saferide/provider-initial-password/$email"
+  echo "==> Initial password stored at SSM /saferide/provider-initial-password/$email_slug"
 done
 
 json="{\"version\": $version, \"providers\": [${payload%,}]}"
