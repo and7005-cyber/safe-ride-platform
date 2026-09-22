@@ -605,3 +605,49 @@ BEGIN
     VALUES ('local-tail', jsonb_build_object('target_school', '5cae0000-0000-0000-0000-000000000001'));
   END IF;
 END $$;
+
+-- GPS tracking fixtures (U1, migration 016): a short trail and one exception
+-- per kind, each with one event, on a completed seeded run of school A
+-- (bus Simba, 2026-06-17), so the run report, the exception
+-- surfaces and the verify `gps` set have rows to show before Release 3
+-- writes real ones. Illustrative values: distances are approximate and the
+-- run is historical, so no "today" check counts them and no prompt is left
+-- pending. Same guard as above: local development only.
+DO $$
+BEGIN
+  IF coalesce(current_setting('saferide.allow_demo_seed', true), '') <> 'yes' THEN
+    RAISE EXCEPTION 'Demo seed blocked: local development only. Set saferide.allow_demo_seed = ''yes'' in this session to apply it.';
+  END IF;
+END $$;
+
+-- Trail: the Start Run checkpoint at the gate, then the Arrive and Board
+-- fixes at stop 1 (Kilimani).
+INSERT INTO public.run_positions (id, school_id, run_id, bus_id, source, action_kind, action_key, lat, lng, accuracy_m, captured_at, received_at, fix_reason, flags) VALUES
+  ('70160000-0000-0000-0000-000000000001', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '146a1837-af5e-494c-8be6-f78db9c4280a', 'checkpoint', 'start',  NULL,                                   -1.333667, 36.73547, NULL, NULL,                      '2026-06-17 10:51:06+00', NULL, '{}'),
+  ('70160000-0000-0000-0000-000000000002', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '146a1837-af5e-494c-8be6-f78db9c4280a', 'action',     'arrive', '71160000-0000-0000-0000-000000000002', -1.29035,  36.78215, 18.5, '2026-06-17 10:51:30+00', '2026-06-17 10:51:31+00', NULL, '{}'),
+  ('70160000-0000-0000-0000-000000000003', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '146a1837-af5e-494c-8be6-f78db9c4280a', 'action',     'board',  '71160000-0000-0000-0000-000000000003', -1.29018,  36.78244, 22.0, '2026-06-17 10:51:45+00', '2026-06-17 10:51:46+00', NULL, '{}')
+ON CONFLICT (id) DO NOTHING;
+
+-- One exception per kind. Students: 0001 at stop 1 (Kilimani), 0003 at stop 2
+-- (Lavington), 0004 at stop 3 (Karen). The custody exception is reviewed;
+-- the rest await the office.
+INSERT INTO public.run_exceptions (id, school_id, run_id, stop_order, student_id, kind, reason, fix_lat, fix_lng, fix_accuracy_m, fix_captured_at, distance_m, seen_at_stop, created_at, reviewed_at, reviewed_by) VALUES
+  ('72160000-0000-0000-0000-000000000001', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', 2,    '50000000-0000-0000-0000-000000000003', 'custody-away',         NULL,          -1.2952, 36.7810, 20.0,  '2026-06-17 10:51:50+00', 2280.0, false, '2026-06-17 10:51:50+00', '2026-06-17 12:00:00+00', 'a0000000-0000-0000-0000-000000000011'),
+  ('72160000-0000-0000-0000-000000000002', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', 1,    NULL,                                   'stop-bypassed',        NULL,          NULL,    NULL,    NULL,  NULL,                     NULL,   NULL,  '2026-06-17 10:51:55+00', NULL, NULL),
+  ('72160000-0000-0000-0000-000000000003', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', 3,    '50000000-0000-0000-0000-000000000004', 'absent-remote',        NULL,          -1.2902, 36.7823, 25.0,  '2026-06-17 10:51:58+00', 5100.0, false, '2026-06-17 10:51:58+00', NULL, NULL),
+  ('72160000-0000-0000-0000-000000000004', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', 1,    '50000000-0000-0000-0000-000000000001', 'absent-attested',      NULL,          -1.2789, 36.7685, 30.0,  '2026-06-17 10:52:00+00', 1900.0, NULL,  '2026-06-17 10:52:00+00', NULL, NULL),
+  ('72160000-0000-0000-0000-000000000005', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', 2,    '50000000-0000-0000-0000-000000000003', 'unverified',           'too-coarse',  -1.2800, 36.7700, 900.0, '2026-06-17 10:52:05+00', NULL,   NULL,  '2026-06-17 10:52:05+00', NULL, NULL),
+  ('72160000-0000-0000-0000-000000000006', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', NULL, NULL,                                   'implausible-movement', 'jump',        -1.3300, 36.7350, 5.0,   '2026-06-17 10:52:10+00', 5200.0, NULL,  '2026-06-17 10:52:10+00', NULL, NULL)
+ON CONFLICT (id) DO NOTHING;
+
+-- One event per exception: the prompts are answered (confirm, resolution,
+-- not-at-stop with call-now sent, told-me); the two unverified/implausible
+-- records carry no prompt.
+INSERT INTO public.run_exception_events (id, exception_id, school_id, run_id, student_id, action_key, fix_lat, fix_lng, fix_accuracy_m, fix_captured_at, distance_m, prompt_state, delivered_at, shown_at, response, call_now_due_at, call_now_sent_at, created_at) VALUES
+  ('73160000-0000-0000-0000-000000000001', '72160000-0000-0000-0000-000000000001', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '50000000-0000-0000-0000-000000000003', '71160000-0000-0000-0000-000000000004', -1.2952, 36.7810, 20.0,  '2026-06-17 10:51:50+00', 2280.0, 'answered', '2026-06-17 10:51:51+00', '2026-06-17 10:51:52+00', 'confirmed',   NULL,                     NULL,                     '2026-06-17 10:51:50+00'),
+  ('73160000-0000-0000-0000-000000000002', '72160000-0000-0000-0000-000000000002', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '50000000-0000-0000-0000-000000000001', '71160000-0000-0000-0000-000000000005', NULL,    NULL,    NULL,  NULL,                     NULL,   'answered', '2026-06-17 10:51:56+00', '2026-06-17 10:51:57+00', 'resolution',  NULL,                     NULL,                     '2026-06-17 10:51:55+00'),
+  ('73160000-0000-0000-0000-000000000003', '72160000-0000-0000-0000-000000000003', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '50000000-0000-0000-0000-000000000004', '71160000-0000-0000-0000-000000000006', -1.2902, 36.7823, 25.0,  '2026-06-17 10:51:58+00', 5100.0, 'answered', '2026-06-17 10:51:59+00', '2026-06-17 10:51:59+00', 'not-at-stop', '2026-06-17 10:52:00+00', '2026-06-17 10:52:02+00', '2026-06-17 10:51:58+00'),
+  ('73160000-0000-0000-0000-000000000004', '72160000-0000-0000-0000-000000000004', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '50000000-0000-0000-0000-000000000001', '71160000-0000-0000-0000-000000000007', -1.2789, 36.7685, 30.0,  '2026-06-17 10:52:00+00', 1900.0, 'answered', '2026-06-17 10:52:01+00', '2026-06-17 10:52:01+00', 'told-me',     NULL,                     NULL,                     '2026-06-17 10:52:00+00'),
+  ('73160000-0000-0000-0000-000000000005', '72160000-0000-0000-0000-000000000005', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', '50000000-0000-0000-0000-000000000003', '71160000-0000-0000-0000-000000000008', -1.2800, 36.7700, 900.0, '2026-06-17 10:52:05+00', NULL,   NULL,       NULL,                     NULL,                     NULL,          NULL,                     NULL,                     '2026-06-17 10:52:05+00'),
+  ('73160000-0000-0000-0000-000000000006', '72160000-0000-0000-0000-000000000006', '5cae0000-0000-0000-0000-000000000001', 'c78b07bb-d18e-4caa-a21c-976bdc489743', NULL,                                   '71160000-0000-0000-0000-000000000009', -1.3300, 36.7350, 5.0,   '2026-06-17 10:52:10+00', 5200.0, NULL,       NULL,                     NULL,                     NULL,          NULL,                     NULL,                     '2026-06-17 10:52:10+00')
+ON CONFLICT (id) DO NOTHING;

@@ -255,7 +255,7 @@ _CHECK_SETS["tenancy-preflight"] = [
 ]
 
 _CHECK_SETS["tenancy-post-move"] = [
-    ("null-scope-counts", """select 'live_buses' as tbl, count(*) as null_scope from live_buses where school_id is null union all select 'live_routes' as tbl, count(*) as null_scope from live_routes where school_id is null union all select 'live_students' as tbl, count(*) as null_scope from live_students where school_id is null union all select 'live_runs' as tbl, count(*) as null_scope from live_runs where school_id is null union all select 'live_fleet_plans' as tbl, count(*) as null_scope from live_fleet_plans where school_id is null union all select 'live_incidents' as tbl, count(*) as null_scope from live_incidents where school_id is null union all select 'live_student_absences' as tbl, count(*) as null_scope from live_student_absences where school_id is null union all select 'live_communicated_stops' as tbl, count(*) as null_scope from live_communicated_stops where school_id is null union all select 'live_student_routes' as tbl, count(*) as null_scope from live_student_routes where school_id is null union all select 'live_route_stops' as tbl, count(*) as null_scope from live_route_stops where school_id is null union all select 'run_stops' as tbl, count(*) as null_scope from run_stops where school_id is null union all select 'run_absences' as tbl, count(*) as null_scope from run_absences where school_id is null union all select 'run_participation' as tbl, count(*) as null_scope from run_participation where school_id is null""", False),
+    ("null-scope-counts", """select 'live_buses' as tbl, count(*) as null_scope from live_buses where school_id is null union all select 'live_routes' as tbl, count(*) as null_scope from live_routes where school_id is null union all select 'live_students' as tbl, count(*) as null_scope from live_students where school_id is null union all select 'live_runs' as tbl, count(*) as null_scope from live_runs where school_id is null union all select 'live_fleet_plans' as tbl, count(*) as null_scope from live_fleet_plans where school_id is null union all select 'live_incidents' as tbl, count(*) as null_scope from live_incidents where school_id is null union all select 'live_student_absences' as tbl, count(*) as null_scope from live_student_absences where school_id is null union all select 'live_communicated_stops' as tbl, count(*) as null_scope from live_communicated_stops where school_id is null union all select 'live_student_routes' as tbl, count(*) as null_scope from live_student_routes where school_id is null union all select 'live_route_stops' as tbl, count(*) as null_scope from live_route_stops where school_id is null union all select 'run_stops' as tbl, count(*) as null_scope from run_stops where school_id is null union all select 'run_absences' as tbl, count(*) as null_scope from run_absences where school_id is null union all select 'run_participation' as tbl, count(*) as null_scope from run_participation where school_id is null union all select 'run_positions' as tbl, count(*) as null_scope from run_positions where school_id is null union all select 'run_exceptions' as tbl, count(*) as null_scope from run_exceptions where school_id is null union all select 'run_exception_events' as tbl, count(*) as null_scope from run_exception_events where school_id is null union all select 'driver_action_keys' as tbl, count(*) as null_scope from driver_action_keys where school_id is null""", False),
     ("school-rows", "select id, name, code from live_schools order by name", False),
     (
         # By NAME (production's Greenfield id differs from the local seed's).
@@ -294,22 +294,115 @@ _CHECK_SETS["tenancy-rls"] = [
     (
         "rls-enabled",
         "select relname, relrowsecurity, relforcerowsecurity from pg_class "
-        "where relname in ('live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation') order by relname",
+        "where relname in ('live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation', 'run_positions', 'run_exceptions', 'run_exception_events', 'driver_action_keys') order by relname",
         False,
     ),
-    ("no-guc-row-visibility", """select 'live_buses' as tbl, count(*) as visible_rows from live_buses union all select 'live_routes' as tbl, count(*) as visible_rows from live_routes union all select 'live_students' as tbl, count(*) as visible_rows from live_students union all select 'live_runs' as tbl, count(*) as visible_rows from live_runs union all select 'live_fleet_plans' as tbl, count(*) as visible_rows from live_fleet_plans union all select 'live_incidents' as tbl, count(*) as visible_rows from live_incidents union all select 'live_student_absences' as tbl, count(*) as visible_rows from live_student_absences union all select 'live_communicated_stops' as tbl, count(*) as visible_rows from live_communicated_stops union all select 'live_student_routes' as tbl, count(*) as visible_rows from live_student_routes union all select 'live_route_stops' as tbl, count(*) as visible_rows from live_route_stops union all select 'run_stops' as tbl, count(*) as visible_rows from run_stops union all select 'run_absences' as tbl, count(*) as visible_rows from run_absences union all select 'run_participation' as tbl, count(*) as visible_rows from run_participation""", False),
+    ("no-guc-row-visibility", """select 'live_buses' as tbl, count(*) as visible_rows from live_buses union all select 'live_routes' as tbl, count(*) as visible_rows from live_routes union all select 'live_students' as tbl, count(*) as visible_rows from live_students union all select 'live_runs' as tbl, count(*) as visible_rows from live_runs union all select 'live_fleet_plans' as tbl, count(*) as visible_rows from live_fleet_plans union all select 'live_incidents' as tbl, count(*) as visible_rows from live_incidents union all select 'live_student_absences' as tbl, count(*) as visible_rows from live_student_absences union all select 'live_communicated_stops' as tbl, count(*) as visible_rows from live_communicated_stops union all select 'live_student_routes' as tbl, count(*) as visible_rows from live_student_routes union all select 'live_route_stops' as tbl, count(*) as visible_rows from live_route_stops union all select 'run_stops' as tbl, count(*) as visible_rows from run_stops union all select 'run_absences' as tbl, count(*) as visible_rows from run_absences union all select 'run_participation' as tbl, count(*) as visible_rows from run_participation union all select 'run_positions' as tbl, count(*) as visible_rows from run_positions union all select 'run_exceptions' as tbl, count(*) as visible_rows from run_exceptions union all select 'run_exception_events' as tbl, count(*) as visible_rows from run_exception_events union all select 'driver_action_keys' as tbl, count(*) as visible_rows from driver_action_keys""", False),
     (
         "set-school-guc",
         "select set_config('saferide.school_ids', %s, false) as school_ids",
         True,
     ),
-    ("cross-school-visibility", """select 'live_buses' as tbl, count(*) as foreign_rows from live_buses where school_id::text <> %s union all select 'live_routes' as tbl, count(*) as foreign_rows from live_routes where school_id::text <> %s union all select 'live_students' as tbl, count(*) as foreign_rows from live_students where school_id::text <> %s union all select 'live_runs' as tbl, count(*) as foreign_rows from live_runs where school_id::text <> %s union all select 'live_fleet_plans' as tbl, count(*) as foreign_rows from live_fleet_plans where school_id::text <> %s union all select 'live_incidents' as tbl, count(*) as foreign_rows from live_incidents where school_id::text <> %s union all select 'live_student_absences' as tbl, count(*) as foreign_rows from live_student_absences where school_id::text <> %s union all select 'live_communicated_stops' as tbl, count(*) as foreign_rows from live_communicated_stops where school_id::text <> %s union all select 'live_student_routes' as tbl, count(*) as foreign_rows from live_student_routes where school_id::text <> %s union all select 'live_route_stops' as tbl, count(*) as foreign_rows from live_route_stops where school_id::text <> %s union all select 'run_stops' as tbl, count(*) as foreign_rows from run_stops where school_id::text <> %s union all select 'run_absences' as tbl, count(*) as foreign_rows from run_absences where school_id::text <> %s union all select 'run_participation' as tbl, count(*) as foreign_rows from run_participation where school_id::text <> %s""", True),
-    ("policy-presence", "select c.relname as tbl, c.relrowsecurity as rls, count(p.polname) as policies from pg_class c left join pg_policy p on p.polrelid = c.oid where c.relname in ('live_buses','live_routes','live_students','live_runs','live_fleet_plans','live_incidents','live_student_absences','live_communicated_stops','live_student_routes','live_route_stops','run_stops','run_absences','run_participation','live_admin_audit') group by c.relname, c.relrowsecurity order by c.relname", False),
+    ("cross-school-visibility", """select 'live_buses' as tbl, count(*) as foreign_rows from live_buses where school_id::text <> %s union all select 'live_routes' as tbl, count(*) as foreign_rows from live_routes where school_id::text <> %s union all select 'live_students' as tbl, count(*) as foreign_rows from live_students where school_id::text <> %s union all select 'live_runs' as tbl, count(*) as foreign_rows from live_runs where school_id::text <> %s union all select 'live_fleet_plans' as tbl, count(*) as foreign_rows from live_fleet_plans where school_id::text <> %s union all select 'live_incidents' as tbl, count(*) as foreign_rows from live_incidents where school_id::text <> %s union all select 'live_student_absences' as tbl, count(*) as foreign_rows from live_student_absences where school_id::text <> %s union all select 'live_communicated_stops' as tbl, count(*) as foreign_rows from live_communicated_stops where school_id::text <> %s union all select 'live_student_routes' as tbl, count(*) as foreign_rows from live_student_routes where school_id::text <> %s union all select 'live_route_stops' as tbl, count(*) as foreign_rows from live_route_stops where school_id::text <> %s union all select 'run_stops' as tbl, count(*) as foreign_rows from run_stops where school_id::text <> %s union all select 'run_absences' as tbl, count(*) as foreign_rows from run_absences where school_id::text <> %s union all select 'run_participation' as tbl, count(*) as foreign_rows from run_participation where school_id::text <> %s union all select 'run_positions' as tbl, count(*) as foreign_rows from run_positions where school_id::text <> %s union all select 'run_exceptions' as tbl, count(*) as foreign_rows from run_exceptions where school_id::text <> %s union all select 'run_exception_events' as tbl, count(*) as foreign_rows from run_exception_events where school_id::text <> %s union all select 'driver_action_keys' as tbl, count(*) as foreign_rows from driver_action_keys where school_id::text <> %s""", True),
+    ("policy-presence", "select c.relname as tbl, c.relrowsecurity as rls, count(p.polname) as policies from pg_class c left join pg_policy p on p.polrelid = c.oid where c.relname in ('live_buses','live_routes','live_students','live_runs','live_fleet_plans','live_incidents','live_student_absences','live_communicated_stops','live_student_routes','live_route_stops','run_stops','run_absences','run_participation','run_positions','run_exceptions','run_exception_events','driver_action_keys','live_admin_audit') group by c.relname, c.relrowsecurity order by c.relname", False),
     ("provider-health-fn", "select * from provider_school_health()", False),
 ]
 
+# --- GPS tracking check set (U1) ---------------------------------------------
+# Release 1 go/no-go and the post-deploy verification after every GPS release
+# (docs/plans/2026-09-19-001-feat-gps-bus-tracking-plan.md, Operational
+# Notes). Observations only, all read-only SELECTs. "Today" is the Nairobi
+# day, as every date predicate in the DAOs. On a fresh database every entry
+# returns zero counts (or an empty list) without error. Expectations:
+#   trail-rows-per-run-today          one row per run with a trail today
+#   trail-rows-per-run-per-minute     load per run; peak matters in Release 4
+#   fix-coverage-ratio-today          nine in ten action rows carry a fix
+#                                     (target after two weeks of Release 3)
+#   exceptions-by-kind-today          reviewed weekly against the run count
+#   pending-prompts-on-completed-runs should be 0 (End Run/close auto-resolve)
+#   call-now-due-unsent-over-10m      should be 0 (the next action or poll
+#                                     re-attempts due-but-unsent rows)
+#   trail-rows-classification-failed  should be 0; each is a logged tap
+#   trail-rows-past-retention         per school; non-zero for a school with
+#                                     no Start Run inside its retention window
+#                                     means the on-demand purge is due
+_CHECK_SETS["gps"] = [
+    (
+        "trail-rows-per-run-today",
+        "select run_id, source, count(*) as rows from run_positions "
+        "where (received_at at time zone 'Africa/Nairobi')::date "
+        "= (now() at time zone 'Africa/Nairobi')::date "
+        "group by 1, 2 order by 1, 2",
+        False,
+    ),
+    (
+        "trail-rows-per-run-per-minute",
+        "with per_minute as ("
+        "  select run_id, date_trunc('minute', received_at) as minute, count(*) as rows"
+        "  from run_positions"
+        "  where (received_at at time zone 'Africa/Nairobi')::date"
+        "    = (now() at time zone 'Africa/Nairobi')::date"
+        "  group by 1, 2)"
+        " select run_id, sum(rows) as rows, count(*) as active_minutes,"
+        " round(avg(rows), 2) as avg_rows_per_minute, max(rows) as peak_rows_per_minute"
+        " from per_minute group by run_id order by peak_rows_per_minute desc, run_id",
+        False,
+    ),
+    (
+        "fix-coverage-ratio-today",
+        "select count(*) filter (where lat is not null and lng is not null) as with_fix, "
+        "count(*) as action_rows, "
+        "round(count(*) filter (where lat is not null and lng is not null)::numeric "
+        "/ nullif(count(*), 0), 3) as ratio "
+        "from run_positions where source = 'action' "
+        "and (received_at at time zone 'Africa/Nairobi')::date "
+        "= (now() at time zone 'Africa/Nairobi')::date",
+        False,
+    ),
+    (
+        "exceptions-by-kind-today",
+        "select kind, count(*) as exceptions, "
+        "count(*) filter (where reviewed_at is null) as unreviewed "
+        "from run_exceptions "
+        "where (created_at at time zone 'Africa/Nairobi')::date "
+        "= (now() at time zone 'Africa/Nairobi')::date "
+        "group by 1 order by 1",
+        False,
+    ),
+    (
+        "pending-prompts-on-completed-runs",
+        "select count(*) as pending_on_completed from run_exception_events e "
+        "join live_runs r on r.id = e.run_id "
+        "where e.prompt_state = 'pending' and r.status = 'completed'",
+        False,
+    ),
+    (
+        "call-now-due-unsent-over-10m",
+        "select count(*) as overdue from run_exception_events "
+        "where call_now_due_at is not null and call_now_sent_at is null "
+        "and call_now_due_at < now() - interval '10 minutes'",
+        False,
+    ),
+    (
+        "trail-rows-classification-failed",
+        "select count(*) as flagged from run_positions "
+        "where 'classification-failed' = any(flags)",
+        False,
+    ),
+    (
+        "trail-rows-past-retention",
+        "select s.id as school_id, s.name, "
+        "coalesce(s.position_retention_days, 90) as retention_days, "
+        "count(p.id) as rows_past_retention from live_schools s "
+        "left join run_positions p on p.school_id = s.id "
+        "and p.received_at < now() - make_interval(days => coalesce(s.position_retention_days, 90)) "
+        "group by 1, 2, 3 order by 4 desc, 2",
+        False,
+    ),
+]
+
 # The canonical list and the generated SQL must not drift.
-assert set(SCHOOL_OWNED_TABLES) == {'live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation'}
+assert set(SCHOOL_OWNED_TABLES) == {'live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation', 'run_positions', 'run_exceptions', 'run_exception_events', 'driver_action_keys'}
 assert GREENFIELD_SCHOOL_ID == '5cae0000-0000-0000-0000-000000000001'
 assert set(SEED_DEMO_EMAILS) == {'admin@test.com', 'and7005@gmail.com', 'and7005@yahoo.it', 'francis@saferide.test', 'mary@saferide.test'}
 

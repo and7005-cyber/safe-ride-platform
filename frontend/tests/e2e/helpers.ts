@@ -269,6 +269,10 @@ export function sqlDropSchool(schoolId: string): void {
     "live_parent_students",
     "live_student_routes",
     "live_route_stops",
+    // 016 run children before the run; the key table before the school row.
+    "run_exception_events",
+    "run_exceptions",
+    "run_positions",
     "run_stops",
     "run_absences",
     "run_participation",
@@ -276,6 +280,7 @@ export function sqlDropSchool(schoolId: string): void {
     "live_routes",
     "live_students",
     "live_buses",
+    "driver_action_keys",
     "school_memberships",
     "provider_support_sessions",
   ];

@@ -7,7 +7,8 @@ cannot fall out of the isolation surface unnoticed.
 
 # Every table whose rows belong to exactly one school. All of these end up
 # with `school_id NOT NULL`, a `(school_id)` index, composite keys and a
-# row-level-security policy (migration 015 / U14).
+# row-level-security policy (migration 015 / U14; the GPS tracking tables
+# arrive already scoped in migration 016).
 SCHOOL_OWNED_TABLES: tuple[str, ...] = (
     "live_buses",
     "live_routes",
@@ -22,6 +23,10 @@ SCHOOL_OWNED_TABLES: tuple[str, ...] = (
     "run_stops",
     "run_absences",
     "run_participation",
+    "run_positions",
+    "run_exceptions",
+    "run_exception_events",
+    "driver_action_keys",
 )
 
 # Nullable school (provider-global actions have no school); its own split

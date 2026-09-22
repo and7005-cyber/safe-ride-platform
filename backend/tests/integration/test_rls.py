@@ -32,7 +32,12 @@ SCHOOL_OWNED = [
     "live_fleet_plans", "live_incidents", "live_student_absences",
     "live_communicated_stops", "live_student_routes", "live_route_stops",
     "run_stops", "run_absences", "run_participation",
+    # Migration 016 (GPS tracking): scoped from birth, policy landed by the
+    # migration itself rather than by 015's data-guarded pass.
+    "run_positions", "run_exceptions", "run_exception_events", "driver_action_keys",
 ]
+
+GPS_TABLES = ["run_positions", "run_exceptions", "run_exception_events", "driver_action_keys"]
 
 USER_OWNED = ["app_users", "auth_sessions", "school_memberships", "live_schools"]
 
@@ -285,3 +290,324 @@ def test_record_audit_survives_a_guc_less_provider_write():
         )
         assert uuid.UUID(audit_id)
         conn.rollback()
+
+
+# --- migration 016: the GPS tracking tables (U1) ------------------------------
+# run_positions, run_exceptions and run_exception_events are run children
+# (composite (run_id, school_id) key, cascade); driver_action_keys is keyed
+# (school, driver, key) with a SET NULL run reference. All four carry the
+# school_isolation policy from birth.
+
+from contextlib import contextmanager
+
+
+def test_rls_catalog_matches_the_canonical_tenancy_list():
+    # This file's hand-written list and app.core.tenancy must not drift: the
+    # verify Lambda and the migrate tooling read the canonical tuple.
+    from app.core.tenancy import SCHOOL_OWNED_TABLES
+
+    assert set(SCHOOL_OWNED) == set(SCHOOL_OWNED_TABLES)
+    assert set(GPS_TABLES) <= set(SCHOOL_OWNED_TABLES)
+
+
+@contextmanager
+def gps_rows():
+    """One throwaway (completed, long past) run per seeded school with one row
+    in each 016 table, written as the owner (RLS is enabled, not FORCEd): the
+    sandbox the isolation probes read against. Yields per-school ids; the exit
+    deletes the key rows and the runs (the run children cascade)."""
+    world: dict[str, dict[str, str]] = {}
+    with master() as m:
+        for school in (SCHOOL_A_ID, SCHOOL_B_ID):
+            bus, driver = m.execute(
+                "select id, driver_id from live_buses where school_id = %s "
+                "order by name limit 1",
+                (school,),
+            ).fetchone()
+            route = m.execute(
+                "select id from live_routes where school_id = %s order by name limit 1",
+                (school,),
+            ).fetchone()[0]
+            run = m.execute(
+                "insert into live_runs (bus_id, route_id, school_id, driver_id, type, "
+                "date, status, total_stops) "
+                "values (%s, %s, %s, %s, 'morning', '2020-01-06', 'completed', 2) "
+                "returning id",
+                (bus, route, school, driver),
+            ).fetchone()[0]
+            driver = driver or uuid.uuid4()  # the key table has no driver FK
+            m.execute(
+                "insert into run_positions (school_id, run_id, bus_id, source, lat, lng) "
+                "values (%s, %s, %s, 'checkpoint', -1.30, 36.80)",
+                (school, run, bus),
+            )
+            exception = m.execute(
+                "insert into run_exceptions (school_id, run_id, stop_order, kind) "
+                "values (%s, %s, 1, 'custody-away') returning id",
+                (school, run),
+            ).fetchone()[0]
+            m.execute(
+                "insert into run_exception_events "
+                "(exception_id, school_id, run_id, prompt_state, response) "
+                "values (%s, %s, %s, 'answered', 'confirmed')",
+                (exception, school, run),
+            )
+            key = m.execute(
+                "insert into driver_action_keys "
+                "(school_id, driver_id, key, run_id, action, request_fingerprint) "
+                "values (%s, %s, gen_random_uuid(), %s, 'board', 'IT rls') returning key",
+                (school, driver, run),
+            ).fetchone()[0]
+            world[school] = {
+                "run": str(run), "bus": str(bus), "driver": str(driver),
+                "exception": str(exception), "key": str(key),
+            }
+    try:
+        yield world
+    finally:
+        with master() as m:
+            for school, ids in world.items():
+                m.execute(
+                    "delete from driver_action_keys where school_id = %s and key = %s",
+                    (school, ids["key"]),
+                )
+                m.execute("delete from live_runs where id = %s", (ids["run"],))
+
+
+def _inserts_for(world, school):
+    """One INSERT per 016 table that writes a row belonging to `school`."""
+    ids = world[school]
+    return [
+        (
+            "run_positions",
+            "insert into run_positions (school_id, run_id, bus_id, source) "
+            "values (%s, %s, %s, 'checkpoint')",
+            (school, ids["run"], ids["bus"]),
+        ),
+        (
+            "run_exceptions",
+            "insert into run_exceptions (school_id, run_id, stop_order, kind) "
+            "values (%s, %s, 2, 'stop-bypassed')",
+            (school, ids["run"]),
+        ),
+        (
+            "run_exception_events",
+            "insert into run_exception_events (exception_id, school_id, run_id, prompt_state) "
+            "values (%s, %s, %s, 'pending')",
+            (ids["exception"], school, ids["run"]),
+        ),
+        (
+            "driver_action_keys",
+            "insert into driver_action_keys "
+            "(school_id, driver_id, key, run_id, action, request_fingerprint) "
+            "values (%s, %s, gen_random_uuid(), %s, 'arrive', 'IT rls')",
+            (school, ids["driver"], ids["run"]),
+        ),
+    ]
+
+
+def test_gps_tables_hide_the_other_school_under_the_guc():
+    with gps_rows() as world, app_conn() as conn:
+        arm(conn, SCHOOL_A_ID)
+        for table in GPS_TABLES:
+            mine = conn.execute(
+                f"select count(*) from {table} where school_id = %s", (SCHOOL_A_ID,)
+            ).fetchone()[0]
+            theirs = conn.execute(
+                f"select count(*) from {table} where school_id = %s", (SCHOOL_B_ID,)
+            ).fetchone()[0]
+            assert mine >= 1, f"{table}: own rows invisible"
+            assert theirs == 0, f"{table} leaked {theirs} school-B rows"
+        # By run id too: school B's run children are simply not there.
+        b_run = world[SCHOOL_B_ID]["run"]
+        for table in ("run_positions", "run_exceptions", "run_exception_events"):
+            assert (
+                conn.execute(
+                    f"select count(*) from {table} where run_id = %s", (b_run,)
+                ).fetchone()[0]
+                == 0
+            ), table
+        # And a cross-school UPDATE touches nothing (rows outside the GUC do
+        # not exist for the runtime role).
+        touched = conn.execute(
+            "update run_exceptions set reviewed_at = now() where school_id = %s",
+            (SCHOOL_B_ID,),
+        ).rowcount
+        assert touched == 0
+        conn.rollback()
+
+
+def test_gps_tables_refuse_a_cross_school_insert_with_42501():
+    with gps_rows() as world, app_conn() as conn:
+        for table, sql, params in _inserts_for(world, SCHOOL_B_ID):
+            arm(conn, SCHOOL_A_ID)  # set_config(..., true) is transaction-local
+            with pytest.raises(errors.InsufficientPrivilege, match="row-level security"):
+                conn.execute(sql, params)
+            conn.rollback()
+
+
+def test_gps_tables_without_a_guc_read_empty_and_refuse_every_write():
+    with gps_rows() as world, app_conn() as conn:
+        for table in GPS_TABLES:
+            count = conn.execute(f"select count(*) from {table}").fetchone()[0]
+            assert count == 0, f"{table} leaked {count} rows with no GUC"
+        for table, sql, params in _inserts_for(world, SCHOOL_A_ID):
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(sql, params)
+            conn.rollback()
+        # UPDATE and DELETE see nothing either.
+        assert conn.execute("update run_positions set flags = '{}'").rowcount == 0
+        assert conn.execute("delete from driver_action_keys").rowcount == 0
+        conn.rollback()
+
+
+def test_run_exceptions_insert_returning_works_inside_a_scoped_connection():
+    # RLS write pitfall named in the plan: the policy must cover the freshly
+    # inserted row so INSERT … RETURNING (and the read-back) succeed.
+    with gps_rows() as world, app_conn() as conn:
+        arm(conn, SCHOOL_A_ID)
+        run = world[SCHOOL_A_ID]["run"]
+        row = conn.execute(
+            "insert into run_exceptions (school_id, run_id, stop_order, kind, reason) "
+            "values (%s, %s, 2, 'unverified', 'no-fix') returning id, kind, school_id",
+            (SCHOOL_A_ID, run),
+        ).fetchone()
+        assert row and row[1] == "unverified" and str(row[2]) == SCHOOL_A_ID
+        event = conn.execute(
+            "insert into run_exception_events (exception_id, school_id, run_id, prompt_state) "
+            "values (%s, %s, %s, 'pending') returning id, prompt_state",
+            (row[0], SCHOOL_A_ID, run),
+        ).fetchone()
+        assert event and event[1] == "pending"
+        assert (
+            conn.execute(
+                "select count(*) from run_exceptions where id = %s", (row[0],)
+            ).fetchone()[0]
+            == 1
+        )
+        conn.rollback()
+
+
+def test_composite_key_refuses_a_cross_school_run_child_even_for_the_owner():
+    with gps_rows() as world, psycopg.connect(DSN, autocommit=False) as m:
+        with pytest.raises(errors.ForeignKeyViolation):
+            m.execute(
+                "insert into run_positions (school_id, run_id, bus_id, source) "
+                "values (%s, %s, %s, 'checkpoint')",
+                (SCHOOL_B_ID, world[SCHOOL_A_ID]["run"], world[SCHOOL_B_ID]["bus"]),
+            )
+        m.rollback()
+
+
+def test_gps_tables_carry_school_isolation_without_force_and_validated_keys():
+    with master() as m:
+        for table in GPS_TABLES:
+            rls, force = m.execute(
+                "select relrowsecurity, relforcerowsecurity from pg_class "
+                "where oid = %s::regclass",
+                (table,),
+            ).fetchone()
+            assert rls and not force, table
+            policies = m.execute(
+                "select polname, polcmd, polroles::regrole[]::text[] from pg_policy "
+                "where polrelid = %s::regclass",
+                (table,),
+            ).fetchall()
+            assert [(p[0], p[1]) for p in policies] == [("school_isolation", "*")], table
+            assert policies[0][2] == ["saferide_app"], table
+            assert m.execute(
+                "select has_table_privilege('saferide_app', %s, "
+                "'select, insert, update, delete')",
+                (table,),
+            ).fetchone()[0], f"{table}: runtime role lacks grants"
+        # 015's shape for every child reference: (col, school_id) -> parent
+        # (id, school_id), validated, ON DELETE mirroring the plain key and
+        # never nulling the school.
+        for child, col, parent, on_delete in (
+            ("run_positions", "run_id", "live_runs", "ON DELETE CASCADE"),
+            ("run_positions", "bus_id", "live_buses", "ON DELETE CASCADE"),
+            ("run_exceptions", "run_id", "live_runs", "ON DELETE CASCADE"),
+            ("run_exceptions", "student_id", "live_students", "ON DELETE SET NULL (student_id)"),
+            ("run_exception_events", "run_id", "live_runs", "ON DELETE CASCADE"),
+            ("run_exception_events", "student_id", "live_students", "ON DELETE SET NULL (student_id)"),
+            ("driver_action_keys", "run_id", "live_runs", "ON DELETE SET NULL (run_id)"),
+        ):
+            row = m.execute(
+                "select convalidated, pg_get_constraintdef(oid) from pg_constraint "
+                "where conname = %s",
+                (f"{child}_{col}_school_fkey",),
+            ).fetchone()
+            assert row and row[0], f"{child}.{col}: composite key missing or NOT VALID"
+            assert f"REFERENCES {parent}(id, school_id)" in row[1], row[1]
+            assert on_delete in row[1], row[1]
+
+
+def test_sandbox_teardown_survives_rows_in_all_four_gps_tables():
+    # The hand-written teardown lists in conftest must sweep the 016 tables:
+    # the run children go with the run, and the key table must be emptied
+    # before the school row (it references live_schools without cascade).
+    from conftest import school_sandbox
+
+    with school_sandbox("IT GPS Teardown", lat=-1.3, lng=36.8) as sandbox:
+        school = sandbox["id"]
+        with master() as m:
+            bus = m.execute(
+                "insert into live_buses (name, plate_number, capacity, status, school_id) "
+                "values ('IT GPS Bus', 'IT-GPS-1', 10, 'idle', %s) returning id",
+                (school,),
+            ).fetchone()[0]
+            run = m.execute(
+                "insert into live_runs (bus_id, school_id, type, date, status, total_stops) "
+                "values (%s, %s, 'morning', '2020-01-07', 'completed', 1) returning id",
+                (bus, school),
+            ).fetchone()[0]
+            m.execute(
+                "insert into run_positions (school_id, run_id, bus_id, source, lat, lng) "
+                "values (%s, %s, %s, 'action', -1.3, 36.8)",
+                (school, run, bus),
+            )
+            exception = m.execute(
+                "insert into run_exceptions (school_id, run_id, kind) "
+                "values (%s, %s, 'implausible-movement') returning id",
+                (school, run),
+            ).fetchone()[0]
+            m.execute(
+                "insert into run_exception_events (exception_id, school_id, run_id) "
+                "values (%s, %s, %s)",
+                (exception, school, run),
+            )
+            m.execute(
+                "insert into driver_action_keys "
+                "(school_id, driver_id, key, run_id, action, request_fingerprint) "
+                "values (%s, %s, gen_random_uuid(), %s, 'start', 'IT gps')",
+                (school, sandbox["admin_id"], run),
+            )
+    with master() as m:
+        assert (
+            m.execute(
+                "select count(*) from live_schools where id = %s", (school,)
+            ).fetchone()[0]
+            == 0
+        )
+        for table in GPS_TABLES:
+            assert (
+                m.execute(
+                    f"select count(*) from {table} where school_id = %s", (school,)
+                ).fetchone()[0]
+                == 0
+            ), table
+
+
+def test_migration_016_double_applies_cleanly():
+    from pathlib import Path
+
+    sql = (
+        Path(__file__).resolve().parents[2] / "db" / "migrations" / "016_gps_tracking.sql"
+    ).read_text()
+    from psycopg.pq import ExecStatus
+
+    with psycopg.connect(DSN, autocommit=True) as m:
+        result = m.pgconn.exec_(sql.encode())
+        assert result.status in (
+            ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
+        ), result.error_message.decode()

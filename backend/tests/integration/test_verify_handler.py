@@ -40,7 +40,7 @@ def test_unknown_check_set_is_rejected_with_the_valid_list(verify):
     assert "drop-tables" in result["reason"]
     assert set(result["valid_check_sets"]) == {
         "migrations", "migration-011", "baseline", "post-apply",
-        "tenancy-preflight", "tenancy-post-move", "tenancy-rls",
+        "tenancy-preflight", "tenancy-post-move", "tenancy-rls", "gps",
     }
 
 
@@ -160,4 +160,41 @@ def test_tenancy_rls_assumes_the_runtime_role(verify):
     # can assume it; grants and policies arrive with later releases, so data
     # entries may be labeled errors until then.
     assert by_label["current-user"]["rows"][0]["current_user"] == "saferide_app"
+    json.dumps(result)
+
+
+# --- GPS tracking check set (migration 016 / U1) ------------------------------
+
+
+def test_gps_check_set_runs_clean_on_a_database_at_016(verify):
+    # Every entry is a plain SELECT over the 016 tables: no labeled errors,
+    # unique labels, JSON-serializable rows, and the scalar backlog checks
+    # come back as integers (zero on a fresh database; the suites' own probes
+    # roll back, so nothing else should accumulate here).
+    result = verify.handler({"checks": "gps"})
+    assert result["status"] == "ok", result
+    labels = [e["label"] for e in result["results"]]
+    assert len(labels) == len(set(labels))
+    assert labels == [
+        "trail-rows-per-run-today",
+        "trail-rows-per-run-per-minute",
+        "fix-coverage-ratio-today",
+        "exceptions-by-kind-today",
+        "pending-prompts-on-completed-runs",
+        "call-now-due-unsent-over-10m",
+        "trail-rows-classification-failed",
+        "trail-rows-past-retention",
+    ]
+    by_label = {e["label"]: e for e in result["results"]}
+    for label, entry in by_label.items():
+        assert "error" not in entry, f"{label}: {entry.get('error')}"
+    assert by_label["pending-prompts-on-completed-runs"]["rows"][0]["pending_on_completed"] >= 0
+    assert by_label["call-now-due-unsent-over-10m"]["rows"][0]["overdue"] >= 0
+    assert by_label["trail-rows-classification-failed"]["rows"][0]["flagged"] >= 0
+    coverage = by_label["fix-coverage-ratio-today"]["rows"][0]
+    assert coverage["action_rows"] >= coverage["with_fix"] >= 0
+    # One row per school, default retention shown when the school has none.
+    retention = by_label["trail-rows-past-retention"]["rows"]
+    assert {r["name"] for r in retention} >= {"Greenfield Academy", "IT Second School"}
+    assert all(r["retention_days"] == 90 or 7 <= r["retention_days"] <= 365 for r in retention)
     json.dumps(result)
