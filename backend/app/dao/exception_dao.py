@@ -94,6 +94,18 @@ child; the row's ``reason`` is the union of every flag seen on the run so
 far, comma-joined in vocabulary order, so the office reads the whole picture
 on one line. No prompt, no call-now, no incident: the office's second
 opinion, nothing the driver has to answer.
+
+The trail-driven nudges (U15, R29, R30) are the fifth writer — and mostly a
+reader. ``evaluate_vicinity`` replays the run's plain pings against its
+stops after every accepted ping batch and on every driver-context read;
+nothing about vicinity is stored. A not-yet-arrived stop the bus is inside
+yields the *arrival offer* (no row, no event: the answer is an Arrive to
+that stop by ``target_stop_order``); a stop whose departure the batch just
+completed, with children unrecorded, gets the very same bypassed-stop
+evaluation an Arrive runs — the same row, the same prompt, the same office
+alert, written inside the ping's transaction because the pings route
+dispatches nothing post-commit — so the exception exists before the bus
+reaches the next stop (AE14) and the next Arrive finds it already there.
 """
 
 import logging
@@ -111,17 +123,21 @@ from app.core.errors import (
 from app.core.scope import SchoolScope
 from app.dao import participation_dao, position_dao
 from app.dao.audit_dao import masked_display_sql, record_audit
-from app.dao.school_thresholds import resolve_school_thresholds
+from app.dao.school_thresholds import SchoolThresholds, resolve_school_thresholds
 from app.services.position_rules import (
     CUSTODY_WITHIN,
     PLAUSIBILITY_FLAGS,
     REASON_STOP_UNVERIFIED,
+    VICINITY_INSIDE,
+    VICINITY_LEFT,
     NormalisedFix,
     StoredFix,
     classify_absent,
     classify_custody,
+    exit_radius_m,
     jump_distance_m,
     plausibility_flags,
+    vicinity_state,
     within_vicinity,
 )
 
@@ -322,6 +338,132 @@ def evaluate_bypassed_stop(
         "raised": raised,
         "prompt": prompt,
     }
+
+
+def bypassed_stop_alert_detail(stop_order: int, stop_name: str | None, students: list) -> str:
+    """The office alert's detail for a newly raised bypassed stop — the stop
+    and the children, never a coordinate — shared by the Arrive path (the
+    router, post-commit) and the ping path (in-transaction, U15) so the
+    feed reads one sentence whichever raised it."""
+    names = ", ".join(s["name"] for s in students)
+    return f"Stop {stop_order} ({stop_name}): no record yet for {names}."
+
+
+# --- the trail-driven nudges (U15: R29, R30, R31; F7; AE14) ----------------------
+
+
+def evaluate_vicinity(
+    conn, run: dict[str, Any], *, thresholds: SchoolThresholds,
+    batch_row_ids: list[str] | None,
+) -> dict[str, Any]:
+    """Replay the run's plain pings against its stops and act on what the
+    trail says (R29, R30). Nothing about vicinity is stored: the state is
+    derived from the window (``position_dao.recent_plain_pings``) with the
+    pure ``vicinity_state`` — enter at the school's vicinity radius, leave
+    at one and a half times it, two-fix hysteresis, coarse and flagged pings
+    excluded before the geometry sees them.
+
+    Called by the ping batch (``batch_row_ids`` = the trail rows it just
+    wrote) inside its savepoint, and by the driver context with
+    ``batch_row_ids`` None — a read that derives the offer and evaluates no
+    departure, so a reload sees the same offer the last batch did.
+
+    - **Arrival offer** (R29): the lowest-order not-yet-arrived stop
+      (``stop_order > stops_completed``) whose state is ``inside`` is
+      offered by name — ``{stop_order, stop_name}``. Not an exception, no
+      event, no row: the answer is an Arrive to that stop
+      (``target_stop_order``), and the offer goes when the trail or the
+      progress says so.
+    - **Departure** (R30; AE14): a stop whose state is ``left`` *and* whose
+      departure this batch completed — the second exterior ping of the pair
+      is one of ``batch_row_ids`` — gets U2's own evaluation
+      (``evaluate_bypassed_stop``), which decides "children unrecorded" with
+      the closure gate's predicate, upserts the per-(run, stop) row and adds
+      a pending prompt when none is pending. Idempotent by construction: the
+      next Arrive's evaluation finds the row and stays quiet, and a locked
+      screen only delays the completing ping. The last stop and the school
+      gate are never evaluated (End Run's gate owns the last stop). When the
+      row was inserted here, the office alert is written in the same
+      per-stop savepoint (``record_lifecycle_incident_on``) — the pings route
+      has no post-commit hook — so row and alert land together or not at all.
+
+    Returns ``{"prompts": [...], "arrival_offer": {...} | None}``; each
+    prompt is ``_prompt_payload``'s shape. Logs run and stop order only.
+    """
+    from app.dao.incident_dao import record_lifecycle_incident_on
+
+    run_id = str(run["id"])
+    stops = position_dao.vicinity_stops(conn, run_id)
+    if not stops:
+        return {"prompts": [], "arrival_offer": None}
+    pings = position_dao.recent_plain_pings(
+        conn, run_id, retention_days=thresholds.position_retention_days,
+    )
+    if not pings:
+        return {"prompts": [], "arrival_offer": None}
+    fixes = [fix for _row_id, fix in pings]
+    enter_m = float(thresholds.vicinity_radius_m)
+    exit_m = exit_radius_m(enter_m)
+    stops_completed = int(run.get("stops_completed") or 0)
+    total_stops = int(run.get("total_stops") or 0)
+    last_order = max(stop["stop_order"] for stop in stops)
+    in_batch = set(batch_row_ids or ())
+
+    prompts: list[dict[str, Any]] = []
+    offer: dict[str, Any] | None = None
+    for stop in stops:
+        order = int(stop["stop_order"])
+        state = vicinity_state(
+            fixes, (stop["lat"], stop["lng"]),
+            enter_m=enter_m, exit_m=exit_m, accuracy_cap_m=thresholds.fix_accuracy_cap_m,
+        )
+        if state.state == VICINITY_INSIDE and order > stops_completed and offer is None:
+            offer = {"stop_order": order, "stop_name": stop["name"]}
+            continue
+        if state.state != VICINITY_LEFT or not in_batch or state.completed_by is None:
+            continue
+        if pings[state.completed_by[1]][0] not in in_batch:
+            continue  # completed by an earlier batch, which raised it then
+        if stop["is_school_gate"] or order >= max(last_order, total_stops):
+            continue
+        # One savepoint per stop: a fault on one departure costs neither
+        # another stop's prompt nor the offer, and the batch is unaffected.
+        try:
+            with conn.transaction():
+                bypassed = evaluate_bypassed_stop(conn, run, order)
+                if bypassed and bypassed["raised"]:
+                    record_lifecycle_incident_on(
+                        conn, str(run["school_id"]), run_id, STOP_BYPASSED,
+                        bypassed_stop_alert_detail(
+                            bypassed["stop_order"], bypassed["stop_name"], bypassed["students"]
+                        ),
+                    )
+        except Exception:
+            logger.exception(
+                "departure not evaluated; the next Arrive's check covers it (run=%s stop_order=%s)",
+                run_id, order,
+            )
+            continue
+        if not bypassed:
+            continue
+        if bypassed["prompt"]:
+            prompts.append(bypassed["prompt"])
+        logger.info(
+            "departure without outcomes (run=%s stop_order=%s exception=%s raised=%s prompt=%s)",
+            run_id, order, bypassed["exception_id"], bypassed["raised"],
+            "pending" if bypassed["prompt"] else "already pending",
+        )
+    return {"prompts": prompts, "arrival_offer": offer}
+
+
+def arrival_offer(conn, run: dict[str, Any]) -> dict[str, Any] | None:
+    """The driver context's read of the arrival offer (R29): the same
+    derivation as the ping batch's, on the same window, with no departure
+    evaluation — so a reload or a second device sees the offer the trail
+    supports right now, and nothing is written. ``run`` needs ``id``,
+    ``school_id``, ``stops_completed`` and ``total_stops``."""
+    thresholds = resolve_school_thresholds(conn, str(run["school_id"]))
+    return evaluate_vicinity(conn, run, thresholds=thresholds, batch_row_ids=None)["arrival_offer"]
 
 
 def pending_prompts(conn, run: dict[str, Any]) -> list[dict[str, Any]]:
@@ -564,12 +706,13 @@ def _upsert_stop_keyed_exception(
 def _upsert_run_keyed_unverified(
     conn, run: dict[str, Any], *, reason: str, fix_columns: _FixColumns,
     distance_m: float | None,
-) -> str:
-    """One ``unverified`` row per (run, reason) for ``no-fix`` and
-    ``too-coarse`` (R20): a GPS-denied run must not spawn a row per tap. No
-    index keys these, so the (run, reason) pair is serialised on a
-    transaction-scoped advisory lock before the select-for-update, and the
-    first tap inside the lock inserts."""
+) -> tuple[str, bool]:
+    """One ``unverified`` row per (run, reason) for ``no-fix``,
+    ``too-coarse`` (R20) and ``session-mismatch`` (U14): a GPS-denied run
+    must not spawn a row per tap. No index keys these, so the (run, reason)
+    pair is serialised on a transaction-scoped advisory lock before the
+    select-for-update, and the first tap inside the lock inserts. Returns
+    ``(id, inserted)`` so a once-per-run caller can tell the first time."""
     run_id = str(run["id"])
     conn.execute(
         "select pg_advisory_xact_lock(hashtext(%s))", (f"unverified:{run_id}:{reason}",)
@@ -583,7 +726,7 @@ def _upsert_run_keyed_unverified(
         (run_id, UNVERIFIED, reason),
     ).fetchone()
     if existing:
-        return str(existing["id"])
+        return str(existing["id"]), False
     inserted = conn.execute(
         """
         insert into run_exceptions
@@ -594,7 +737,40 @@ def _upsert_run_keyed_unverified(
         """,
         (str(run["school_id"]), run_id, UNVERIFIED, reason, *fix_columns, distance_m),
     ).fetchone()
-    return str(inserted["id"])
+    return str(inserted["id"]), True
+
+
+# The `reason` of the unverified row a refused ping stream leaves for the
+# office (GPS plan U14/R28): pings arrived from an auth session other than the
+# one bound to the run. Not a check reason — no tap is classified by it — so
+# it lives here, beside the writer, rather than in position_rules.
+REASON_SESSION_MISMATCH = "session-mismatch"
+
+
+def record_session_mismatch(conn, run: dict[str, Any]) -> tuple[str, bool]:
+    """Flag the run once for pings from a second session (U14/R28): one
+    ``unverified`` / ``session-mismatch`` row per run with one silent ledger
+    event written the first time only — no student, no fix, no prompt, no
+    call-now, no incident — so a second phone looping on the endpoint adds
+    nothing after the first refusal. Returns ``(exception_id, first_time)``.
+    Logs the run id only."""
+    exception_id, inserted = _upsert_run_keyed_unverified(
+        conn, run, reason=REASON_SESSION_MISMATCH, fix_columns=(None, None, None, None),
+        distance_m=None,
+    )
+    if inserted:
+        conn.execute(
+            """
+            insert into run_exception_events (exception_id, school_id, run_id)
+            values (%s, %s, %s)
+            """,
+            (exception_id, str(run["school_id"]), str(run["id"])),
+        )
+        logger.info(
+            "pings from a second session refused; run flagged for review (run=%s exception=%s)",
+            run["id"], exception_id,
+        )
+    return exception_id, inserted
 
 
 def record_custody_check(
@@ -713,7 +889,7 @@ def _record_unverified(
             fix_columns=fix_columns, distance_m=None,
         )
     else:
-        exception_id = _upsert_run_keyed_unverified(
+        exception_id, _inserted = _upsert_run_keyed_unverified(
             conn, run, reason=reason, fix_columns=fix_columns, distance_m=distance_m,
         )
     conn.execute(
@@ -907,8 +1083,14 @@ class PlausibilityVerdict:
         return bool(self.flags)
 
 
+_PREVIOUS_FROM_TRAIL = object()
+
+
 def assess_plausibility(
     conn, run: dict[str, Any], *, trail_row_id: str, fix: NormalisedFix, retention_days: int,
+    previous: StoredFix | None | object = _PREVIOUS_FROM_TRAIL,
+    stops: list[tuple[Any, Any]] | None = None,
+    exempt: Iterable[str] = (),
 ) -> PlausibilityVerdict:
     """Judge the tap's fix against the run's previous fix and planned stops
     and merge the flags onto its trail row (U12, R32).
@@ -920,16 +1102,28 @@ def assess_plausibility(
     stops the run's own snapshot. A fix-less tap has nothing to judge.
     Merges through ``position_dao.add_flags`` so ``clock-skew`` from the
     boundary stays and nothing is written twice. Never logs a coordinate.
+
+    A ping batch (U14) passes ``previous`` and ``stops`` itself: its rows
+    share one receipt time, so the trail cannot order them, and the batch is
+    judged in capture order against the ping before it. ``exempt`` names
+    flags the caller does not apply (the batch exempts ``repeat-coordinates``
+    — a parked phone's stream legitimately repeats).
     """
     stored = fix.fix
     if stored is None:
         return PlausibilityVerdict(flags=(), previous=None, jump_m=None)
     run_id = str(run["id"])
-    previous = position_dao.previous_fix(
-        conn, run_id, before_row_id=trail_row_id, retention_days=retention_days
+    if previous is _PREVIOUS_FROM_TRAIL:
+        previous = position_dao.previous_fix(
+            conn, run_id, before_row_id=trail_row_id, retention_days=retention_days
+        )
+    if stops is None:
+        stops = position_dao.planned_stops(conn, run_id)
+    skipped = set(exempt)
+    flags = tuple(
+        flag for flag in plausibility_flags(fix, previous=previous, stops=stops)
+        if flag not in skipped
     )
-    stops = position_dao.planned_stops(conn, run_id)
-    flags = plausibility_flags(fix, previous=previous, stops=stops)
     if flags:
         position_dao.add_flags(conn, trail_row_id, flags)
     return PlausibilityVerdict(

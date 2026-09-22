@@ -140,6 +140,7 @@ export class FixCapture {
   private status: LocationStatus = NO_STATUS;
   private approximateStreak = 0;
   private listeners = new Set<() => void>();
+  private positionListeners = new Set<(fix: Fix) => void>();
   private visibilityBound = false;
 
   constructor(private readonly deps: FixCaptureDeps) {}
@@ -245,6 +246,28 @@ export class FixCapture {
     return this.last?.position ?? null;
   }
 
+  /** The cached fix while it is still fresh (under the cache window), as
+   * the `Fix` a request carries; null otherwise. The ping stream's first
+   * batch (GPS plan U14): the watch's first fix lands inside the Start Run
+   * tap, before the context has confirmed the run and the stream is
+   * listening, and a phone that does not move again would otherwise have
+   * nothing to send. */
+  freshFix(): Fix | null {
+    if (!this.last || this.deps.now() - this.last.receivedAt >= CACHE_FRESH_MS) return null;
+    return this.toFix(this.last.position);
+  }
+
+  /** Every fix the watch (or a tap's one-shot request) delivers, as the
+   * `Fix` a request carries — the Phase 2 ping stream's source (GPS plan
+   * U14). Nothing arrives outside a run: the watch only runs during one.
+   * Returns the unsubscribe. */
+  onPosition(listener: (fix: Fix) => void): () => void {
+    this.positionListeners.add(listener);
+    return () => {
+      this.positionListeners.delete(listener);
+    };
+  }
+
   // Status ------------------------------------------------------------------
 
   getStatus(): LocationStatus {
@@ -342,17 +365,24 @@ export class FixCapture {
     // Permission came back after a denial (the driver fixed the setting):
     // the dead watch is replaced so the cache warms again.
     if (wasDenied && this.watchId != null) this.restartWatch();
+    if (this.positionListeners.size > 0) {
+      const fix = this.toFix(position);
+      for (const listener of this.positionListeners) listener(fix);
+    }
+  }
+
+  private toFix(position: GeolocationPosition): Fix {
+    return {
+      lat: position.coords.latitude,
+      lng: position.coords.longitude,
+      accuracy_m: position.coords.accuracy,
+      captured_at: isoWithOffset(this.captureTime(position)),
+    };
   }
 
   private toPayload(position: GeolocationPosition): FixPayload {
-    const accuracy = position.coords.accuracy;
-    const fix: Fix = {
-      lat: position.coords.latitude,
-      lng: position.coords.longitude,
-      accuracy_m: accuracy,
-      captured_at: isoWithOffset(this.captureTime(position)),
-    };
-    if (Number.isFinite(accuracy) && accuracy > this.config.fix_accuracy_cap_m) {
+    const fix = this.toFix(position);
+    if (Number.isFinite(fix.accuracy_m) && fix.accuracy_m > this.config.fix_accuracy_cap_m) {
       return { ...fix, reason: "coarse" };
     }
     return fix;

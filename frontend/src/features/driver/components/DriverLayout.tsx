@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { Bus, Home, MapPin, TriangleAlert } from "lucide-react";
 import { RoleMobileLayout, type NavItem } from "@/app/layouts/RoleMobileLayout";
 import { useDriverContext, useRunFixWatch } from "@/features/driver/driverHooks";
+import { useRunPings } from "@/features/driver/useRunPings";
+import { useWakeLockForRun } from "@/features/driver/useWakeLock";
 import { LocationStatusBanner } from "./LocationStatusBanner";
 import { NudgeQueue } from "./NudgeQueue";
 
@@ -21,9 +23,14 @@ export const DRIVER_NAV: NavItem[] = [
 // Since U6 it also keeps the GPS watch in step with the run (every tab polls
 // the context, so the watch resumes on reload from whichever tab loads) and
 // shows the location indicator under the prompt card, for the same reason.
+// Since U14 the ping stream and the screen wake lock ride the same context
+// here: the run is spent on the board as much as on the Run page, and both
+// must follow the run, not the tab.
 export function DriverLayout({ title, children }: { title: string; children: ReactNode }) {
   const { data } = useDriverContext();
   useRunFixWatch(data);
+  useRunPings(data);
+  useWakeLockForRun(data);
   return (
     <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title={title}>
       <NudgeQueue />

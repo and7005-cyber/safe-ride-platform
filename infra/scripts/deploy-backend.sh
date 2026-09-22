@@ -153,7 +153,17 @@ GPS_PARAMS=(
   GpsStaleAfterS:GPS_STALE_AFTER_S
   GpsFixWaitBudgetS:GPS_FIX_WAIT_BUDGET_S
 )
-for pair in "${GPS_PARAMS[@]}"; do
+# API-stage throttling (GPS plan U14), same shape and same rule: the template
+# Defaults are the live values; export the variable to override one deploy.
+# These are API Gateway settings, not app Settings — no GPS_ prefix, and the
+# app never reads them.
+API_THROTTLE_PARAMS=(
+  ApiDefaultBurstLimit:API_DEFAULT_BURST_LIMIT
+  ApiDefaultRateLimit:API_DEFAULT_RATE_LIMIT
+  PingsRouteBurstLimit:API_PINGS_BURST_LIMIT
+  PingsRouteRateLimit:API_PINGS_RATE_LIMIT
+)
+for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"; do
   param="${pair%%:*}"; var="${pair##*:}"
   if [ -n "${!var:-}" ]; then
     DEPLOY_PARAMS+=("${param}=${!var}")

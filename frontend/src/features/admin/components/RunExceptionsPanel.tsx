@@ -92,6 +92,9 @@ const REASON_LABEL: Record<string, string> = {
   "too-coarse": "fix too coarse",
   "stop-unverified": "stop position unverified",
   invalid: "fix could not be read",
+  // Pings refused from a sign-in other than the one that started the run
+  // (GPS plan U14/R28): one PIN on two phones, or a run handed between them.
+  "session-mismatch": "live pings refused from a second sign-in",
   // The unverified check's fourth reason (R20) and the flags behind it (U12).
   implausible: "fix flagged implausible",
   "clock-skew": "capture time ahead of the server clock",

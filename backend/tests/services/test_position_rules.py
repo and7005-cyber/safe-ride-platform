@@ -41,15 +41,22 @@ from app.services.position_rules import (
     REASON_STOP_UNVERIFIED,
     REASON_TOO_COARSE,
     UNVERIFIED_REASONS,
+    VICINITY_EXIT_FACTOR,
+    VICINITY_INSIDE,
+    VICINITY_LEFT,
+    VICINITY_OUTSIDE,
     AbsentCheck,
     CustodyCheck,
     NormalisedFix,
     StoredFix,
+    VicinityState,
     classify_absent,
     classify_custody,
+    exit_radius_m,
     jump_distance_m,
     normalise_fix,
     plausibility_flags,
+    vicinity_state,
     within_vicinity,
 )
 
@@ -695,3 +702,128 @@ def test_a_flagged_fix_neither_corroborates_an_absent_nor_counts_as_seen_at_stop
     # trail reader (position_dao.run_fixes) drops flagged fixes before
     # `within_vicinity` ever sees them.
     assert within_vicinity(on_the_pin, STOP, vicinity_m=VICINITY, accuracy_cap_m=CAP)
+
+
+# --- the vicinity state machine (U15: R29, R30, R31; F7) ------------------------
+#
+# Derived from a run's plain pings in capture order against one stop: two
+# consecutive plain pings inside the enter radius enter, two consecutive plain
+# pings beyond the exit radius leave, a fix between the radii changes nothing,
+# and a coarse fix is skipped — it neither counts nor breaks a pair.
+
+ENTER = 100.0
+EXIT = 150.0
+
+
+def ping_at(metres_north: float, accuracy: float = 12.0, *, seconds: float = 0.0) -> StoredFix:
+    return StoredFix(
+        lat=STOP[0] + metres_north * METRE, lng=STOP[1], accuracy_m=accuracy,
+        captured_at=CAPTURED + timedelta(seconds=seconds),
+    )
+
+
+def state_of(pings, stop=STOP, *, enter=ENTER, exit_=EXIT, cap=CAP) -> VicinityState:
+    return vicinity_state(pings, stop, enter_m=enter, exit_m=exit_, accuracy_cap_m=cap)
+
+
+def test_the_exit_radius_is_one_and_a_half_times_the_enter_radius():
+    assert VICINITY_EXIT_FACTOR == 1.5
+    assert exit_radius_m(100) == 150.0
+    # A per-school enter radius (U11) scales the exit with it.
+    assert exit_radius_m(200) == 300.0
+
+
+def test_no_pings_or_a_single_fix_inside_does_not_enter():
+    assert state_of([]) == VicinityState(state=VICINITY_OUTSIDE, completed_by=None)
+    assert state_of([ping_at(20)]).state == VICINITY_OUTSIDE
+    # Two inside pings that are not consecutive plain pings — a far one
+    # between them — do not enter either.
+    broken = [ping_at(20), ping_at(600, seconds=10), ping_at(25, seconds=20)]
+    assert state_of(broken).state == VICINITY_OUTSIDE
+
+
+def test_two_consecutive_plain_pings_inside_enter_and_the_pair_is_reported():
+    entered = state_of([ping_at(400), ping_at(20, seconds=10), ping_at(30, seconds=20)])
+    assert entered.state == VICINITY_INSIDE
+    assert entered.completed_by == (1, 2)
+    # A third inside ping keeps the state and the pair that produced it.
+    more = state_of([ping_at(400), ping_at(20, seconds=10), ping_at(30, seconds=20), ping_at(10, seconds=30)])
+    assert more == VicinityState(state=VICINITY_INSIDE, completed_by=(1, 2))
+
+
+def test_enter_is_distance_less_accuracy_against_the_enter_radius():
+    # 110 m off the pin with a 20 m radius is 90 m net: inside.
+    assert state_of([ping_at(110, 20), ping_at(105, 20, seconds=5)]).state == VICINITY_INSIDE
+    # 130 m with 20 m is 110 m net: not inside, however many.
+    assert state_of([ping_at(130, 20), ping_at(125, 20, seconds=5)]).state == VICINITY_OUTSIDE
+
+
+def test_a_fix_between_the_radii_does_not_toggle_and_one_exterior_fix_does_not_leave():
+    inside = [ping_at(20), ping_at(30, seconds=5)]
+    between = state_of([*inside, ping_at(120, seconds=10), ping_at(135, seconds=15)])
+    assert between.state == VICINITY_INSIDE and between.completed_by == (0, 1)
+    # 160 m off with a 20 m radius is 140 m net — inside the exit radius still.
+    assert state_of([*inside, ping_at(160, 20, seconds=10), ping_at(165, 20, seconds=15)]).state == VICINITY_INSIDE
+    # One exterior ping is not a departure.
+    assert state_of([*inside, ping_at(400, seconds=10)]).state == VICINITY_INSIDE
+    # An exterior ping, a fix back inside the exit radius, an exterior ping:
+    # the two exterior pings are not consecutive, so still inside.
+    flapping = state_of([*inside, ping_at(400, seconds=10), ping_at(120, seconds=15), ping_at(400, seconds=20)])
+    assert flapping.state == VICINITY_INSIDE
+
+
+def test_two_consecutive_exterior_pings_after_entering_leave_and_the_first_completing_pair_is_kept():
+    trail = [ping_at(20), ping_at(30, seconds=5), ping_at(175, 20, seconds=10), ping_at(400, seconds=15)]
+    left = state_of(trail)
+    assert left.state == VICINITY_LEFT
+    assert left.completed_by == (2, 3)
+    # Further exterior pings do not move the pair: the departure is the
+    # first batch that completed it, and only that batch raises.
+    assert state_of([*trail, ping_at(800, seconds=20), ping_at(1200, seconds=25)]).completed_by == (2, 3)
+    # Exactly at the exit radius net is not exterior: 170 m with 20 m is 150.
+    assert state_of([ping_at(20), ping_at(30, seconds=5), ping_at(170, 20, seconds=10), ping_at(170, 20, seconds=15)]).state == VICINITY_INSIDE
+
+
+def test_re_entry_and_a_second_exit_report_the_new_pairs():
+    trail = [
+        ping_at(20), ping_at(30, seconds=5),            # enter (0, 1)
+        ping_at(400, seconds=10), ping_at(500, seconds=15),  # leave (2, 3)
+        ping_at(40, seconds=20), ping_at(20, seconds=25),    # re-enter (4, 5)
+    ]
+    back = state_of(trail)
+    assert back == VicinityState(state=VICINITY_INSIDE, completed_by=(4, 5))
+    again = state_of([*trail, ping_at(400, seconds=30), ping_at(600, seconds=35)])
+    assert again == VicinityState(state=VICINITY_LEFT, completed_by=(6, 7))
+    # Leaving from `left` needs an entry first: exterior pings after an
+    # exit never make a second departure on their own.
+    assert state_of([*trail[:4], ping_at(900, seconds=20), ping_at(950, seconds=25)]).completed_by == (2, 3)
+
+
+def test_a_coarse_ping_is_skipped_it_neither_counts_nor_breaks_a_pair():
+    # Coarse right on the stop: never enters, however many.
+    assert state_of([ping_at(0, 900), ping_at(5, 900, seconds=5), ping_at(3, 900, seconds=10)]).state == VICINITY_OUTSIDE
+    # Between two inside pings a coarse one is ignored: the pair stands.
+    skipped = state_of([ping_at(20), ping_at(10, 900, seconds=5), ping_at(30, seconds=10)])
+    assert skipped == VicinityState(state=VICINITY_INSIDE, completed_by=(0, 2))
+    # Coarse and far after entering does not leave.
+    assert state_of([ping_at(20), ping_at(30, seconds=5), ping_at(5000, 900, seconds=10), ping_at(5100, 900, seconds=15)]).state == VICINITY_INSIDE
+    # Exactly the cap is not coarse (as everywhere else).
+    assert state_of([ping_at(20, CAP), ping_at(30, CAP, seconds=5)]).state == VICINITY_INSIDE
+
+
+def test_a_stop_without_usable_coordinates_is_never_entered():
+    inside = [ping_at(20), ping_at(30, seconds=5)]
+    assert state_of(inside, stop=None).state == VICINITY_OUTSIDE
+    assert state_of(inside, stop=(None, 36.7823)).state == VICINITY_OUTSIDE
+    assert state_of(inside, stop=(float("nan"), 36.7823)).state == VICINITY_OUTSIDE
+
+
+def test_per_school_radii_change_the_verdict():
+    # 150 m off, 12 m radius: outside a 100 m enter radius, inside a 200 m one.
+    far = [ping_at(150), ping_at(155, seconds=5)]
+    assert state_of(far).state == VICINITY_OUTSIDE
+    assert state_of(far, enter=200, exit_=300).state == VICINITY_INSIDE
+    # ... and with a 300 m exit radius, 280 m is not a departure.
+    trail = [*far, ping_at(280, seconds=10), ping_at(285, seconds=15)]
+    assert state_of(trail, enter=200, exit_=300).state == VICINITY_INSIDE
+    assert state_of([*far, ping_at(320, seconds=10), ping_at(330, seconds=15)], enter=200, exit_=300).state == VICINITY_LEFT

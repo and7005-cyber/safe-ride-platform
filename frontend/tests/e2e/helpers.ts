@@ -196,7 +196,16 @@ export function schoolHeaders(token: string, schoolId: string) {
  * gains no new dependency.
  */
 export function purgeRun(runId: string): void {
-  psql(`delete from live_runs where id = '${runId}'`);
+  // The run's notification and incident rows outlive it by design (their
+  // run reference is SET NULL, so a family's feed survives a run delete).
+  // For a purged test run that history is noise the next spec would count
+  // — a second remote absent would find yesterday's "call the office now"
+  // card — so it goes with the run.
+  psql(
+    `delete from live_notifications where run_id = '${runId}'; ` +
+      `delete from live_incidents where run_id = '${runId}'; ` +
+      `delete from live_runs where id = '${runId}'`,
+  );
 }
 
 /**

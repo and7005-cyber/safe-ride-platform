@@ -140,6 +140,33 @@ Parameters:
     MinValue: 1
     MaxValue: 30
     Description: Seconds a driver tap waits for a cold GPS fix before posting without one (system-wide).
+  # API-stage throttling (GPS plan U14, live-parity rule). The account's Lambda
+  # concurrency floor is 10, so one looping phone could take every school's
+  # console down: the pings route gets its own bound, well under the pool, and
+  # the stage a generous default that still stops a runaway client. Numbers are
+  # requests per second (rate) and the token bucket (burst); the Defaults are
+  # the live values, overridable per deploy from deploy-backend.sh. Kept in
+  # step by backend/tests/core/test_gps_settings.py.
+  ApiDefaultBurstLimit:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: Stage-wide burst limit (requests) for every route without its own setting.
+  ApiDefaultRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Stage-wide steady-state rate limit (requests per second) for every route without its own setting.
+  PingsRouteBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Burst limit (requests) for POST /api/runs/driver/pings.
+  PingsRouteRateLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Steady-state rate limit (requests per second) for POST /api/runs/driver/pings.
   DbEngineVersion:
     Type: String
     Default: "16.14"
@@ -350,6 +377,16 @@ Resources:
       # CORS is handled by the FastAPI app (CORSMiddleware), so it is left off
       # here to avoid duplicate/ conflicting headers.
       Description: SafeRide API
+      # Stage throttling (GPS plan U14): the default applies to every route
+      # the proxy serves; the pings route is declared as its own route on
+      # ApiFunction below so this per-route setting has a key to bind to.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ApiDefaultBurstLimit
+        ThrottlingRateLimit: !Ref ApiDefaultRateLimit
+      RouteSettings:
+        "POST /api/runs/driver/pings":
+          ThrottlingBurstLimit: !Ref PingsRouteBurstLimit
+          ThrottlingRateLimit: !Ref PingsRouteRateLimit
 
   # ---------------------------------------------------------------- Functions
   ApiFunction:
@@ -426,6 +463,15 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /
             Method: ANY
+        # The one route with its own throttle (GPS plan U14). Same function,
+        # same handler; API Gateway prefers the exact route over the proxy,
+        # so nothing else about routing changes.
+        Pings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/runs/driver/pings
+            Method: POST
 
   MigrateFunction:
     Type: AWS::Serverless::Function

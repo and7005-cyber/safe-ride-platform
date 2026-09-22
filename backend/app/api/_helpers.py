@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -7,6 +8,8 @@ from psycopg import Error as PsycopgError
 
 from app.core.errors import (
     IdempotencyConflictError,
+    PingPacedError,
+    PingRefusedError,
     PromptConflictError,
     SafeRideError,
     to_http_exception,
@@ -20,13 +23,26 @@ BAD_REQUEST_SQLSTATES = {"22P02", "22007", "22008", "23514"}
 
 
 def map_error(error: Exception) -> HTTPException:
-    if isinstance(error, IdempotencyConflictError):
-        # Same shape as the prompt conflicts (GPS plan U7/R33): `code` is
-        # what the client branches on; the detail never carries the stored
-        # response or any of the request's own fields.
+    if isinstance(error, (IdempotencyConflictError, PingRefusedError)):
+        # Same shape as the prompt conflicts (GPS plan U7/R33; U14/R28):
+        # `code` is what the client branches on; the detail never carries
+        # the stored response or any of the request's own fields.
         return HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
+        )
+    if isinstance(error, PingPacedError):
+        # The 429 is structured too (GPS plan U14): `code` plus how long the
+        # stream is out of pace, and the standard Retry-After header.
+        wait = max(1, math.ceil(error.retry_after_s))
+        return HTTPException(
+            status_code=error.status_code,
+            detail={
+                "code": error.code,
+                "message": str(error),
+                "retry_after_s": round(error.retry_after_s, 3),
+            },
+            headers={"Retry-After": str(wait)},
         )
     if isinstance(error, PromptConflictError):
         # Structured like the auth surface's second-factor refusals: the

@@ -33,6 +33,12 @@ same goes for `ride-cancelled` and `admin-notice`: their `run_id` stays NULL
 cancellation confirmation fires only on a real scope transition, and two
 identical broadcasts are deliberately two rows.
 
+**Live pings never notify.** The Phase 2 position stream (`POST
+/api/runs/driver/pings`, GPS plan U14/R24) inserts trail rows and nothing
+else: no notification type, no fan-out, no background task. A bus moving
+between stops changes the map, not the feed; `bus-approaching` stays
+stop-order based and fires only on the Arrive tap.
+
 **Corrections retract.** Each `*-corrected` type first deletes the feed row it
 supersedes (`student-boarded`, `student-absent` or `dropped-off`) for that
 (parent, run, student), because the dedup index would otherwise suppress the
