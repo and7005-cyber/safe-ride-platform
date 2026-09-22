@@ -18,7 +18,18 @@
 // run on the server; a `ping-too-soon` refusal skips one interval. Nothing
 // is sent before Start Run: there is no run to send for.
 
+// Since U15 an accepted batch's response can carry what the trail says
+// (R29, R30): `prompts` — a bypassed-stop prompt raised the moment the bus
+// left a stop with children unrecorded — and `arrival_offer`. Both go
+// straight to the nudge queue from the response, so the card shows on this
+// batch rather than one context poll later; the poll then owns them.
+
 import { useEffect, useSyncExternalStore } from "react";
+import {
+  nudgeStore,
+  type ArrivalOffer,
+  type NudgePrompt,
+} from "@/features/driver/components/nudgeStore";
 import type { DriverContext } from "@/features/driver/driverHooks";
 import { actionEnvelopes, getDeviceId } from "@/lib/actionEnvelope";
 import { api, ApiError } from "@/lib/apiClient";
@@ -51,8 +62,18 @@ export interface PingStreamStatus {
   lastAcceptedAt: number | null;
 }
 
+/** What an accepted batch's response may carry for the nudge queue (U15). */
+export interface PingResponseNudges {
+  prompts?: NudgePrompt[] | null;
+  arrival_offer?: ArrivalOffer | null;
+}
+
 export interface RunPingsDeps {
   post: (body: PingBatch) => Promise<unknown>;
+  /** An accepted batch's response body, with the run it was for — the
+   * nudge queue reads `prompts` and `arrival_offer` off it (U15). Not
+   * called for a refused batch, nor when the run changed under it. */
+  onResponse?: (runId: string, body: unknown) => void;
   /** The run's fix source — `fixCapture.onPosition`. Returns the unsubscribe. */
   onPosition: (listener: (fix: Fix) => void) => () => void;
   /** The watch's fresh cached fix when the stream starts — the Start Run
@@ -242,10 +263,11 @@ export class RunPings {
   private async send(runId: string, fixes: Fix[]): Promise<void> {
     this.inFlight = true;
     try {
-      await this.deps.post({ run_id: runId, fixes, device_id: this.deps.deviceId() });
+      const body = await this.deps.post({ run_id: runId, fixes, device_id: this.deps.deviceId() });
       if (this.runId !== runId) return;
       this.lastAccepted = fixes[fixes.length - 1]!;
       this.emit({ lastAcceptedAt: this.deps.now() });
+      this.deps.onResponse?.(runId, body);
     } catch (error) {
       if (this.runId !== runId) return;
       if (error instanceof ApiError && error.status === 409 && error.code === SESSION_MISMATCH_CODE) {
@@ -280,9 +302,21 @@ export class RunPings {
   }
 }
 
+/** Feed a batch response's nudges to the queue (U15): the prompts it raised
+ * as a response delivery, and the server's current word on the arrival
+ * offer — set whenever the body carries the key, null included, so an
+ * offer the trail withdrew leaves the card at once. */
+export function applyPingResponse(runId: string, body: unknown): void {
+  if (!body || typeof body !== "object") return;
+  const nudges = body as PingResponseNudges;
+  nudgeStore.ingest(nudges.prompts ?? [], "response");
+  if ("arrival_offer" in nudges) nudgeStore.setArrivalOffer(nudges.arrival_offer ?? null, runId);
+}
+
 /** The app's one stream. */
 export const runPings = new RunPings({
   post: (body) => api.post(PINGS_PATH, body),
+  onResponse: applyPingResponse,
   onPosition: (listener) => fixCapture.onPosition(listener),
   freshFix: () => fixCapture.freshFix(),
   deviceId: () => getDeviceId(),

@@ -31,6 +31,19 @@ forward-only served position — nothing else:
   stays unsent across a ping and is drained by the next context poll;
 - no log line carries a coordinate; the manifest lists the route.
 
+The trail-driven nudges (GPS plan U15: R29, R30, R31; F7; AE14) ride the
+same route and are tested at the bottom of this module: the arrival offer
+on entering a not-yet-arrived stop (two plain pings inside the enter
+radius, named in the response and the context), the Arrive to a named stop
+it answers with (`target_stop_order`), the bypassed-stop exception raised
+by the first exterior batch that completes a departure with children
+unrecorded — row, pending prompt and office alert in the ping's own
+transaction, and the next Arrive quiet about it — the hysteresis (one fix
+inside does not enter, a fix between the radii does not toggle, coarse and
+flagged pings change nothing), the locked-screen delay, the fallback to the
+next Arrive when pings stop, the gate never raised, and a vicinity fault
+flagging nothing.
+
 Isolation: an own throwaway school (school_sandbox) with two drivers, two
 buses, a morning route with two students on bus 1, and the school's ping
 interval set to the smallest value that keeps the pacing waits short. Every
@@ -48,22 +61,30 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, METRE, purge_run, school_sandbox
+from app.core.config import GPS_PING_RUN_START_GRACE_S
+from conftest import DSN, METRE, haversine_m, purge_run, school_sandbox
 from test_gps_actions import (
     IMPLAUSIBLE_MOVEMENT,
     UNVERIFIED,
     _create_driver,
+    _wait_for,
     api_log_tail,
     arrive,
     bus_position,
+    clear_injected_failure,
+    context,
     coordinate_needles,
     end_run,
     exceptions,
     fix,
+    incidents,
+    inject_exception_insert_failure,
     latest_session_id,
+    layout,
     ledger,
     login,
     pin_login,
+    post,
     run_row,
     start,
     trail,
@@ -288,6 +309,8 @@ def test_a_batch_of_six_inserts_six_ping_rows_and_serves_the_newest_by_capture_t
             "dropped": {"invalid": 0, "outside_window": 0, "duplicate": 0},
             "flagged": 0,
             "served_at": body["served_at"],
+            "prompts": [],
+            "arrival_offer": None,
         }
         assert datetime.fromisoformat(body["served_at"]) == newest_captured(fixes)
 
@@ -359,7 +382,7 @@ def test_out_of_order_pings_never_move_the_served_position_backwards_and_duplica
         assert response.status_code == 200, response.text
         assert response.json() == {
             "accepted": 0, "dropped": {"invalid": 0, "outside_window": 0, "duplicate": 3},
-            "flagged": 0, "served_at": None,
+            "flagged": 0, "served_at": None, "prompts": [], "arrival_offer": None,
         }
         assert len(ping_rows(run_id)) == 5
 
@@ -552,6 +575,7 @@ def test_coarse_skewed_and_flagged_pings_are_stored_but_never_served_and_the_fla
         assert response.json() == {
             "accepted": 4, "dropped": {"invalid": 0, "outside_window": 2, "duplicate": 0},
             "flagged": 2, "served_at": response.json()["served_at"],
+            "prompts": [], "arrival_offer": None,
         }
         assert datetime.fromisoformat(response.json()["served_at"]) == datetime.fromisoformat(
             plain["captured_at"]
@@ -581,7 +605,7 @@ def test_coarse_skewed_and_flagged_pings_are_stored_but_never_served_and_the_fla
         assert response.status_code == 200, response.text
         assert response.json() == {
             "accepted": 0, "dropped": {"invalid": 3, "outside_window": 0, "duplicate": 0},
-            "flagged": 0, "served_at": None,
+            "flagged": 0, "served_at": None, "prompts": [], "arrival_offer": None,
         }
         assert len(ping_rows(run_id)) == 4
         assert_served_ping(fleet["bus1"]["id"], plain)
@@ -629,5 +653,495 @@ def test_the_endpoint_schedules_no_background_task(client, admin_headers, fleet)
                 ).fetchone()["call_now_sent_at"]
             time.sleep(0.2)
         assert sent is not None
+    finally:
+        purge_run(run_id)
+
+
+# =====================================================================================
+# The trail-driven nudges (GPS plan U15: R29, R30, R31; F7; AE14)
+# =====================================================================================
+#
+# The sandbox's morning route: stop 1 and stop 2 are the two children's homes
+# (a kilometre apart along the same longitude), stop 3 the school gate. The
+# defaults apply: enter at 100 m, leave at 150 m, accuracy cap 200 m.
+
+STOP_BYPASSED = "stop-bypassed"
+ENTER_M = 100.0
+EXIT_M = 150.0
+PROMPT_KEYS = {
+    "event_id", "exception_id", "kind", "stop_order", "stop_name", "student_id",
+    "students", "answers", "distance_m", "created_at", "delivered_at", "shown_at",
+}
+
+
+class Drive:
+    """Mints ping fixes along an honest drive for one run: capture times
+    advance by the travel time at a bus's pace from the last fix (under the
+    plausibility cap, so nothing is flagged), starting inside the run's
+    capture window and never ahead of the wall clock; accuracies vary like a
+    phone's; every point is given as metres north and east of a stop's pin
+    (never on it — a fix within two metres of a pin is flagged)."""
+
+    SPEED_MPS = 25.0
+
+    def __init__(self, run_id: str):
+        created = run_row(run_id)["created_at"]
+        self.clock = created - timedelta(seconds=GPS_PING_RUN_START_GRACE_S - 10)
+        self.at: tuple[float, float] | None = None
+        self.n = 0
+
+    def near(self, pin: tuple, *, north_m: float, east_m: float = 0.0,
+             accuracy: float | None = None) -> dict:
+        lat = pin[0] + north_m * METRE
+        lng = pin[1] + east_m * METRE
+        travel = haversine_m(self.at, (lat, lng)) if self.at is not None else 0.0
+        self.clock += timedelta(seconds=max(1.0, travel / self.SPEED_MPS))
+        now = datetime.now(timezone.utc)
+        if self.clock > now:
+            time.sleep((self.clock - now).total_seconds())
+        self.n += 1
+        self.at = (lat, lng)
+        return {
+            "lat": lat, "lng": lng,
+            "accuracy_m": accuracy if accuracy is not None else 14.25 + 0.5 * (self.n % 20),
+            "captured_at": iso(self.clock),
+        }
+
+
+def send(client, headers, run_id: str, fixes: list[dict]) -> dict:
+    """One paced batch: waits the pace first, posts, asserts 200, returns the
+    body — every U15 batch is one of these, so the pacing can never fail a
+    scenario by accident."""
+    wait_pace()
+    response = ping(client, headers, run_id, fixes)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["accepted"] == len(fixes), body
+    assert body["flagged"] == 0, body
+    return body
+
+
+def arrive_to(client, headers, run_id: str, target: int, *, fix_body="default") -> httpx.Response:
+    """The arrival offer's answer: an Arrive to the stop it named."""
+    body = {"run_id": run_id, "device_id": DEVICE_ID, "target_stop_order": target}
+    if fix_body == "default":
+        body["fix"] = fix()
+    elif fix_body is not None:
+        body["fix"] = fix_body
+    return post(client, headers, "/api/runs/driver/arrive", body)
+
+
+def arrived_orders(run_id: str) -> set[int]:
+    with db() as conn:
+        rows = conn.execute(
+            "select distinct stop_order from run_stops where run_id = %s and arrived_at is not null",
+            (run_id,),
+        ).fetchall()
+    return {r["stop_order"] for r in rows}
+
+
+def bypassed_rows(client, admin_headers, run_id: str) -> list[dict]:
+    return exceptions(client, admin_headers, run_id, STOP_BYPASSED)
+
+
+def unflagged(run_id: str) -> bool:
+    return all(tuple(r["flags"]) == () for r in trail(run_id))
+
+
+def route_layout(fleet, run_id: str) -> dict:
+    """The run's own stop snapshot plus the child at each order."""
+    shape = layout(run_id)
+    child_at = {}
+    for kid in (fleet["a"], fleet["b"]):
+        child_at[shape["by_student"][kid["id"]]] = kid
+    with db() as conn:
+        names = {
+            r["stop_order"]: r["name"] for r in conn.execute(
+                "select distinct on (stop_order) stop_order, name from run_stops "
+                "where run_id = %s order by stop_order, is_school_gate desc, name",
+                (run_id,),
+            ).fetchall()
+        }
+    return {**shape, "child_at": child_at, "names": names}
+
+
+def test_the_sandbox_route_has_two_child_stops_before_the_gate(client, fleet):
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        assert shape["gate"] == 3 and shape["last"] == 3
+        assert set(shape["child_at"]) == {1, 2}
+        assert all(shape["coords"][order][0] is not None for order in (1, 2, 3))
+    finally:
+        purge_run(run_id)
+
+
+# AE14: leave a stop with a child unrecorded (R30) ---------------------------------------
+
+def test_ae14_leaving_a_stop_with_a_child_unrecorded_raises_the_bypassed_stop_from_the_completing_batch(
+    client, admin_headers, fleet,
+):
+    """The bus enters stop 1 (two plain pings inside 100 m less accuracy),
+    the driver Arrives and boards nobody, and drives off. The first exterior
+    ping raises nothing; the second — the batch that completes the exit —
+    carries the bypassed-stop prompt in its response, and the exception row
+    and the office alert exist before any Arrive at stop 2. Further exterior
+    pings add nothing; the later Arrive at stop 2 finds the row and stays
+    quiet: one row, one pending event, one incident."""
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin, child, name = shape["coords"][1], shape["child_at"][1], shape["names"][1]
+        drive = Drive(run_id)
+
+        # Approaching: one fix inside is not an entry.
+        approach = send(client, h, run_id, [
+            drive.near(pin, north_m=300), drive.near(pin, north_m=200), drive.near(pin, north_m=30),
+        ])
+        assert approach["prompts"] == [] and approach["arrival_offer"] is None
+        assert context(client, h)["arrival_offer"] is None
+
+        # The second plain fix inside completes the entry: the offer names the stop.
+        entered = send(client, h, run_id, [drive.near(pin, north_m=25, east_m=12)])
+        assert entered["arrival_offer"] == {"stop_order": 1, "stop_name": name}
+        assert entered["prompts"] == []
+        assert context(client, h)["arrival_offer"] == {"stop_order": 1, "stop_name": name}
+
+        # The driver Arrives (the Run page's tap): the offer is gone; nobody boards.
+        assert arrive(client, h, run_id, expected=1).status_code == 200
+        assert context(client, h)["arrival_offer"] is None
+        assert bypassed_rows(client, admin_headers, run_id) == []
+
+        # First exterior ping (200 m − accuracy > 150): not yet a departure.
+        first_out = send(client, h, run_id, [drive.near(pin, north_m=200)])
+        assert first_out["prompts"] == [] and first_out["arrival_offer"] is None
+        assert bypassed_rows(client, admin_headers, run_id) == []
+        assert incidents(client, admin_headers, run_id, STOP_BYPASSED) == []
+
+        # The batch that completes the exit raises it — response, row, alert.
+        left = send(client, h, run_id, [drive.near(pin, north_m=260, east_m=-15)])
+        assert len(left["prompts"]) == 1, left
+        prompt = left["prompts"][0]
+        assert set(prompt) == PROMPT_KEYS
+        assert prompt["kind"] == STOP_BYPASSED and prompt["stop_order"] == 1
+        assert prompt["stop_name"] == name and prompt["answers"] == ["dismissed"]
+        assert [s["id"] for s in prompt["students"]] == [child["id"]]
+        assert prompt["delivered_at"] is None and prompt["shown_at"] is None
+
+        rows = bypassed_rows(client, admin_headers, run_id)
+        assert len(rows) == 1 and rows[0]["id"] == prompt["exception_id"]
+        assert rows[0]["status"] == "open" and rows[0]["stop_order"] == 1
+        assert [s["id"] for s in rows[0]["students"]] == [child["id"]]
+        events = ledger(rows[0]["id"])
+        assert len(events) == 1 and events[0]["prompt_state"] == "pending"
+        assert str(events[0]["id"]) == prompt["event_id"]
+        # The office alert was written in the ping's own transaction: no
+        # waiting on a background task, because there is none.
+        alerts = incidents(client, admin_headers, run_id, STOP_BYPASSED)
+        assert len(alerts) == 1, alerts
+        assert alerts[0]["description"].endswith(f"Stop 1 ({name}): no record yet for {child['name']}.")
+        assert alerts[0]["lifecycle"] is True and alerts[0]["acknowledged"] is True
+        for needle in coordinate_needles(*[f for f in trail(run_id) if f["lat"] is not None]):
+            assert needle not in alerts[0]["description"], needle
+        # The context re-delivers the same prompt, stamping its delivery.
+        delivered = context(client, h)["pending_prompts"]
+        assert [p["event_id"] for p in delivered] == [prompt["event_id"]]
+        assert delivered[0]["delivered_at"] is not None
+        assert unflagged(run_id)
+
+        # Further exterior pings: nothing new.
+        further = send(client, h, run_id, [drive.near(pin, north_m=320), drive.near(pin, north_m=400)])
+        assert further["prompts"] == []
+        assert len(ledger(rows[0]["id"])) == 1
+
+        # The Arrive at stop 2 evaluates stop 1 as N−1, finds the row and
+        # says nothing: still one row, one pending event, one incident.
+        arrived = arrive(client, h, run_id, expected=2)
+        assert arrived.status_code == 200, arrived.text
+        assert arrived.json()["prompts"] == []
+        assert len(bypassed_rows(client, admin_headers, run_id)) == 1
+        assert [e["prompt_state"] for e in ledger(rows[0]["id"])] == ["pending"]
+        time.sleep(1.0)  # the Arrive's post-commit alert task, had it fired
+        assert len(incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
+    finally:
+        purge_run(run_id)
+
+
+# Hysteresis (R31): one fix, two fixes, the boundary, coarse and flagged pings --------------
+
+def test_one_fix_inside_does_not_enter_two_do_a_boundary_fix_does_not_toggle_and_coarse_or_flagged_pings_change_nothing(
+    client, admin_headers, fleet,
+):
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin, child, name = shape["coords"][1], shape["child_at"][1], shape["names"][1]
+        offer = {"stop_order": 1, "stop_name": name}
+        drive = Drive(run_id)
+
+        # One plain fix inside: no entry.
+        one = send(client, h, run_id, [drive.near(pin, north_m=400), drive.near(pin, north_m=20)])
+        assert one["arrival_offer"] is None
+
+        # Two coarse fixes right at the stop: coarse never enters.
+        wait_pace()
+        coarse = ping(client, h, run_id, [
+            drive.near(pin, north_m=12, accuracy=900), drive.near(pin, north_m=16, east_m=5, accuracy=900),
+        ])
+        assert coarse.status_code == 200 and coarse.json()["arrival_offer"] is None
+        assert {r["fix_reason"] for r in ping_rows(run_id)} == {"none", "coarse"}
+
+        # Two flagged fixes at the stop (accuracy zero, U12): flagged never enters.
+        wait_pace()
+        flagged = ping(client, h, run_id, [
+            drive.near(pin, north_m=24, accuracy=0), drive.near(pin, north_m=28, east_m=-6, accuracy=0),
+        ])
+        assert flagged.status_code == 200, flagged.text
+        assert flagged.json()["flagged"] == 2 and flagged.json()["arrival_offer"] is None
+        assert context(client, h)["arrival_offer"] is None
+
+        # The next plain fix inside is the second consecutive *plain* fix
+        # inside (the coarse and flagged ones changed nothing, neither way):
+        # entered, and the offer names the stop.
+        two = send(client, h, run_id, [drive.near(pin, north_m=30, east_m=10)])
+        assert two["arrival_offer"] == offer
+        assert context(client, h)["arrival_offer"] == offer
+
+        # 120 m off (net above the enter radius, inside the exit radius): no toggle.
+        boundary = send(client, h, run_id, [drive.near(pin, north_m=120, east_m=20)])
+        assert boundary["arrival_offer"] == offer
+        # One exterior fix, then back inside the exit radius: still inside.
+        flap = send(client, h, run_id, [drive.near(pin, north_m=190), drive.near(pin, north_m=130)])
+        assert flap["arrival_offer"] == offer and flap["prompts"] == []
+        assert context(client, h)["arrival_offer"] == offer
+        assert bypassed_rows(client, admin_headers, run_id) == []
+
+        # Two exterior fixes: left — and the stop was passed without an
+        # Arrive with its child unrecorded, so the departure raises it (R30).
+        gone = send(client, h, run_id, [drive.near(pin, north_m=200), drive.near(pin, north_m=245, east_m=8)])
+        assert gone["arrival_offer"] is None
+        assert [p["stop_order"] for p in gone["prompts"]] == [1]
+        assert [s["id"] for s in gone["prompts"][0]["students"]] == [child["id"]]
+        rows = bypassed_rows(client, admin_headers, run_id)
+        assert len(rows) == 1 and rows[0]["status"] == "open"
+        assert len(incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
+        assert unflagged_plain(run_id)
+
+        # The catch-up Arrives find the row: nothing new from either.
+        for expected in (1, 2):
+            arrived = arrive(client, h, run_id, expected=expected)
+            assert arrived.status_code == 200 and arrived.json()["prompts"] == []
+        assert len(bypassed_rows(client, admin_headers, run_id)) == 1
+        assert [e["prompt_state"] for e in ledger(rows[0]["id"])] == ["pending"]
+    finally:
+        purge_run(run_id)
+
+
+def unflagged_plain(run_id: str) -> bool:
+    """No trail row carries `classification-failed` (a vicinity fault flags
+    nothing); rows flagged on purpose by a test keep their own flags."""
+    return all("classification-failed" not in r["flags"] for r in trail(run_id))
+
+
+# The offer for a later stop and its answer (R29) --------------------------------------------
+
+def test_entering_a_later_stop_offers_it_by_name_and_the_answer_advances_past_the_skipped_stop(
+    client, admin_headers, fleet,
+):
+    """Stop 1 never visited. Entering stop 2 offers Arrive at stop 2 by name
+    (response and context). Answering with ``target_stop_order`` 2 moves
+    progress to 2 in one transaction, evaluates stop 1's bypass (prompt, row,
+    office alert), stamps ``arrived_at`` on stop 2 only, and the offer leaves
+    the context. A target at or below progress is a recorded no-op; one
+    beyond the run is refused."""
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin2, name2 = shape["coords"][2], shape["names"][2]
+        skipped_child = shape["child_at"][1]
+        drive = Drive(run_id)
+
+        entered = send(client, h, run_id, [
+            drive.near(pin2, north_m=300), drive.near(pin2, north_m=40), drive.near(pin2, north_m=28, east_m=9),
+        ])
+        assert entered["arrival_offer"] == {"stop_order": 2, "stop_name": name2}
+        assert context(client, h)["arrival_offer"] == {"stop_order": 2, "stop_name": name2}
+
+        actions_before = len([r for r in trail(run_id) if r["source"] == "action"])
+        answered = arrive_to(client, h, run_id, 2)
+        assert answered.status_code == 200, answered.text
+        body = answered.json()
+        assert body["noop"] is False and body["run"]["stops_completed"] == 2
+        assert [p["stop_order"] for p in body["prompts"]] == [1]
+        assert [s["id"] for s in body["prompts"][0]["students"]] == [skipped_child["id"]]
+        assert arrived_orders(run_id) == {2}, "only the stop reached is stamped"
+        rows = bypassed_rows(client, admin_headers, run_id)
+        assert [(r["stop_order"], r["status"]) for r in rows] == [(1, "open")]
+        alerts = _wait_for(lambda: incidents(client, admin_headers, run_id, STOP_BYPASSED))
+        assert len(alerts) == 1 and skipped_child["name"] in alerts[0]["description"]
+        assert context(client, h)["arrival_offer"] is None
+        assert [p["event_id"] for p in context(client, h)["pending_prompts"]] == [
+            body["prompts"][0]["event_id"]
+        ]
+
+        # A stale target (the offer answered twice, or from a second device):
+        # a recorded no-op — trail row, nothing else.
+        for stale in (1, 2):
+            again = arrive_to(client, h, run_id, stale)
+            assert again.status_code == 200, again.text
+            assert again.json()["noop"] is True and again.json()["prompts"] == []
+            assert again.json()["run"]["stops_completed"] == 2
+        assert len([r for r in trail(run_id) if r["source"] == "action"]) == actions_before + 3
+        assert arrived_orders(run_id) == {2}
+        assert len(bypassed_rows(client, admin_headers, run_id)) == 1
+        # A target the run does not have.
+        assert arrive_to(client, h, run_id, 9).status_code == 400
+        assert arrive_to(client, h, run_id, 0).status_code == 400
+
+        # The target that is exactly the next stop is a plain Arrive: to the
+        # gate here, passing stop 2 with its child unrecorded.
+        gate = arrive_to(client, h, run_id, 3)
+        assert gate.status_code == 200, gate.text
+        assert gate.json()["run"]["stops_completed"] == 3
+        assert [p["stop_order"] for p in gate.json()["prompts"]] == [2]
+        assert arrived_orders(run_id) == {2, 3}
+        assert sorted(r["stop_order"] for r in bypassed_rows(client, admin_headers, run_id)) == [1, 2]
+    finally:
+        purge_run(run_id)
+
+
+# A locked screen, and no pings at all (R30's fallback) ------------------------------------
+
+def test_a_screen_locked_after_one_exterior_ping_raises_exactly_one_exception_on_the_next_batch(
+    client, admin_headers, fleet,
+):
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin = shape["coords"][1]
+        drive = Drive(run_id)
+        send(client, h, run_id, [drive.near(pin, north_m=300), drive.near(pin, north_m=30), drive.near(pin, north_m=20, east_m=10)])
+        assert arrive(client, h, run_id, expected=1).status_code == 200
+        first_out = send(client, h, run_id, [drive.near(pin, north_m=210)])
+        assert first_out["prompts"] == []
+        # The screen locks: no pings for a while. Nothing is raised meanwhile.
+        time.sleep(PACE_S * 2)
+        assert bypassed_rows(client, admin_headers, run_id) == []
+        assert context(client, h)["pending_prompts"] == []
+        # The screen unlocks a kilometre on: this batch completes the exit.
+        resumed = send(client, h, run_id, [drive.near(pin, north_m=900), drive.near(pin, north_m=980)])
+        assert [p["stop_order"] for p in resumed["prompts"]] == [1]
+        rows = bypassed_rows(client, admin_headers, run_id)
+        assert len(rows) == 1
+        assert [e["prompt_state"] for e in ledger(rows[0]["id"])] == ["pending"]
+        assert len(incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
+        # And only one, however the run goes on.
+        more = send(client, h, run_id, [drive.near(pin, north_m=1050)])
+        assert more["prompts"] == []
+        assert arrive(client, h, run_id, expected=2).json()["prompts"] == []
+        assert len(bypassed_rows(client, admin_headers, run_id)) == 1
+        assert len(ledger(rows[0]["id"])) == 1
+        time.sleep(1.0)
+        assert len(incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
+    finally:
+        purge_run(run_id)
+
+
+def test_when_pings_stop_after_one_exterior_ping_the_next_arrive_raises_it_exactly_once(
+    client, admin_headers, fleet,
+):
+    """Decision 5: nothing here runs without pings; U2's check on the next
+    Arrive is the fallback, unchanged."""
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin, child = shape["coords"][1], shape["child_at"][1]
+        drive = Drive(run_id)
+        send(client, h, run_id, [drive.near(pin, north_m=300), drive.near(pin, north_m=30), drive.near(pin, north_m=22, east_m=8)])
+        assert arrive(client, h, run_id, expected=1).status_code == 200
+        assert send(client, h, run_id, [drive.near(pin, north_m=210)])["prompts"] == []
+        assert bypassed_rows(client, admin_headers, run_id) == []
+
+        arrived = arrive(client, h, run_id, expected=2)
+        assert arrived.status_code == 200, arrived.text
+        prompts = arrived.json()["prompts"]
+        assert [p["stop_order"] for p in prompts] == [1]
+        assert [s["id"] for s in prompts[0]["students"]] == [child["id"]]
+        rows = bypassed_rows(client, admin_headers, run_id)
+        assert len(rows) == 1 and [e["prompt_state"] for e in ledger(rows[0]["id"])] == ["pending"]
+        alerts = _wait_for(lambda: incidents(client, admin_headers, run_id, STOP_BYPASSED))
+        assert len(alerts) == 1
+        # A ping after the Arrive that completes the old exit: the row is
+        # there already, the prompt pending — nothing new.
+        late = send(client, h, run_id, [drive.near(pin, north_m=300)])
+        assert late["prompts"] == []
+        assert len(ledger(rows[0]["id"])) == 1
+        assert len(incidents(client, admin_headers, run_id, STOP_BYPASSED)) == 1
+    finally:
+        purge_run(run_id)
+
+
+# The gate is offered but never raised; a vicinity fault flags nothing -----------------------
+
+def test_the_school_gate_is_offered_on_entering_but_never_raised_on_leaving(client, admin_headers, fleet):
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        gate_pin, gate_name = shape["coords"][3], shape["names"][3]
+        drive = Drive(run_id)
+        entered = send(client, h, run_id, [
+            drive.near(gate_pin, north_m=300), drive.near(gate_pin, north_m=35), drive.near(gate_pin, north_m=25, east_m=10),
+        ])
+        # The lowest not-yet-arrived stop the bus is inside is the gate; the
+        # offer names it (an Arrive there is a real Arrive).
+        assert entered["arrival_offer"] == {"stop_order": 3, "stop_name": gate_name}
+        left = send(client, h, run_id, [drive.near(gate_pin, north_m=220), drive.near(gate_pin, north_m=280)])
+        assert left["prompts"] == [] and left["arrival_offer"] is None
+        assert bypassed_rows(client, admin_headers, run_id) == []
+        assert incidents(client, admin_headers, run_id, STOP_BYPASSED) == []
+    finally:
+        purge_run(run_id)
+
+
+def test_a_vicinity_fault_flags_nothing_on_the_trail_and_the_batch_is_still_accepted(
+    client, admin_headers, fleet,
+):
+    """The exception insert is made to fail (a trigger): the batch that
+    would have raised the departure is still 200 with its rows plain — no
+    `classification-failed`, no row, no alert, no prompt — and once the
+    fault is gone the next Arrive raises it as today."""
+    h = fleet["driver_headers"]
+    run_id = start_run(client, fleet)
+    try:
+        shape = route_layout(fleet, run_id)
+        pin = shape["coords"][1]
+        drive = Drive(run_id)
+        send(client, h, run_id, [drive.near(pin, north_m=300), drive.near(pin, north_m=30), drive.near(pin, north_m=24, east_m=6)])
+        assert arrive(client, h, run_id, expected=1).status_code == 200
+        send(client, h, run_id, [drive.near(pin, north_m=210)])
+        inject_exception_insert_failure()
+        try:
+            broken = send(client, h, run_id, [drive.near(pin, north_m=270, east_m=-10)])
+        finally:
+            clear_injected_failure()
+        assert broken["prompts"] == [] and broken["arrival_offer"] is None
+        assert len(ping_rows(run_id)) == 5
+        assert unflagged(run_id)
+        assert bypassed_rows(client, admin_headers, run_id) == []
+        assert incidents(client, admin_headers, run_id, STOP_BYPASSED) == []
+        # The departure was completed by that batch; later batches do not
+        # re-raise it — the next Arrive's own check does.
+        assert send(client, h, run_id, [drive.near(pin, north_m=330)])["prompts"] == []
+        arrived = arrive(client, h, run_id, expected=2)
+        assert arrived.status_code == 200, arrived.text
+        assert [p["stop_order"] for p in arrived.json()["prompts"]] == [1]
+        assert len(bypassed_rows(client, admin_headers, run_id)) == 1
+        assert _wait_for(lambda: incidents(client, admin_headers, run_id, STOP_BYPASSED))
     finally:
         purge_run(run_id)

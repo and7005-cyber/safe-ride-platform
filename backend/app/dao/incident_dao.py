@@ -20,6 +20,85 @@ _LIFECYCLE_HEADLINE = {
 }
 
 
+def record_lifecycle_incident_on(
+    conn,
+    school_id: str,
+    run_id: str,
+    incident_type: str,
+    detail: str | None = None,
+    *,
+    dedup: bool = False,
+    student_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Record a run-lifecycle event on the office feed, on the caller's
+    connection — the transaction-level half of
+    ``IncidentDao.create_lifecycle_incident`` (which opens its own scoped
+    connection and delegates here).
+
+    The ping path (GPS plan U15/R30) writes through this directly: the pings
+    route dispatches no background task by design, so a bypassed-stop
+    exception a ping batch raised writes its office alert inside the same
+    savepoint as the exception row — both land or neither does, and the
+    alert can never be lost between commit and a fan-out that does not
+    exist. Same resolution, text, dedup and marker rules as the post-commit
+    path; see the method's docstring for why each is as it is.
+    """
+    run = conn.execute(
+        """
+        select r.id, r.driver_id, r.bus_id, r.type, r.school_id,
+               b.name as bus_name, b.driver_name, rt.name as route_name
+        from live_runs r
+        left join live_buses b on b.id = r.bus_id
+        left join live_routes rt on rt.id = r.route_id
+        where r.id = %s and r.school_id = %s
+        """,
+        (run_id, school_id),
+    ).fetchone()
+    if not run:
+        return None
+    period = "morning" if run["type"] == "morning" else "afternoon"
+    where = f"{run['route_name'] or 'Route'} ({period}) — {run['bus_name'] or 'bus'}"
+    headline = _LIFECYCLE_HEADLINE.get(incident_type, incident_type)
+    description = f"{where}: {headline}"
+    if detail:
+        description = f"{description} {detail}"
+    if student_id is not None:
+        existing = conn.execute(
+            """
+            select 1 from live_incidents
+            where run_id = %s and type = %s and student_id = %s
+            limit 1
+            """,
+            (run["id"], incident_type, student_id),
+        ).fetchone()
+        if existing:
+            return None
+    elif dedup:
+        existing = conn.execute(
+            """
+            select 1 from live_incidents
+            where run_id = %s and type = %s and description = %s
+            limit 1
+            """,
+            (run["id"], incident_type, description),
+        ).fetchone()
+        if existing:
+            return None
+    row = conn.execute(
+        """
+        insert into live_incidents
+            (run_id, driver_id, driver_name, bus_id, bus_name, type, description,
+             run_type, lifecycle, acknowledged, school_id, student_id)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, true, true, %s, %s)
+        returning *
+        """,
+        (run["id"], run["driver_id"], run["driver_name"], run["bus_id"],
+         run["bus_name"], incident_type, description, run["type"],
+         run["school_id"], student_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 class IncidentDao:
     def list_incidents(self, scope: SchoolScope) -> list[dict[str, Any]]:
         with get_connection(scope) as conn:
@@ -126,62 +205,15 @@ class IncidentDao:
         remote absent is one situation per child per run however many times
         the driver marks, undoes and marks again. Student-stamped rows never
         reach a parent feed; lifecycle rows never did either.
+
+        The write itself is ``record_lifecycle_incident_on``, shared with
+        the ping path (GPS plan U15), which writes inside its own transaction.
         """
         with get_connection(scope) as conn:
-            run = conn.execute(
-                """
-                select r.id, r.driver_id, r.bus_id, r.type, r.school_id,
-                       b.name as bus_name, b.driver_name, rt.name as route_name
-                from live_runs r
-                left join live_buses b on b.id = r.bus_id
-                left join live_routes rt on rt.id = r.route_id
-                where r.id = %s and r.school_id = %s
-                """,
-                (run_id, scope.school_id),
-            ).fetchone()
-            if not run:
-                return None
-            period = "morning" if run["type"] == "morning" else "afternoon"
-            where = f"{run['route_name'] or 'Route'} ({period}) — {run['bus_name'] or 'bus'}"
-            headline = _LIFECYCLE_HEADLINE.get(incident_type, incident_type)
-            description = f"{where}: {headline}"
-            if detail:
-                description = f"{description} {detail}"
-            if student_id is not None:
-                existing = conn.execute(
-                    """
-                    select 1 from live_incidents
-                    where run_id = %s and type = %s and student_id = %s
-                    limit 1
-                    """,
-                    (run["id"], incident_type, student_id),
-                ).fetchone()
-                if existing:
-                    return None
-            elif dedup:
-                existing = conn.execute(
-                    """
-                    select 1 from live_incidents
-                    where run_id = %s and type = %s and description = %s
-                    limit 1
-                    """,
-                    (run["id"], incident_type, description),
-                ).fetchone()
-                if existing:
-                    return None
-            row = conn.execute(
-                """
-                insert into live_incidents
-                    (run_id, driver_id, driver_name, bus_id, bus_name, type, description,
-                     run_type, lifecycle, acknowledged, school_id, student_id)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, true, true, %s, %s)
-                returning *
-                """,
-                (run["id"], run["driver_id"], run["driver_name"], run["bus_id"],
-                 run["bus_name"], incident_type, description, run["type"],
-                 run["school_id"], student_id),
-            ).fetchone()
-        return dict(row) if row else None
+            return record_lifecycle_incident_on(
+                conn, str(scope.school_id), run_id, incident_type, detail,
+                dedup=dedup, student_id=student_id,
+            )
 
     def create_driver_incident(
         self,

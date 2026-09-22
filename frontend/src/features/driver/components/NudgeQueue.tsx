@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { BellRing, Check, MapPin, PhoneOff, Undo2, UserX, X } from "lucide-react";
+import { BellRing, Check, MapPin, Navigation, PhoneOff, Undo2, UserX, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
 import { useDriverContext } from "@/features/driver/driverHooks";
 import { postDriverAction } from "@/lib/actionEnvelope";
 import { ApiError, api } from "@/lib/apiClient";
 import {
+  ARRIVAL_OFFER_KIND,
   isPromptConflict,
   nudgeStore,
   useNudgeHead,
@@ -15,14 +16,17 @@ import {
 import { useAttentionCue } from "./useAttentionCue";
 
 // One non-modal card above the page content, on every driver tab (GPS plan
-// U3: R13, R15, R23, R34; U9: R14; U10: R17). Fed by the context poll here and
-// by the action responses on the pages (Arrive today); the store decides which
-// prompt shows. Three cards exist: the bypassed stop (safety cue, outcome
-// shortcuts, dismiss), the custody confirm (silent, Confirm or Undo, no
-// dismiss — undo is the answer that takes the tap back) and the remote-absent
-// attestation (safety cue; "they told me", "I wasn't at the stop", dismiss —
-// the dismiss counts as "not at the stop"; the undo of the mark is the board
-// page's Undo, the same reverse path as every other correction).
+// U3: R13, R15, R23, R34; U9: R14; U10: R17; U15: R29, R30). Fed by the
+// context poll here, by the action responses on the pages (Arrive) and by the
+// ping stream's responses (U15); the store decides which prompt shows. Four
+// cards exist: the bypassed stop (safety cue, outcome shortcuts, dismiss), the
+// custody confirm (silent, Confirm or Undo, no dismiss — undo is the answer
+// that takes the tap back), the remote-absent attestation (safety cue; "they
+// told me", "I wasn't at the stop", dismiss — the dismiss counts as "not at
+// the stop"; the undo of the mark is the board page's Undo, the same reverse
+// path as every other correction) and the arrival offer (silent, lowest
+// priority, one Arrive button to the stop it names, a dismiss the store
+// remembers only while the server keeps offering that stop).
 //
 // Deliberately not a dialog and not a shadcn Card: nothing overlays the page
 // (a tap outside changes nothing — only the card's own dismiss dismisses), and
@@ -30,9 +34,15 @@ import { useAttentionCue } from "./useAttentionCue";
 // a roster row by anything that locates rows that way.
 
 export function NudgeQueue() {
-  const { data } = useDriverContext();
+  const { data, dataUpdatedAt } = useDriverContext();
   const head = useNudgeHead();
 
+  // Every successful poll reconciles, not only one whose payload changed:
+  // the query keeps the previous `data` reference when a poll comes back
+  // deep-equal (structural sharing), and a response-fed prompt resolved
+  // inside its grace period would otherwise never meet the poll that says
+  // it is gone — identical polls, no effect, a card that outlives its
+  // prompt. `dataUpdatedAt` moves on each fetch.
   useEffect(() => {
     if (!data) return;
     if (!data.active_run) {
@@ -40,7 +50,9 @@ export function NudgeQueue() {
       return;
     }
     nudgeStore.ingest(data.pending_prompts ?? [], "context");
-  }, [data]);
+    // The offer is derived on every poll (U15): set whole, none included.
+    nudgeStore.setArrivalOffer(data.arrival_offer ?? null, data.active_run.id);
+  }, [data, dataUpdatedAt]);
 
   if (!head || !data?.active_run) return null;
   return (
@@ -112,6 +124,22 @@ export function remoteAbsentCopy(prompt: NudgePrompt): {
   };
 }
 
+/** Driver-facing copy for the arrival offer (F7, R29): the stop by name and
+ * the one question — "Arrive at <stop>?" — with what prompted it. */
+export function arrivalOfferCopy(prompt: NudgePrompt): {
+  title: string;
+  body: string;
+  arriveLabel: string;
+} {
+  const where = prompt.stop_name ?? (prompt.stop_order != null ? `stop ${prompt.stop_order}` : "this stop");
+  const stop = prompt.stop_order != null ? `stop ${prompt.stop_order}` : "this stop";
+  return {
+    title: `Arrive at ${where}?`,
+    body: `Your phone puts the bus at ${stop} and no arrival is recorded yet.`,
+    arriveLabel: "Arrive",
+  };
+}
+
 function NudgeCard({
   prompt,
   afternoon,
@@ -131,12 +159,37 @@ function NudgeCard({
   // First show of this prompt on this screen: the cue (by kind — the custody
   // confirm stays silent) and the shown-at acknowledgement. A prompt the
   // server already knows was shown (reload, second device) gets neither; a
-  // failed ack is not retried here — the next first-show does it.
+  // failed ack is not retried here — the next first-show does it. The
+  // arrival offer is no server event: nothing to acknowledge, and silent.
   useEffect(() => {
+    if (prompt.kind === ARRIVAL_OFFER_KIND) return;
     if (prompt.shown_at || !nudgeStore.markShown(prompt.event_id)) return;
     cue(prompt.kind);
     api.post(`/api/runs/driver/prompts/${prompt.event_id}/shown`).catch(() => {});
   }, [prompt.event_id, prompt.kind, prompt.shown_at, cue]);
+
+  // The offer's answer (U15/R29): an Arrive to the stop it names, by
+  // `target_stop_order` — never the Run page's "next stop" expectation, so a
+  // stop the bus skipped on the way is evaluated for a bypass by the server,
+  // and its prompt, if any, comes back on this response. The card hides
+  // until the server's offer changes; a failure keeps it for a retry.
+  const arriveHere = async () => {
+    if (prompt.stop_order == null) return;
+    setBusy(true);
+    try {
+      const result = await postDriverAction(
+        "/api/runs/driver/arrive",
+        { run_id: runId, target_stop_order: prompt.stop_order },
+        { runId },
+      );
+      nudgeStore.ingest(result?.prompts, "response");
+      nudgeStore.hideArrivalOffer(prompt.event_id);
+      await refresh();
+    } catch (err) {
+      toast({ title: "Could not record the arrival", description: (err as Error).message, variant: "destructive" });
+      setBusy(false);
+    }
+  };
 
   const respond = async (answer: string) => {
     setBusy(true);
@@ -215,6 +268,50 @@ function NudgeCard({
       setBusy(false);
     }
   };
+
+  if (prompt.kind === ARRIVAL_OFFER_KIND) {
+    // The arrival offer (U15/R29): silent, below every real prompt, one
+    // button. The dismiss is local — the server keeps offering the stop
+    // while the trail supports it — and lasts until that offer changes.
+    const copy = arrivalOfferCopy(prompt);
+    return (
+      <section
+        role="region"
+        aria-label="Driver prompt"
+        aria-live="polite"
+        data-testid="nudge-card"
+        data-event-id={prompt.event_id}
+        data-kind={prompt.kind}
+        data-stop-order={prompt.stop_order ?? ""}
+        className="mb-4 rounded-lg border border-primary/40 bg-primary/5 p-4 shadow-sm"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <Navigation className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
+            <div>
+              <p className="font-semibold leading-tight">{copy.title}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{copy.body}</p>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label="Dismiss prompt"
+            data-testid="nudge-dismiss"
+            disabled={busy}
+            onClick={() => nudgeStore.hideArrivalOffer(prompt.event_id)}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button size="sm" data-testid="nudge-arrive" disabled={busy} onClick={arriveHere}>
+            <MapPin className="h-4 w-4" /> {copy.arriveLabel}
+          </Button>
+        </div>
+      </section>
+    );
+  }
 
   if (prompt.kind === "custody-away") {
     const copy = custodyCopy(prompt, afternoon);

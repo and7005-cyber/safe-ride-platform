@@ -4,7 +4,7 @@ import { api } from "@/lib/apiClient";
 import { actionEnvelopes } from "@/lib/actionEnvelope";
 import { fixCapture } from "@/lib/geo/fixCapture";
 import { POLL_LIVE } from "@/lib/queries";
-import type { NudgePrompt } from "@/features/driver/components/nudgeStore";
+import type { ArrivalOffer, NudgePrompt } from "@/features/driver/components/nudgeStore";
 
 export interface DriverContext {
   bus: any | null;
@@ -19,6 +19,10 @@ export interface DriverContext {
   /** The open run's pending prompts, safety kinds first (GPS plan U3/R34).
    * Present and empty with no bus or no run. */
   pending_prompts: NudgePrompt[];
+  /** The not-yet-arrived stop the trail puts the bus at (GPS plan U15/R29),
+   * derived on every poll; null when there is none. Optional only for an
+   * older server. */
+  arrival_offer?: ArrivalOffer | null;
   /** The school's resolved tracking config (GPS plan U11): the fix-wait
    * budget, the accuracy cap and the ping interval, resolved per school on
    * every poll — a School Settings change reaches the phone on the next one.

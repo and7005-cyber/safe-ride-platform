@@ -12,10 +12,12 @@ import {
   PING_MAX_BATCH,
   RunPings,
   STATIONARY_EVERY_N_INTERVALS,
+  applyPingResponse,
   distanceM,
   pingIntervalMs,
   type PingBatch,
 } from "@/features/driver/useRunPings";
+import { ARRIVAL_OFFER_KIND, nudgeStore } from "@/features/driver/components/nudgeStore";
 import {
   WAKE_LOCK_HINT,
   WakeLockKeeper,
@@ -53,12 +55,19 @@ function fix(over: Partial<Fix> = {}): Fix {
   };
 }
 
-function build(over: { post?: (body: PingBatch) => Promise<unknown>; freshFix?: () => Fix | null } = {}) {
+function build(
+  over: {
+    post?: (body: PingBatch) => Promise<unknown>;
+    freshFix?: () => Fix | null;
+    onResponse?: (runId: string, body: unknown) => void;
+  } = {},
+) {
   const positionListeners = new Set<(fix: Fix) => void>();
   const post = vi.fn(over.post ?? (async () => ({ accepted: 1 })));
   const doc = fakeDocument();
   const stream = new RunPings({
     post,
+    onResponse: over.onResponse,
     onPosition: (listener) => {
       positionListeners.add(listener);
       return () => positionListeners.delete(listener);
@@ -559,5 +568,83 @@ describe("wake lock (R25)", () => {
     // The lock that arrived after the run ended was let go at once.
     expect(late.release).toHaveBeenCalledTimes(1);
     expect(sentinels).toHaveLength(0);
+  });
+});
+
+describe("response nudges (GPS plan U15: R29, R30)", () => {
+  it("hands an accepted batch's body to onResponse with its run id, and never a refused batch's", async () => {
+    const body = { accepted: 1, prompts: [], arrival_offer: { stop_order: 1, stop_name: "Kilimani, Nairobi" } };
+    const onResponse = vi.fn();
+    const { stream, emit } = build({ post: async () => body, onResponse });
+    stream.sync("run-1", INTERVAL_S);
+    emit(fix());
+    await tick();
+    expect(onResponse).toHaveBeenCalledTimes(1);
+    expect(onResponse).toHaveBeenCalledWith("run-1", body);
+
+    const refused = vi.fn();
+    const paced = build({
+      post: async () => {
+        throw new ApiError("too soon", 429, "ping-too-soon");
+      },
+      onResponse: refused,
+    });
+    paced.stream.sync("run-2", INTERVAL_S);
+    paced.emit(fix());
+    await tick();
+    expect(paced.post).toHaveBeenCalledTimes(1);
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  it("is not called for a batch whose run ended under it", async () => {
+    let release: (value: unknown) => void = () => {};
+    const onResponse = vi.fn();
+    const { stream, emit } = build({
+      post: () => new Promise((resolve) => { release = resolve; }),
+      onResponse,
+    });
+    stream.sync("run-1", INTERVAL_S);
+    emit(fix());
+    await tick();
+    stream.sync(null, INTERVAL_S);
+    release({ accepted: 1, prompts: [], arrival_offer: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onResponse).not.toHaveBeenCalled();
+  });
+
+  it("applyPingResponse feeds the queue: prompts as a response delivery, the offer set whole, null included", () => {
+    nudgeStore.clear();
+    try {
+      applyPingResponse("run-1", {
+        accepted: 2,
+        prompts: [
+          {
+            event_id: "e1", exception_id: "x1", kind: "stop-bypassed", stop_order: 1,
+            stop_name: "Kilimani, Nairobi", student_id: null,
+            students: [{ id: "s1", name: "Faith Achieng" }], answers: ["dismissed"],
+            created_at: "2026-09-22T06:40:00+00:00", delivered_at: null, shown_at: null,
+          },
+        ],
+        arrival_offer: { stop_order: 2, stop_name: "Lavington, Nairobi" },
+      });
+      expect(nudgeStore.all().map((p) => [p.kind, p.stop_order])).toEqual([
+        ["stop-bypassed", 1],
+        [ARRIVAL_OFFER_KIND, 2],
+      ]);
+      // The trail withdrew the offer: the next response says so and the card goes.
+      applyPingResponse("run-1", { accepted: 1, prompts: [], arrival_offer: null });
+      expect(nudgeStore.all().map((p) => p.kind)).toEqual(["stop-bypassed"]);
+      // A body without the key (an older server) leaves the offer alone.
+      applyPingResponse("run-1", { accepted: 1, prompts: [], arrival_offer: { stop_order: 2, stop_name: null } });
+      applyPingResponse("run-1", { accepted: 1 });
+      expect(nudgeStore.all().map((p) => p.kind)).toEqual(["stop-bypassed", ARRIVAL_OFFER_KIND]);
+      // Nothing to read: no change, no throw.
+      applyPingResponse("run-1", null);
+      applyPingResponse("run-1", "accepted");
+      expect(nudgeStore.size()).toBe(2);
+    } finally {
+      nudgeStore.settle("e1");
+      nudgeStore.clear();
+    }
   });
 });

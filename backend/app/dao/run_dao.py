@@ -472,7 +472,7 @@ class RunDao:
                 return {
                     "bus": None, "routes": [], "active_run": None, "run_stops": [],
                     "students": [], "blocking": [], "completed_route_ids_today": [],
-                    "pending_prompts": [], "config": config,
+                    "pending_prompts": [], "arrival_offer": None, "config": config,
                 }
             routes = conn.execute(
                 "select * from live_routes where bus_id = %s order by type asc", (bus["id"],)
@@ -601,6 +601,7 @@ class RunDao:
             )
             run_stops = []
             pending_prompts: list[dict[str, Any]] = []
+            arrival_offer: dict[str, Any] | None = None
             if active_dict:
                 run_stops = [
                     dict(s)
@@ -622,6 +623,18 @@ class RunDao:
                         "pending prompts unavailable; context served without them (run=%s)",
                         active_dict["id"],
                     )
+                # The arrival offer (GPS plan U15/R29), derived from the trail
+                # on every read like the ping batch derives it, so a reload
+                # sees the offer the last batch did. Read-only, and in its own
+                # savepoint for the same reason as the prompts.
+                try:
+                    with conn.transaction():
+                        arrival_offer = exception_dao.arrival_offer(conn, active_dict)
+                except Exception:
+                    logger.exception(
+                        "arrival offer unavailable; context served without it (run=%s)",
+                        active_dict["id"],
+                    )
         return {
             "bus": dict(bus),
             "routes": [dict(r) for r in routes],
@@ -631,6 +644,7 @@ class RunDao:
             "blocking": [{"id": str(b["id"]), "name": b["name"]} for b in blocking],
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
             "pending_prompts": pending_prompts,
+            "arrival_offer": arrival_offer,
             "config": config,
         }
 
@@ -1075,10 +1089,12 @@ class RunDao:
     def arrive_next_stop(
         self, scope: SchoolScope, run_id: str, *,
         expected_stop_order: int | None = None,
+        target_stop_order: int | None = None,
         envelope: ActionEnvelope | None = None,
     ) -> dict[str, Any]:
-        """Arrive at the next stop; returns ``{run, arrival_incident, prompts,
-        noop}`` plus router-only keys.
+        """Arrive at the next stop — or, from the arrival offer, at a named
+        one; returns ``{run, arrival_incident, prompts, noop}`` plus
+        router-only keys.
 
         ``expected_stop_order`` (GPS plan U7/R33) is the stop the client
         meant to reach — ``stops_completed + 1`` as it last saw it. When it
@@ -1088,8 +1104,20 @@ class RunDao:
         evaluation, no prompt auto-resolution — and the response is the
         current run with ``noop`` true. Without it (older clients) every tap
         is "arrive at next", the catch-up behaviour below.
+
+        ``target_stop_order`` (GPS plan U15/R29) is the arrival offer's
+        answer: the stop the trail says the bus is at, by order. Progress
+        moves to it in this one transaction; every stop passed on the way
+        (``stops_completed + 1 … target − 1``, and the stop just left behind
+        as on any Arrive) gets U2's bypassed-stop evaluation, each raising
+        its own prompt and office alert as today, and only the target is
+        stamped ``arrived_at`` — the ones between were passed, not reached.
+        A target of ``stops_completed + 1`` is exactly a plain Arrive; one at
+        or below ``stops_completed`` is a recorded no-op like a stale
+        expectation; one beyond the run's stops is refused. When both are
+        sent the target wins: the offer knows which stop it named.
         """
-        from app.core.errors import ConflictError, ForbiddenError
+        from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 
         driver_id = scope.user_id
         with get_connection(scope) as conn:
@@ -1101,15 +1129,27 @@ class RunDao:
                 raise ForbiddenError("Run is not owned by this driver")
             tap = self._open_tap(
                 conn, scope, envelope, action="arrive", run_id=str(run_id),
-                identity={"run_id": str(run_id), "expected_stop_order": expected_stop_order},
+                identity={
+                    "run_id": str(run_id), "expected_stop_order": expected_stop_order,
+                    "target_stop_order": target_stop_order,
+                },
             )
             if run["status"] == "completed":
                 raise ConflictError("Run is already completed")
             self._assert_service_day(conn, run)
-            if (
-                expected_stop_order is not None
-                and expected_stop_order != run["stops_completed"] + 1
-            ):
+            current_completed = int(run["stops_completed"])
+            if target_stop_order is not None:
+                if target_stop_order < 1 or target_stop_order > int(run["total_stops"]):
+                    raise BadRequestError("That stop is not on this run")
+                stale = target_stop_order <= current_completed
+                new_completed = target_stop_order
+            else:
+                stale = (
+                    expected_stop_order is not None
+                    and expected_stop_order != current_completed + 1
+                )
+                new_completed = min(current_completed + 1, int(run["total_stops"]))
+            if stale:
                 self._record_tap(conn, tap, run_id=str(run_id), bus_id=str(run["bus_id"]))
                 current = conn.execute(
                     "select * from live_runs where id = %s", (run_id,)
@@ -1120,7 +1160,6 @@ class RunDao:
                 }
                 self._seal_tap(conn, tap, body, run_id=str(run_id))
                 return {**body, "auto_resolved": []}
-            new_completed = min(run["stops_completed"] + 1, run["total_stops"])
             conn.execute(
                 "update live_runs set stops_completed = %s where id = %s", (new_completed, run_id)
             )
@@ -1130,13 +1169,16 @@ class RunDao:
             # office force-close needs evidence the bus actually reached the school
             # gate before it asserts a child arrived safely. Every row at this
             # stop_order is stamped: a shared stop carries one row per student.
+            # Only the stop reached: an offer that jumped past stops leaves
+            # theirs null — they were passed, not reached (U15).
             #
-            # Deliberately NOT idempotent. arrive_next_stop takes no stop
-            # identifier — every tap means "arrive at next" — so repeat tapping is
-            # the only way a driver catches progress up to a child's stop_order,
-            # and reaching it is a precondition for confirming their drop-off.
-            # Suppressing repeats would leave a driver who missed a tap unable to
-            # confirm, pushing them toward marking the child absent instead.
+            # Deliberately NOT idempotent. A plain arrive_next_stop takes no
+            # stop identifier — every tap means "arrive at next" — so repeat
+            # tapping is the only way a driver catches progress up to a child's
+            # stop_order, and reaching it is a precondition for confirming their
+            # drop-off. Suppressing repeats would leave a driver who missed a tap
+            # unable to confirm, pushing them toward marking the child absent
+            # instead.
             conn.execute(
                 "update run_stops set arrived_at = now() "
                 "where run_id = %s and stop_order = %s",
@@ -1187,6 +1229,10 @@ class RunDao:
             # Bypassed-stop check (GPS plan U2/R15). Progress moved to N, so the
             # stop the bus just left behind is N−1, and the closure gate's own
             # per-stop predicate decides whether anyone there is unrecorded.
+            # An Arrive to a named stop (U15) passes every stop between the
+            # old progress and the target too; each is evaluated the same way,
+            # in its own savepoint, so one stop's fault never costs another's
+            # prompt.
             #
             # The check, the exception upsert and the prompt event run in a
             # savepoint on this same connection (psycopg opens one because the
@@ -1196,20 +1242,28 @@ class RunDao:
             # — never a coordinate — flags the tap's trail row
             # `classification-failed` (U7), and is swallowed, so a prompt-side
             # bug can never block a driver's tap (R23, R40).
-            bypassed = None
-            passed_order = new_completed - 1
-            try:
-                with conn.transaction():
-                    bypassed = exception_dao.evaluate_bypassed_stop(
-                        conn, dict(run), passed_order
+            passed_orders = (
+                list(range(current_completed, new_completed))
+                if new_completed > current_completed
+                else [new_completed - 1]
+            )
+            evaluated: list[dict[str, Any]] = []
+            for passed_order in passed_orders:
+                try:
+                    with conn.transaction():
+                        bypassed = exception_dao.evaluate_bypassed_stop(
+                            conn, dict(run), passed_order
+                        )
+                except Exception:
+                    logger.exception(
+                        "stop-bypassed evaluation failed; the Arrive still commits "
+                        "(run=%s stop_order=%s)",
+                        run_id, passed_order,
                     )
-            except Exception:
-                logger.exception(
-                    "stop-bypassed evaluation failed; the Arrive still commits "
-                    "(run=%s stop_order=%s)",
-                    run_id, passed_order,
-                )
-                self._flag_classification_failed(conn, tap)
+                    self._flag_classification_failed(conn, tap)
+                    continue
+                if bypassed:
+                    evaluated.append(bypassed)
             # Prompt auto-resolution on Arrive (GPS plan U3/R17, R34): shown
             # remote-absent prompts close as unanswered, nothing else — its own
             # savepoint so a fault in one exception-side step never rolls back
@@ -1225,7 +1279,7 @@ class RunDao:
                 )
                 self._flag_classification_failed(conn, tap)
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
-            prompts = [bypassed["prompt"]] if bypassed and bypassed["prompt"] else []
+            prompts = [b["prompt"] for b in evaluated if b["prompt"]]
             body: dict[str, Any] = {
                 "run": public_run(updated), "arrival_incident": arrival_incident,
                 "prompts": prompts, "noop": False,
@@ -1238,14 +1292,13 @@ class RunDao:
             # For the router (U10 decides call-now from it); popped before the
             # response leaves.
             "auto_resolved": auto_resolved,
+            # For the router's office alerts only — the exceptions this tap
+            # inserted, in stop order; it pops this before the response leaves.
+            "bypassed_stops": [
+                {key: b[key] for key in ("exception_id", "stop_order", "stop_name", "students")}
+                for b in evaluated if b["raised"]
+            ],
         }
-        if bypassed and bypassed["raised"]:
-            # For the router's office alert only; it pops this before the
-            # response leaves.
-            result["bypassed_stop"] = {
-                key: bypassed[key]
-                for key in ("exception_id", "stop_order", "stop_name", "students")
-            }
         return result
 
     def end_run(

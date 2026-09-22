@@ -5,15 +5,20 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   aboutDistance,
+  arrivalOfferCopy,
   bypassedStopCopy,
   custodyCopy,
   remoteAbsentCopy,
 } from "@/features/driver/components/NudgeQueue";
 import {
+  ARRIVAL_OFFER_KIND,
+  ARRIVAL_OFFER_PRIORITY,
   NudgeStore,
   PROMPT_PRIORITY,
   RENDERABLE_KINDS,
   RESPONSE_GRACE_MS,
+  arrivalOfferEventId,
+  arrivalOfferPrompt,
   comparePrompts,
   isPromptConflict,
   priorityOf,
@@ -343,5 +348,139 @@ describe("remoteAbsentCopy", () => {
     expect(store.head()?.event_id).toBe("r1");
     store.settle("r1");
     expect(store.head()?.event_id).toBe("c1");
+  });
+});
+
+// --- the arrival offer (GPS plan U15: R29; F7) -------------------------------------
+//
+// Not a server prompt: `arrival_offer` on the context poll and on a ping
+// response, minted into the queue per (run, stop). Below every real prompt,
+// never reconciled against the prompt list, and its dismiss is remembered
+// only while the server keeps offering that very stop.
+
+describe("arrival offer", () => {
+  const KILIMANI = { stop_order: 1, stop_name: "Kilimani, Nairobi" };
+  const LAVINGTON = { stop_order: 2, stop_name: "Lavington, Nairobi" };
+
+  it("ranks below every server prompt, has one answer, and is never admitted from a prompt list", () => {
+    expect(ARRIVAL_OFFER_KIND).toBe("arrival-offer");
+    expect(priorityOf(ARRIVAL_OFFER_KIND)).toBe(ARRIVAL_OFFER_PRIORITY);
+    expect(ARRIVAL_OFFER_PRIORITY).toBeGreaterThan(priorityOf("custody-away"));
+    expect(ARRIVAL_OFFER_PRIORITY).toBeGreaterThan(priorityOf("never-heard-of"));
+    // The server table is untouched (it mirrors exception_dao.PROMPT_PRIORITY).
+    expect(PROMPT_PRIORITY).not.toHaveProperty(ARRIVAL_OFFER_KIND);
+    expect(RENDERABLE_KINDS.has(ARRIVAL_OFFER_KIND)).toBe(false);
+    const minted = arrivalOfferPrompt("run-1", KILIMANI);
+    expect(minted).toEqual({
+      event_id: "arrival-offer:run-1:1",
+      exception_id: "",
+      kind: "arrival-offer",
+      stop_order: 1,
+      stop_name: "Kilimani, Nairobi",
+      student_id: null,
+      students: [],
+      answers: ["arrive"],
+      distance_m: null,
+      created_at: null,
+      delivered_at: null,
+      shown_at: null,
+    });
+    expect(arrivalOfferEventId("run-1", 4)).toBe("arrival-offer:run-1:4");
+    // A prompt list never carries it; if one did, it would be ignored.
+    const store = new NudgeStore();
+    store.ingest([prompt({ event_id: "arrival-offer:run-1:1", kind: ARRIVAL_OFFER_KIND })], "context");
+    expect(store.size()).toBe(0);
+  });
+
+  it("shows the offered stop, survives context polls that list no prompts, and yields to a real prompt", () => {
+    const store = new NudgeStore();
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()).toMatchObject({ kind: ARRIVAL_OFFER_KIND, stop_order: 1, stop_name: "Kilimani, Nairobi" });
+    // The poll's prompt list does not list it: it stays (the offer is set
+    // whole by the same poll, not reconciled away by it).
+    store.ingest([], "context", Date.now() + RESPONSE_GRACE_MS * 2);
+    expect(store.head()?.kind).toBe(ARRIVAL_OFFER_KIND);
+    // A bypassed-stop prompt from a ping response outranks it at once.
+    store.ingest([prompt({ event_id: "b" })], "response");
+    expect(store.head()?.event_id).toBe("b");
+    expect(store.all().map((p) => p.kind)).toEqual(["stop-bypassed", ARRIVAL_OFFER_KIND]);
+    store.settle("b");
+    expect(store.head()?.kind).toBe(ARRIVAL_OFFER_KIND);
+  });
+
+  it("replaces the card when another stop is offered, removes it when none is, and keeps the reference when unchanged", () => {
+    const store = new NudgeStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.setArrivalOffer(KILIMANI, "run-1");
+    const first = store.head();
+    expect(listener).toHaveBeenCalledTimes(1);
+    store.setArrivalOffer({ ...KILIMANI }, "run-1");
+    expect(store.head()).toBe(first);
+    expect(listener).toHaveBeenCalledTimes(1);
+    store.setArrivalOffer(LAVINGTON, "run-1");
+    expect(store.head()?.stop_order).toBe(2);
+    expect(store.size()).toBe(1);
+    store.setArrivalOffer(null, "run-1");
+    expect(store.head()).toBeNull();
+    store.setArrivalOffer(undefined, "run-1");
+    expect(store.size()).toBe(0);
+  });
+
+  it("keeps a dismissed stop hidden while the server keeps offering it, and forgets the dismiss once the offer changes", () => {
+    const store = new NudgeStore();
+    store.setArrivalOffer(KILIMANI, "run-1");
+    const id = store.head()!.event_id;
+    store.hideArrivalOffer(id);
+    expect(store.head()).toBeNull();
+    // The next poll still offers Kilimani: still hidden.
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()).toBeNull();
+    // The bus leaves: no offer. Back again later: the card shows again.
+    store.setArrivalOffer(null, "run-1");
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()?.event_id).toBe(id);
+    // Dismissed again, then another stop is offered: that one shows, and
+    // Kilimani offered after it shows too (the dismiss went with the change).
+    store.hideArrivalOffer(id);
+    store.setArrivalOffer(LAVINGTON, "run-1");
+    expect(store.head()?.stop_order).toBe(2);
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()?.stop_order).toBe(1);
+    // Hiding is not settling: no tombstone.
+    store.hideArrivalOffer(id);
+    store.setArrivalOffer(null, "run-1");
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()?.event_id).toBe(id);
+  });
+
+  it("clears with the run and forgets its dismisses", () => {
+    const store = new NudgeStore();
+    store.setArrivalOffer(KILIMANI, "run-1");
+    store.hideArrivalOffer(store.all()[0]!.event_id);
+    store.clear();
+    expect(store.head()).toBeNull();
+    // The same run again (or a new one): the offer shows.
+    store.setArrivalOffer(KILIMANI, "run-1");
+    expect(store.head()?.kind).toBe(ARRIVAL_OFFER_KIND);
+    store.clear();
+    expect(store.head()).toBeNull();
+  });
+});
+
+describe("arrivalOfferCopy", () => {
+  it("asks 'Arrive at <stop>?' by name, says why, and offers one button", () => {
+    const named = arrivalOfferCopy(arrivalOfferPrompt("run-1", { stop_order: 1, stop_name: "Kilimani, Nairobi" }));
+    expect(named).toEqual({
+      title: "Arrive at Kilimani, Nairobi?",
+      body: "Your phone puts the bus at stop 1 and no arrival is recorded yet.",
+      arriveLabel: "Arrive",
+    });
+    const unnamed = arrivalOfferCopy(arrivalOfferPrompt("run-1", { stop_order: 3, stop_name: null }));
+    expect(unnamed.title).toBe("Arrive at stop 3?");
+  });
+
+  it("is silent: the cue policy has nothing for it", () => {
+    expect(cuePolicy(ARRIVAL_OFFER_KIND)).toEqual({ tone: false, vibrate: false });
   });
 });

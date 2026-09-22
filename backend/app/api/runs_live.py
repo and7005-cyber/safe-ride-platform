@@ -11,7 +11,7 @@ from app.core.config import GPS_PING_MAX_BATCH
 from app.core.errors import ActionReplayed, ClosureRefusedError
 from app.core.permissions import require_driver_scope, require_school, require_staff
 from app.core.scope import STAFF_ROLES, SchoolScope
-from app.dao.exception_dao import ExceptionDao
+from app.dao.exception_dao import ExceptionDao, bypassed_stop_alert_detail
 from app.dao.idempotency_dao import ActionEnvelope, parse_key
 from app.dao.incident_dao import IncidentDao
 from app.dao.position_dao import PositionDao
@@ -85,6 +85,12 @@ class ArrivePayload(RunIdPayload):
     # saw it (GPS plan U7/R33). A tap whose expectation has passed is a
     # recorded no-op; absent (older clients), every tap is "arrive at next".
     expected_stop_order: int | None = None
+    # The arrival offer's answer (GPS plan U15/R29): the stop the trail put the
+    # bus at, by order. Progress moves straight to it, every stop passed on the
+    # way is evaluated for a bypass, and only this one is stamped reached. Sent
+    # by the offer card alone; the Run page keeps sending the expectation. When
+    # both arrive, the target wins.
+    target_stop_order: int | None = None
 
 
 class BoardingPayload(EnvelopeFields):
@@ -278,11 +284,14 @@ def driver_context(
 ):
     """The driver's bus, routes, active run, roster, blocking set and — GPS
     plan U3/R34 — `pending_prompts`: the open run's pending prompts, safety
-    kinds first, each with its event id, copy inputs and allowed answers.
-    Polled every 5 s, so a reload or a second device re-shows them. Each poll
-    also drains the school's call-now outbox (GPS plan U10/R18): a notice
-    decided but not yet sent — a fan-out lost between commit and send — goes
-    out on the next poll, once."""
+    kinds first, each with its event id, copy inputs and allowed answers;
+    and — GPS plan U15/R29 — `arrival_offer`: the not-yet-arrived stop the
+    trail puts the bus at (`{stop_order, stop_name}` or null), derived on
+    every read so a reload sees it. Polled every 5 s, so a reload or a
+    second device re-shows them. Each poll also drains the school's
+    call-now outbox (GPS plan U10/R18): a notice decided but not yet sent —
+    a fan-out lost between commit and send — goes out on the next poll,
+    once."""
     context = safe_call(lambda: dao.get_driver_context(scope))
     background_tasks.add_task(_send_due_call_now, scope)
     return context
@@ -353,13 +362,18 @@ def arrive(
     scope: SchoolScope = Depends(require_driver_scope),
     idempotency_key: str | None = IdempotencyKeyHeader,
 ):
-    """Arrive at the next stop. Response ``{run, arrival_incident, prompts,
-    noop}``. With ``expected_stop_order`` behind the run's progress the tap is
-    a recorded no-op (GPS plan U7/R33): ``noop`` true, the current run, no
-    incident, no prompts, and nothing dispatched from here."""
+    """Arrive at the next stop, or at the stop the arrival offer named.
+    Response ``{run, arrival_incident, prompts, noop}``. With
+    ``expected_stop_order`` behind the run's progress — or
+    ``target_stop_order`` at or below it — the tap is a recorded no-op (GPS
+    plan U7/R33): ``noop`` true, the current run, no incident, no prompts,
+    and nothing dispatched from here. A ``target_stop_order`` past the next
+    stop (GPS plan U15/R29) evaluates every stop passed on the way; each
+    newly raised bypassed-stop exception reaches the office as below."""
     result, replayed = _tap(
         lambda: dao.arrive_next_stop(
             scope, payload.run_id, expected_stop_order=payload.expected_stop_order,
+            target_stop_order=payload.target_stop_order,
             envelope=_envelope(idempotency_key, payload),
         )
     )
@@ -386,16 +400,16 @@ def arrive(
     # lifecycle feed (GPS plan U2/R15, R21): post-commit, DAO-direct, never the
     # parent fan-out, and marked lifecycle so the parent alerts reader excludes
     # it. Raised only when the exception row itself was inserted, which is the
-    # dedup on (run, stop order): a catch-up Arrive or a reopen finds the row
-    # already there and stays quiet. The text names the stop and the children,
-    # never a coordinate.
-    bypassed = result.pop("bypassed_stop", None)
-    if bypassed:
-        names = ", ".join(s["name"] for s in bypassed["students"])
+    # dedup on (run, stop order): a catch-up Arrive, a reopen, or a stop the
+    # ping path already raised (GPS plan U15) finds the row there and stays
+    # quiet. One alert per stop an offer-answered Arrive passed. The text
+    # names the stop and the children, never a coordinate.
+    for bypassed in result.pop("bypassed_stops", None) or []:
         background_tasks.add_task(
             _record_lifecycle_alert, scope, str(result["run"]["id"]), "stop-bypassed",
-            f"Stop {bypassed['stop_order']} ({bypassed['stop_name']}): "
-            f"no record yet for {names}.",
+            bypassed_stop_alert_detail(
+                bypassed["stop_order"], bypassed["stop_name"], bypassed["students"]
+            ),
         )
     return result
 
@@ -515,18 +529,24 @@ def record_handover(
 @router.post("/driver/pings")
 def record_pings(payload: PingsPayload, scope: SchoolScope = Depends(require_driver_scope)):
     """A batch of interval position fixes for the driver's own in-progress
-    run (GPS plan U14: R24, R26, R27, R28; F6) — the trail insert and the
-    forward-only served position, and nothing else: no ``BackgroundTasks``
-    parameter on purpose, so no push, no outbox drain, no purge can ride a
-    ping (a ping never notifies a parent, R24).
+    run (GPS plan U14: R24, R26, R27, R28; F6) — the trail insert, the
+    forward-only served position and the trail-driven nudges (GPS plan
+    U15: R29, R30), and nothing else: no ``BackgroundTasks`` parameter on
+    purpose, so no push, no outbox drain, no purge can ride a ping (a ping
+    never notifies a parent, R24). The one office alert a batch can raise —
+    a stop left with children unrecorded — is written inside the DAO's
+    transaction beside its exception row, not dispatched from here.
 
     Refusals are structured: 404 another school's run, 403 not this
     driver's, 409 ``run-not-active`` (AE15), 409 ``session-mismatch`` (the
     run is flagged once for the office; the next tapped action re-binds
     it), 429 ``ping-too-soon`` with ``retry_after_s`` and Retry-After, 422 a
     batch over ``GPS_PING_MAX_BATCH`` or empty. Response ``{accepted,
-    dropped: {invalid, outside_window, duplicate}, flagged, served_at}``.
-    The API stage throttles this route on its own (template).
+    dropped: {invalid, outside_window, duplicate}, flagged, served_at,
+    prompts, arrival_offer}`` — ``prompts`` in the action-response shape
+    (the card shows on this response; the context poll re-delivers it),
+    ``arrival_offer`` ``{stop_order, stop_name}`` or null. The API stage
+    throttles this route on its own (template).
     """
     return safe_call(
         lambda: position_dao.record_pings(

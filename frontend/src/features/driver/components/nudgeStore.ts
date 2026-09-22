@@ -20,7 +20,12 @@
 //   it, and the server's 409 conflicts settle it the same way (R23: both
 //   "already answered" and "resolved" mean remove the card and refresh);
 // - only kinds this client can render enter the queue (the bypassed stop, the
-//   custody confirm and the remote-absent attestation).
+//   custody confirm and the remote-absent attestation);
+// - the arrival offer (GPS plan U15/R29) is the one client-side kind: not a
+//   server prompt but a derived fact — `arrival_offer` on the context poll and
+//   on every ping response — so it is set whole, never reconciled against the
+//   prompt list, ranks below every real prompt, and its dismiss is remembered
+//   here, per stop, only until the server stops offering that stop.
 
 import { useSyncExternalStore } from "react";
 import { ApiError } from "@/lib/apiClient";
@@ -70,7 +75,47 @@ export const RESPONSE_GRACE_MS = 12_000;
 
 export const PROMPT_CONFLICT_CODES = new Set(["prompt-already-answered", "prompt-resolved"]);
 
+/** The arrival offer (GPS plan U15/R29): `arrival_offer` on the driver
+ * context and on a ping response — the not-yet-arrived stop the trail puts
+ * the bus at. Not an exception, not an event: the answer is an Arrive to
+ * that stop. */
+export interface ArrivalOffer {
+  stop_order: number;
+  stop_name: string | null;
+}
+
+/** The client-side kind the offer takes in the queue. Never sent by the
+ * server as a prompt; the store mints it from `arrival_offer`. */
+export const ARRIVAL_OFFER_KIND = "arrival-offer";
+/** Below every server prompt, including kinds this client does not know. */
+export const ARRIVAL_OFFER_PRIORITY = 3;
+/** The offer's one answer, for the card. */
+export const ARRIVAL_OFFER_ANSWER = "arrive";
+
+export function arrivalOfferEventId(runId: string, stopOrder: number): string {
+  return `${ARRIVAL_OFFER_KIND}:${runId}:${stopOrder}`;
+}
+
+/** The offer in the queue's own shape, keyed per (run, stop). */
+export function arrivalOfferPrompt(runId: string, offer: ArrivalOffer): NudgePrompt {
+  return {
+    event_id: arrivalOfferEventId(runId, offer.stop_order),
+    exception_id: "",
+    kind: ARRIVAL_OFFER_KIND,
+    stop_order: offer.stop_order,
+    stop_name: offer.stop_name ?? null,
+    student_id: null,
+    students: [],
+    answers: [ARRIVAL_OFFER_ANSWER],
+    distance_m: null,
+    created_at: null,
+    delivered_at: null,
+    shown_at: null,
+  };
+}
+
 export function priorityOf(kind: string): number {
+  if (kind === ARRIVAL_OFFER_KIND) return ARRIVAL_OFFER_PRIORITY;
   return PROMPT_PRIORITY[kind] ?? 2;
 }
 
@@ -109,6 +154,10 @@ export class NudgeStore {
   private entries = new Map<string, Entry>();
   private settled = new Set<string>();
   private shown = new Set<string>();
+  /** The current offer's id, and the offer ids hidden by a local dismiss or
+   * an answered Arrive — kept only while the server keeps offering them. */
+  private offerId: string | null = null;
+  private hiddenOffers = new Set<string>();
   private listeners = new Set<() => void>();
   private headSnapshot: NudgePrompt | null = null;
 
@@ -116,7 +165,8 @@ export class NudgeStore {
 
   /** Merge a delivery. `context` deliveries also reconcile: entries the poll
    * no longer lists are removed, unless they are response-fed and younger
-   * than the grace period. */
+   * than the grace period. The arrival offer is not a listed prompt and is
+   * never reconciled here — `setArrivalOffer` owns it. */
   ingest(prompts: NudgePrompt[] | null | undefined, source: PromptSource, now = Date.now()): void {
     const listed = new Set<string>();
     for (const prompt of prompts ?? []) {
@@ -138,11 +188,45 @@ export class NudgeStore {
     if (source === "context") {
       for (const [id, entry] of this.entries) {
         if (listed.has(id)) continue;
+        if (entry.prompt.kind === ARRIVAL_OFFER_KIND) continue;
         if (entry.source === "response" && now - entry.addedAt < RESPONSE_GRACE_MS) continue;
         this.entries.delete(id);
       }
     }
     this.recompute();
+  }
+
+  /** The server's current word on the arrival offer (GPS plan U15/R29),
+   * from the context poll or a ping response: the offered stop, or none.
+   * Set whole: an offer for another stop replaces the card; none removes
+   * it. A stop hidden by `hideArrivalOffer` stays hidden while the server
+   * keeps offering exactly that stop, and is forgotten the moment the offer
+   * changes — so the same stop offered again later (the bus came back)
+   * shows again. */
+  setArrivalOffer(offer: ArrivalOffer | null | undefined, runId: string | null, now = Date.now()): void {
+    const id = offer && runId != null ? arrivalOfferEventId(runId, offer.stop_order) : null;
+    for (const hidden of this.hiddenOffers) {
+      if (hidden !== id) this.hiddenOffers.delete(hidden);
+    }
+    if (this.offerId && this.offerId !== id) this.entries.delete(this.offerId);
+    this.offerId = id;
+    if (id && offer && !this.hiddenOffers.has(id)) {
+      const prompt = arrivalOfferPrompt(runId!, offer);
+      const existing = this.entries.get(id);
+      if (existing) {
+        if (!samePrompt(existing.prompt, prompt)) existing.prompt = prompt;
+      } else {
+        this.entries.set(id, { prompt, source: "context", addedAt: now });
+      }
+    }
+    this.recompute();
+  }
+
+  /** The offer's card was dismissed, or its Arrive was posted: hide it
+   * until the server's offer changes. Not a tombstone. */
+  hideArrivalOffer(eventId: string): void {
+    this.hiddenOffers.add(eventId);
+    if (this.entries.delete(eventId)) this.recompute();
   }
 
   /** Answered, dismissed, or conflicted on the server: gone for good. */
@@ -159,8 +243,11 @@ export class NudgeStore {
     return true;
   }
 
-  /** No open run: nothing to ask. Tombstones and shown ids are kept. */
+  /** No open run: nothing to ask, and no offer to remember. Tombstones and
+   * shown ids are kept. */
   clear(): void {
+    this.offerId = null;
+    this.hiddenOffers.clear();
     if (this.entries.size === 0) return;
     this.entries.clear();
     this.recompute();

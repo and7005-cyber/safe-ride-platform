@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
 import {
   ADMIN,
   API_URL,
@@ -13,11 +13,13 @@ import {
   signInAs,
   signInAsDriver,
   sqlAgeBusPosition,
+  sqlAgeTrail,
   sqlClearBusPosition,
 } from "./helpers";
 
 // Phase 2 interval pings, the wake lock and prominent staleness (GPS plan
-// U14: R24, R25, R27, R28; F6; AE13). The driver drives the app in the
+// U14: R24, R25, R27, R28; F6; AE13), and the trail-driven nudges (GPS plan
+// U15: R29, R30; F7; AE14) at the bottom. The driver drives the app in the
 // browser with an emulated phone; the pings it posts are read off the
 // requests and their effect off the staff API and the fleet map.
 //
@@ -318,4 +320,219 @@ test("R28: a second sign-in that taps takes the run's pings with it; this app's 
   await context.setGeolocation({ latitude: -1.2961, longitude: 36.8219, accuracy: 20 });
   await expect.poll(() => pings.length, { timeout: 20_000 }).toBeGreaterThan(refusedAt);
   expect(pings[pings.length - 1]).toEqual({ status: 200, code: null });
+});
+
+// --- the trail-driven nudges (GPS plan U15: R29, R30; F7; AE14) ---------------------
+//
+// Same seeded route: stop 1 Kilimani (Faith), stop 2 Lavington (Happiness),
+// stop 3 Karen (Kevin), stop 4 the gate. The emulated phone is driven into
+// Kilimani's vicinity, the offer is answered, and the bus pulls away without
+// boarding Faith. Every move is one ping batch (the spec waits for each
+// batch before the next move), and the trail is aged before each move so
+// the plausibility safeguard reads a bus's pace, not a teleport — as
+// driver-gps.spec does before its long moves.
+
+const KILIMANI = { latitude: -1.2902, longitude: 36.7823, accuracy: 20 };
+
+/** `north` and `east` metres off a point (one degree is ~111.2 km), with
+ * the phone's own accuracy — never on the pin (a fix on it is flagged). */
+function offsetOf(
+  point: typeof KILIMANI, north: number, east = 0, accuracy = point.accuracy,
+): typeof KILIMANI {
+  return {
+    latitude: point.latitude + north / 111_195,
+    longitude: point.longitude + east / 111_195,
+    accuracy,
+  };
+}
+
+/** Records every position the live watch delivered, so a move can be
+ * waited for before the next one. */
+const FIX_LOG = `
+  window.__fixes = [];
+  const geo = navigator.geolocation;
+  const watch = geo.watchPosition.bind(geo);
+  geo.watchPosition = (ok, err, opts) => watch((pos) => {
+    window.__fixes.push({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    ok(pos);
+  }, err, opts);
+`;
+
+async function moveTo(page: Page, context: BrowserContext, point: typeof KILIMANI) {
+  await context.setGeolocation(point);
+  await expect
+    .poll(
+      async () => {
+        const fixes: { lat: number; lng: number }[] = await page.evaluate(
+          () => (window as any).__fixes ?? [],
+        );
+        const last = fixes[fixes.length - 1];
+        return last != null
+          && Math.abs(last.lat - point.latitude) < 1e-6
+          && Math.abs(last.lng - point.longitude) < 1e-6;
+      },
+      { timeout: 10_000, message: "the emulated move should reach the live watch" },
+    )
+    .toBe(true);
+}
+
+async function adminExceptions(request: APIRequestContext, runId: string) {
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const response = await request.get(`${API_URL}/api/runs/${runId}/exceptions`, {
+    headers: schoolHeaders(token, SCHOOL_A_ID),
+  });
+  expect(response.ok()).toBeTruthy();
+  return response.json();
+}
+
+async function officeBypassedAlerts(request: APIRequestContext, runId: string) {
+  const token = await apiToken(request, ADMIN.email, ADMIN.password);
+  const response = await request.get(`${API_URL}/api/incidents`, {
+    headers: schoolHeaders(token, SCHOOL_A_ID),
+  });
+  expect(response.ok()).toBeTruthy();
+  return (await response.json()).filter((i: any) => i.run_id === runId && i.type === "stop-bypassed");
+}
+
+interface PingExchange {
+  status: number;
+  body: any;
+}
+
+test("R29/R30 (AE14): driving into Kilimani offers Arrive by name; answering it advances the run; pulling away without boarding Faith raises the bypassed-stop card from the ping response, before any Arrive at stop 2; the card resolves as usual", async ({ page, context, request }) => {
+  await page.addInitScript(FIX_LOG);
+  const pings: PingExchange[] = [];
+  page.on("response", async (response) => {
+    if (response.url().endsWith(PINGS) && response.request().method() === "POST") {
+      let body: any = null;
+      try {
+        body = await response.json();
+      } catch {
+        // A refused batch may carry no JSON.
+      }
+      pings.push({ status: response.status(), body });
+    }
+  });
+
+  /** Age the trail, move the phone, wait for the batch that carries the move. */
+  const moveAndPing = async (runId: string, point: typeof KILIMANI): Promise<PingExchange> => {
+    const before = pings.length;
+    sqlAgeTrail(runId, 60);
+    await moveTo(page, context, point);
+    await expect.poll(() => pings.length, { timeout: 25_000 }).toBeGreaterThan(before);
+    const last = pings[pings.length - 1]!;
+    expect(last.status).toBe(200);
+    expect(last.body.flagged).toBe(0);
+    return last;
+  };
+
+  // The run starts 250 m short of Kilimani's pin: outside, no offer.
+  await context.setGeolocation(offsetOf(KILIMANI, 250));
+  await signInAsDriver(page);
+  await startMorningRun(page);
+  const ctx = await driverContext(request);
+  const runId: string = ctx.active_run.id;
+  const faith = ctx.students.find((s: any) => s.name === SEED.parentChild);
+  expect(faith).toBeTruthy();
+  await expect.poll(() => pings.length, { timeout: 20_000 }).toBeGreaterThanOrEqual(1);
+  expect(pings[0]!.status).toBe(200);
+  expect(pings[0]!.body.arrival_offer).toBeNull();
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+
+  // One fix inside the vicinity is not an entry (R31's hysteresis).
+  const one = await moveAndPing(runId, offsetOf(KILIMANI, 30));
+  expect(one.body.arrival_offer).toBeNull();
+  expect(one.body.prompts).toEqual([]);
+  await page.waitForTimeout(1_000);
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+
+  // The second completes it: the offer names Kilimani on this response, and
+  // the card is up at once — silent, one button.
+  const two = await moveAndPing(runId, offsetOf(KILIMANI, 22, 40));
+  expect(two.body.arrival_offer).toEqual({ stop_order: 1, stop_name: expect.stringMatching(SEED.parentChildStop) });
+  const card = page.getByTestId("nudge-card");
+  await expect(card).toBeVisible();
+  await expect(card).toHaveAttribute("data-kind", "arrival-offer");
+  await expect(card).toHaveAttribute("data-stop-order", "1");
+  await expect(card).toContainText(/^Arrive at Kilimani/);
+  expect((await driverContext(request)).arrival_offer).toEqual(two.body.arrival_offer);
+
+  // Answering it: an Arrive to that stop. The run reads 1/4, only stop 1 is
+  // stamped reached, the card goes and the context offers nothing.
+  await page.getByTestId("nudge-arrive").click();
+  await expect(page.getByText(/^1\/\d+ stops completed$/)).toBeVisible();
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+  const afterArrive = await driverContext(request);
+  expect(afterArrive.active_run.stops_completed).toBe(1);
+  expect(afterArrive.run_stops.filter((s: any) => s.arrived_at != null).map((s: any) => s.stop_order)).toEqual([1]);
+  expect(afterArrive.arrival_offer).toBeNull();
+  expect(afterArrive.pending_prompts).toEqual([]);
+
+  // Pulling away without boarding Faith. The first exterior ping raises
+  // nothing ...
+  const out = await moveAndPing(runId, offsetOf(KILIMANI, 220));
+  expect(out.body.prompts).toEqual([]);
+  expect(out.body.arrival_offer).toBeNull();
+  expect((await adminExceptions(request, runId)).filter((x: any) => x.kind === "stop-bypassed")).toHaveLength(0);
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+
+  // ... the second completes the departure: the bypassed-stop prompt is on
+  // this response, the card is up from it (AE14), and the exception and the
+  // office alert exist before any Arrive at stop 2.
+  const gone = await moveAndPing(runId, offsetOf(KILIMANI, 262, -30));
+  expect(gone.body.prompts).toHaveLength(1);
+  const prompt = gone.body.prompts[0];
+  expect(prompt.kind).toBe("stop-bypassed");
+  expect(prompt.stop_order).toBe(1);
+  expect(prompt.students.map((s: any) => s.id)).toEqual([faith.id]);
+  await expect(card).toBeVisible();
+  await expect(card).toHaveAttribute("data-kind", "stop-bypassed");
+  await expect(card).toHaveAttribute("data-event-id", prompt.event_id);
+  await expect(card).toContainText(SEED.parentChild);
+  await expect(card).toContainText("has no record. Mark boarded or absent?");
+
+  const raised = (await adminExceptions(request, runId)).filter((x: any) => x.kind === "stop-bypassed");
+  expect(raised).toHaveLength(1);
+  expect(raised[0].stop_order).toBe(1);
+  expect(raised[0].status).toBe("open");
+  expect(raised[0].events.map((e: any) => e.prompt_state)).toEqual(["pending"]);
+  const alerts = await officeBypassedAlerts(request, runId);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0].description).toContain(SEED.parentChild);
+  expect(alerts[0].description).toContain("no record yet");
+
+  // The normal resolution through the card: Faith boarded, the exception
+  // resolved on read, the tap exempt from the custody check (it came 260 m
+  // from the stop). The card leaves through the poll; it was fed by the
+  // ping response seconds ago, so the store's response grace (12 s) may
+  // hold it until a poll past the grace says it is gone.
+  await page.getByTestId(`nudge-outcome-${faith.id}`).click();
+  await expect
+    .poll(
+      async () =>
+        (await adminExceptions(request, runId)).find((x: any) => x.kind === "stop-bypassed")?.status,
+      { timeout: 15_000 },
+    )
+    .toBe("resolved");
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0, { timeout: 25_000 });
+  const resolved = await adminExceptions(request, runId);
+  const bypassed = resolved.filter((x: any) => x.kind === "stop-bypassed");
+  expect(bypassed).toHaveLength(1);
+  expect(bypassed[0].status).toBe("resolved");
+  expect(bypassed[0].events.map((e: any) => [e.prompt_state, e.response])).toEqual([
+    ["answered", "resolution"],
+    [null, "resolution"],
+  ]);
+  expect(resolved.filter((x: any) => x.kind === "custody-away")).toHaveLength(0);
+
+  // The Arrive at stop 2 finds the row and raises nothing new: one row, one
+  // alert, no card. The watch's cached fix is older than 15 s by now, so
+  // the tap asks for a fresh one and may wait the fix-wait budget (5 s)
+  // before it posts (R2).
+  await page.getByRole("button", { name: "Arrive Next Stop" }).click();
+  await expect(page.getByText(/^2\/\d+ stops completed$/)).toBeVisible({ timeout: 15_000 });
+  await page.waitForTimeout(1_500);
+  await expect(page.getByTestId("nudge-card")).toHaveCount(0);
+  expect((await adminExceptions(request, runId)).filter((x: any) => x.kind === "stop-bypassed")).toHaveLength(1);
+  expect(await officeBypassedAlerts(request, runId)).toHaveLength(1);
 });

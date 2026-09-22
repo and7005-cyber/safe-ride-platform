@@ -1,5 +1,6 @@
 """Position rules: fix validation (GPS plan U7), the custody geometry (U9),
-the absent classification (U10) and the plausibility safeguard (U12).
+the absent classification (U10), the plausibility safeguard (U12) and the
+vicinity state machine behind the Phase 2 nudges (U15).
 
 Pure: no I/O and no clock of its own — ``normalise_fix`` takes ``now``,
 ``plausibility_flags`` takes the previous fix and the planned stops — so the
@@ -36,12 +37,19 @@ would report? Its flags are stored on the trail row and make every check
 custody or vicinity check, corroborates nothing and is never "bus seen at
 stop" — while the office gets one ``implausible-movement`` exception per run
 listing the flagged fixes. Flags never block the tap.
+
+The vicinity state machine (``vicinity_state``, R29, R30) replays a run's
+plain pings against one stop with two radii and two-fix hysteresis: two
+consecutive pings inside the enter radius enter, two beyond the exit radius
+leave, anything between the radii changes nothing. The DAO derives it from
+the trail on every accepted ping batch and every driver-context read; nothing
+about it is stored.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -432,13 +440,92 @@ def within_vicinity(
 ) -> bool:
     """Did this fix place the phone at the stop? The same geometry as the
     custody check — cap first, then ``distance − accuracy`` inside the
-    vicinity radius — so "bus seen at stop" (R13) and, later, U15's arrival
-    nudge read one rule. A coarse fix on the stop vouches for nothing; a stop
+    vicinity radius — so "bus seen at stop" (R13) and U15's arrival nudge
+    read one rule. A coarse fix on the stop vouches for nothing; a stop
     without coordinates is never seen."""
     point = _usable_point(stop)
     if fix is None or point is None or fix.accuracy_m > accuracy_cap_m:
         return False
     return haversine_m((fix.lat, fix.lng), point) - fix.accuracy_m <= vicinity_m
+
+
+# --- the vicinity state machine (U15: R29, R30, R31; F7) ------------------------
+
+VICINITY_OUTSIDE = "outside"   # never entered inside the window
+VICINITY_INSIDE = "inside"     # entered, not left since
+VICINITY_LEFT = "left"         # entered, then left
+
+# The exit radius is the enter radius (the school's `vicinity_radius_m`, U11)
+# times this: 100 m to enter, 150 m to leave by default (the plan's "check
+# ordering and geometry"). One knob, so a school that widens its vicinity
+# widens the hysteresis band with it.
+VICINITY_EXIT_FACTOR = 1.5
+
+
+def exit_radius_m(enter_m: float) -> float:
+    return float(enter_m) * VICINITY_EXIT_FACTOR
+
+
+@dataclass(frozen=True)
+class VicinityState:
+    """Where the trail puts the bus relative to one stop. ``completed_by``
+    is the pair of indexes (into the pings given) that produced the current
+    state — the two pings that entered, or the two that left — and None
+    while the bus has never entered. Once ``left``, later exterior pings do
+    not move the pair: the departure belongs to the batch that completed
+    it, and only that batch raises (R30)."""
+
+    state: str
+    completed_by: tuple[int, int] | None
+
+
+def vicinity_state(
+    pings: Sequence[StoredFix],
+    stop: tuple[Any, Any] | None,
+    *,
+    enter_m: float,
+    exit_m: float,
+    accuracy_cap_m: float,
+) -> VicinityState:
+    """Replay the run's plain pings, in capture order, against one stop
+    (R29, R30; AE14). Two-fix hysteresis with two radii:
+
+    - ``inside`` after two *consecutive* plain pings with ``distance −
+      accuracy ≤ enter_m``; a single fix inside does not enter;
+    - ``left`` after, while inside, two consecutive plain pings with
+      ``distance − accuracy > exit_m``; one exterior ping is not a departure;
+    - a fix between the radii — or one exterior fix followed by one back
+      inside the exit radius — changes nothing, so a bus parked on the
+      boundary does not flap;
+    - a coarse ping (accuracy above the cap) is skipped: it neither counts
+      toward a pair nor breaks one. The caller keeps flagged pings out
+      before this sees them (U12's rule: a flagged fix moves nothing);
+    - from ``left``, two inside pings re-enter and a later exit reports its
+      own pair; exterior pings after an exit never make a second departure;
+    - a stop without usable coordinates is never entered.
+
+    The pair reported is the one that produced the current state; while
+    the state holds, later pings do not move it.
+    """
+    point = _usable_point(stop)
+    if point is None:
+        return VicinityState(state=VICINITY_OUTSIDE, completed_by=None)
+    state = VICINITY_OUTSIDE
+    completed_by: tuple[int, int] | None = None
+    # (index, inside-enter, beyond-exit) of the previous plain ping.
+    previous: tuple[int, bool, bool] | None = None
+    for index, ping in enumerate(pings):
+        if ping.accuracy_m > accuracy_cap_m:
+            continue
+        net = haversine_m((ping.lat, ping.lng), point) - ping.accuracy_m
+        inside, beyond = net <= enter_m, net > exit_m
+        if previous is not None:
+            if state != VICINITY_INSIDE and inside and previous[1]:
+                state, completed_by = VICINITY_INSIDE, (previous[0], index)
+            elif state == VICINITY_INSIDE and beyond and previous[2]:
+                state, completed_by = VICINITY_LEFT, (previous[0], index)
+        previous = (index, inside, beyond)
+    return VicinityState(state=state, completed_by=completed_by)
 
 
 # --- the absent classification (U10: R16, R17, R20) -----------------------------

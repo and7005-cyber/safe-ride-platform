@@ -306,6 +306,68 @@ def planned_stops(conn, run_id: str) -> list[tuple[float, float]]:
     return [(row["lat"], row["lng"]) for row in rows]
 
 
+# The vicinity window (U15): the newest this many plain pings of the run, by
+# capture time, replayed in capture order against every stop. A count, not a
+# clock: a phone locked for twenty minutes after leaving a stop still has its
+# entry in the window when the next batch lands, so that batch completes the
+# departure (the plan's "screen locked right after leaving" case). Thirty
+# pings is five minutes at the default interval — long enough to hold an
+# approach, a stop and a departure, small enough to replay on every batch and
+# every context poll.
+VICINITY_WINDOW_PINGS = 30
+
+
+def vicinity_stops(conn, run_id: str) -> list[dict[str, Any]]:
+    """The run's stops with usable coordinates, one per stop order (a shared
+    stop has one row per child; the gate row wins a tie, then the name, as
+    every stop-name read here orders it), ascending — the stops U15 replays
+    the trail against. ``{stop_order, name, lat, lng, is_school_gate}``."""
+    rows = conn.execute(
+        """
+        select distinct on (stop_order) stop_order, name, lat, lng, is_school_gate
+        from run_stops
+        where run_id = %s and lat is not null and lng is not null
+        order by stop_order asc, is_school_gate desc, name asc
+        """,
+        (run_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def recent_plain_pings(
+    conn, run_id: str, *, retention_days: int, limit: int = VICINITY_WINDOW_PINGS,
+) -> list[tuple[str, StoredFix]]:
+    """The run's newest ``limit`` *plain* pings by capture time, returned in
+    capture order (oldest first) as ``(row id, fix)`` — the vicinity
+    window (U15). Plain: source ``ping``, the four fix columns present,
+    reason ``none`` (a coarse ping is not plain), no flag at all — not
+    ``clock-skew``, not a plausibility flag, not ``classification-failed``
+    — and received inside the school's retention (``retention_days``,
+    resolved by the caller). A ping that is not plain never enters or
+    leaves a stop (R31, R32); a late older batch takes its place in capture
+    order, never at the end."""
+    rows = conn.execute(
+        f"""
+        select p.id, p.lat, p.lng, p.accuracy_m, p.captured_at
+        from run_positions p
+        where p.run_id = %(run_id)s
+          and p.source = %(ping)s
+          and {_FIX_ROW_SQL}
+          and p.fix_reason = %(plain)s
+          and cardinality(p.flags) = 0
+          and {_RETENTION_SQL}
+        order by p.captured_at desc, p.id desc
+        limit %(limit)s
+        """,
+        {
+            "run_id": run_id, "ping": SOURCE_PING, "checkpoint": SOURCE_CHECKPOINT,
+            "plain": "none", "retention_days": int(retention_days), "limit": int(limit),
+        },
+    ).fetchall()
+    rows.reverse()
+    return [(str(row["id"]), _stored(row)) for row in rows]
+
+
 # --- the served position (five columns, one statement) -------------------------
 
 
@@ -534,10 +596,24 @@ class PositionDao:
         flagged and unjudged pings are stored and never served; a dense
         stream loses nothing by it.
 
+        After the rows are written, the vicinity step (U15: R29, R30) replays
+        the run's plain pings against its stops in its own savepoint — see
+        ``exception_dao.evaluate_vicinity``: a stop this batch's pings
+        completed a departure from, with children still unrecorded, gets
+        U2's bypassed-stop exception, prompt and office alert now rather
+        than at the next Arrive; a not-yet-arrived stop the bus is inside
+        yields the arrival offer. A failure there flags nothing on the trail
+        (the fixes themselves are fine), is logged with the run id, and the
+        batch is still accepted; the next Arrive's own check is the
+        fallback. Still no background task and no parent notification.
+
         Returns ``{accepted, dropped: {invalid, outside_window, duplicate},
-        flagged, served_at}``; ``served_at`` is the capture time now served,
-        or None when this batch did not move the position. The log line
-        carries the run id and counts — never a coordinate.
+        flagged, served_at, prompts, arrival_offer}``; ``served_at`` is the
+        capture time now served, or None when this batch did not move the
+        position; ``prompts`` the pending prompts this batch raised, in the
+        action-response shape; ``arrival_offer`` ``{stop_order, stop_name}``
+        or None. The log line carries the run id and counts — never a
+        coordinate.
         """
         from app.dao import exception_dao  # lazy: exception_dao imports this module
 
@@ -545,9 +621,13 @@ class PositionDao:
         mismatch: str | None = None
         outcome: dict[str, Any] | None = None
         with get_connection(scope) as conn:
+            # type, total_stops and stops_completed feed the vicinity step
+            # (U15); the row is locked for the batch, so a concurrent Arrive
+            # waits behind it and reads the trail this batch wrote.
             run = conn.execute(
                 """
                 select id, school_id, bus_id, driver_id, status, created_at, started_session_id,
+                       type, total_stops, stops_completed,
                        date = (now() at time zone 'Africa/Nairobi')::date as is_today
                 from live_runs
                 where id = %s and school_id = %s
@@ -639,6 +719,7 @@ class PositionDao:
         device = idempotency_dao.device_id_of(device_id)
         previous: Any = _PREVIOUS_FROM_TRAIL
         accepted = flagged = unjudged = 0
+        accepted_rows: list[str] = []
         servable: StoredFix | None = None
         for normalised in usable:
             stored = normalised.fix
@@ -651,6 +732,7 @@ class PositionDao:
                 dropped["duplicate"] += 1
                 continue
             accepted += 1
+            accepted_rows.append(row_id)
             verdict = None
             try:
                 with conn.transaction():
@@ -691,15 +773,37 @@ class PositionDao:
         served_at = None
         if servable is not None and write_ping_position(conn, bus_id, servable):
             served_at = servable.captured_at
+        # The vicinity step (U15), once per batch, after the rows are in: its
+        # own savepoint, and inside it one savepoint per stop evaluated, so
+        # a fault there neither touches the rows above nor fails the batch.
+        # Nothing on the trail is flagged for it — the fixes are sound; only
+        # the nudge derived from them was not — and the log names the run.
+        prompts: list[dict[str, Any]] = []
+        arrival_offer: dict[str, Any] | None = None
+        if accepted:
+            try:
+                with conn.transaction():
+                    nudges = exception_dao.evaluate_vicinity(
+                        conn, run, thresholds=thresholds, batch_row_ids=accepted_rows,
+                    )
+                prompts = nudges["prompts"]
+                arrival_offer = nudges["arrival_offer"]
+            except Exception:
+                logger.exception(
+                    "vicinity not evaluated; the batch is still accepted (run=%s)", run_id
+                )
         logger.info(
             "ping batch recorded (run=%s accepted=%s flagged=%s unjudged=%s "
-            "invalid=%s outside_window=%s duplicate=%s served=%s)",
+            "invalid=%s outside_window=%s duplicate=%s served=%s prompts=%s offer=%s)",
             run_id, accepted, flagged, unjudged, dropped["invalid"],
             dropped["outside_window"], dropped["duplicate"], served_at is not None,
+            len(prompts), arrival_offer["stop_order"] if arrival_offer else None,
         )
         return {
             "accepted": accepted,
             "dropped": dropped,
             "flagged": flagged,
             "served_at": served_at.isoformat() if served_at else None,
+            "prompts": prompts,
+            "arrival_offer": arrival_offer,
         }
