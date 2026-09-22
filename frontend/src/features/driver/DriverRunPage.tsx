@@ -48,11 +48,14 @@ export const LOCATION_EXPLAINER = {
       label: "What",
       text:
         "Your phone's position — where, how accurate, and when — taken at each tap: "
-        + "Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run.",
+        + "Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run — and, between taps, "
+        + "the same reading about every 10 seconds while this app is on your screen.",
     },
     {
       label: "When",
-      text: "Only while a run is in progress. Nothing is asked for before Start Run or after End Run.",
+      text:
+        "Only while a run is in progress and this app is on your screen — never with the screen "
+        + "off or the app in the background. Nothing is asked for before Start Run or after End Run.",
     },
     {
       label: "Who sees it",

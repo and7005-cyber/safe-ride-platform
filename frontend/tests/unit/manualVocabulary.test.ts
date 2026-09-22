@@ -10,7 +10,11 @@ import {
   type RunException,
 } from "@/features/admin/components/RunExceptionsPanel";
 import { TRACKING_FIELDS } from "@/features/admin/trackingFields";
-import { LOCATION_EXPLAINER } from "@/features/driver/DriverRunPage";
+import { arrivalOfferCopy } from "@/features/driver/components/NudgeQueue";
+import { arrivalOfferPrompt } from "@/features/driver/components/nudgeStore";
+import { LOCATION_EXPLAINER, PING_PAUSED_HINT } from "@/features/driver/DriverRunPage";
+import { DEFAULT_PING_INTERVAL_S } from "@/features/driver/useRunPings";
+import { WAKE_LOCK_HINT } from "@/features/driver/useWakeLock";
 import { POSITION_SOURCE_LABEL, formatAge, freshnessLabel } from "@/lib/positionFreshness";
 import {
   ADMIN_INCIDENT_LABEL,
@@ -258,5 +262,76 @@ describe("the guides describe the GPS release in the shipped words", () => {
     const admin = read("admin-guide.md");
     expect(admin).not.toMatch(/Drivers can't undo these/i);
     expect(admin).not.toMatch(/only advances as the driver taps/i);
+  });
+});
+
+/**
+ * GPS plan Release 4 (U14, U15: R24–R30; F6, F7). Live pings put two one-line
+ * hints on the Run page, a fourth card in the nudge queue and a fourth
+ * position source on the fleet map, and turn "last seen" from "a long gap
+ * between stops" into "the driver's screen is off". The same tie: every line
+ * the app can show has the wording in the guide that explains it.
+ */
+describe("the guides describe live pings in the shipped words", () => {
+  it("carries the arrival-offer card as NudgeQueue words it, with its one button", () => {
+    const driver = read("driver-guide.md");
+    // The guide's worked example is stop 4, Moi Avenue — the same stop its
+    // bypassed-stop example uses — so derive the card's copy from that offer.
+    const copy = arrivalOfferCopy(arrivalOfferPrompt("run", { stop_order: 4, stop_name: "Moi Avenue" }));
+    expect(copy.title).toMatch(/^Arrive at /);
+    expect(driver).toContain(`**"${copy.title}"**`);
+    expect(driver).toContain(copy.body);
+    expect(driver).toContain(`**${copy.arriveLabel}**`);
+    expect(driver).toMatch(/four kinds/);
+  });
+
+  it("quotes the Run page's two hints verbatim and names what to do about each", () => {
+    const driver = read("driver-guide.md");
+    expect(driver).toContain(WAKE_LOCK_HINT);
+    expect(driver).toContain(PING_PAUSED_HINT);
+    // Both hints ask something of the driver; the guide says what, not just
+    // what the line reads.
+    expect(driver).toMatch(/screen timeout/i);
+    expect(driver).toMatch(/charger/);
+  });
+
+  it("states the ping cadence and the foreground-only rule for drivers", () => {
+    const driver = read("driver-guide.md");
+    expect(driver).toContain(`every ${DEFAULT_PING_INTERVAL_S} seconds`);
+    expect(driver).toMatch(/screen is off/);
+    expect(driver).toMatch(/in the background/);
+    // The departure prompt no longer waits for the next Arrive (R30).
+    expect(driver).toMatch(/drives away from a stop/);
+  });
+
+  it("gives the office the live source, the header's stale count and the second-sign-in reason", () => {
+    const admin = read("admin-guide.md");
+    expect(admin).toContain(POSITION_SOURCE_LABEL.ping);
+    expect(admin).not.toMatch(/not in use yet/i);
+    // FleetMapPage's header suffix beside the active-bus count.
+    expect(admin).toContain("last seen a while ago");
+    // RunExceptionsPanel's REASON_LABEL for a refused ping batch (R28).
+    expect(admin).toContain(reasonLabel("session-mismatch")!);
+    expect(admin).toMatch(/screen is off/);
+  });
+
+  it("tells parents the marker moves between stops and what 'last seen' means now", () => {
+    const parent = read("parent-guide.md");
+    expect(parent).toMatch(/between stops/);
+    expect(parent).toMatch(/screen is off/);
+    expect(parent).toMatch(/still running/);
+    // Pings never notify (R24): the guide promises no new message.
+    expect(parent).toMatch(/no new notification/i);
+  });
+
+  it("extends the briefing's notice with the cadence and the screen, and keeps the sign-off", () => {
+    const briefing = read("driver-gps-briefing.md");
+    expect(briefing).toContain(`every ${DEFAULT_PING_INTERVAL_S} seconds`);
+    expect(briefing).toMatch(/screen/);
+    expect(briefing).toContain(WAKE_LOCK_HINT);
+    expect(briefing).toMatch(/charger/);
+    for (const line of ["Delivered by Kuumbai", "Confirmed by Kuumbai", "School informed"]) {
+      expect(briefing).toContain(line);
+    }
   });
 });

@@ -52,9 +52,9 @@ If a stop you expected is missing, that student was marked absent by the office 
 **2. At every stop, tap "Arrive Next Stop".**
 The Run tab shows your list of stops in order, with a progress bar. When you reach a stop, tap **Arrive Next Stop**. This is important for two reasons:
 
-- It moves the bus on the live map that parents and the school office watch. The tap sends your phone's position with it, so the map shows where the bus actually was when you tapped — see [Your phone's location during a run](#your-phones-location-during-a-run).
+- It moves the bus on the live map that parents and the school office watch. The tap sends your phone's position with it, so the map shows where the bus actually was when you tapped. Between taps, while the app is on your screen, the app also sends the bus's position on its own, so the map shows the bus moving between stops — see [Your phone's location during a run](#your-phones-location-during-a-run).
 - It sends a "**Bus approaching**" notification to the parents at the next stop.
-- If you tap Arrive at a later stop while a child at the stop you just passed still has nothing recorded, a prompt card appears — see [Prompts the app may show you](#prompts-the-app-may-show-you).
+- If the bus drives away from a stop — or you tap Arrive at a later one — while a child at that stop still has nothing recorded, a prompt card appears. And if the bus reaches a stop you have not tapped Arrive for, a card offers **Arrive** for that stop by name — see [Prompts the app may show you](#prompts-the-app-may-show-you).
 
 **3. Board the students.**
 Switch to the **Board** tab (titled **Student Boarding** in the morning). Each student's **Board** button unlocks only after you have tapped **Arrive Next Stop** for their stop.
@@ -106,7 +106,9 @@ Once the red panel is empty, **End Run** closes the run.
 
 **While a run is in progress, the app uses your phone's location.** It takes one position — where you are, how accurate the reading is, and the time — at each tap: Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run. That position travels with the tap and becomes the bus's position on the office's map and the parents' Track page.
 
-**Nothing outside a run.** The app asks for nothing before you tap Start Run and nothing after End Run. It does not track you between runs, and it does not record where you are when the app is closed. Who sees the positions, and for how long, is in the [driver briefing](driver-gps-briefing.md), which your transport coordinator goes through with you before this version reaches you.
+**Between taps, while the app is on your screen, it also sends the bus's position on its own** — about every 10 seconds (your school can set this anywhere from 5 to 60 seconds), and less often while the bus is standing still. This is what lets the office and the families see the bus move along the road between stops instead of jumping from one stop to the next. It happens only while the run is in progress **and** the app is on the screen: nothing is sent when the screen is off, when the app is in the background or another app is in front, and nothing before Start Run or after End Run. When the screen does go dark, nothing breaks — the office and the families see the bus's last position with **"last seen"** beside it, and sending picks up again on its own as soon as you unlock the phone and come back to the app, or at your next tap.
+
+**Nothing outside a run.** The app asks for nothing before you tap Start Run and nothing after End Run. It does not track you between runs, it does not record where you are while the screen is off or the app is in the background, and it does not record where you are when the app is closed. Who sees the positions, and for how long, is in the [driver briefing](driver-gps-briefing.md), which your transport coordinator goes through with you before this version reaches you.
 
 **The run always starts, and every tap always completes**, whatever your phone says about location. A tap waits a few seconds for a position at most; if none arrives, the tap goes through without one and the office simply sees the planned stop instead of your phone.
 
@@ -141,11 +143,29 @@ Your browser remembers your answer. If you said no by mistake, or the phone is o
 
 Neither banner ever blocks a tap. Do not stop driving the route to fix it — do it at a stop, or after the run.
 
+### The screen stays on during a run
+
+While a run is in progress the app asks your phone to **keep the screen awake**, because a phone that locks itself stops sending the bus's position until you unlock it and come back to the app. You no longer need to tap the screen to keep it alive. If your phone will not allow it — a battery saver, an older browser, an iPhone home-screen app before iOS 18.4 — the Run tab shows a one-line yellow hint:
+
+> **Keep your screen on during the run — this phone will not keep it awake by itself.**
+
+Then set your phone's screen timeout longer for the run, or tap the screen now and then. Every tap keeps working either way.
+
+**Battery:** a screen that stays on for a whole run uses battery, and so does sending the position. **Keep the phone on its charger on the bus.**
+
+### "Started from another sign-in"
+
+If the Run tab shows this line —
+
+> **Live tracking is paused: this run was started from another sign-in. Your next tap here resumes it.**
+
+— the run was started from a different sign-in of your PIN: a second phone, or an assistant who started it for you. Until you tap something, this phone's positions between taps are not accepted, so the bus moves on the map only at taps. **Any tap from this phone** — Arrive, Board, Drop-off, Absent — moves the run to this phone and the line goes away; from then on this phone sends the positions. Your taps themselves are never refused. Do not share one PIN across two phones during a run: only the phone that tapped last sends the live position.
+
 ## Prompts the app may show you
 
-Sometimes a yellow card appears above the page, on whichever driver tab you are on. It is the app noticing something about a tap; **it never undoes or blocks your tap** — the tap has already gone through. Only one card shows at a time; the card's own **✕** dismisses it (tapping elsewhere does not), and a card you have not answered comes back if you reload or switch phones. There are three kinds.
+Sometimes a yellow card appears above the page, on whichever driver tab you are on. It is the app noticing something about a tap, or about where the bus is; **it never undoes or blocks your tap** — the tap has already gone through. Only one card shows at a time; the card's own **✕** dismisses it (tapping elsewhere does not), and a card you have not answered comes back if you reload or switch phones. There are four kinds.
 
-**1. A stop passed with nothing recorded** — after an Arrive. Title: the stop (**"Stop 4: Moi Avenue"**); text: **"{names} have no record. Mark boarded or absent?"** Each child listed has two buttons: **Boarded** (in the afternoon, **Dropped off**) and **Absent**. Tap the right one for each child; the card shrinks as you go and disappears when the last child is recorded. The **✕** dismisses the card, but the stop stays flagged for the office until every child has an outcome. This card **sounds a tone and vibrates**.
+**1. A stop passed with nothing recorded** — after an Arrive, or **as soon as the bus drives away from a stop** while a child there still has nothing recorded (the app sees this from the positions it sends between taps, so the card can appear while you are still near the stop). Title: the stop (**"Stop 4: Moi Avenue"**); text: **"{names} have no record. Mark boarded or absent?"** Each child listed has two buttons: **Boarded** (in the afternoon, **Dropped off**) and **Absent**. Tap the right one for each child; the card shrinks as you go and disappears when the last child is recorded. The **✕** dismisses the card, but the stop stays flagged for the office until every child has an outcome. This card **sounds a tone and vibrates**.
 
 **2. A boarding or drop-off far from the stop** — after a Board or Drop-off tapped well away from that child's stop. Text: **"You marked {name} boarded about 1.8 km from their stop. Confirm, or undo?"** Tap **Confirm** if it is right — a guardian brought the child to you further along, say — or **Undo** if you tapped the wrong child. Undo puts the child back to "nothing recorded", tells the family the mark was withdrawn, and lets you record what really happens. This card is **silent** and has no ✕: Confirm or Undo is the answer.
 
@@ -155,6 +175,8 @@ Sometimes a yellow card appears above the page, on whichever driver tab you are 
 - **No — I wasn't at the stop** — you did not get to the stop. The mark is kept, and the office is alerted **and the family is asked to call the office** if the child should be on the bus.
 
 Dismissing this card with **✕**, or leaving it unanswered until your next Arrive, counts the same as **No — I wasn't at the stop**. If the mark itself was a mistake, tap **Undo** on the child's row on the Board tab. This card **sounds a tone and vibrates**.
+
+**4. Arrive at a stop?** — when the positions your phone sends between taps put the bus at a stop you have not tapped Arrive for. It is not about a tap; it is the app offering you one. Title: **"Arrive at Moi Avenue?"**; text: **"Your phone puts the bus at stop 4 and no arrival is recorded yet."** One button: **Arrive**, which records the arrival at that stop — the same as tapping **Arrive Next Stop** there. If you drove past an earlier stop on the way, that stop is checked for children left unrecorded and its card follows if there are any. The **✕** dismisses it for as long as the app keeps offering that same stop; once the bus moves on, a card can appear again for the next stop, or for this one if you come back to it. This card is **silent**, waits its turn behind any other card, appears only while the app is on your screen and sending positions, and never records anything by itself: if you are not at that stop, dismiss it.
 
 **Where a card asks you to confirm, it is asking you, not accusing you.** A phone's position is not exact, and the office reads your answer next to it. A child who genuinely boarded at a different place, a phoned-in absence marked from the road, a stop reached before the phone caught up — these are all fine, and Confirm or **Yes — they told me** is the right answer.
 
@@ -171,8 +193,8 @@ The school office sees the report immediately on their Alerts page, and for dela
 ## Staying connected
 
 - The app needs a **live internet connection** for every action. There is no offline mode and taps do not queue up: if a tap fails you'll see a red error message — **tap it again once you have signal**. Retrying is safe: the app remembers the first attempt, sends exactly the same tap again (with the position from the first attempt, not a new one), and the server never records it twice — no double boarding, no second notification.
-- **Keep the app open during the run.** The screen refreshes every few seconds while it is open. Stop the phone from sleeping (or tap the screen periodically) so you can act quickly at each stop.
-- **Location is used only during a run.** Between Start Run and End Run, each tap carries your phone's position; outside a run the app asks for nothing. See [Your phone's location during a run](#your-phones-location-during-a-run).
+- **Keep the app open and on the screen during the run.** The screen refreshes every few seconds while it is open, and the app keeps the screen awake itself while a run is in progress — see [The screen stays on during a run](#the-screen-stays-on-during-a-run). The bus's position between stops is only sent while the app is on the screen, so **keep the phone on its charger on the bus** rather than letting it sleep.
+- **Location is used only during a run.** Between Start Run and End Run, each tap carries your phone's position and, while the app is on the screen, the app sends the bus's position about every 10 seconds; outside a run the app asks for nothing. See [Your phone's location during a run](#your-phones-location-during-a-run).
 
 ## Quick fixes
 
@@ -191,5 +213,10 @@ The school office sees the report immediately on their Alerts page, and for dela
 | Red error after a tap | Check your signal and tap again. The same tap is re-sent; nothing is counted twice. |
 | Yellow **Location off** banner | Your phone refused location. Taps still work. Follow **How to turn it on** when stopped — see [Allowing location on your phone](#allowing-location-on-your-phone). |
 | Yellow **Turn on precise location** banner | Your phone is sharing a rough location. Turn on precise location in the phone's settings — steps in the banner and in this guide. |
-| A yellow card appears above the page | It is a prompt about a tap you made — see [Prompts the app may show you](#prompts-the-app-may-show-you). Your tap already went through; answer the card when you can. |
+| A yellow card appears above the page | It is a prompt about a tap you made, or about where the bus is — see [Prompts the app may show you](#prompts-the-app-may-show-you). Your tap already went through; answer the card when you can. |
+| A card asks **"Arrive at …?"** | The bus is at a stop you have not tapped Arrive for. Tap **Arrive** if you are there; **✕** if you are not. It records nothing on its own. |
+| Yellow hint: **"Keep your screen on during the run — this phone will not keep it awake by itself."** | Your phone would not let the app keep the screen awake. Set a longer screen timeout for the run, or tap the screen now and then. Taps work regardless — see [The screen stays on during a run](#the-screen-stays-on-during-a-run). |
+| Yellow hint: **"Live tracking is paused: this run was started from another sign-in. …"** | The run was started from another sign-in of your PIN. Any tap from this phone moves the run here and live tracking resumes — see ["Started from another sign-in"](#started-from-another-sign-in). |
+| The battery drains fast on a run | Expected: the screen stays on for the whole run and the phone sends the bus's position every few seconds. Keep the phone on its charger on the bus. |
+| The office says the bus "went quiet" between stops | The bus's position between stops is only sent while the app is on your screen. Unlock the phone and come back to the app; sending resumes on its own, and your next tap sends a position too. |
 | "Your session has expired." | Sign in again with your PIN. |

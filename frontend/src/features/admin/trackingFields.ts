@@ -62,7 +62,7 @@ export const TRACKING_FIELDS: readonly TrackingFieldSpec[] = [
     unit: "s",
     min: 5,
     max: 60,
-    help: "How often the driver app sends the bus position between stops once live pings are enabled.",
+    help: "How often the driver app sends the bus position between stops while a run is on and the app is on the driver's screen; every third interval while the bus is standing still.",
   },
 ];
 

@@ -10,15 +10,17 @@ It takes about ten minutes. The driver should have their phone with them.
 
 Until now the app did not use your phone's location; the bus moved on the map only when you tapped **Arrive Next Stop**. From this release, **while a run is in progress, each tap also sends your phone's position**, so the office and the parents see where the bus actually was when you tapped. Nothing else about running a trip changes: the same taps, the same order, the same rules for ending a run.
 
+**With live tracking** (the release that follows), the app also sends the bus's position **on its own, about every 10 seconds, while the run is on and the app is on your screen** — never with the screen off or the app in the background — so the office and the parents see the bus move between stops, and it **keeps your screen awake** for the run. Still nothing outside a run.
+
 ## The notice
 
-This is the same text the app shows you before your phone asks for permission the first time.
+This is the text the app shows you before your phone asks for permission the first time, with the live-tracking lines added for this briefing.
 
 **Share the bus's location during runs**
 
-**What** — Your phone's position — where, how accurate, and when — taken at each tap: Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run.
+**What** — Your phone's position — where, how accurate, and when — taken at each tap: Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run — and, with live tracking, the same reading between taps (see **When**).
 
-**When** — Only while a run is in progress. Nothing is asked for before Start Run or after End Run. The app does not track you between runs, at home, or when it is closed.
+**When** — Only while a run is in progress. Nothing is asked for before Start Run or after End Run. The app does not track you between runs, at home, or when it is closed. With live tracking, also about every 10 seconds on its own while the run is on and the app is on your screen — never with the screen off, never with the app in the background.
 
 **Who sees it** — Your school's transport office and the provider (Kuumbai Kenya), as the bus's position on their map and in the run's report. Parents see where the bus is, never your phone's details — not its accuracy, not its device, not the app's checks on your taps.
 
@@ -48,15 +50,24 @@ If you said no by mistake, a yellow **Location off** banner appears at the top o
 
 **iPhone, app added to the home screen** — the permission is under the app's own name: **Settings**, **Privacy & Security**, **Location Services**, **the SafeRide app**, **"While Using the App"**.
 
-## Three prompts you may see
+## Your screen during a run
+
+With live tracking the app **keeps your screen awake** while a run is in progress, because a phone that locks itself stops sending until you unlock it and come back to the app. If your phone will not allow it, the Run tab shows **"Keep your screen on during the run — this phone will not keep it awake by itself."** — set a longer screen timeout for the run. With the screen off nothing is sent; the office sees **"last seen"** beside the bus until you return to the app or tap.
+
+**Battery:** a screen that stays on for a whole run, plus the sending, uses battery. **Keep the phone on its charger on the bus.**
+
+If the Run tab says **"Live tracking is paused: this run was started from another sign-in."**, the run was started from another phone with your PIN; any tap from this phone moves it here. Do not run one PIN on two phones at once.
+
+## Prompts you may see
 
 Sometimes a yellow card appears above the page. **Your tap has already gone through**; the card is a question, not a block, and only its own **✕** closes it.
 
 | The card | What it asks | Your answers |
 | --- | --- | --- |
-| **A stop passed with nothing recorded** (tone and vibration) | *"{names} have no record. Mark boarded or absent?"* — you tapped Arrive at a later stop while a child at the previous stop had nothing recorded | Per child: **Boarded** (afternoon: **Dropped off**) or **Absent**. The card shrinks as you go |
+| **A stop passed with nothing recorded** (tone and vibration) | *"{names} have no record. Mark boarded or absent?"* — you tapped Arrive at a later stop while a child at the previous stop had nothing recorded; with live tracking, also as soon as the bus drives away from that stop | Per child: **Boarded** (afternoon: **Dropped off**) or **Absent**. The card shrinks as you go |
 | **A boarding or drop-off far from the stop** (silent) | *"You marked {name} boarded about 1.8 km from their stop. Confirm, or undo?"* | **Confirm** if it is right; **Undo** if you tapped the wrong child — the family is told the mark was withdrawn |
 | **An absent marked away from the stop** (tone and vibration) | *"You marked {name} absent about 1.8 km from their stop. Did a parent or the office tell you {name} isn't coming?"* | **Yes — they told me** if a parent or the office told you; **No — I wasn't at the stop** if you did not reach the stop. Dismissing the card counts as no, and the family is asked to call the office |
+| **Arrive at a stop?** (silent; live tracking only) | *"Arrive at {stop}?" — "Your phone puts the bus at stop {n} and no arrival is recorded yet."* — the bus is at a stop you have not tapped Arrive for | **Arrive** if you are there — it records the arrival, like Arrive Next Stop; **✕** if you are not. It records nothing by itself |
 
 Answering honestly is all that is asked. A child who boarded somewhere else, a phoned-in absence marked from the road, a stop reached before the phone caught up — all normal, and **Confirm** or **Yes — they told me** is the right answer.
 
@@ -70,7 +81,9 @@ Answering honestly is all that is asked. A child who boarded somewhere else, a p
 - [ ] The driver has read the notice (What / When / Who sees it / How long / Questions) and had the chance to ask questions.
 - [ ] The driver knows location is used **only between Start Run and End Run**.
 - [ ] The driver has allowed location on their own phone (precise, on Android), or knows where the **How to turn it on** steps are.
-- [ ] The driver has seen the three prompts and knows what each answer means — and that dismissing the absent prompt counts as "not at the stop".
+- [ ] The driver has seen the prompts and knows what each answer means — and that dismissing the absent prompt counts as "not at the stop".
+- [ ] With live tracking: the driver knows the app sends the bus's position about every 10 seconds while the run is on and the app is on screen — never with the screen off or the app in the background — and that the app keeps the screen awake for the run.
+- [ ] The driver keeps the phone on its charger on the bus.
 - [ ] The driver knows a tap always completes and that retrying is safe.
 - [ ] The driver knows whom to ask: the school's transport coordinator.
 
