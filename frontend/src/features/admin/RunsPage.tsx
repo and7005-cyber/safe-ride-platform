@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Pencil, PhoneCall, Plus, SquareX, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -32,10 +32,11 @@ import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListToolbar } from "@/features/admin/components/ListToolbar";
 import { PageHeader } from "@/features/admin/components/PageHeader";
+import { RunExceptionsPanel } from "@/features/admin/components/RunExceptionsPanel";
 import { RunFlagBadges } from "@/features/admin/components/RunFlagBadges";
 import { api } from "@/lib/apiClient";
 import { useIsDirector } from "@/lib/auth";
-import { useBuses, useRoutes, useRuns, useSchoolKey } from "@/lib/queries";
+import { useBuses, useRoutes, useRunReport, useRuns, useSchoolKey } from "@/lib/queries";
 import {
   RUN_STATUS_FILTERS,
   RUN_STATUS_LABEL,
@@ -82,11 +83,8 @@ export function RunsPage() {
   const [reportId, setReportId] = useState<string | null>(null);
 
   // Post-run audit report (R14): fetched fresh each time a row's dialog opens.
-  const { data: report } = useQuery({
-    queryKey: schoolKey("run-report", reportId),
-    queryFn: ({ signal }) => api.get(`/api/runs/${reportId}/report`, undefined, { signal }),
-    enabled: Boolean(reportId),
-  });
+  // School-keyed in queries.ts so the exceptions panel can invalidate it.
+  const { data: report } = useRunReport(reportId);
 
   const filtered = useMemo(
     () =>
@@ -338,7 +336,9 @@ export function RunsPage() {
       </Dialog>
 
       <Dialog open={Boolean(reportId)} onOpenChange={(o) => { if (!o) setReportId(null); }}>
-        <DialogContent>
+        {/* Wider than the form dialogs: the exceptions panel lays a stop and
+            its children side by side. */}
+        <DialogContent className="sm:max-w-2xl">
           <DialogHeader><DialogTitle>Run Report</DialogTitle></DialogHeader>
           {!report ? (
             <p className="text-sm text-muted-foreground">Loading report…</p>
@@ -419,6 +419,12 @@ export function RunsPage() {
                   </ul>
                 </div>
               )}
+
+              {/* Stop exceptions (GPS plan U4/R21): every row the run
+                  raised, with its derived open/resolved state and the
+                  office's review stamp. Reviewing here clears the "to
+                  review" badge on the list without removing the row. */}
+              <RunExceptionsPanel runId={report.id} exceptions={report.exceptions ?? []} />
             </div>
           )}
         </DialogContent>

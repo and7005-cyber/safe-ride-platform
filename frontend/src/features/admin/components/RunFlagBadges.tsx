@@ -1,4 +1,4 @@
-import { AlertTriangle, PhoneCall } from "lucide-react";
+import { AlertTriangle, Flag, PhoneCall } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
 /**
@@ -10,7 +10,12 @@ import { Badge } from "@/components/ui/badge";
 export function RunFlagBadges({
   run,
 }: {
-  run: { no_progress?: boolean; stale?: boolean; contact_pending?: number | string | null };
+  run: {
+    no_progress?: boolean;
+    stale?: boolean;
+    contact_pending?: number | string | null;
+    exception_count?: number | string | null;
+  };
 }) {
   return (
     <>
@@ -32,6 +37,16 @@ export function RunFlagBadges({
       {Number(run.contact_pending ?? 0) > 0 && (
         <Badge variant="destructive" data-testid="contact-pending">
           <PhoneCall className="h-3 w-3" /> {run.contact_pending} to call
+        </Badge>
+      )}
+      {/* Stop exceptions nobody in the office has looked at yet (GPS plan
+          U4/R21). Counted from the stored review stamp, never from whether the
+          exception is still open: a reviewed exception may still be open, and
+          an open one the office has seen no longer needs the badge. Absent
+          from a driver's list altogether (R22). */}
+      {Number(run.exception_count ?? 0) > 0 && (
+        <Badge variant="warning" data-testid="exceptions-to-review">
+          <Flag className="h-3 w-3" /> {run.exception_count} to review
         </Badge>
       )}
     </>

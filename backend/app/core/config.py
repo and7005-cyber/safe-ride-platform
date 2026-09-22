@@ -83,7 +83,6 @@ class Settings(BaseSettings):
     vapid_public_key: str = Field(default="", alias="VAPID_PUBLIC_KEY")
     vapid_private_key: str = Field(default="", alias="VAPID_PRIVATE_KEY")
     vapid_subject: str = Field(default="mailto:admin@saferidekenya.com", alias="VAPID_SUBJECT")
-    bus_approaching_radius_m: int = Field(default=1000, alias="BUS_APPROACHING_RADIUS_M")
 
     @field_validator("firebase_service_account_json", "firebase_web_config_json", mode="after")
     @classmethod

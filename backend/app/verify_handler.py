@@ -326,6 +326,9 @@ _CHECK_SETS["tenancy-rls"] = [
 #   trail-rows-past-retention         per school; non-zero for a school with
 #                                     no Start Run inside its retention window
 #                                     means the on-demand purge is due
+#   check-widenings                   all three true; false means an older
+#                                     file's CHECK recreation ran after 016
+#                                     (re-apply 016)
 _CHECK_SETS["gps"] = [
     (
         "trail-rows-per-run-today",
@@ -397,6 +400,22 @@ _CHECK_SETS["gps"] = [
         "left join run_positions p on p.school_id = s.id "
         "and p.received_at < now() - make_interval(days => coalesce(s.position_retention_days, 90)) "
         "group by 1, 2, 3 order by 4 desc, 2",
+        False,
+    ),
+    (
+        "check-widenings",
+        "select conname, case conname "
+        "when 'live_notifications_type_check' then "
+        "strpos(pg_get_constraintdef(oid), 'absent-call-now') > 0 "
+        "and strpos(pg_get_constraintdef(oid), 'boarding-corrected') > 0 "
+        "when 'live_incidents_type_check' then "
+        "strpos(pg_get_constraintdef(oid), 'stop-bypassed') > 0 "
+        "and strpos(pg_get_constraintdef(oid), 'absent-remote') > 0 "
+        "when 'live_admin_audit_action_check' then "
+        "strpos(pg_get_constraintdef(oid), 'exception-reviewed') > 0 "
+        "end as widened_by_016 "
+        "from pg_constraint where conname in ('live_notifications_type_check', "
+        "'live_incidents_type_check', 'live_admin_audit_action_check') order by 1",
         False,
     ),
 ]

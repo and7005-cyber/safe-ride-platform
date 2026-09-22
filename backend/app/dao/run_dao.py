@@ -1,11 +1,14 @@
+import logging
 from typing import Any
 
 from app.core.db import get_connection
 from app.core.scope import SchoolScope
 from app.dao.audit_dao import actor_display, record_audit
 from app.dao.absence_dao import AbsenceDao, absent_student_ids
-from app.dao import participation_dao
+from app.dao import exception_dao, participation_dao
 from app.dao.status_sql import display_status_case, no_progress_case, scope_covers
+
+logger = logging.getLogger("saferide.runs")
 
 
 class RunDao:
@@ -36,11 +39,26 @@ class RunDao:
                 " and r.status <> 'completed' "
                 "and r.date <= (now() at time zone 'Africa/Nairobi')::date"
             )
+        # Stop exceptions still awaiting the office (GPS plan U4/R21): the
+        # stored reviewed_at alone, never the derived open/resolved status —
+        # deriving it would re-run the per-stop outcome predicate across every
+        # run in history on each poll of this list. The column is absent, not
+        # zero, for a driver: exceptions are office-facing (R22), and this
+        # list is the one read a driver shares with staff.
+        exception_count_sql = ""
         if scope.role == "driver":
             where += (
                 " and r.bus_id in (select id from live_buses "
                 "where driver_id = %(driver_id)s and school_id = %(school_id)s)"
             )
+        else:
+            exception_count_sql = """,
+                       (
+                           select count(*) from run_exceptions x
+                           where x.run_id = r.id
+                             and x.school_id = r.school_id
+                             and x.reviewed_at is null
+                       ) as exception_count"""
         with get_connection(scope) as conn:
             rows = conn.execute(
                 f"""
@@ -59,7 +77,7 @@ class RunDao:
                            where p.run_id = r.id
                              and p.unaccounted_at is not null
                              and p.contacted_at is null
-                       ) as contact_pending
+                       ) as contact_pending{exception_count_sql}
                 from live_runs r
                 left join live_buses b on b.id = r.bus_id
                 left join live_routes rt on rt.id = r.route_id
@@ -374,10 +392,14 @@ class RunDao:
             # office can reopen a force-closed run days later and still see who
             # was never accounted for and whether anyone rang their family.
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
+            # Stop exceptions with their derived status (GPS plan U2/R21): the
+            # same read the staff list route serves, on this connection.
+            exceptions = exception_dao.list_exceptions(conn, dict(run))
         report = dict(run)
         report["absent_students"] = [dict(a) for a in absent]
         report["unaccounted"] = outstanding
         report["approximate"] = approximate
+        report["exceptions"] = exceptions
         return report
 
     # --- driver context ----------------------------------------------------
@@ -395,8 +417,9 @@ class RunDao:
             ).fetchone()
             if not bus:
                 return {
-                    "bus": None, "routes": [], "active_run": None, "students": [],
-                    "completed_route_ids_today": [],
+                    "bus": None, "routes": [], "active_run": None, "run_stops": [],
+                    "students": [], "blocking": [], "completed_route_ids_today": [],
+                    "pending_prompts": [],
                 }
             routes = conn.execute(
                 "select * from live_routes where bus_id = %s order by type asc", (bus["id"],)
@@ -514,6 +537,7 @@ class RunDao:
                 else []
             )
             run_stops = []
+            pending_prompts: list[dict[str, Any]] = []
             if active_dict:
                 run_stops = [
                     dict(s)
@@ -523,6 +547,18 @@ class RunDao:
                         (active_dict["id"],),
                     ).fetchall()
                 ]
+                # Server-owned prompts (GPS plan U3/R34): the pending events of
+                # this run, priority-ordered, delivered_at stamped on first
+                # return. In a savepoint like every exception-side write: a
+                # fault here must never take the driver's whole context down.
+                try:
+                    with conn.transaction():
+                        pending_prompts = exception_dao.pending_prompts(conn, active_dict)
+                except Exception:
+                    logger.exception(
+                        "pending prompts unavailable; context served without them (run=%s)",
+                        active_dict["id"],
+                    )
         return {
             "bus": dict(bus),
             "routes": [dict(r) for r in routes],
@@ -531,6 +567,7 @@ class RunDao:
             "students": [dict(s) for s in students],
             "blocking": [{"id": str(b["id"]), "name": b["name"]} for b in blocking],
             "completed_route_ids_today": [str(r["route_id"]) for r in completed_today],
+            "pending_prompts": pending_prompts,
         }
 
     def _assert_service_day(self, conn, run: dict) -> None:
@@ -850,8 +887,62 @@ class RunDao:
                         "update live_runs set incidents = incidents + 1 where id = %s", (run_id,)
                     )
                     arrival_incident = dict(inc)
+            # Bypassed-stop check (GPS plan U2/R15). Progress moved to N, so the
+            # stop the bus just left behind is N−1, and the closure gate's own
+            # per-stop predicate decides whether anyone there is unrecorded.
+            #
+            # The check, the exception upsert and the prompt event run in a
+            # savepoint on this same connection (psycopg opens one because the
+            # transaction is already in progress). Everything above is the
+            # atomic core and commits exactly as before; a failure in here rolls
+            # back to the savepoint, is logged with the run and stop order only
+            # — never a coordinate — and swallowed, so a prompt-side bug can
+            # never block a driver's tap (R23, R40). No trail row exists yet
+            # (U7), so 'classification-failed' is this log line for now.
+            bypassed = None
+            passed_order = new_completed - 1
+            try:
+                with conn.transaction():
+                    bypassed = exception_dao.evaluate_bypassed_stop(
+                        conn, dict(run), passed_order
+                    )
+            except Exception:
+                logger.exception(
+                    "stop-bypassed evaluation failed; the Arrive still commits "
+                    "(run=%s stop_order=%s)",
+                    run_id, passed_order,
+                )
+            # Prompt auto-resolution on Arrive (GPS plan U3/R17, R34): shown
+            # remote-absent prompts close as unanswered, nothing else — its own
+            # savepoint so a fault in one exception-side step never rolls back
+            # the other, and never the tap.
+            auto_resolved: list[dict[str, Any]] = []
+            try:
+                with conn.transaction():
+                    auto_resolved = exception_dao.resolve_pending_on_arrive(conn, str(run_id))
+            except Exception:
+                logger.exception(
+                    "prompt auto-resolution on Arrive failed; the Arrive still commits (run=%s)",
+                    run_id,
+                )
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
-        return {"run": dict(updated), "arrival_incident": arrival_incident}
+        result: dict[str, Any] = {
+            "run": dict(updated), "arrival_incident": arrival_incident, "prompts": [],
+            # For the router (U10 decides call-now from it); popped before the
+            # response leaves.
+            "auto_resolved": auto_resolved,
+        }
+        if bypassed:
+            if bypassed["prompt"]:
+                result["prompts"].append(bypassed["prompt"])
+            if bypassed["raised"]:
+                # For the router's office alert only; it pops this before the
+                # response leaves.
+                result["bypassed_stop"] = {
+                    key: bypassed[key]
+                    for key in ("exception_id", "stop_order", "stop_name", "students")
+                }
+        return result
 
     def end_run(self, scope: SchoolScope, run_id: str) -> dict[str, Any]:
         """Complete a run — refused while any roster child is unaccounted (U4).
@@ -939,10 +1030,28 @@ class RunDao:
                 "update live_buses set current_lat = null, current_lng = null where id = %s",
                 (run["bus_id"],),
             )
+            # Every prompt still pending closes as unanswered with the run
+            # (GPS plan U3/R17, R34) — after the gate, so a refused closure
+            # leaves them pending; no call-now follows (the gate owns the
+            # child). Savepoint: a fault here never keeps a run open.
+            auto_resolved = self._close_pending_prompts(conn, str(run_id), "End Run")
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
         result = dict(updated)
         result["boarded_student_ids"] = boarded_ids
+        result["auto_resolved"] = auto_resolved
         return result
+
+    @staticmethod
+    def _close_pending_prompts(conn, run_id: str, action: str) -> list[dict[str, Any]]:
+        try:
+            with conn.transaction():
+                return exception_dao.resolve_all_pending(conn, run_id)
+        except Exception:
+            logger.exception(
+                "prompt auto-resolution on %s failed; the run still closes (run=%s)",
+                action, run_id,
+            )
+            return []
 
     def force_close_run(
         self, scope: SchoolScope, run_id: str, actor: dict[str, Any]
@@ -1006,6 +1115,9 @@ class RunDao:
                 "update live_buses set current_lat = null, current_lng = null where id = %s",
                 (run["bus_id"],),
             )
+            # The office close ends the prompts too (GPS plan U3/R17, R34):
+            # pending → unanswered, shown or not, never a call-now.
+            auto_resolved = self._close_pending_prompts(conn, str(run_id), "force-close")
             updated = conn.execute("select * from live_runs where id = %s", (run_id,)).fetchone()
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
             record_audit(
@@ -1027,7 +1139,30 @@ class RunDao:
         result["gate_arrival_recorded"] = gate_reached
         result["unaccounted"] = outstanding
         result["force_closed_by_display"] = actor_display(actor, scope)
+        result["auto_resolved"] = auto_resolved
         return result
+
+    @staticmethod
+    def _attach_resolution_tap(
+        conn, run: dict[str, Any], event_id: str | None, student_id: str, action: str
+    ) -> None:
+        """Record the outcome as a bypassed-stop resolution when the child sits
+        at the stop of a pending prompt of this run (GPS plan U3/R15).
+
+        Every Board, Drop-off and Absent comes through here: membership on
+        the run's own stop snapshot is the key, so a catch-up sequence from the
+        board page answers the prompt exactly as the card's shortcuts do. The
+        card's event id is a hint the DAO may log and ignore. In a savepoint —
+        the tap has already been recorded above it and is never refused (R23).
+        """
+        try:
+            with conn.transaction():
+                exception_dao.record_resolution(conn, dict(run), student_id, event_id=event_id)
+        except Exception:
+            logger.exception(
+                "resolution tap not attached; the %s still commits (run=%s event=%s)",
+                action, run["id"], event_id,
+            )
 
     def record_parent_contact(
         self, scope: SchoolScope, run_id: str, student_id: str
@@ -1049,23 +1184,9 @@ class RunDao:
             outstanding = participation_dao.unaccounted_children(conn, str(run_id))
         return {"run_id": str(run_id), "unaccounted": outstanding}
 
-    def write_position(self, scope: SchoolScope, lat: float, lng: float) -> dict[str, Any]:
-        """Record the bus position; returns the active run snapshot."""
-        from app.core.errors import ForbiddenError
-
-        driver_id = scope.user_id
-        with get_connection(scope) as conn:
-            run = self.find_active_run_today(conn, self._bus_id_for_driver(conn, scope))
-            if not run or str(run["driver_id"]) != str(driver_id):
-                raise ForbiddenError("No active run for this driver")
-            conn.execute(
-                "update live_buses set current_lat = %s, current_lng = %s where id = %s",
-                (lat, lng, run["bus_id"]),
-            )
-        return dict(run)
-
     def toggle_boarding(
-        self, scope: SchoolScope, student_id: str, on_bus: bool
+        self, scope: SchoolScope, student_id: str, on_bus: bool, *,
+        event_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Board a student on a morning run; returns (student, run snapshot).
 
@@ -1073,6 +1194,9 @@ class RunDao:
         dropoff_student) and one-way: un-boarding is disabled because a
         boarded push already went out and silently retracting a safety
         assertion is worse than routing the fix through the office (R26).
+
+        ``event_id`` names the bypassed-stop prompt the tap came through, when
+        it did (GPS plan U3); see _attach_resolution_tap.
         """
         from app.core.errors import ConflictError, ForbiddenError
 
@@ -1107,6 +1231,7 @@ class RunDao:
             participation_dao.record_boarding(
                 conn, str(run["id"]), student_id, row["name"], str(driver_id), presumed=False
             )
+            self._attach_resolution_tap(conn, run, event_id, student_id, "boarding")
             # Recount students_boarded from participation in the SAME
             # transaction — never increment/decrement, so repeated taps can't
             # drift the counter (R15), and it no longer reads a status column
@@ -1119,7 +1244,7 @@ class RunDao:
         return dict(row), dict(run)
 
     def dropoff_student(
-        self, scope: SchoolScope, student_id: str
+        self, scope: SchoolScope, student_id: str, *, event_id: str | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Confirm a drop-off at a reached stop on the driver's active
         afternoon run; returns (student, run snapshot).
@@ -1164,6 +1289,7 @@ class RunDao:
                 (student_id,),
             ).fetchone()
             participation_dao.record_dropoff(conn, str(run["id"]), student_id, str(driver_id))
+            self._attach_resolution_tap(conn, run, event_id, student_id, "drop-off")
             dropped_count = participation_dao.count_dropped_off(conn, str(run["id"]))
             run = conn.execute(
                 "update live_runs set students_boarded = %s where id = %s returning *",
@@ -1306,7 +1432,8 @@ class RunDao:
         return dict(student), dict(run), reversed_what
 
     def mark_student_absent(
-        self, scope: SchoolScope, student_id: str, *, whole_day: bool = False
+        self, scope: SchoolScope, student_id: str, *, whole_day: bool = False,
+        event_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Driver marks a roster student absent mid-run (U8/R17-R20); returns
         (student, run snapshot enriched with route_name/bus_name for the
@@ -1424,6 +1551,7 @@ class RunDao:
             # (U2). On an afternoon run this retracts the presumed board the
             # auto-board wrote — the correction that presumption exists to allow.
             participation_dao.clear_for_student(conn, str(run["id"]), student_id)
+            self._attach_resolution_tap(conn, run, event_id, student_id, "absent mark")
             boarded_count = (
                 participation_dao.count_dropped_off(conn, str(run["id"]))
                 if run["type"] == "afternoon"

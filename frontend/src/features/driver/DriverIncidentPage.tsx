@@ -13,8 +13,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/use-toast";
-import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
-import { DRIVER_NAV } from "@/features/driver/DriverHomePage";
+import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { api } from "@/lib/apiClient";
 
 const TYPES = [
@@ -46,7 +45,7 @@ export function DriverIncidentPage() {
   };
 
   return (
-    <RoleMobileLayout nav={DRIVER_NAV} variant="primary" title="Report Incident">
+    <DriverLayout title="Report Incident">
       <div className="space-y-4">
         <div className="flex items-center gap-2 rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
           <TriangleAlert className="h-4 w-4 shrink-0" />
@@ -74,6 +73,6 @@ export function DriverIncidentPage() {
           </CardContent>
         </Card>
       </div>
-    </RoleMobileLayout>
+    </DriverLayout>
   );
 }

@@ -23,8 +23,9 @@ from typing import Any
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-# Mirror of migration 013's live_admin_audit_action_check, kept in lockstep
-# by tests/core/test_audit_actions.py.
+# Mirror of live_admin_audit_action_check as last widened — 013's list plus
+# 016's 'exception-reviewed' — kept in lockstep by
+# tests/core/test_audit_actions.py.
 ALLOWED_ACTIONS = frozenset({
     "plan-applied", "plan-restored", "pin-map-viewed",
     "staff-created", "staff-role-offered", "staff-offer-accepted",
@@ -44,6 +45,7 @@ ALLOWED_ACTIONS = frozenset({
     "parent-updated", "parent-deleted", "parent-link-declined",
     "provider-step-in", "provider-step-out",
     "provider-account-created", "provider-account-removed", "provider-totp-reset",
+    "exception-reviewed",
 })
 
 PROVIDER_DISPLAY = "SafeRide"
@@ -93,7 +95,9 @@ def record_audit(
     bug before a transaction is burned.
     """
     if action not in ALLOWED_ACTIONS:
-        raise ValueError(f"audit action {action!r} is not in migration 013's vocabulary")
+        raise ValueError(
+            f"audit action {action!r} is not in the audit action vocabulary (013 + 016)"
+        )
 
     provider_actor = _is_provider_actor(actor, scope)
     actor_kind = "provider" if provider_actor else "staff"

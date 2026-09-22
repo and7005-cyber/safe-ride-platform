@@ -184,10 +184,17 @@ def test_gps_check_set_runs_clean_on_a_database_at_016(verify):
         "call-now-due-unsent-over-10m",
         "trail-rows-classification-failed",
         "trail-rows-past-retention",
+        "check-widenings",
     ]
     by_label = {e["label"]: e for e in result["results"]}
     for label, entry in by_label.items():
         assert "error" not in entry, f"{label}: {entry.get('error')}"
+    # The three CHECKs 016 widened must still carry the new values: an older
+    # migration re-applied after 016 (013 recreates the audit CHECK) would
+    # silently revert them, and only this observation would show it.
+    widened = by_label["check-widenings"]["rows"]
+    assert len(widened) == 3, widened
+    assert all(r["widened_by_016"] is True for r in widened), widened
     assert by_label["pending-prompts-on-completed-runs"]["rows"][0]["pending_on_completed"] >= 0
     assert by_label["call-now-due-unsent-over-10m"]["rows"][0]["overdue"] >= 0
     assert by_label["trail-rows-classification-failed"]["rows"][0]["flagged"] >= 0

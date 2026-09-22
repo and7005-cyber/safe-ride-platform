@@ -269,26 +269,6 @@ class PushDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def remaining_student_stops(self, run_id: str, stops_completed: int, scope: object = UNSET) -> list[dict]:
-        """Upcoming (not yet reached) student stops for a run, with coordinates."""
-        with get_connection(scope) as conn:
-            rows = conn.execute(
-                """
-                select rs.stop_order, rs.lat, rs.lng, rs.student_id, s.name as student_name,
-                       {display_status} as student_status
-                from run_stops rs
-                join live_students s on s.id = rs.student_id
-                where rs.run_id = %s
-                  and rs.stop_order > %s
-                  and rs.is_school_gate = false
-                  and rs.student_id is not null
-                  and rs.lat is not null
-                  and rs.lng is not null
-                """.format(display_status=display_status_case("s")),
-                (run_id, stops_completed),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
     def retract_notifications(self, run_id: str, student_id: str, types: list[str], scope: object = UNSET) -> int:
         """Remove notifications superseded by a driver correction (U5).
 

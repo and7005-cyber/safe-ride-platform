@@ -8,6 +8,7 @@ from app.core.auth import get_current_user
 from app.core.errors import ClosureRefusedError
 from app.core.permissions import require_driver_scope, require_school, require_staff
 from app.core.scope import STAFF_ROLES, SchoolScope
+from app.dao.exception_dao import ExceptionDao
 from app.dao.incident_dao import IncidentDao
 from app.dao.run_dao import RunDao
 from app.services.push_service import PushService
@@ -17,6 +18,7 @@ logger = logging.getLogger("saferide.runs")
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 dao = RunDao()
 incident_dao = IncidentDao()
+exception_dao = ExceptionDao()
 push_service = PushService()
 # The runs list serves two surfaces (U7): staff read their school's runs; a
 # driver token resolves to their own school and the DAO narrows to their
@@ -53,18 +55,20 @@ class RunIdPayload(BaseModel):
     run_id: str
 
 
-class PositionPayload(BaseModel):
-    lat: float
-    lng: float
-
-
 class BoardingPayload(BaseModel):
     student_id: str
     on_bus: bool
+    # The bypassed-stop prompt this tap came through, when it did (GPS plan
+    # U3/R15): the server records the tap on that exception's ledger as its
+    # resolution. Optional, and never a reason to refuse the tap.
+    event_id: str | None = None
 
 
 class StudentIdPayload(BaseModel):
     student_id: str
+    # Same courtesy for drop-off (GPS plan U3); reverse takes it up in U9 for
+    # the prompt's undo, and contacted ignores it.
+    event_id: str | None = None
 
 
 class AbsentPayload(BaseModel):
@@ -73,6 +77,11 @@ class AbsentPayload(BaseModel):
     # stop was the old behaviour, and it struck the child off the other run's
     # roster too — so the bus never stopped for them (U8/R17).
     whole_day: bool = False
+    event_id: str | None = None
+
+
+class PromptAnswerPayload(BaseModel):
+    answer: str
 
 
 class HandoverPayload(BaseModel):
@@ -136,6 +145,9 @@ def force_close_run(
     so there is one decision point rather than two that can disagree.
     """
     result = safe_call(lambda: dao.force_close_run(scope, run_id, actor=user))
+    # Prompts the close marked unanswered (GPS plan U3): no call-now follows
+    # from a close, so nothing consumes this yet; kept off the response.
+    result.pop("auto_resolved", None)
     background_tasks.add_task(push_service.notify_run_ended, result, scope=scope)
     outstanding = [c["student_name"] for c in result.get("unaccounted") or []]
     background_tasks.add_task(
@@ -165,15 +177,67 @@ def record_parent_contact(
 @router.get("/{run_id}/report")
 def run_report(run_id: str, scope: SchoolScope = Depends(require_staff)):
     """Post-run report (R14-R16): the run row + bus/route/driver names + the
-    absent_students snapshot (approximate=true on the legacy fallback)."""
+    absent_students snapshot (approximate=true on the legacy fallback) + the
+    run's stop exceptions with derived status (GPS plan U2)."""
     return safe_call(lambda: dao.run_report(scope, run_id))
+
+
+@router.get("/{run_id}/exceptions")
+def list_run_exceptions(run_id: str, scope: SchoolScope = Depends(require_staff)):
+    """A run's stop exceptions (GPS plan U2/R21): kind, stop, the children
+    still without an outcome, derived open/resolved status, review state and
+    the prompt/response ledger. Staff of the active school only; a run of
+    another school is 404 through RLS. Parents have no route to this (R22)."""
+    return safe_call(lambda: exception_dao.list_for_run(scope, run_id))
+
+
+@router.post("/{run_id}/exceptions/{exception_id}/review")
+def review_run_exception(
+    run_id: str,
+    exception_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    """Mark an exception reviewed (R21): director or coordinator, the provider
+    stepped in as director. Idempotent; the first review writes one
+    exception-reviewed audit row carrying the exception id only."""
+    return safe_call(
+        lambda: exception_dao.mark_reviewed(scope, run_id, exception_id, actor=user)
+    )
 
 
 # Driver run lifecycle (U7: driver-scoped — school derived, header refused) ----
 
 @router.get("/driver/context")
 def driver_context(scope: SchoolScope = Depends(require_driver_scope)):
+    """The driver's bus, routes, active run, roster, blocking set and — GPS
+    plan U3/R34 — `pending_prompts`: the open run's pending prompts, safety
+    kinds first, each with its event id, copy inputs and allowed answers.
+    Polled every 5 s, so a reload or a second device re-shows them."""
     return safe_call(lambda: dao.get_driver_context(scope))
+
+
+@router.post("/driver/prompts/{event_id}/shown")
+def acknowledge_prompt_shown(event_id: str, scope: SchoolScope = Depends(require_driver_scope)):
+    """The card mounted (GPS plan U3): stamp shown_at once, first stamp wins.
+    The event must belong to this driver's run (403 otherwise; another
+    school's event is 404 through RLS)."""
+    return safe_call(lambda: exception_dao.acknowledge_shown(scope, event_id))
+
+
+@router.post("/driver/prompts/{event_id}/respond")
+def respond_to_prompt(
+    event_id: str, payload: PromptAnswerPayload,
+    scope: SchoolScope = Depends(require_driver_scope),
+):
+    """Record the driver's answer to a prompt (GPS plan U3/R23, R34).
+
+    Same answer again: 200, unchanged. A different answer after one was
+    recorded: 409 `prompt-already-answered`; any answer after Arrive, End Run
+    or force-close closed it: 409 `prompt-resolved` — both carry the recorded
+    state in `detail`, and the client drops the card and refreshes on either.
+    """
+    return safe_call(lambda: exception_dao.respond(scope, event_id, payload.answer))
 
 
 @router.post("/driver/start")
@@ -193,10 +257,28 @@ def arrive(
     scope: SchoolScope = Depends(require_driver_scope),
 ):
     result = safe_call(lambda: dao.arrive_next_stop(scope, payload.run_id))
+    # Prompts this Arrive closed as unanswered (GPS plan U3): U10 decides the
+    # call-now notice from them here; until then they stay off the response.
+    result.pop("auto_resolved", None)
     if result.get("arrival_incident"):
         background_tasks.add_task(push_service.notify_reached_school, result["run"], scope=scope)
     # Arriving a stop means the next stop's children should get ready.
     background_tasks.add_task(push_service.notify_bus_approaching, result["run"], scope=scope)
+    # A newly raised bypassed-stop exception reaches the office through the
+    # lifecycle feed (GPS plan U2/R15, R21): post-commit, DAO-direct, never the
+    # parent fan-out, and marked lifecycle so the parent alerts reader excludes
+    # it. Raised only when the exception row itself was inserted, which is the
+    # dedup on (run, stop order): a catch-up Arrive or a reopen finds the row
+    # already there and stays quiet. The text names the stop and the children,
+    # never a coordinate.
+    bypassed = result.pop("bypassed_stop", None)
+    if bypassed:
+        names = ", ".join(s["name"] for s in bypassed["students"])
+        background_tasks.add_task(
+            _record_lifecycle_alert, scope, str(result["run"]["id"]), "stop-bypassed",
+            f"Stop {bypassed['stop_order']} ({bypassed['stop_name']}): "
+            f"no record yet for {names}.",
+        )
     return result
 
 
@@ -216,23 +298,10 @@ def end_run(
         raise map_error(refusal) from refusal
     except Exception as error:
         raise map_error(error) from error
+    run.pop("auto_resolved", None)  # GPS plan U3: closed prompts, no call-now at End Run
     background_tasks.add_task(push_service.notify_run_ended, run, scope=scope)
     background_tasks.add_task(_record_lifecycle_alert, scope, str(run["id"]), "run-completed")
     return run
-
-
-@router.post("/driver/position")
-def write_position(
-    payload: PositionPayload, background_tasks: BackgroundTasks,
-    scope: SchoolScope = Depends(require_driver_scope),
-):
-    # The run snapshot is captured at request time so the notification task
-    # never races a subsequent arrive/end request re-reading run state.
-    run = safe_call(lambda: dao.write_position(scope, payload.lat, payload.lng))
-    background_tasks.add_task(
-        push_service.notify_bus_position, run, payload.lat, payload.lng, scope=scope
-    )
-    return {"ok": True}
 
 
 @router.post("/driver/boarding")
@@ -243,7 +312,9 @@ def toggle_boarding(
     # Morning-only and one-way: the DAO 409s afternoon runs (use /driver/
     # dropoff) and on_bus=false (un-boarding retracts a sent safety push).
     student, run = safe_call(
-        lambda: dao.toggle_boarding(scope, payload.student_id, payload.on_bus)
+        lambda: dao.toggle_boarding(
+            scope, payload.student_id, payload.on_bus, event_id=payload.event_id
+        )
     )
     background_tasks.add_task(
         push_service.notify_student_boarded, run, payload.student_id, scope=scope
@@ -259,7 +330,9 @@ def dropoff_student(
     """Confirm a drop-off at a reached stop on the driver's active afternoon
     run (R32). The tap-time notification carries run_id + student_id so the
     dedup index suppresses retries."""
-    student, run = safe_call(lambda: dao.dropoff_student(scope, payload.student_id))
+    student, run = safe_call(
+        lambda: dao.dropoff_student(scope, payload.student_id, event_id=payload.event_id)
+    )
     background_tasks.add_task(
         push_service.notify_student_dropped_off, student, run, scope=scope
     )
@@ -394,7 +467,8 @@ def mark_student_absent(
     """
     student, run = safe_call(
         lambda: dao.mark_student_absent(
-            scope, payload.student_id, whole_day=payload.whole_day
+            scope, payload.student_id, whole_day=payload.whole_day,
+            event_id=payload.event_id,
         )
     )
     background_tasks.add_task(

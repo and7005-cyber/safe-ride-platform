@@ -40,6 +40,26 @@ class ClosureRefusedError(ConflictError):
         self.blocking = blocking
 
 
+class PromptConflictError(ConflictError):
+    """A prompt answer the ledger cannot take (GPS plan U3/R23, R34).
+
+    Carries a machine-readable ``code`` — ``prompt-already-answered`` when a
+    different answer arrives after one was recorded, ``prompt-resolved`` when
+    any answer arrives after Arrive, End Run or force-close closed the prompt
+    as unanswered — plus the recorded state, so the client can drop the card
+    and refresh without parsing the message. A replay of the same answer is
+    not a conflict and never raises this.
+    """
+
+    def __init__(
+        self, message: str, *, code: str, prompt_state: str | None, response: str | None
+    ):
+        super().__init__(message)
+        self.code = code
+        self.prompt_state = prompt_state
+        self.response = response
+
+
 class TooManyRequestsError(SafeRideError):
     status_code = 429
 
