@@ -27,11 +27,24 @@ import {
 } from "@/components/ui/select";
 import { ToastAction } from "@/components/ui/toast";
 import { useToast } from "@/components/ui/use-toast";
-import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
+import {
+  AccuracyCircle,
+  BusMarkerGlyph,
+  FitBounds,
+  RoutePolyline,
+  useNow,
+  type LatLng,
+} from "@/components/map/MapPrimitives";
 import { PlacePicker, type Provenance, type ResolvedPlace } from "@/features/admin/components/PlacePicker";
 import { PlannerCsvDialog } from "@/features/admin/components/PlannerCsvDialog";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
 import { api } from "@/lib/apiClient";
+import {
+  accuracyRadius,
+  freshnessLabel,
+  sourceLabel,
+  type StaffBusPosition,
+} from "@/lib/positionFreshness";
 import { POLL_LIVE, useBuses, useSchoolKey } from "@/lib/queries";
 
 // Distinct, high-contrast colours assigned deterministically per bus.
@@ -40,21 +53,9 @@ const PALETTE = [
   "#0891b2", "#db2777", "#65a30d", "#475569", "#ea580c",
 ];
 
-const BUS_PATH =
-  "M4 16c0 .88.39 1.67 1 2.22V20c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h8v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1.78c.61-.55 1-1.34 1-2.22V6c0-3.5-3.58-4-8-4s-8 .5-8 4v10zm3.5 1c-.83 0-1.5-.67-1.5-1.5S6.67 14 7.5 14s1.5.67 1.5 1.5S8.33 17 7.5 17zm9 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm1.5-6H6V6h12v5z";
-
-function BusGlyph({ color }: { color: string }) {
-  return (
-    <div
-      style={{ background: color }}
-      className="flex h-[30px] w-[30px] items-center justify-center rounded-full border-2 border-white shadow-[0_1px_4px_rgba(0,0,0,.45)]"
-    >
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff" aria-hidden="true">
-        <path d={BUS_PATH} />
-      </svg>
-    </div>
-  );
-}
+/** A bus row whose served position is present (GPS plan U8): the one
+ * position object the server derives — nothing here reads around it. */
+type LocatedBus = { id: string; name: string; position: StaffBusPosition } & Record<string, any>;
 
 function StopGlyph({ seq, school }: { seq: number; school?: boolean }) {
   return (
@@ -100,7 +101,10 @@ export function FleetMapPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
-  const located = (buses as any[]).filter((b) => b.current_lat != null && b.current_lng != null);
+  // Buses with a served position. Re-rendered on a 5 s tick as well as on
+  // each poll so the freshness lines keep counting (GPS plan U8).
+  const located = (buses as any[]).filter((b): b is LocatedBus => b.position != null);
+  const now = useNow();
   const [selectedBus, setSelectedBus] = useState<string | null>(null);
 
   // Stable colour per bus, by sorted id so it doesn't shuffle as data changes.
@@ -385,7 +389,7 @@ export function FleetMapPage() {
 
   const focusPoints: LatLng[] = planned.length
     ? plannedPath
-    : located.map((b) => ({ lat: b.current_lat, lng: b.current_lng }));
+    : located.map((b) => ({ lat: b.position.lat, lng: b.position.lng }));
   const focusKey = planned.length
     ? `plan:${planned.map((s) => `${s.lat},${s.lng}`).join("|")}`
     : `buses:${located.map((b) => b.id).sort().join(",")}`;
@@ -412,28 +416,75 @@ export function FleetMapPage() {
             >
               <FitBounds points={focusPoints} focusKey={focusKey} />
 
-              {located.map((bus: any) => (
+              {/* One marker per located bus, keyed by bus id, with exactly one
+                  child whatever the position says: stale and GPS-off are class
+                  toggles on the glyph, so a poll that only moves or ages a
+                  position never recreates the marker (GPS plan U8). */}
+              {located.map((bus) => (
                 <AdvancedMarker
                   key={bus.id}
-                  position={{ lat: bus.current_lat, lng: bus.current_lng }}
+                  position={{ lat: bus.position.lat, lng: bus.position.lng }}
                   onClick={() => setSelectedBus(bus.id)}
                 >
-                  <BusGlyph color={colorMap[bus.id] ?? PALETTE[0]} />
+                  <BusMarkerGlyph
+                    color={colorMap[bus.id] ?? PALETTE[0]}
+                    busId={bus.id}
+                    stale={bus.position.stale}
+                    gpsOff={bus.position.gps_off}
+                    title={`${bus.name} — ${freshnessLabel(bus.position, now) ?? "position time unknown"}`}
+                  />
                 </AdvancedMarker>
               ))}
 
+              {/* A fix's accuracy radius, capped at 300 m so an approximate-
+                  location grant cannot swallow the map. Circles are their own
+                  overlays, not marker children. */}
+              {located.map((bus) => {
+                const radius = accuracyRadius(bus.position.accuracy_m);
+                if (radius == null) return null;
+                return (
+                  <AccuracyCircle
+                    key={`accuracy-${bus.id}`}
+                    center={{ lat: bus.position.lat, lng: bus.position.lng }}
+                    radiusM={radius}
+                    color={colorMap[bus.id] ?? PALETTE[0]}
+                  />
+                );
+              })}
+
               {selectedBus &&
                 (() => {
-                  const bus = located.find((b: any) => b.id === selectedBus);
+                  const bus = located.find((b) => b.id === selectedBus);
                   if (!bus) return null;
+                  const position = bus.position;
                   return (
                     <InfoWindow
-                      position={{ lat: bus.current_lat, lng: bus.current_lng }}
+                      position={{ lat: position.lat, lng: position.lng }}
                       onCloseClick={() => setSelectedBus(null)}
                     >
-                      <div className="space-y-1 text-sm">
+                      <div className="space-y-1 text-sm" data-testid="bus-info-window">
                         <p className="font-semibold" style={{ color: colorMap[bus.id] }}>{bus.name}</p>
-                        <p>{bus.position_label ?? "On the move"}</p>
+                        <p data-testid="bus-info-label">{position.label ?? "On the move"}</p>
+                        <p className="text-xs text-muted-foreground" data-testid="bus-info-source">
+                          Source: {sourceLabel(position.source)}
+                          {position.accuracy_m != null && ` · ±${Math.round(position.accuracy_m)} m`}
+                        </p>
+                        <p
+                          className={position.stale ? "text-xs text-amber-700" : "text-xs text-muted-foreground"}
+                          data-testid="bus-info-freshness"
+                          data-stale={position.stale ? "true" : "false"}
+                        >
+                          {freshnessLabel(position, now) ?? "Position time unknown"}
+                        </p>
+                        {position.no_gps_for_run ? (
+                          <p className="text-xs text-red-700" data-testid="bus-info-gps">
+                            No GPS for this run — checkpoint positions only
+                          </p>
+                        ) : position.gps_off ? (
+                          <p className="text-xs text-red-700" data-testid="bus-info-gps">
+                            Phone GPS off since the last tap
+                          </p>
+                        ) : null}
                         <p>Driver: {bus.driver_name ?? "—"}</p>
                         <p>Plate: {bus.plate_number ?? "—"}</p>
                       </div>
@@ -465,15 +516,25 @@ export function FleetMapPage() {
                   its position updates as they arrive at each stop.
                 </p>
               ) : (
-                located.map((bus: any) => (
-                  <div key={bus.id} className="flex items-center gap-2 text-sm">
+                located.map((bus) => (
+                  <div
+                    key={bus.id}
+                    className="flex items-center gap-2 text-sm"
+                    data-testid={`bus-row-${bus.id}`}
+                  >
                     <span
                       className="h-3 w-3 shrink-0 rounded-full border border-white shadow"
                       style={{ background: colorMap[bus.id] }}
                     />
                     <span className="font-medium">{bus.name}</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {bus.position_label ?? "Live"}
+                    <span className="ml-auto text-right text-xs text-muted-foreground">
+                      <span className="block">{bus.position.label ?? "Live"}</span>
+                      <span
+                        className={`block ${bus.position.stale ? "text-amber-700" : ""}`}
+                        data-testid="bus-row-freshness"
+                      >
+                        {freshnessLabel(bus.position, now) ?? "time unknown"}
+                      </span>
                     </span>
                   </div>
                 ))

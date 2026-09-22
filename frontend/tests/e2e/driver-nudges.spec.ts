@@ -161,9 +161,9 @@ test("a bypassed stop raises one card with tone and vibration; it survives a rel
   expect(
     bypassed[0].events.some((e: any) => e.student_id === faith.id && e.response === "resolution"),
   ).toBe(true);
-  // U9 placeholder: a resolution tap is exempt from the custody check.
-  // Nothing raises custody-away until U9; the assertion is named here so U9
-  // turns it into the real one (a far fix on this tap, still no exception).
+  // The exemption (U9/R14): the board came through the card with the suite's
+  // default fix — Nairobi CBD, some 4 km from Kilimani — and raises no
+  // custody exception because it resolved the bypassed stop.
   expect(rows.filter((x: any) => x.kind === "custody-away")).toHaveLength(0);
 
   // The board agrees: Faith is on the bus.

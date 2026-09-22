@@ -60,6 +60,36 @@ class PromptConflictError(ConflictError):
         self.response = response
 
 
+class IdempotencyConflictError(ConflictError):
+    """An action key the ledger cannot honour (GPS plan U7/R33).
+
+    ``code`` is machine-readable, like ``PromptConflictError``:
+    ``idempotency-mismatch`` when the same (school, driver, key) arrives with a
+    different request fingerprint — the stored response is never revealed —
+    and ``idempotency-in-flight`` when the first attempt under that key is
+    still executing (the insert waited out the lock timeout). The client
+    retries the same envelope on in-flight and drops it on mismatch.
+    """
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+class ActionReplayed(Exception):
+    """Not an error: the key was seen before with the same fingerprint, and
+    this is the stored response (GPS plan U7/R33). Raised from inside the
+    action DAO so the router returns ``body`` unchanged and dispatches no
+    side effects — no push, no lifecycle alert, no purge — for a tap that
+    already happened. Prompts are re-derived by the context poll, not stored.
+    """
+
+    def __init__(self, body, *, action: str):
+        super().__init__(f"replayed {action}")
+        self.body = body
+        self.action = action
+
+
 class TooManyRequestsError(SafeRideError):
     status_code = 429
 

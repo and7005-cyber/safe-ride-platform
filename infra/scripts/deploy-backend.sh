@@ -138,6 +138,28 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 [ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
 [ -n "$VAPID_SUBJ" ] && DEPLOY_PARAMS+=("VapidSubject=${VAPID_SUBJ}")
+# GPS tracking system defaults (GPS plan U11). The template Defaults equal the
+# app's Settings defaults; an operator changes one for a deploy by exporting
+# the same variable name the app reads (e.g. GPS_CUSTODY_THRESHOLD_M=200) —
+# omitted means the template Default, never an empty override (SAM rejects
+# those). Schools override the first five per school in School Settings; the
+# last two are system-wide. Each pair is TemplateParameter:ENV_NAME.
+GPS_PARAMS=(
+  GpsCustodyThresholdM:GPS_CUSTODY_THRESHOLD_M
+  GpsVicinityRadiusM:GPS_VICINITY_RADIUS_M
+  GpsFixAccuracyCapM:GPS_FIX_ACCURACY_CAP_M
+  GpsPositionRetentionDays:GPS_POSITION_RETENTION_DAYS
+  GpsPingIntervalS:GPS_PING_INTERVAL_S
+  GpsStaleAfterS:GPS_STALE_AFTER_S
+  GpsFixWaitBudgetS:GPS_FIX_WAIT_BUDGET_S
+)
+for pair in "${GPS_PARAMS[@]}"; do
+  param="${pair%%:*}"; var="${pair##*:}"
+  if [ -n "${!var:-}" ]; then
+    DEPLOY_PARAMS+=("${param}=${!var}")
+    echo "==> GPS default override: ${param}=${!var} (from \$${var})"
+  fi
+done
 sam deploy --parameter-overrides "${DEPLOY_PARAMS[@]}"
 
 API_URL="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" HttpApiUrl)"

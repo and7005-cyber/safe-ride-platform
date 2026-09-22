@@ -6,6 +6,7 @@ import {
   EXCEPTION_KINDS,
   EXCEPTION_KIND_LABEL,
   EXCEPTION_KIND_NOTE,
+  PLAUSIBILITY_FLAGS,
   childrenLine,
   distanceLine,
   eventLine,
@@ -15,6 +16,7 @@ import {
   reasonLabel,
   responseLabel,
   seenAtStopLine,
+  statusBadge,
   unreviewedCount,
   type RunException,
   type RunExceptionEvent,
@@ -91,6 +93,29 @@ describe("reasons and responses read as words", () => {
 
   it("opens out an unknown reason instead of hiding it", () => {
     expect(reasonLabel("some-new-reason")).toBe("some new reason");
+  });
+
+  // The plausibility safeguard (GPS plan U12, R32): the vocabulary is the
+  // server's (position_rules.PLAUSIBILITY_FLAGS), verbatim and in order, and
+  // every name has office wording — a flag must never reach the panel as a
+  // slug.
+  it("labels every plausibility flag, and a comma-joined reason flag by flag", () => {
+    expect([...PLAUSIBILITY_FLAGS]).toEqual([
+      "clock-skew", "jump", "speed", "accuracy-zero", "repeat-coordinates", "at-planned-stop",
+    ]);
+    for (const flag of PLAUSIBILITY_FLAGS) {
+      const label = reasonLabel(flag)!;
+      expect(label).toBeTruthy();
+      expect(label).not.toBe(flag.replace(/-/g, " "));
+      expect(label).not.toMatch(/[a-z]-[a-z]/);
+    }
+    expect(reasonLabel("implausible")).toBe("fix flagged implausible");
+    expect(reasonLabel("jump,speed")).toBe(
+      "implausible jump between fixes, implied speed too high for a bus",
+    );
+    expect(reasonLabel("accuracy-zero,at-planned-stop")).toBe(
+      "accuracy reported as zero, fix exactly on a planned stop's pin",
+    );
   });
 
   it("labels every answer the prompts record", () => {
@@ -185,6 +210,17 @@ describe("the ledger in plain words", () => {
     expect(eventLine(event())).toContain("tap recorded, no prompt shown");
   });
 
+  it("reads an implausible fix's distance as movement, not distance from a stop (U12)", () => {
+    const moved = eventLine(event({ distance_m: 5200, student_id: "s1" }), "implausible-movement");
+    expect(moved).toContain("tap recorded, no prompt shown");
+    expect(moved).toContain("(moved 5.2 km since the previous fix)");
+    expect(moved).not.toContain("away");
+    // A run's first fix has nothing to have moved from.
+    expect(eventLine(event(), "implausible-movement")).not.toContain("moved");
+    // Other kinds keep the distance-from-the-stop wording.
+    expect(eventLine(event({ distance_m: 2280 }), "custody-away")).toContain("(2.3 km away)");
+  });
+
   it("states the call-now notice's fate", () => {
     expect(eventLine(event({
       prompt_state: "answered", response: "not-at-stop",
@@ -203,5 +239,50 @@ describe("the count the badge shows", () => {
       exception({ status: null }),
     ])).toBe(2);
     expect(unreviewedCount([])).toBe(0);
+  });
+});
+
+// --- the custody tap's derived status and children (GPS plan U9) ----------------
+
+describe("a custody tap's row", () => {
+  it("lists the tapped children plainly, not as 'still no outcome'", () => {
+    expect(childrenLine(exception({
+      kind: "custody-away", status: "open",
+      students: [{ id: "a", name: "Wanjiru" }, { id: "b", name: "Brian" }],
+    }))).toBe("Wanjiru, Brian");
+    expect(childrenLine(exception({
+      kind: "unverified", students: [{ id: "a", name: "Wanjiru" }],
+    }))).toBe("Wanjiru");
+  });
+
+  it("badges every derived status the server can send, and nothing for none", () => {
+    expect(statusBadge("open")).toEqual({ label: "Open", variant: "warning" });
+    expect(statusBadge("resolved")).toEqual({ label: "Resolved", variant: "success" });
+    expect(statusBadge("confirmed")).toEqual({ label: "Confirmed by driver", variant: "success" });
+    expect(statusBadge("retracted")).toEqual({ label: "Retracted", variant: "secondary" });
+    // The remote absent's settled classes (GPS plan U10/R17).
+    expect(statusBadge("attested")).toEqual({ label: "Attested by driver", variant: "secondary" });
+    expect(statusBadge("uncorroborated")).toEqual({ label: "Uncorroborated", variant: "warning" });
+    expect(statusBadge(null)).toBeNull();
+  });
+
+  it("wordings are sentence case with no raw slug", () => {
+    for (const status of ["open", "resolved", "confirmed", "retracted", "attested", "uncorroborated"] as const) {
+      const label = statusBadge(status)!.label;
+      expect(label[0]).toBe(label[0]!.toUpperCase());
+      expect(label).not.toMatch(/[a-z]-[a-z]/);
+    }
+  });
+});
+
+describe("the custody undo on the ledger (GPS plan U9)", () => {
+  it("reads a retraction as undone by the driver, answered or appended", () => {
+    expect(responseLabel("retracted")).toBe("undone by the driver");
+    expect(eventLine(event({ prompt_state: "answered", response: "retracted" }))).toContain(
+      "prompt answered: undone by the driver",
+    );
+    const appended = eventLine(event({ prompt_state: null, response: "retracted", student_id: "a" }));
+    expect(appended).toContain("undone by the driver");
+    expect(appended).not.toContain("prompt");
   });
 });

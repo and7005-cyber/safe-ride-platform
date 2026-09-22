@@ -74,12 +74,32 @@ export const EXCEPTION_KIND_NOTE: Record<ExceptionKind, string> = {
     "A fix on this run moved further or faster than a bus can, or reported an accuracy that cannot be trusted.",
 };
 
+/** The plausibility safeguard's flag vocabulary (GPS plan U12, R32), in the
+ * order the server reports it; an implausible-movement row's `reason` is
+ * these names comma-joined. backend/app/services/position_rules.py
+ * (PLAUSIBILITY_FLAGS) owns the names; keep the two in step. */
+export const PLAUSIBILITY_FLAGS = [
+  "clock-skew",
+  "jump",
+  "speed",
+  "accuracy-zero",
+  "repeat-coordinates",
+  "at-planned-stop",
+] as const;
+
 const REASON_LABEL: Record<string, string> = {
   "no-fix": "no fix for this action",
   "too-coarse": "fix too coarse",
   "stop-unverified": "stop position unverified",
   invalid: "fix could not be read",
+  // The unverified check's fourth reason (R20) and the flags behind it (U12).
+  implausible: "fix flagged implausible",
+  "clock-skew": "capture time ahead of the server clock",
   jump: "implausible jump between fixes",
+  speed: "implied speed too high for a bus",
+  "accuracy-zero": "accuracy reported as zero",
+  "repeat-coordinates": "same coordinates as the previous fix",
+  "at-planned-stop": "fix exactly on a planned stop's pin",
   accuracy: "accuracy reading cannot be trusted",
 };
 
@@ -90,6 +110,9 @@ const RESPONSE_LABEL: Record<string, string> = {
   "told-me": "a parent or the office told the driver",
   "not-at-stop": "the driver was not at the stop",
   undo: "undone by the driver",
+  // The custody undo (GPS plan U9): a pending prompt answered this way, or
+  // the row appended after a confirmation the driver later withdrew.
+  retracted: "undone by the driver",
 };
 
 export interface RunExceptionEvent {
@@ -119,7 +142,10 @@ export interface RunException {
   fix_captured_at: string | null;
   distance_m: number | null;
   seen_at_stop: boolean | null;
-  status: "open" | "resolved" | null;
+  /** Derived by the server: open/resolved for a bypassed stop (current
+   * outcomes), open/confirmed/retracted for a custody tap (its prompt
+   * answers); null for the kinds that define none. */
+  status: "open" | "resolved" | "confirmed" | "retracted" | "attested" | "uncorroborated" | null;
   created_at: string;
   reviewed_at: string | null;
   reviewed_by_display: string | null;
@@ -136,11 +162,16 @@ export function kindNote(kind: string): string | null {
   return (EXCEPTION_KIND_NOTE as Record<string, string>)[kind] ?? null;
 }
 
-/** A stored reason in words; an unknown reason is echoed with its hyphens
- * opened out rather than hidden, because the office needs to see it. */
+/** A stored reason in words — flag by flag when several are comma-joined
+ * (an implausible-movement row); an unknown reason is echoed with its
+ * hyphens opened out rather than hidden, because the office needs to see it. */
 export function reasonLabel(reason: string | null | undefined): string | null {
   if (!reason) return null;
-  return REASON_LABEL[reason] ?? reason.replace(/-/g, " ");
+  return reason
+    .split(",")
+    .filter(Boolean)
+    .map((token) => REASON_LABEL[token] ?? token.replace(/-/g, " "))
+    .join(", ");
 }
 
 export function responseLabel(response: string | null | undefined): string | null {
@@ -189,22 +220,52 @@ export function seenAtStopLine(x: Pick<RunException, "seen_at_stop">): string | 
 }
 
 /** The children the row is about: the ones still without an outcome for a
- * stop-keyed kind, the named child for a student-keyed one. */
+ * bypassed stop, the children tapped for a custody or unverified row, the
+ * named child for a student-keyed one. */
 export function childrenLine(x: Pick<RunException, "kind" | "students" | "student_name" | "status">): string | null {
   if (x.students.length > 0) {
     const names = x.students.map((s) => s.name);
-    return `Still no outcome: ${names.join(", ")}`;
+    return x.kind === "stop-bypassed" ? `Still no outcome: ${names.join(", ")}` : names.join(", ");
   }
   if (x.student_name) return x.student_name;
   if (x.status === "resolved") return "Every child at this stop now has an outcome";
   return null;
 }
 
-/** One ledger event in plain words, oldest first in the panel. */
-export function eventLine(event: RunExceptionEvent): string {
+/** The status badge's wording and tone, or null when the kind defines none. */
+export function statusBadge(status: RunException["status"]): { label: string; variant: "warning" | "success" | "secondary" } | null {
+  switch (status) {
+    case "open":
+      return { label: "Open", variant: "warning" };
+    case "resolved":
+      return { label: "Resolved", variant: "success" };
+    case "confirmed":
+      return { label: "Confirmed by driver", variant: "success" };
+    case "retracted":
+      return { label: "Retracted", variant: "secondary" };
+    // The remote absent's two settled classes (GPS plan U10/R17): attested is
+    // history, uncorroborated is the live one the office phones about.
+    case "attested":
+      return { label: "Attested by driver", variant: "secondary" };
+    case "uncorroborated":
+      return { label: "Uncorroborated", variant: "warning" };
+    default:
+      return null;
+  }
+}
+
+/** One ledger event in plain words, oldest first in the panel. `kind` is the
+ * row's: on an implausible-movement row an event's distance is how far the
+ * fix moved since the previous one, not a distance from a stop. */
+export function eventLine(event: RunExceptionEvent, kind?: string): string {
   const at = clock(event.created_at);
   const when = at ? `${at} — ` : "";
-  const away = event.distance_m != null ? ` (${formatDistance(event.distance_m)} away)` : "";
+  const distance = formatDistance(event.distance_m);
+  const away = distance
+    ? kind === "implausible-movement"
+      ? ` (moved ${distance} since the previous fix)`
+      : ` (${distance} away)`
+    : "";
   const parts: string[] = [];
   if (event.prompt_state === "pending") {
     if (event.shown_at) parts.push(`prompt shown to the driver at ${clock(event.shown_at)}, not yet answered`);
@@ -290,6 +351,7 @@ export function RunExceptionsPanel({
             const reason = reasonLabel(x.reason);
             const children = childrenLine(x);
             const note = kindNote(x.kind);
+            const status = statusBadge(x.status);
             return (
               <li
                 key={x.id}
@@ -300,10 +362,10 @@ export function RunExceptionsPanel({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="font-medium">{kindLabel(x.kind)}</span>
                   {reason && <span className="text-muted-foreground">— {reason}</span>}
-                  {/* Derived by the server from current outcomes; only the
-                      kinds that define it carry it. */}
-                  {x.status === "open" && <Badge variant="warning">Open</Badge>}
-                  {x.status === "resolved" && <Badge variant="success">Resolved</Badge>}
+                  {/* Derived by the server — from current outcomes for a
+                      bypassed stop, from the prompt answers for a custody
+                      tap; only the kinds that define it carry it. */}
+                  {status && <Badge variant={status.variant}>{status.label}</Badge>}
                 </div>
                 {note && <p className="text-xs text-muted-foreground">{note}</p>}
                 <div className="grid gap-x-4 gap-y-1 sm:grid-cols-2">
@@ -326,7 +388,7 @@ export function RunExceptionsPanel({
                 {x.events.length > 0 && (
                   <ul className="space-y-0.5 text-xs text-muted-foreground">
                     {x.events.map((event) => (
-                      <li key={event.id}>{eventLine(event)}</li>
+                      <li key={event.id}>{eventLine(event, x.kind)}</li>
                     ))}
                   </ul>
                 )}

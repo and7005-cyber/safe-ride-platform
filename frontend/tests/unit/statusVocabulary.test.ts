@@ -43,6 +43,11 @@ const NOTIFICATION_VALUES = [
   "run-started", "student-boarded", "bus-approaching", "reached-school",
   "on-way-home", "dropped-off", "student-absent", "incident", "admin-notice",
   "ride-cancelled", "custom",
+  // The boarding undo's neutral correction (GPS plan U9/R35).
+  "boarding-corrected",
+  // The absent undo's correction (reworded neutrally in GPS plan U10), the
+  // drop-off correction, and the remote-absent call-now notice (U10/R18).
+  "absence-corrected", "dropoff-corrected", "absent-call-now",
 ] as const;
 const ADMIN_INCIDENT_VALUES = [
   "breakdown", "accident", "student", "traffic", "arrival", "other",

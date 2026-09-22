@@ -1,6 +1,6 @@
 # SafeRide Kenya Beta
 
-SafeRide is a Phase 1 school transport MVP for Nairobi private schools. It includes an admin web app, a driver mobile web flow, parent progress links, a local FastAPI/Postgres backend, parent notifications, and offline-tolerant driver taps.
+SafeRide is a Phase 1 school transport MVP for Nairobi private schools. It includes an admin web app, a driver mobile web flow, parent progress links, a local FastAPI/Postgres backend, parent notifications, and phone-GPS bus tracking during runs.
 
 ## What Is Included
 
@@ -13,7 +13,8 @@ SafeRide is a Phase 1 school transport MVP for Nairobi private schools. It inclu
 - School setup workflows for buses, drivers, students, parent contacts, parent links, trips, and ordered student stops.
 - Daily attendance marking for absent students and alternative transport.
 - Driver PIN login with short-lived session tokens.
-- Driver trip selection, trip start/end, passenger boarding/drop-off/not-present taps, issue reporting, and offline tap queueing.
+- Driver trip selection, trip start/end, passenger boarding/drop-off/not-present taps, and issue reporting. Taps need a live connection and do not queue offline; a failed tap is retried by tapping again under the same idempotency key, so nothing is recorded twice.
+- Phone-GPS bus tracking (Phase 1): every driver tap between Start Run and End Run carries the phone's position, which becomes the bus's position on the office fleet map and the parent Track page, with source and freshness ("updated / last seen X ago"). Nothing is requested or recorded outside a run. Taps made away from the child's stop, stops passed with nothing recorded, and absents marked remotely raise office-facing stop exceptions with server-owned driver prompts that never block a tap; per-school thresholds live in School Settings; the position trail is purged after the school's retention period (default 90 days). Interval pings between taps are designed but not enabled.
 - Parent link page that shows only the parent child by name and anonymizes other stops.
 - FastAPI routes for admin, driver, parent, and notification workflows.
 - Local Postgres migrations, seed data, Docker Compose scripts, and DAO/service layers.
@@ -211,7 +212,9 @@ to restore pristine demo state at any time.
 
 The app installs as a PWA (manifest + service worker + icons) and notifies
 parents about bus events: run started, child boarded, bus approaching,
-arrived at school, on the way home, dropped off, and driver incidents. The
+arrived at school, on the way home, dropped off, marked absent, the call-now
+notice for an uncorroborated remote absent, neutral corrections when a driver
+withdraws a mark, and driver incidents. The
 notification feed always works in-app; real device push activates when
 Firebase Cloud Messaging (or plain VAPID web push) credentials are configured.
 See [docs/push-notifications.md](docs/push-notifications.md) for the full

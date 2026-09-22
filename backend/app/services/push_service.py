@@ -29,6 +29,15 @@ Notification types:
                    changed the child's stop/time/bus
   route-unassigned a fleet-plan apply (U6) or a manual live-route edit (U13)
                    left the child without a route for a leg
+  boarding-corrected the driver withdrew a boarding mark (GPS plan U9); retracts
+                   student-boarded and claims nothing about where the child is
+  absence-corrected the driver withdrew an absent mark (GPS plan U10, reworded
+                   neutrally); retracts student-absent only, never absent-call-now
+  absent-call-now  the child was marked absent away from the stop and nothing
+                   corroborated it (GPS plan U10/R18): call the office now if the
+                   child should be on the bus. Additional to student-absent, its
+                   own type, at most once per child per run (capped on the
+                   exception ledger, not only here), never retracted
 
 Rows persist the run's period as run_type ('morning'/'afternoon') so the
 parent feed can filter by period even after the run itself is deleted
@@ -222,15 +231,34 @@ class PushService:
             # unique on (user, run, student, type), so leaving it would suppress
             # the driver's genuine second confirmation as a duplicate — the
             # family would keep the false message and never get the true one.
-            superseded = (
-                ["student-absent"] if reversed_what == "absence" else ["dropped-off"]
-            )
+            superseded = {
+                "absence": ["student-absent"],
+                "boarding": ["student-boarded"],
+            }.get(reversed_what, ["dropped-off"])
             self.dao.retract_notifications(str(run["id"]), student_id, superseded, scope=scope)
 
             if reversed_what == "absence":
+                # Neutral by design (GPS plan U10/R35): the mark is withdrawn
+                # and the driver will record what happens; the message claims
+                # nothing about where the child is. It used to say "They are
+                # on the bus" — a claim manufactured from a tap that may have
+                # been made kilometres from the stop.
                 type_ = "absence-corrected"
-                title = "Correction: not absent"
-                tail = "was marked absent by mistake. They are on the bus."
+                title = "Correction: absent mark withdrawn"
+                tail = (
+                    "was marked absent by mistake; that mark has been withdrawn. "
+                    "The driver will record what happens at the stop."
+                )
+            elif reversed_what == "boarding":
+                # Neutral by design (GPS plan U9/R35): the mark is withdrawn
+                # and the driver will record what happens; the message claims
+                # nothing about where the child is.
+                type_ = "boarding-corrected"
+                title = "Correction: boarding withdrawn"
+                tail = (
+                    "was marked as boarded by mistake; that mark has been withdrawn. "
+                    "The driver will record what happens at the stop."
+                )
             else:
                 type_ = "dropoff-corrected"
                 title = "Correction: not dropped off"
@@ -303,6 +331,45 @@ class PushService:
                 )
         except Exception:
             logger.exception("notify_student_absent failed")
+
+    def notify_absent_call_now(self, student: dict, run: dict, scope: object = UNSET) -> bool:
+        """The loudest parent message (GPS plan U10/R18): the driver marked the
+        child absent away from the stop and nothing corroborated it — a
+        skipped stop is indistinguishable from a no-show until someone asks.
+        Additional to ``student-absent``, its own type, that child's linked
+        parents only, run-scoped so the dedup index makes a retried drain a
+        no-op; the exception ledger caps it at once per child per run before
+        it ever reaches here. Never retracted by an undo. The body names no
+        stop and no distance: it asks for a phone call, nothing else.
+
+        Unlike its siblings this reports its outcome: True when every linked
+        parent's feed row landed (or was already there), False when the
+        fan-out failed — the outbox drain stamps the event sent only on True,
+        so a failed send stays due and is retried on the next action or poll.
+        """
+        try:
+            student_id = str(student["id"])
+            for link in self.dao.parents_of_students([student_id], scope=scope):
+                name = link["student_name"]
+                self._notify(
+                    link["parent_id"],
+                    type="absent-call-now",
+                    title="Call the office now",
+                    body=(
+                        f"{name} was marked absent away from their stop. If {name} should "
+                        "be on the bus, please call the school office now."
+                    ),
+                    student_id=student_id,
+                    run_id=str(run["id"]),
+                    bus_id=run.get("bus_id"),
+                    run_type=run.get("type"),
+                    school_id=run.get("school_id"),
+                    scope=scope,
+                )
+            return True
+        except Exception:
+            logger.exception("notify_absent_call_now failed")
+            return False
 
     def notify_ride_cancelled(self, student: dict, scope: str) -> None:
         """A parent cancelled the child's ride (U5) — confirm to EVERY linked

@@ -7,7 +7,8 @@ This manual is split by role. Each guide is self-contained — share only the re
 | Guide | Audience | What it covers |
 | --- | --- | --- |
 | [School Staff Guide](admin-guide.md) | School directors and transport coordinators | Staff accounts and roles, buses, drivers, students and routes; daily attendance; monitoring live runs; alerts and parent broadcasts |
-| [Driver Guide](driver-guide.md) | Bus drivers | Signing in with a PIN, starting a run, recording boarding and drop-offs, reporting incidents |
+| [Driver Guide](driver-guide.md) | Bus drivers | Signing in with a PIN, starting a run, recording boarding and drop-offs, the phone's location during a run, the prompts, reporting incidents |
+| [Driver GPS Briefing](driver-gps-briefing.md) | Bus drivers, delivered by Kuumbai before the GPS release reaches them | One page: what location data is collected, when, who sees it, how long it is kept, whom to ask; allowing location; the three prompts; sign-off |
 | [Parent Guide](parent-guide.md) | Parents and guardians | Creating your account, connecting schools, following the bus live, notifications, cancelling a ride |
 | [Provider Guide](provider-guide.md) | Kuumbai Kenya staff (internal — do not share with schools) | Two-step sign-in, provisioning schools, stepping in to support a school, provider accounts, the audit reader |
 

@@ -265,6 +265,116 @@ def school_sandbox(
             pg.execute("delete from app_users where id = %s", (admin_id,))
 
 
+# --- a moving phone (GPS plan U12) ------------------------------------------
+# The plausibility safeguard judges every fix against the run's previous one:
+# a teleport, a repeated coordinate or accuracy, a fix on a stop's pin is
+# flagged and clears no check. A suite that posts fixes milliseconds apart
+# from kilometres away would flag its own taps, so the GPS suites mint their
+# fixes through one Phone that behaves like a phone on a bus: capture times
+# in the past that advance by the travel time between consecutive fixes,
+# coordinates that never repeat unless the same fix is re-sent (the client's
+# 15 s cache window, U6/U7). Tests that want a flag build the fix by hand.
+
+from datetime import datetime, timedelta, timezone
+from math import asin, cos, radians, sin, sqrt
+
+NAIROBI_OFFSET = timezone(timedelta(hours=3))
+METRE = 1 / 111_195.0  # degrees of latitude per metre
+
+
+def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lng1, lat2, lng2 = map(radians, (a[0], a[1], b[0], b[1]))
+    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lng2 - lng1) / 2) ** 2
+    return 2 * 6_371_000.0 * asin(sqrt(h))
+
+
+class Phone:
+    """Mints plausible consecutive fixes for one driver at a time.
+
+    ``begin_run`` (called by the suites' start helpers) rewinds the clock to
+    an hour ago so a run's fixes never reach the clock-skew tolerance, and
+    re-stamps a start fix minted a moment earlier so the run's first fix is
+    also its earliest. ``fix`` advances the clock by the distance from the
+    last fix at ``SPEED_MPS`` (under the 40 m/s cap; a kilometre takes over
+    30 s), cycles a non-integer accuracy the way a phone's varies, defaults
+    the coordinates to the run's home then a few metres on from the last fix,
+    and nudges an explicit coordinate that repeats the last one by a few
+    decimetres east. An explicit ``captured_at`` is sent as given.
+    """
+
+    SPEED_MPS = 30.0
+    MIN_GAP_S = 3.0
+    DRIFT_M = 5.0
+    NUDGE_M = 0.3
+    ACCURACIES = tuple(12.25 + 0.5 * n for n in range(40))
+
+    def __init__(self, home: tuple[float, float]):
+        self.home = home
+        self.minted: set[str] = set()
+        self.mints = 0
+        self.begin_run(None)
+
+    def begin_run(self, fix_body) -> None:
+        self.clock = datetime.now(timezone.utc) - timedelta(hours=1)
+        self.at: tuple[float, float] | None = None
+        self.last_accuracy: float | None = None
+        if (
+            isinstance(fix_body, dict)
+            and fix_body.get("captured_at") in self.minted
+            and fix_body.get("lat") is not None
+        ):
+            self.at = (fix_body["lat"], fix_body["lng"])
+            self.last_accuracy = fix_body.get("accuracy_m")
+            self.clock += timedelta(seconds=self.MIN_GAP_S)
+            fix_body["captured_at"] = self._stamp()
+
+    def _stamp(self) -> str:
+        stamp = self.clock.astimezone(NAIROBI_OFFSET).isoformat(timespec="milliseconds")
+        self.minted.add(stamp)
+        return stamp
+
+    def _next_accuracy(self) -> float:
+        for _ in range(len(self.ACCURACIES)):
+            value = self.ACCURACIES[self.mints % len(self.ACCURACIES)]
+            self.mints += 1
+            if value != self.last_accuracy:
+                return value
+        return self.ACCURACIES[0]
+
+    def fix(self, lat=None, lng=None, accuracy=None, captured_at=None, **extra) -> dict:
+        if lat is None and lng is None:
+            if self.at is None:
+                lat, lng = self.home
+            else:
+                lat, lng = self.at[0] + self.DRIFT_M * METRE, self.at[1]
+        else:
+            lat = self.home[0] if lat is None else lat
+            lng = self.home[1] if lng is None else lng
+            if self.at is not None and (lat, lng) == self.at:
+                lng = lng + self.NUDGE_M * METRE
+        if accuracy is None:
+            accuracy = self._next_accuracy()
+        if captured_at is None:
+            travel = haversine_m(self.at, (lat, lng)) if self.at is not None else 0.0
+            self.clock += timedelta(seconds=max(self.MIN_GAP_S, travel / self.SPEED_MPS))
+            captured_at = self._stamp()
+        self.at = (lat, lng)
+        self.last_accuracy = accuracy
+        return {"lat": lat, "lng": lng, "accuracy_m": accuracy, "captured_at": captured_at, **extra}
+
+    def jump(self, lat: float, lng: float, accuracy=None, *, after_s: float) -> dict:
+        """An implausible move on purpose: a fix at exactly (lat, lng) —
+        no nudge — captured ``after_s`` after the last one, whatever the
+        distance. The U12 tests build their teleports with this."""
+        self.clock += timedelta(seconds=after_s)
+        captured_at = self._stamp()
+        if accuracy is None:
+            accuracy = self._next_accuracy()
+        self.at = (lat, lng)
+        self.last_accuracy = accuracy
+        return {"lat": lat, "lng": lng, "accuracy_m": accuracy, "captured_at": captured_at}
+
+
 @pytest.fixture(scope="session")
 def in_process_db():
     """Point the app's process-global connection pool at the suite's DSN.

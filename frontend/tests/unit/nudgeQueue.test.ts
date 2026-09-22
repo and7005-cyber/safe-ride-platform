@@ -3,10 +3,16 @@
 // conflicts settle a card the same way; the cue is keyed by kind (F3/F4 loud,
 // the custody confirm silent).
 import { describe, expect, it, vi } from "vitest";
-import { bypassedStopCopy } from "@/features/driver/components/NudgeQueue";
+import {
+  aboutDistance,
+  bypassedStopCopy,
+  custodyCopy,
+  remoteAbsentCopy,
+} from "@/features/driver/components/NudgeQueue";
 import {
   NudgeStore,
   PROMPT_PRIORITY,
+  RENDERABLE_KINDS,
   RESPONSE_GRACE_MS,
   comparePrompts,
   isPromptConflict,
@@ -122,12 +128,12 @@ describe("NudgeStore", () => {
   it("admits only kinds this client renders", () => {
     const store = new NudgeStore();
     store.ingest(
-      [prompt({ event_id: "a", kind: "absent-remote" }), prompt({ event_id: "b" })],
+      [prompt({ event_id: "a", kind: "unknown-kind" }), prompt({ event_id: "b" })],
       "context",
     );
     expect(store.all().map((p) => p.event_id)).toEqual(["b"]);
     const wider = new NudgeStore(ALL_KINDS);
-    wider.ingest([prompt({ event_id: "a", kind: "absent-remote" })], "context");
+    wider.ingest([prompt({ event_id: "a", kind: "unknown-kind" })], "context");
     expect(wider.size()).toBe(1);
   });
 
@@ -240,5 +246,102 @@ describe("bypassedStopCopy", () => {
     );
     expect(three.title).toBe("Stop 4");
     expect(three.body).toBe("Brian, Amina and Kevin have no record. Mark boarded or absent?");
+  });
+});
+
+// --- the custody confirm (GPS plan U9: R14, F2) ---------------------------------
+
+describe("custodyCopy", () => {
+  const far = prompt({
+    event_id: "c1",
+    kind: "custody-away",
+    stop_order: 1,
+    stop_name: "Kilimani",
+    student_id: "s1",
+    students: [{ id: "s1", name: "Wanjiru" }],
+    answers: ["confirmed"],
+    distance_m: 1800,
+  });
+
+  it("names the child, the outcome tapped and the distance, and offers confirm or undo", () => {
+    expect(custodyCopy(far, false)).toEqual({
+      title: "Stop 1: Kilimani",
+      body: "You marked Wanjiru boarded about 1.8 km from their stop. Confirm, or undo?",
+    });
+    expect(custodyCopy(far, true).body).toBe(
+      "You marked Wanjiru dropped off about 1.8 km from their stop. Confirm, or undo?",
+    );
+  });
+
+  it("rounds the distance to what a driver can picture", () => {
+    expect(aboutDistance(1800)).toBe("1.8 km");
+    expect(aboutDistance(1849)).toBe("1.8 km");
+    expect(aboutDistance(999)).toBe("1000 m");
+    expect(aboutDistance(263)).toBe("260 m");
+    expect(aboutDistance(4)).toBe("10 m");
+    expect(aboutDistance(null)).toBe("some way");
+    expect(aboutDistance(Number.NaN)).toBe("some way");
+  });
+
+  it("copes with a prompt missing its stop name or child", () => {
+    const bare = custodyCopy(prompt({ ...far, stop_name: null, students: [] }), false);
+    expect(bare.title).toBe("Stop 1");
+    expect(bare.body).toContain("You marked this child boarded");
+  });
+
+  it("renders in the queue: the custody kind is renderable, after a safety prompt", () => {
+    expect([...RENDERABLE_KINDS].sort()).toEqual(["absent-remote", "custody-away", "stop-bypassed"]);
+    const store = new NudgeStore();
+    const bypassed = prompt({ event_id: "b1", created_at: "2026-09-20T06:31:00+00:00" });
+    store.ingest([far, bypassed], "context");
+    expect(store.size()).toBe(2);
+    expect(store.head()?.event_id).toBe("b1");
+    store.settle("b1");
+    expect(store.head()?.event_id).toBe("c1");
+  });
+});
+
+// --- the remote-absent attestation (GPS plan U10: R17, F4) -----------------------
+
+describe("remoteAbsentCopy", () => {
+  const remote = prompt({
+    event_id: "r1",
+    kind: "absent-remote",
+    stop_order: 3,
+    stop_name: "Karen",
+    student_id: "s1",
+    students: [{ id: "s1", name: "Brian" }],
+    answers: ["told-me", "not-at-stop", "dismissed"],
+    distance_m: 3000,
+    created_at: "2026-09-20T06:40:00+00:00",
+  });
+
+  it("names the child, the distance and asks the one question that decides the class", () => {
+    expect(remoteAbsentCopy(remote)).toEqual({
+      title: "Stop 3: Karen",
+      body: "You marked Brian absent about 3.0 km from their stop. Did a parent or the office tell you Brian isn't coming?",
+    });
+  });
+
+  it("copes with a prompt missing its stop name, distance or child", () => {
+    const bare = remoteAbsentCopy(prompt({ ...remote, stop_name: null, students: [], distance_m: null }));
+    expect(bare.title).toBe("Stop 3");
+    expect(bare.body).toBe(
+      "You marked this child absent about some way from their stop. Did a parent or the office tell you this child isn't coming?",
+    );
+  });
+
+  it("is a safety prompt: renderable, cued, and ahead of the custody confirm in the queue", () => {
+    expect(RENDERABLE_KINDS.has("absent-remote")).toBe(true);
+    expect(cuePolicy("absent-remote")).toEqual({ tone: true, vibrate: true });
+    const store = new NudgeStore();
+    const custody = prompt({
+      event_id: "c1", kind: "custody-away", created_at: "2026-09-20T06:30:00+00:00",
+    });
+    store.ingest([custody, remote], "context");
+    expect(store.size()).toBe(2);
+    expect(store.head()?.event_id).toBe("r1");
+    store.settle("r1");
+    expect(store.head()?.event_id).toBe("c1");
   });
 });

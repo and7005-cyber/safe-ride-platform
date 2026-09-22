@@ -19,8 +19,8 @@
 // - an answered or dismissed id is a tombstone: a stale poll cannot resurrect
 //   it, and the server's 409 conflicts settle it the same way (R23: both
 //   "already answered" and "resolved" mean remove the card and refresh);
-// - only kinds this client can render enter the queue (U10 adds the
-//   remote-absent card, U9 the custody confirm).
+// - only kinds this client can render enter the queue (the bypassed stop, the
+//   custody confirm and the remote-absent attestation).
 
 import { useSyncExternalStore } from "react";
 import { ApiError } from "@/lib/apiClient";
@@ -40,6 +40,8 @@ export interface NudgePrompt {
   student_id: string | null;
   students: PromptStudent[];
   answers: string[];
+  /** The tap's distance from the stop, for the custody copy (U9); null for a bypassed stop. */
+  distance_m?: number | null;
   created_at?: string | null;
   delivered_at?: string | null;
   shown_at?: string | null;
@@ -55,7 +57,11 @@ export const PROMPT_PRIORITY: Record<string, number> = {
   "custody-away": 1,
 };
 
-export const RENDERABLE_KINDS: ReadonlySet<string> = new Set(["stop-bypassed"]);
+export const RENDERABLE_KINDS: ReadonlySet<string> = new Set([
+  "stop-bypassed",
+  "absent-remote",
+  "custody-away",
+]);
 
 /** How long a response-fed entry survives a poll that does not list it. Two
  * polls at POLL_LIVE (5 s) comfortably outlast any request that was already

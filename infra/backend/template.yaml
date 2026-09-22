@@ -92,6 +92,54 @@ Parameters:
       /saferide/totp-pepper, which must pre-exist — the deploy script fails
       rather than minting one, because a silent rotation would re-enrol every
       provider.
+  # GPS tracking system defaults (GPS plan U11: R26, R31, R38). Each Default
+  # equals the Settings default in backend/app/core/config.py (kept in step by
+  # backend/tests/core/test_gps_settings.py) and is the value beneath a
+  # school's own setting; deploy-backend.sh passes an override only when the
+  # operator exports the matching GPS_* variable. Staleness and the fix-wait
+  # budget have no per-school column — these ARE their live values.
+  GpsCustodyThresholdM:
+    Type: Number
+    Default: 150
+    MinValue: 25
+    MaxValue: 2000
+    Description: Metres from the stop (less accuracy) beyond which a Board/Drop-off is flagged.
+  GpsVicinityRadiusM:
+    Type: Number
+    Default: 100
+    MinValue: 25
+    MaxValue: 2000
+    Description: Metres (less accuracy) within which a fix counts as "at the stop".
+  GpsFixAccuracyCapM:
+    Type: Number
+    Default: 200
+    MinValue: 25
+    MaxValue: 2000
+    Description: Fixes with reported accuracy above this are too coarse to check against.
+  GpsPositionRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 365
+    Description: Days the position trail is kept (by receipt time) when a school sets none.
+  GpsPingIntervalS:
+    Type: Number
+    Default: 10
+    MinValue: 5
+    MaxValue: 60
+    Description: Seconds between Phase 2 position pings, served to the driver app.
+  GpsStaleAfterS:
+    Type: Number
+    Default: 90
+    MinValue: 10
+    MaxValue: 3600
+    Description: Seconds after which a served bus position renders stale (system-wide).
+  GpsFixWaitBudgetS:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 30
+    Description: Seconds a driver tap waits for a cold GPS fix before posting without one (system-wide).
   DbEngineVersion:
     Type: String
     Default: "16.14"
@@ -343,6 +391,15 @@ Resources:
           VAPID_PUBLIC_KEY: !Ref VapidPublicKey
           VAPID_PRIVATE_KEY: !Ref VapidPrivateKey
           VAPID_SUBJECT: !Ref VapidSubject
+          # GPS tracking system defaults (GPS plan U11); the names the app's
+          # Settings read. A school's own values override the first five.
+          GPS_CUSTODY_THRESHOLD_M: !Ref GpsCustodyThresholdM
+          GPS_VICINITY_RADIUS_M: !Ref GpsVicinityRadiusM
+          GPS_FIX_ACCURACY_CAP_M: !Ref GpsFixAccuracyCapM
+          GPS_POSITION_RETENTION_DAYS: !Ref GpsPositionRetentionDays
+          GPS_PING_INTERVAL_S: !Ref GpsPingIntervalS
+          GPS_STALE_AFTER_S: !Ref GpsStaleAfterS
+          GPS_FIX_WAIT_BUDGET_S: !Ref GpsFixWaitBudgetS
       Policies:
         - Statement:
             - Effect: Allow
@@ -389,6 +446,9 @@ Resources:
           # Tenancy (U2): runtime-role sync and provider bootstrap inputs.
           DB_APP_PASSWORD: !Ref DbAppPassword
           PROVIDER_BOOTSTRAP_SSM: /saferide/provider-bootstrap
+          # The on-demand gps-purge action resolves the retention default
+          # exactly as the API's purge does (GPS plan U11).
+          GPS_POSITION_RETENTION_DAYS: !Ref GpsPositionRetentionDays
       Policies:
         - Statement:
             - Effect: Allow
@@ -422,6 +482,9 @@ Resources:
       Environment:
         Variables:
           DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
+          # The `gps` check set reports trail rows past retention against the
+          # same default the API and the purge resolve (GPS plan U11).
+          GPS_POSITION_RETENTION_DAYS: !Ref GpsPositionRetentionDays
 
   # ---------------------------------------------------- Custom domain (gated)
   ApiDomain:

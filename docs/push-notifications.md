@@ -10,23 +10,43 @@ PWA on phones (Android Chrome and iOS 16.4+ Safari via "Add to Home Screen").
 | `run-started` | Driver starts a **morning** run | Parents of every non-absent student on the run |
 | `on-way-home` | Driver starts an **afternoon** run | Same |
 | `student-boarded` | Driver marks a student as on the bus | That student's parents |
-| `bus-approaching` | Driver arrives at the stop just before the child's stop (stop-order based, no GPS) | Parents of non-absent students at that next stop |
+| `bus-approaching` | Driver arrives at the stop just before the child's stop (stop-order based — fired by the Arrive tap, not by the phone's position) | Parents of non-absent students at that next stop |
 | `reached-school` | Bus arrives at the school gate (or a morning run ends) | Parents of every non-absent student on the run |
 | `dropped-off` | An afternoon run ends | Same |
 | `student-absent` | Driver marks a student absent at pickup | That student's parents only |
+| `absent-call-now` | A remote absent mark ended up **uncorroborated**: the driver answered "No — I wasn't at the stop", dismissed the prompt, or left it unanswered until their next Arrive (GPS plan U10/R18). Additional to `student-absent`; never sent when the prompt is still open at End Run or force-close | That student's parents only — **at most once per child per run**, capped on the exception's event ledger before it reaches the push service, and **never retracted** by an undo |
+| `boarding-corrected` | Driver undoes their own boarding (Board-tab Undo, or Undo on the far-from-stop prompt); retracts `student-boarded` | That student's parents only |
+| `absence-corrected` | Driver undoes their own absent mark; retracts `student-absent` only (never `absent-call-now`). Body is neutral: the mark is withdrawn, the driver will record what happens | That student's parents only |
+| `dropoff-corrected` | Driver undoes their own drop-off; retracts `dropped-off` | That student's parents only |
 | `incident` | Driver reports breakdown / accident / traffic / student issue / notice | Parents of every student on that bus |
 | `ride-cancelled` | A parent cancels the child's ride (Cancel-a-Ride) | That student's linked parents only |
 | `admin-notice` | Office broadcasts a message to a route | Every parent with a child assigned to the route (one copy per parent) |
 
 Run-scoped types (`run-started`, `on-way-home`, `student-boarded`,
-`bus-approaching`, `reached-school`, `dropped-off`, `student-absent`) are
-deduplicated per
+`bus-approaching`, `reached-school`, `dropped-off`, `student-absent`,
+`absent-call-now`, `boarding-corrected`, `absence-corrected`,
+`dropoff-corrected`) are deduplicated per
 (parent, run, student, type), so a parent gets each at most once per run.
 Incident notifications are never deduplicated — every report matters. The
 same goes for `ride-cancelled` and `admin-notice`: their `run_id` stays NULL
 (they are not tied to a run), so every emission is a real row — the
 cancellation confirmation fires only on a real scope transition, and two
 identical broadcasts are deliberately two rows.
+
+**Corrections retract.** Each `*-corrected` type first deletes the feed row it
+supersedes (`student-boarded`, `student-absent` or `dropped-off`) for that
+(parent, run, student), because the dedup index would otherwise suppress the
+driver's genuine second confirmation as a duplicate of the message being
+corrected. `absent-call-now` is the one row a correction never removes: a
+mark/undo cycle must not re-arm the loudest message, and a family that was
+asked to call is not stood down by the app.
+
+**The call-now decision is durable.** The transaction that classifies the
+absent mark stamps the notice *due* on the exception event; the post-commit
+task sends it and stamps it *sent*; any later driver action or driver-context
+poll on that run re-attempts due-but-unsent rows. The once-per-child cap
+lives on that ledger, so a retry, a second prompt for the same child, or a
+re-marked absence cannot send it twice.
 
 Every notification is stored in `live_notifications` and shown in the parent
 **Alerts** tab even when push is unavailable. Push delivery (FCM and/or Web

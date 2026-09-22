@@ -4,7 +4,10 @@ These wrap the pure resolution in ``app.core.scope`` with I/O: the enriched
 session user comes from ``get_current_user``, the resolved scope is published
 in the request context var (async dependencies run in the request task, so a
 sync endpoint executed in the threadpool — and its DAO calls — inherit it),
-and a staff switch persists ``last_school_id`` for header fallback.
+and a staff switch persists ``last_school_id`` for header fallback. The
+enriched user's ``session_id`` rides into ``SchoolScope.session_id`` for the
+driver and staff guards alike (GPS plan U7), so the action DAOs can bind a
+run and its trail rows to the auth session that tapped.
 
 Guards:
 - ``require_staff``    — director or coordinator inside the header school

@@ -8,6 +8,15 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/components/ui/use-toast";
 import { MapPicker } from "@/features/admin/components/MapPicker";
 import { PageHeader } from "@/features/admin/components/PageHeader";
+import {
+  TRACKING_FIELDS,
+  trackingFieldError,
+  trackingFormFromSchool,
+  trackingFormValid,
+  trackingPayload,
+  type TrackingDefaults,
+  type TrackingForm,
+} from "@/features/admin/trackingFields";
 import { api } from "@/lib/apiClient";
 import { phoneError } from "@/lib/validation";
 import { useSchoolKey, useSchoolSettings } from "@/lib/queries";
@@ -16,6 +25,12 @@ import { useSchoolKey, useSchoolSettings } from "@/lib/queries";
 // inside ONE active school, whose name, contact, bell times and gate location
 // are edited here. There is no create and no delete anywhere — schools are
 // created by the provider and never deleted from the app.
+//
+// GPS plan U11 (R26, R31, R38): a second card, "Tracking", holds the five
+// per-school knobs. Each shows its system default (served by the API as
+// `tracking_defaults`) as the placeholder and in the help text; an empty
+// field means "use the default", and "Use default" empties it. One Save
+// writes both cards; every changed value is audited server-side.
 
 const EMPTY = {
   name: "",
@@ -34,6 +49,7 @@ export function SchoolSettingsPage() {
   const { data: school } = useSchoolSettings();
 
   const [form, setForm] = useState({ ...EMPTY });
+  const [tracking, setTracking] = useState<TrackingForm>(() => trackingFormFromSchool(null));
   const [saving, setSaving] = useState(false);
   const [seededId, setSeededId] = useState<string | null>(null);
 
@@ -50,14 +66,21 @@ export function SchoolSettingsPage() {
       morning_bell: school.morning_bell ?? "",
       afternoon_bell: school.afternoon_bell ?? "",
     });
+    setTracking(trackingFormFromSchool(school));
   }, [school, seededId]);
 
   const phoneErr = phoneError(form.phone, { allowLandline: true });
+  const defaults: TrackingDefaults = school?.tracking_defaults ?? {};
+  const trackingOk = trackingFormValid(tracking);
 
   const save = async () => {
     if (!school) return;
     if (!form.address || form.lat == null || form.lng == null) {
       toast({ title: "Address and a map location are required", variant: "destructive" });
+      return;
+    }
+    if (!trackingOk) {
+      toast({ title: "Check the tracking values", variant: "destructive" });
       return;
     }
     setSaving(true);
@@ -70,6 +93,8 @@ export function SchoolSettingsPage() {
         lng: form.lng,
         morning_bell: form.morning_bell || null,
         afternoon_bell: form.afternoon_bell || null,
+        // Every knob, as a number or an explicit null (clear to default).
+        ...trackingPayload(tracking),
       });
       await qc.invalidateQueries({ queryKey: schoolKey("school-settings") });
       // Bells feed the route schedules; routes re-solve against them.
@@ -86,7 +111,7 @@ export function SchoolSettingsPage() {
     <div className="space-y-6">
       <PageHeader
         title="School Settings"
-        subtitle="This school's name, contact details, bell times and gate location"
+        subtitle="This school's name, contact details, bell times, gate location and tracking thresholds"
         action={
           school?.code ? (
             <Badge variant="outline" data-testid="school-code">
@@ -164,13 +189,81 @@ export function SchoolSettingsPage() {
               Click the map to set the school gate location.
             </p>
           </div>
-          <div className="flex justify-end">
-            <Button onClick={save} disabled={saving || !form.name || !!phoneErr || !school}>
-              {saving ? "Saving…" : "Save"}
-            </Button>
+        </CardContent>
+      </Card>
+
+      <Card className="max-w-2xl" data-testid="tracking-card">
+        <CardContent className="space-y-4 p-5">
+          <div>
+            <h2 className="text-base font-semibold">Tracking</h2>
+            <p className="text-xs text-muted-foreground">
+              How the driver app's GPS fixes are judged for this school. Leave a field empty
+              to use the system default shown; every change is recorded in the audit log.
+            </p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {TRACKING_FIELDS.map((spec) => {
+              const value = tracking[spec.key];
+              const error = trackingFieldError(spec, value);
+              const fallback = defaults[spec.key];
+              const inputId = `tracking-${spec.key}`;
+              return (
+                <div key={spec.key} className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label htmlFor={inputId}>
+                      {spec.label}{" "}
+                      <span className="text-xs font-normal text-muted-foreground">({spec.unit})</span>
+                    </Label>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={value === ""}
+                      data-testid={`tracking-default-${spec.key}`}
+                      onClick={() => setTracking({ ...tracking, [spec.key]: "" })}
+                    >
+                      Use default
+                    </Button>
+                  </div>
+                  <Input
+                    id={inputId}
+                    type="number"
+                    inputMode="numeric"
+                    min={spec.min}
+                    max={spec.max}
+                    step={1}
+                    value={value}
+                    placeholder={fallback == null ? "" : String(fallback)}
+                    aria-invalid={error ? true : undefined}
+                    data-testid={inputId}
+                    onChange={(e) => setTracking({ ...tracking, [spec.key]: e.target.value })}
+                  />
+                  {error ? (
+                    <p className="text-xs text-destructive" data-testid={`${inputId}-error`}>
+                      {error}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      {fallback == null ? "" : `Default ${fallback} ${spec.unit}. `}
+                      {spec.help}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </CardContent>
       </Card>
+
+      <div className="flex max-w-2xl justify-end">
+        <Button
+          onClick={save}
+          disabled={saving || !form.name || !!phoneErr || !school || !trackingOk}
+        >
+          {saving ? "Saving…" : "Save"}
+        </Button>
+      </div>
     </div>
   );
 }

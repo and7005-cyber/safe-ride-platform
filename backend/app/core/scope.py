@@ -68,6 +68,12 @@ class SchoolScope:
     role: str  # membership role granting access: director|coordinator|driver
     actor_kind: str = "staff"  # staff | driver | provider (step-in)
     support_session_id: str | None = None
+    # The authenticated auth session (GPS plan U7/R28): the action DAOs stamp
+    # it on the run at Start Run (`live_runs.started_session_id`, re-bound by
+    # any later tapped action) and on every trail row, so Phase 2 pings can be
+    # held to the session that started the run. Server-resolved, never from
+    # the client; None only for callers built outside a request.
+    session_id: str | None = None
 
     @property
     def school_ids(self) -> tuple[str, ...]:
@@ -189,6 +195,7 @@ def resolve_school_scope(
                 role="director",
                 actor_kind="provider",
                 support_session_id=str(support["id"]),
+                session_id=_session_id(user),
             )
         raise ScopeError(403, "An active support session is required for this school")
 
@@ -205,7 +212,14 @@ def resolve_school_scope(
         school_id=school_id,
         role=role,
         actor_kind="driver" if role == "driver" else "staff",
+        session_id=_session_id(user),
     )
+
+
+def _session_id(user: dict) -> str | None:
+    """The enriched session dict's auth session id, when the caller has one."""
+    value = user.get("session_id")
+    return str(value) if value else None
 
 
 def resolve_driver_scope(user: dict, header_school: str | None) -> SchoolScope:
@@ -223,7 +237,8 @@ def resolve_driver_scope(user: dict, header_school: str | None) -> SchoolScope:
         # The driver app has no school picker; stay deterministic.
         school_id = str(last) if last and str(last) in schools else sorted(schools)[0]
     return SchoolScope(
-        user_id=str(user["id"]), school_id=school_id, role="driver", actor_kind="driver"
+        user_id=str(user["id"]), school_id=school_id, role="driver", actor_kind="driver",
+        session_id=_session_id(user),
     )
 
 

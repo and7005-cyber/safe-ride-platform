@@ -162,6 +162,10 @@ export type NotificationType =
   | "incident"
   | "admin-notice"
   | "ride-cancelled"
+  | "boarding-corrected"
+  | "absence-corrected"
+  | "dropoff-corrected"
+  | "absent-call-now"
   | "custom";
 
 export const NOTIFICATION_LABEL: Record<NotificationType, string> = {
@@ -175,6 +179,15 @@ export const NOTIFICATION_LABEL: Record<NotificationType, string> = {
   incident: "Bus incident",
   "admin-notice": "School notice",
   "ride-cancelled": "Ride cancelled",
+  // The driver withdrew a mark (GPS plan U9/U10, R35). Neutral on purpose:
+  // each says the mark is gone, not where the child is. The two older
+  // corrections rendered their raw type in the feed until U10 labelled them.
+  "boarding-corrected": "Boarding mark withdrawn",
+  "absence-corrected": "Absent mark withdrawn",
+  "dropoff-corrected": "Drop-off mark withdrawn",
+  // The loudest message a family receives (GPS plan U10/R18): the child was
+  // marked absent away from the stop and nothing corroborated it.
+  "absent-call-now": "Call the office now",
   custom: "Notice",
 };
 
@@ -189,6 +202,10 @@ export const NOTIFICATION_VARIANT: Record<NotificationType, BadgeVariant> = {
   incident: "destructive",
   "admin-notice": "warning",
   "ride-cancelled": "secondary",
+  "boarding-corrected": "secondary",
+  "absence-corrected": "secondary",
+  "dropoff-corrected": "secondary",
+  "absent-call-now": "destructive",
   custom: "secondary",
 };
 

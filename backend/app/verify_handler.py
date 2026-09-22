@@ -32,11 +32,19 @@ import uuid
 import psycopg
 from psycopg.rows import dict_row
 
+from app.core.config import get_settings
 from app.core.tenancy import (
     GREENFIELD_SCHOOL_ID,
     SCHOOL_OWNED_TABLES,
     SEED_DEMO_EMAILS,
 )
+
+# The system retention default the `gps` set reports against (GPS plan U11):
+# the same Settings field the API and the migrate Lambda's purge resolve, so
+# GPS_POSITION_RETENTION_DAYS is threaded to this function's env too and the
+# observation never disagrees with the purge. A validated int, spliced as a
+# literal into the fixed check SQL.
+_RETENTION_DEFAULT_DAYS = int(get_settings().gps_position_retention_days)
 
 # One statement per (label, sql, needs_school) entry. needs_school entries
 # bind the validated school_id once per placeholder occurrence.
@@ -395,10 +403,13 @@ _CHECK_SETS["gps"] = [
     (
         "trail-rows-past-retention",
         "select s.id as school_id, s.name, "
-        "coalesce(s.position_retention_days, 90) as retention_days, "
+        f"coalesce(s.position_retention_days, {_RETENTION_DEFAULT_DAYS}) as retention_days, "
         "count(p.id) as rows_past_retention from live_schools s "
         "left join run_positions p on p.school_id = s.id "
-        "and p.received_at < now() - make_interval(days => coalesce(s.position_retention_days, 90)) "
+        # Seconds, as the purge's own cutoff (position_dao.RETENTION_CUTOFF_SQL):
+        # an interval's day field is session-zone calendar arithmetic.
+        "and p.received_at < now() - make_interval(secs => "
+        f"coalesce(s.position_retention_days, {_RETENTION_DEFAULT_DAYS}) * 86400) "
         "group by 1, 2, 3 order by 4 desc, 2",
         False,
     ),

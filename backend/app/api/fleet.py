@@ -2,7 +2,7 @@ import datetime as dt
 import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
@@ -26,6 +26,7 @@ from app.core.scope import SchoolScope
 from app.core.validation import clean_phone
 from app.dao.fleet_dao import FleetDao
 from app.dao.push_dao import PushDao
+from app.dao.school_thresholds import KNOB_BOUNDS, PER_SCHOOL_KNOBS
 from app.services import geo_service
 from app.services.push_service import PushService, notify_route_changes
 
@@ -78,6 +79,38 @@ class SchoolPayload(BaseModel):
     afternoon_bell: str | None = None
 
     _v_bells = field_validator("morning_bell", "afternoon_bell")(_validate_hhmm)
+
+    # Per-school tracking knobs (GPS plan U11: R26, R31, R38), bounded here so
+    # a value outside the range is a 422 before any SQL — migration 016's
+    # column CHECKs are never the first line of defence. Three-way semantics
+    # the router preserves with exclude_unset: a knob OMITTED from the body
+    # keeps its stored value (an older Settings page cannot wipe them), an
+    # explicit null clears it to the system default, a number stores it.
+    custody_threshold_m: int | None = Field(
+        default=None, ge=KNOB_BOUNDS["custody_threshold_m"][0], le=KNOB_BOUNDS["custody_threshold_m"][1]
+    )
+    vicinity_radius_m: int | None = Field(
+        default=None, ge=KNOB_BOUNDS["vicinity_radius_m"][0], le=KNOB_BOUNDS["vicinity_radius_m"][1]
+    )
+    fix_accuracy_cap_m: int | None = Field(
+        default=None, ge=KNOB_BOUNDS["fix_accuracy_cap_m"][0], le=KNOB_BOUNDS["fix_accuracy_cap_m"][1]
+    )
+    position_retention_days: int | None = Field(
+        default=None,
+        ge=KNOB_BOUNDS["position_retention_days"][0],
+        le=KNOB_BOUNDS["position_retention_days"][1],
+    )
+    ping_interval_s: int | None = Field(
+        default=None, ge=KNOB_BOUNDS["ping_interval_s"][0], le=KNOB_BOUNDS["ping_interval_s"][1]
+    )
+
+    def tracking_fields(self) -> dict:
+        """The knobs this body actually named (set explicitly, null included);
+        an omitted knob is not here, so the DAO leaves it alone."""
+        return self.model_dump(include=set(PER_SCHOOL_KNOBS), exclude_unset=True)
+
+    def base_fields(self) -> dict:
+        return self.model_dump(exclude=set(PER_SCHOOL_KNOBS))
 
 
 class RouteStopPayload(BaseModel):
@@ -166,7 +199,9 @@ def list_schools(scope: SchoolScope = Depends(require_staff)):
 
 @router.get("/school")
 def get_school(scope: SchoolScope = Depends(require_staff)):
-    """The active school's settings row (same shape as one list element)."""
+    """The active school's settings row (same shape as one list element),
+    including the five per-school tracking knobs as stored (null = default)
+    and ``tracking_defaults``, the system default for each (GPS plan U11)."""
     return safe_call(lambda: dao.get_school(scope))
 
 
@@ -177,13 +212,16 @@ def update_school(
     scope: SchoolScope = Depends(require_staff),
     user: dict = Depends(get_current_user),
 ):
+    """Staff only (director or coordinator; a driver or parent answers 403
+    from the scope dependency). The base fields are written as sent; the
+    tracking knobs only as named (GPS plan U11 — see SchoolPayload)."""
     def run():
         if school_id != scope.school_id:
             # Another school's settings do not exist for this caller (R3).
             raise NotFoundError("School not found")
-        data = payload.model_dump()
+        data = payload.base_fields()
         data["phone"] = clean_phone(data.get("phone"), field="school phone", allow_landline=True)
-        return dao.update_school(scope, data, actor=user)
+        return dao.update_school(scope, data, actor=user, tracking=payload.tracking_fields())
 
     return safe_call(run)
 

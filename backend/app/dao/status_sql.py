@@ -42,6 +42,9 @@ The admin students list wraps this expression with its own 'unassigned' rule
 wrap is admin-side only and lives in student_live_dao.
 """
 
+from app.core.config import get_settings
+
+
 def scope_covers(scope_sql: str, run_type_sql: str) -> str:
     """SQL predicate: the absence ``scope`` covers a run type (U4) — 'day'
     covers every run, a partial scope only its own type. Both arguments are
@@ -193,3 +196,178 @@ def no_progress_case(run: str) -> str:
     The subquery alias (rs) is fragment-local.
     """
     return _NO_PROGRESS_CASE.format(run=run)
+
+
+# --- bus position (GPS plan U8) ------------------------------------------------
+# The served position is live_buses.current_lat/lng; position_source,
+# position_at and position_accuracy_m describe that pair (U7 writes all five in
+# one statement). Everything a reader says ABOUT the position — how old it is,
+# whether it is stale, whether the run's phone has its GPS off, whether the run
+# has produced no fix at all — is derived here, once, and read by the staff bus
+# list, the parent Track query and the parent children/profile queries. Three
+# readers with their own rules would drift the moment the position stopped
+# being a planned stop.
+#
+# Rules:
+# - a bus has a served position only when the pair is non-null; the qualifiers
+#   are never read while it is null (they come back null too);
+# - a non-null pair with a NULL source is a checkpoint of unknown age — the
+#   legacy-writer and rollback shape — and is never stale;
+# - `stale` = the source is known and the position is older than the staleness
+#   threshold (Settings.gps_stale_after_s — a system default with no per-school
+#   column, read at call time so an env override is never baked in at import;
+#   U11). It applies to checkpoints and fixes alike: a stop reached four
+#   minutes ago IS four minutes old, and R27 wants that said rather than hidden;
+# - `gps_off` = the bus's in-progress run's LATEST action row inside retention
+#   carries no fix for a device reason (denied / unavailable / timeout /
+#   invalid). A fix on the next tap clears it with no write (F5, AE2);
+# - `no_gps_for_run` = the in-progress run has action rows inside retention and
+#   none of them carries coordinates (R20's derived "no GPS for this run");
+# - trail reads filter by the school's retention (`position_retention_days`,
+#   default Settings.gps_position_retention_days) by `received_at`, the purge's
+#   own cutoff expression, so a lagging purge is invisible (R12);
+# - the label is one rule for every surface: a fix reads "Phone GPS"; a
+#   checkpoint reads where the run is — starting at the school, at the school,
+#   or at the stop it last reached (the retired Python loop's wording).
+#
+# "In-progress run" is the bus's non-completed run dated today (Africa/Nairobi)
+# — the same predicate the bus-status derivation uses; a prior-day run left open
+# (R15) never feeds these columns.
+
+# Ping rows join later (U14); the served position already carries the source.
+POSITION_SOURCES = ("checkpoint", "action", "ping")
+_NO_FIX_REASONS = "('denied', 'unavailable', 'timeout', 'invalid')"
+
+_RUN_TODAY_SQL = """(
+        select r.id from live_runs r
+        where r.bus_id = {bus}.id
+          and r.date = (now() at time zone 'Africa/Nairobi')::date
+          and r.status <> 'completed'
+        order by r.created_at desc limit 1
+    )"""
+
+# `now()` minus retention in SECONDS (position_dao.RETENTION_CUTOFF_SQL's
+# form, restated here because this module imports nothing from app.dao): an
+# interval's day field is calendar arithmetic in the session time zone.
+# {retention_days} is the system default, filled per call from Settings.
+_RETENTION_CUTOFF_SQL = (
+    "now() - make_interval(secs => (select coalesce(sc.position_retention_days, "
+    "{retention_days}) from live_schools sc where sc.id = {bus}.school_id) * 86400)"
+)
+
+# {stale_s} and {no_fix_reasons} are filled per call alongside the aliases.
+_BUS_POSITION_COLUMNS = """{bus}.current_lat as pos_lat,
+    {bus}.current_lng as pos_lng,
+    case when {served} then {bus}.position_source end as pos_source,
+    case when {served} then {bus}.position_at end as pos_at,
+    case when {served} then {bus}.position_accuracy_m end as pos_accuracy_m,
+    case when {served} and {bus}.position_at is not null
+         then greatest(0, floor(extract(epoch from now() - {bus}.position_at)))::int
+    end as pos_age_s,
+    coalesce(
+        {served}
+        and {bus}.position_source is not null
+        and {bus}.position_at < now() - make_interval(secs => {stale_s}),
+        false
+    ) as pos_stale,
+    coalesce((
+        select p.fix_reason in {no_fix_reasons}
+        from run_positions p
+        where p.run_id = {run}
+          and p.source = 'action'
+          and p.received_at >= {cutoff}
+        order by p.received_at desc, p.id desc
+        limit 1
+    ), false) as pos_gps_off,
+    coalesce((
+        select count(*) filter (where p.lat is not null and p.lng is not null) = 0
+        from run_positions p
+        where p.run_id = {run}
+          and p.source = 'action'
+          and p.received_at >= {cutoff}
+        having count(*) > 0
+    ), false) as pos_no_gps_for_run,
+    case
+        when not {served} then null
+        when {bus}.position_source in ('action', 'ping') then 'Phone GPS'
+        else (
+            select case
+                     when coalesce(r.stops_completed, 0) <= 0 then 'Starting — at school'
+                     when s.is_school_gate then 'At school'
+                     when s.name is not null then 'At ' || s.name || case when exists (
+                         select 1 from run_stops n
+                         where n.run_id = r.id and n.stop_order = r.stops_completed + 1
+                     ) then ' · en route to next' else '' end
+                   end
+            from live_runs r
+            left join lateral (
+                select rs.name, rs.is_school_gate from run_stops rs
+                where rs.run_id = r.id and rs.stop_order = r.stops_completed
+                order by rs.is_school_gate desc limit 1
+            ) s on true
+            where r.bus_id = {bus}.id
+              and r.date = (now() at time zone 'Africa/Nairobi')::date
+              and r.status <> 'completed'
+            order by r.created_at desc limit 1
+        )
+    end as pos_label"""
+
+
+def bus_position_columns(bus: str) -> str:
+    """The position fragment: a comma-separated SELECT list (no leading
+    comma) of ``pos_*`` columns, parameterized by the consuming query's
+    ``live_buses`` table alias. Subquery aliases (r, rs, n, s, p, sc) are
+    fragment-local. Consumers hand the fetched row to :func:`pop_position`.
+
+    The staleness threshold and the retention default are read from Settings
+    on every call (U11): both are ints from validated fields, interpolated as
+    literals because the fragment is spliced into queries that bind their own
+    parameters.
+    """
+    settings = get_settings()
+    served = f"({bus}.current_lat is not null and {bus}.current_lng is not null)"
+    return _BUS_POSITION_COLUMNS.format(
+        bus=bus,
+        served=served,
+        run=_RUN_TODAY_SQL.format(bus=bus),
+        cutoff=_RETENTION_CUTOFF_SQL.format(
+            bus=bus, retention_days=int(settings.gps_position_retention_days)
+        ),
+        stale_s=int(settings.gps_stale_after_s),
+        no_fix_reasons=_NO_FIX_REASONS,
+    )
+
+
+# Payload field -> fragment column. The staff payload carries every field; the
+# parent allowlist (R37, R22) is lat, lng, position_at, stale — never source,
+# accuracy, age or the run's GPS state.
+_POSITION_FIELD_COLUMNS = {
+    "lat": "pos_lat",
+    "lng": "pos_lng",
+    "source": "pos_source",
+    "position_at": "pos_at",
+    "accuracy_m": "pos_accuracy_m",
+    "age_s": "pos_age_s",
+    "stale": "pos_stale",
+    "gps_off": "pos_gps_off",
+    "no_gps_for_run": "pos_no_gps_for_run",
+    "label": "pos_label",
+}
+STAFF_POSITION_FIELDS = tuple(_POSITION_FIELD_COLUMNS)
+PARENT_POSITION_FIELDS = ("lat", "lng", "position_at", "stale")
+
+# The five write-side columns (U7). Readers detach them from a `select b.*`
+# row so the nested `position` object is the only shape a client can render.
+RAW_POSITION_COLUMNS = (
+    "current_lat", "current_lng", "position_source", "position_at", "position_accuracy_m",
+)
+
+
+def pop_position(row: dict, fields: tuple[str, ...] = STAFF_POSITION_FIELDS) -> dict | None:
+    """Detach the fragment's ``pos_*`` columns from a fetched row (mutating
+    it) and return the position object with exactly ``fields`` — or None when
+    the pair is null, i.e. the bus has no served position."""
+    values = {field: row.pop(column, None) for field, column in _POSITION_FIELD_COLUMNS.items()}
+    if values["lat"] is None or values["lng"] is None:
+        return None
+    return {field: values[field] for field in fields}

@@ -3,7 +3,29 @@ from typing import Any
 from app.core.db import get_connection
 from app.core.scope import ParentScope
 from app.dao.audit_dao import record_audit
-from app.dao.status_sql import display_status_case
+from app.dao.status_sql import (
+    PARENT_POSITION_FIELDS,
+    bus_position_columns,
+    display_status_case,
+    pop_position,
+)
+
+# Today's in-progress run the child is ON (GPS plan U8, R37): run_stops
+# membership, Nairobi-safe "today", never completed. This — not the child's
+# derived home bus — is how every parent reader resolves the bus whose position
+# it may serve: a run started from the driver's home must not put their home on
+# a parent's map (R36 keeps that off the served position) and a cross-bus
+# afternoon rider must see the bus they are on. Correlated on the consuming
+# query's ``live_students`` alias ``s``; used as a LEFT JOIN LATERAL body.
+_CHILD_RUN_TODAY_SQL = """
+    select r.id as run_id, r.bus_id
+    from live_runs r
+    where r.date = (now() at time zone 'Africa/Nairobi')::date
+      and r.status <> 'completed'
+      and exists (select 1 from run_stops rs where rs.run_id = r.id and rs.student_id = s.id)
+    order by r.created_at desc
+    limit 1
+"""
 
 
 def _mask_stop_name(name: str, is_own: bool, is_gate: bool) -> str:
@@ -51,6 +73,13 @@ class ParentLiveDao:
         not reopen withdrawal). For a merged 'day' row that means at least
         one half is still withdrawable, which is exactly when the UI should
         offer the action (U13's dialog picks the half).
+
+        ``bus_position`` (GPS plan U8, R37) is the served position of the bus
+        on today's in-progress run the child is ON — ``run_stops``
+        membership, never ``live_students.bus_id`` (a cross-bus afternoon
+        rider's home bus is the wrong bus) — as the parent allowlist ``{lat,
+        lng, position_at, stale}``, or None. ``bus_name`` stays the child's
+        assigned bus: roster information, not a position.
         """
         with get_connection(scope) as conn:
             ids = self._child_ids(conn, scope.user_id)
@@ -59,9 +88,9 @@ class ParentLiveDao:
             rows = conn.execute(
                 f"""
                 select s.*, b.name as bus_name, b.driver_name, b.driver_phone,
-                       b.current_lat as bus_current_lat, b.current_lng as bus_current_lng,
                        sc.name as school_name,
                        {display_status_case("s")} as display_status,
+                       {bus_position_columns("rb")},
                        a.scope as cancel_scope, a.source as cancel_source,
                        case when a.source = 'parent' then exists (
                            select 1
@@ -87,6 +116,8 @@ class ParentLiveDao:
                 left join live_student_absences a
                     on a.student_id = s.id
                    and a.absence_date = (now() at time zone 'Africa/Nairobi')::date
+                left join lateral ({_CHILD_RUN_TODAY_SQL}) cr on true
+                left join live_buses rb on rb.id = cr.bus_id
                 where s.id = any(%s)
                 order by s.name asc
                 """,
@@ -95,6 +126,7 @@ class ParentLiveDao:
         children = []
         for r in rows:
             child = dict(r)
+            child["bus_position"] = pop_position(child, PARENT_POSITION_FIELDS)
             scope = child.pop("cancel_scope")
             source = child.pop("cancel_source")
             withdrawable = child.pop("cancel_withdrawable")
@@ -190,14 +222,26 @@ class ParentLiveDao:
         }
 
     def get_track(self, scope: ParentScope, student_id: str) -> dict[str, Any] | None:
+        """The Track page's read: ``{student, stops, run, bus, bus_position}``.
+
+        ``run`` is today's run the child is ON (run_stops membership — the
+        latest in-progress one first, else the latest completed one so the
+        stop ticks survive the run's end), never "the home bus's latest run"
+        (GPS plan U8, R37). ``bus`` and ``bus_position`` are served only
+        while that run is in progress: the run's bus and its position as the
+        parent allowlist ``{lat, lng, position_at, stale}`` from the shared
+        fragment — no source, accuracy or exception state (R22). ``stops``
+        follow the run's route when there is one, so the ticks and the line
+        describe the same trip for a cross-bus rider; otherwise the child's
+        morning route on their assigned bus, as before.
+        """
         with get_connection(scope) as conn:
             ids = [str(cid) for cid in self._child_ids(conn, scope.user_id)]
             if str(student_id) not in ids:
                 return None  # ownership: not this parent's child
             student = conn.execute(
                 """
-                select s.*, b.name as bus_name, b.driver_name, b.driver_phone,
-                       b.current_lat as bus_current_lat, b.current_lng as bus_current_lng
+                select s.*, b.name as bus_name, b.driver_name, b.driver_phone
                 from live_students s left join live_buses b on b.id = s.bus_id
                 where s.id = %s
                 """,
@@ -205,16 +249,49 @@ class ParentLiveDao:
             ).fetchone()
             if not student:
                 return None
-            # The student's current (morning) route + its stops.
-            route = conn.execute(
-                """
-                select r.* from live_routes r
-                join live_student_routes sr on sr.route_id = r.id
-                where sr.student_id = %s and r.bus_id = %s
-                order by (r.type <> 'morning') asc, r.type asc limit 1
+            run_row = conn.execute(
+                f"""
+                select r.*, rb.name as run_bus_name, {bus_position_columns("rb")}
+                from live_runs r
+                left join live_buses rb on rb.id = r.bus_id
+                where r.date = (now() at time zone 'Africa/Nairobi')::date
+                  and exists (select 1 from run_stops rs
+                              where rs.run_id = r.id and rs.student_id = %s)
+                order by (r.status <> 'completed') desc, r.created_at desc
+                limit 1
                 """,
-                (student_id, student["bus_id"]),
+                (student_id,),
             ).fetchone()
+            run = bus = bus_position = None
+            route = None
+            if run_row:
+                row = dict(run_row)
+                position = pop_position(row, PARENT_POSITION_FIELDS)
+                run_bus_name = row.pop("run_bus_name")
+                if row["status"] != "completed" and row["bus_id"] is not None:
+                    bus = {"id": row["bus_id"], "name": run_bus_name}
+                    bus_position = position
+                # The response shape of a run row is RunDao's (GPS plan U7):
+                # internal columns such as the starting session never travel.
+                from app.dao.run_dao import public_run
+
+                run = public_run(row)
+                if row["route_id"] is not None:
+                    route = conn.execute(
+                        "select r.* from live_routes r where r.id = %s", (row["route_id"],)
+                    ).fetchone()
+            if route is None:
+                # No run today (or its route is gone): the child's current
+                # (morning) route on their assigned bus.
+                route = conn.execute(
+                    """
+                    select r.* from live_routes r
+                    join live_student_routes sr on sr.route_id = r.id
+                    where sr.student_id = %s and r.bus_id = %s
+                    order by (r.type <> 'morning') asc, r.type asc limit 1
+                    """,
+                    (student_id, student["bus_id"]),
+                ).fetchone()
             stops = []
             if route:
                 raw = conn.execute(
@@ -245,18 +322,13 @@ class ParentLiveDao:
                         "lat": s["lat"],
                         "lng": s["lng"],
                     })
-            run = None
-            if student["bus_id"]:
-                r = conn.execute(
-                    """
-                    select * from live_runs
-                    where bus_id = %s and date = (now() at time zone 'Africa/Nairobi')::date
-                    order by created_at desc limit 1
-                    """,
-                    (student["bus_id"],),
-                ).fetchone()
-                run = dict(r) if r else None
-        return {"student": dict(student), "stops": stops, "run": run}
+        return {
+            "student": dict(student),
+            "stops": stops,
+            "run": run,
+            "bus": bus,
+            "bus_position": bus_position,
+        }
 
     def list_alerts(
         self,

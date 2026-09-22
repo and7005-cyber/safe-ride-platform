@@ -11,14 +11,28 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
-import { FitBounds, RoutePolyline, type LatLng } from "@/components/map/MapPrimitives";
+import {
+  BusMarkerGlyph,
+  FitBounds,
+  RoutePolyline,
+  useNow,
+  type LatLng,
+} from "@/components/map/MapPrimitives";
 import { MAP_ID, NAIROBI } from "@/lib/googleMaps";
+import { freshnessLabel } from "@/lib/positionFreshness";
 import { PARENT_NAV, useChildren, useTrack } from "@/features/parent/parentHooks";
+
+// The bus colour on the parent map: the route line's green, so the dot reads
+// as "the bus on this line" rather than a second kind of stop.
+const BUS_COLOR = "#206F4A";
 
 export function ParentTrackPage() {
   const { data: children = [] } = useChildren();
   const [studentId, setStudentId] = useState<string | null>(null);
   const { data: track } = useTrack(studentId);
+  // A 5 s tick keeps "updated X ago" counting between polls: the parent's
+  // payload carries no age, and an unchanged position would freeze the label.
+  const now = useNow();
 
   useEffect(() => {
     if (!studentId && children.length > 0) setStudentId(children[0].id);
@@ -27,10 +41,21 @@ export function ParentTrackPage() {
   const stops = track?.stops ?? [];
   const run = track?.run;
   const completed = run?.stops_completed ?? 0;
-  const busLive = track?.student?.bus_current_lat != null;
+  // The bus is served only while the child's run is in progress (GPS plan
+  // U8, R37): the position IS the live signal, so the badge keys off it as it
+  // did off the bus coordinates before.
+  const position = track?.bus_position ?? null;
+  const busLive = position != null;
+  const busName = track?.bus?.name ?? track?.student?.bus_name ?? "Bus";
+  const freshness = freshnessLabel(position, now);
   const points: LatLng[] = stops
     .filter((s: any) => s.lat != null && s.lng != null)
     .map((s: any) => ({ lat: s.lat, lng: s.lng }));
+  // Fit the stops and the bus once per (route, bus) — keyed on the bus id, not
+  // its position, so the map never re-fits under a parent's fingers as the
+  // dot moves.
+  const fitPoints = position ? [...points, { lat: position.lat, lng: position.lng }] : points;
+  const focusKey = `track:${points.map((p) => `${p.lat},${p.lng}`).join("|")}|bus:${track?.bus?.id ?? ""}`;
 
   return (
     <RoleMobileLayout nav={PARENT_NAV} variant="accent" title="Track Bus">
@@ -56,11 +81,8 @@ export function ParentTrackPage() {
               gestureHandling="greedy"
               className="h-full w-full"
             >
-              <FitBounds
-                points={points}
-                focusKey={`track:${points.map((p) => `${p.lat},${p.lng}`).join("|")}`}
-              />
-              {points.length > 1 && <RoutePolyline path={points} color="#206F4A" />}
+              <FitBounds points={fitPoints} focusKey={focusKey} />
+              {points.length > 1 && <RoutePolyline path={points} color={BUS_COLOR} />}
               {points.map((p, i) => (
                 <AdvancedMarker key={i} position={p}>
                   <span
@@ -70,14 +92,42 @@ export function ParentTrackPage() {
                   />
                 </AdvancedMarker>
               ))}
+              {/* The bus, plotted for the first time (R9): one marker, one
+                  child; stale is a class toggle on the glyph, with the same
+                  dimming the fleet map uses (R27). */}
+              {position && (
+                <AdvancedMarker
+                  key="bus"
+                  position={{ lat: position.lat, lng: position.lng }}
+                  zIndex={20}
+                >
+                  <BusMarkerGlyph
+                    color={BUS_COLOR}
+                    busId={track?.bus?.id}
+                    stale={position.stale}
+                    title={`${busName} — ${freshness ?? "position time unknown"}`}
+                  />
+                </AdvancedMarker>
+              )}
             </Map>
           </div>
-          {/* Live badge only — the bus position is NOT plotted on the map (live parity). */}
+          {/* The live badge as before, now with the position's freshness
+              beside it: "updated X ago" while fresh, "last seen X ago" once
+              the server says stale — the fleet map's wording (R27). */}
           {busLive && (
-            <div className="flex justify-center py-2">
+            <div className="flex flex-wrap items-center justify-center gap-2 py-2">
               <Badge variant="outline" className="animate-pulse-dot">
-                {track?.student?.bus_name ?? "Bus"} is live
+                {busName} is live
               </Badge>
+              {freshness && (
+                <span
+                  data-testid="track-freshness"
+                  data-stale={position.stale ? "true" : "false"}
+                  className={`text-xs ${position.stale ? "text-amber-700" : "text-muted-foreground"}`}
+                >
+                  {freshness}
+                </span>
+              )}
             </div>
           )}
         </Card>

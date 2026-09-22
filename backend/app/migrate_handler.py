@@ -10,15 +10,33 @@ SQL files are executed with libpq's simple-query protocol
 (``pgconn.exec_``) so multi-statement scripts and dollar-quoted ``do $$``
 blocks run exactly as ``psql`` would — naive semicolon splitting would break on
 the enum/function blocks in the migrations.
+
+Named event actions (this Lambda holds the writable connection; the verify
+Lambda is server-enforced read-only):
+
+- ``{"action": "gps-purge", "school_id": "<uuid>", "max_batches": 100}`` —
+  the on-demand GPS retention purge (GPS plan U7/R12) for a school that has
+  stopped running, whose trail the post-Start-Run pass therefore never
+  reaches. Loops ``position_dao.purge_batch`` — the same bounded pass the
+  API runs after Start Run: trail rows older than the school's retention by
+  ``received_at`` (2,000 per batch, 2 s statement timeout), coordinates
+  nulled on exceptions and events older than retention, idempotency keys
+  older than seven days — one transaction per batch, until a batch deletes
+  nothing or ``max_batches`` (default 100, at most 1,000) is reached. Stops
+  and reports ``locked`` when a Start Run pass holds the school's advisory
+  lock. The ``gps`` verify set's ``trail-rows-past-retention`` says when it
+  is due. Nothing is migrated or seeded on this path.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 
 import psycopg
 from psycopg.pq import ExecStatus
+from psycopg.rows import dict_row
 
 DB_DIR = Path(__file__).resolve().parent.parent / "db"
 MIGRATIONS_DIR = DB_DIR / "migrations"
@@ -94,7 +112,14 @@ def _apply_dir(conn: psycopg.Connection, directory: Path, prefix: str) -> dict[s
 
 
 def handler(event=None, context=None) -> dict:
-    """Apply migrations then seeds, then the tenancy post-steps. Idempotent."""
+    """Apply migrations then seeds, then the tenancy post-steps. Idempotent.
+    A named ``action`` in the event runs that action instead (see module
+    docstring)."""
+    action = (event or {}).get("action")
+    if action == "gps-purge":
+        return _gps_purge(event or {})
+    if action is not None:
+        return {"status": "error", "reason": f"unknown action {action!r}"}
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         _ensure_marker_table(conn)
         migrations = _apply_dir(conn, MIGRATIONS_DIR, prefix="")
@@ -259,6 +284,69 @@ def _bootstrap_providers(conn: psycopg.Connection, data: dict) -> dict:
     _mark_applied(conn, marker)
     return {"marker": marker, "providers": applied}
 
+
+
+# --- On-demand GPS retention purge (GPS plan U7/R12) ---------------------------
+
+GPS_PURGE_MAX_BATCHES_DEFAULT = 100
+GPS_PURGE_MAX_BATCHES_CAP = 1000
+
+
+def _parse_gps_purge_event(event: dict) -> tuple[str, int]:
+    """``(school_id, max_batches)`` from the event, or raise ValueError."""
+    try:
+        school_id = str(uuid.UUID(str(event.get("school_id"))))
+    except (TypeError, ValueError) as error:
+        raise ValueError("gps-purge requires a valid school_id (uuid)") from error
+    raw = event.get("max_batches", GPS_PURGE_MAX_BATCHES_DEFAULT)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise ValueError("gps-purge max_batches must be a positive integer")
+    return school_id, min(raw, GPS_PURGE_MAX_BATCHES_CAP)
+
+
+def _gps_purge(event: dict) -> dict:
+    """Loop the bounded purge pass for one school until nothing is left,
+    the school's lock is held elsewhere, or the batch bound is reached.
+
+    The master role is not subject to RLS, so the pass's own ``school_id``
+    predicates are what confine it here — the same statements the scoped
+    API path runs. Each batch is its own transaction (advisory lock and
+    statement timeout end with it). The report carries ids and counts only.
+    """
+    try:
+        school_id, max_batches = _parse_gps_purge_event(event)
+    except ValueError as error:
+        return {"status": "error", "reason": str(error)}
+
+    from app.dao.position_dao import purge_batch  # lazy: not needed to migrate
+
+    totals = {
+        "trail_rows_deleted": 0, "exceptions_nulled": 0, "events_nulled": 0, "keys_deleted": 0,
+    }
+    batches = 0
+    stopped = "clean"
+    with psycopg.connect(_database_url(), autocommit=True, row_factory=dict_row) as conn:
+        while batches < max_batches:
+            with conn.transaction():
+                outcome = purge_batch(conn, school_id)
+            if outcome is None:
+                stopped = "locked"
+                break
+            batches += 1
+            for key in totals:
+                totals[key] += outcome[key]
+            if not any(outcome[key] for key in totals):
+                break
+        else:
+            stopped = "batch-bound"
+    return {
+        "status": "ok",
+        "action": "gps-purge",
+        "school_id": school_id,
+        "batches": batches,
+        "stopped": stopped,
+        **totals,
+    }
 
 
 if __name__ == "__main__":  # local manual run against DATABASE_URL
