@@ -222,6 +222,81 @@ def test_env_example_documents_each_alias_with_its_default(alias):
     assert re.search(rf"^# {alias}={default}$", ENV_EXAMPLE, re.M), alias
 
 
+# --- API-stage throttling (GPS plan U14) -------------------------------------------
+# Not app Settings — API Gateway stage settings — but the same live-parity
+# rule: a template Parameter with a Default (the live value), referenced from
+# the HTTP API's route settings, and passable from deploy-backend.sh under a
+# stable name. Template parameter -> (deploy env name, default).
+
+THROTTLE_PARAMS = {
+    "ApiDefaultBurstLimit": ("API_DEFAULT_BURST_LIMIT", 100),
+    "ApiDefaultRateLimit": ("API_DEFAULT_RATE_LIMIT", 50),
+    "PingsRouteBurstLimit": ("API_PINGS_BURST_LIMIT", 20),
+    "PingsRouteRateLimit": ("API_PINGS_RATE_LIMIT", 10),
+}
+PINGS_ROUTE_KEY = "POST /api/runs/driver/pings"
+
+
+def _resource_block(logical_id: str) -> str:
+    start = TEMPLATE.index(f"\n  {logical_id}:\n")
+    tail = TEMPLATE[start + 1:]
+    end = re.search(r"^  \w+:\n", tail[1:], re.M)
+    return tail[: end.start() + 1] if end else tail
+
+
+@pytest.mark.parametrize("param,env,default", [(p, *v) for p, v in THROTTLE_PARAMS.items()])
+def test_throttle_parameter_has_a_numeric_default(param, env, default):
+    entry = _template_parameter(param)
+    assert entry["Type"] == "Number"
+    assert int(entry["Default"]) == default
+    assert int(entry["MinValue"]) >= 1
+
+
+def test_http_api_binds_the_stage_default_and_the_pings_route_to_the_parameters():
+    block = _resource_block("HttpApi")
+    default = re.search(
+        r"^      DefaultRouteSettings:\n((?:        .*\n)+)", block, re.M
+    )
+    assert default, "HttpApi has no DefaultRouteSettings"
+    assert dict(re.findall(r"^        (\w+): (.+?)\s*$", default.group(1), re.M)) == {
+        "ThrottlingBurstLimit": "!Ref ApiDefaultBurstLimit",
+        "ThrottlingRateLimit": "!Ref ApiDefaultRateLimit",
+    }
+    route = re.search(
+        rf'^        "{re.escape(PINGS_ROUTE_KEY)}":\n((?:          .*\n)+)', block, re.M
+    )
+    assert route, f"HttpApi RouteSettings has no entry for {PINGS_ROUTE_KEY}"
+    assert dict(re.findall(r"^          (\w+): (.+?)\s*$", route.group(1), re.M)) == {
+        "ThrottlingBurstLimit": "!Ref PingsRouteBurstLimit",
+        "ThrottlingRateLimit": "!Ref PingsRouteRateLimit",
+    }
+
+
+def test_the_pings_route_is_a_declared_route_on_the_api_function_and_in_the_manifest():
+    """A per-route setting binds to a route key that exists: the pings route
+    is declared beside the proxy, and it is the manifest's driver-scoped
+    path, so the throttle can never drift from the registered route."""
+    from tests.scope_manifest import MANIFEST
+
+    method, path = PINGS_ROUTE_KEY.split(" ", 1)
+    assert MANIFEST[(method, path)] == "driver-scoped"
+    block = _resource_block("ApiFunction")
+    events = re.search(r"^      Events:\n((?:        .*\n)+)", block, re.M)
+    assert events, "ApiFunction has no Events"
+    declared = re.findall(
+        r"^            Path: (\S+)\n            Method: (\S+)$", events.group(1), re.M
+    )
+    assert (path, method) in declared, declared
+    assert ("/{proxy+}", "ANY") in declared  # the proxy still serves the rest
+
+
+@pytest.mark.parametrize("param,env", [(p, v[0]) for p, v in THROTTLE_PARAMS.items()])
+def test_deploy_script_maps_each_throttle_parameter(param, env):
+    assert f"{param}:{env}" in DEPLOY_SCRIPT
+    # And the loop actually iterates the array the pair lives in.
+    assert 'for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"' in DEPLOY_SCRIPT
+
+
 def test_no_reader_imports_a_retired_module_constant():
     """The five geometry/cadence defaults are Settings fields now; a stray
     import of the old constants would bake a value in at import time."""

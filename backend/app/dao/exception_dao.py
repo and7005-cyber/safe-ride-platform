@@ -564,12 +564,13 @@ def _upsert_stop_keyed_exception(
 def _upsert_run_keyed_unverified(
     conn, run: dict[str, Any], *, reason: str, fix_columns: _FixColumns,
     distance_m: float | None,
-) -> str:
-    """One ``unverified`` row per (run, reason) for ``no-fix`` and
-    ``too-coarse`` (R20): a GPS-denied run must not spawn a row per tap. No
-    index keys these, so the (run, reason) pair is serialised on a
-    transaction-scoped advisory lock before the select-for-update, and the
-    first tap inside the lock inserts."""
+) -> tuple[str, bool]:
+    """One ``unverified`` row per (run, reason) for ``no-fix``,
+    ``too-coarse`` (R20) and ``session-mismatch`` (U14): a GPS-denied run
+    must not spawn a row per tap. No index keys these, so the (run, reason)
+    pair is serialised on a transaction-scoped advisory lock before the
+    select-for-update, and the first tap inside the lock inserts. Returns
+    ``(id, inserted)`` so a once-per-run caller can tell the first time."""
     run_id = str(run["id"])
     conn.execute(
         "select pg_advisory_xact_lock(hashtext(%s))", (f"unverified:{run_id}:{reason}",)
@@ -583,7 +584,7 @@ def _upsert_run_keyed_unverified(
         (run_id, UNVERIFIED, reason),
     ).fetchone()
     if existing:
-        return str(existing["id"])
+        return str(existing["id"]), False
     inserted = conn.execute(
         """
         insert into run_exceptions
@@ -594,7 +595,40 @@ def _upsert_run_keyed_unverified(
         """,
         (str(run["school_id"]), run_id, UNVERIFIED, reason, *fix_columns, distance_m),
     ).fetchone()
-    return str(inserted["id"])
+    return str(inserted["id"]), True
+
+
+# The `reason` of the unverified row a refused ping stream leaves for the
+# office (GPS plan U14/R28): pings arrived from an auth session other than the
+# one bound to the run. Not a check reason — no tap is classified by it — so
+# it lives here, beside the writer, rather than in position_rules.
+REASON_SESSION_MISMATCH = "session-mismatch"
+
+
+def record_session_mismatch(conn, run: dict[str, Any]) -> tuple[str, bool]:
+    """Flag the run once for pings from a second session (U14/R28): one
+    ``unverified`` / ``session-mismatch`` row per run with one silent ledger
+    event written the first time only — no student, no fix, no prompt, no
+    call-now, no incident — so a second phone looping on the endpoint adds
+    nothing after the first refusal. Returns ``(exception_id, first_time)``.
+    Logs the run id only."""
+    exception_id, inserted = _upsert_run_keyed_unverified(
+        conn, run, reason=REASON_SESSION_MISMATCH, fix_columns=(None, None, None, None),
+        distance_m=None,
+    )
+    if inserted:
+        conn.execute(
+            """
+            insert into run_exception_events (exception_id, school_id, run_id)
+            values (%s, %s, %s)
+            """,
+            (exception_id, str(run["school_id"]), str(run["id"])),
+        )
+        logger.info(
+            "pings from a second session refused; run flagged for review (run=%s exception=%s)",
+            run["id"], exception_id,
+        )
+    return exception_id, inserted
 
 
 def record_custody_check(
@@ -713,7 +747,7 @@ def _record_unverified(
             fix_columns=fix_columns, distance_m=None,
         )
     else:
-        exception_id = _upsert_run_keyed_unverified(
+        exception_id, _inserted = _upsert_run_keyed_unverified(
             conn, run, reason=reason, fix_columns=fix_columns, distance_m=distance_m,
         )
     conn.execute(
@@ -907,8 +941,14 @@ class PlausibilityVerdict:
         return bool(self.flags)
 
 
+_PREVIOUS_FROM_TRAIL = object()
+
+
 def assess_plausibility(
     conn, run: dict[str, Any], *, trail_row_id: str, fix: NormalisedFix, retention_days: int,
+    previous: StoredFix | None | object = _PREVIOUS_FROM_TRAIL,
+    stops: list[tuple[Any, Any]] | None = None,
+    exempt: Iterable[str] = (),
 ) -> PlausibilityVerdict:
     """Judge the tap's fix against the run's previous fix and planned stops
     and merge the flags onto its trail row (U12, R32).
@@ -920,16 +960,28 @@ def assess_plausibility(
     stops the run's own snapshot. A fix-less tap has nothing to judge.
     Merges through ``position_dao.add_flags`` so ``clock-skew`` from the
     boundary stays and nothing is written twice. Never logs a coordinate.
+
+    A ping batch (U14) passes ``previous`` and ``stops`` itself: its rows
+    share one receipt time, so the trail cannot order them, and the batch is
+    judged in capture order against the ping before it. ``exempt`` names
+    flags the caller does not apply (the batch exempts ``repeat-coordinates``
+    — a parked phone's stream legitimately repeats).
     """
     stored = fix.fix
     if stored is None:
         return PlausibilityVerdict(flags=(), previous=None, jump_m=None)
     run_id = str(run["id"])
-    previous = position_dao.previous_fix(
-        conn, run_id, before_row_id=trail_row_id, retention_days=retention_days
+    if previous is _PREVIOUS_FROM_TRAIL:
+        previous = position_dao.previous_fix(
+            conn, run_id, before_row_id=trail_row_id, retention_days=retention_days
+        )
+    if stops is None:
+        stops = position_dao.planned_stops(conn, run_id)
+    skipped = set(exempt)
+    flags = tuple(
+        flag for flag in plausibility_flags(fix, previous=previous, stops=stops)
+        if flag not in skipped
     )
-    stops = position_dao.planned_stops(conn, run_id)
-    flags = plausibility_flags(fix, previous=previous, stops=stops)
     if flags:
         position_dao.add_flags(conn, trail_row_id, flags)
     return PlausibilityVerdict(

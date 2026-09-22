@@ -172,8 +172,20 @@ export interface MintOptions {
 export class ActionEnvelopes {
   private pendingByFingerprint = new Map<string, ActionEnvelope>();
   private loaded = false;
+  private sentListeners = new Set<(path: string) => void>();
 
   constructor(private readonly deps: ActionEnvelopesDeps) {}
+
+  /** Called after the server accepted an envelope, with its path. The
+   * ping stream listens (GPS plan U14): a tapped action re-binds the run to
+   * this session on the server, so pings paused on `session-mismatch`
+   * resume on the next one. Returns the unsubscribe. */
+  onSent(listener: (path: string) => void): () => void {
+    this.sentListeners.add(listener);
+    return () => {
+      this.sentListeners.delete(listener);
+    };
+  }
 
   /** The pending envelope for this exact action, or a fresh one. */
   async mint(path: string, action: Record<string, unknown>, opts: MintOptions): Promise<ActionEnvelope> {
@@ -204,6 +216,7 @@ export class ActionEnvelopes {
           [IDEMPOTENCY_HEADER]: envelope.key,
         });
         this.forget(envelope.key);
+        for (const listener of this.sentListeners) listener(envelope.path);
         return result;
       } catch (error) {
         if (isInFlightConflict(error) && attempt < IN_FLIGHT_MAX_RETRIES) {

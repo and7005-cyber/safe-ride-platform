@@ -3,10 +3,11 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api._helpers import map_error, safe_call
 from app.core.auth import get_current_user
+from app.core.config import GPS_PING_MAX_BATCH
 from app.core.errors import ActionReplayed, ClosureRefusedError
 from app.core.permissions import require_driver_scope, require_school, require_staff
 from app.core.scope import STAFF_ROLES, SchoolScope
@@ -118,6 +119,18 @@ class PromptAnswerPayload(BaseModel):
 class HandoverPayload(EnvelopeFields):
     student_id: str
     note: str
+
+
+class PingsPayload(BaseModel):
+    """One Phase 2 ping batch (GPS plan U14/R28). ``fixes`` is bounded here
+    — one to ``GPS_PING_MAX_BATCH`` items — so an oversized batch is a 422
+    before any SQL; each item is ``Any`` because the fixes are normalised
+    leniently inside the transaction (a malformed one is dropped and
+    counted, never a 422). Not an envelope: no key, no replay."""
+
+    run_id: str
+    fixes: list[Any] = Field(min_length=1, max_length=GPS_PING_MAX_BATCH)
+    device_id: Any = None
 
 
 def _envelope(key_header: str | None, payload: EnvelopeFields) -> ActionEnvelope:
@@ -497,6 +510,29 @@ def record_handover(
     )
     background_tasks.add_task(_send_due_call_now, scope)
     return student
+
+
+@router.post("/driver/pings")
+def record_pings(payload: PingsPayload, scope: SchoolScope = Depends(require_driver_scope)):
+    """A batch of interval position fixes for the driver's own in-progress
+    run (GPS plan U14: R24, R26, R27, R28; F6) — the trail insert and the
+    forward-only served position, and nothing else: no ``BackgroundTasks``
+    parameter on purpose, so no push, no outbox drain, no purge can ride a
+    ping (a ping never notifies a parent, R24).
+
+    Refusals are structured: 404 another school's run, 403 not this
+    driver's, 409 ``run-not-active`` (AE15), 409 ``session-mismatch`` (the
+    run is flagged once for the office; the next tapped action re-binds
+    it), 429 ``ping-too-soon`` with ``retry_after_s`` and Retry-After, 422 a
+    batch over ``GPS_PING_MAX_BATCH`` or empty. Response ``{accepted,
+    dropped: {invalid, outside_window, duplicate}, flagged, served_at}``.
+    The API stage throttles this route on its own (template).
+    """
+    return safe_call(
+        lambda: position_dao.record_pings(
+            scope, payload.run_id, payload.fixes, device_id=payload.device_id
+        )
+    )
 
 
 @router.post("/driver/reverse")

@@ -26,8 +26,15 @@ import { DriverLayout } from "@/features/driver/components/DriverLayout";
 import { nudgeStore } from "@/features/driver/components/nudgeStore";
 import { unlockAttentionAudio } from "@/features/driver/components/useAttentionCue";
 import { useDriverContext } from "@/features/driver/driverHooks";
+import { usePingStreamStatus } from "@/features/driver/useRunPings";
+import { WAKE_LOCK_HINT, showWakeLockHint, useWakeLockStatus, wakeLock } from "@/features/driver/useWakeLock";
 import { postDriverAction } from "@/lib/actionEnvelope";
 import { fixCapture, queryPermissionState } from "@/lib/geo/fixCapture";
+
+/** The Run page's line when pings are paused on `session-mismatch` (GPS
+ * plan U14/R28): the run was started from another sign-in of this PIN. */
+export const PING_PAUSED_HINT =
+  "Live tracking is paused: this run was started from another sign-in. Your next tap here resumes it.";
 
 /** The location explainer (GPS plan U6: R4; F1) — shown before the browser's
  * own prompt on a phone that has not answered it yet, and re-checked every
@@ -82,6 +89,8 @@ export function DriverRunPage() {
   const [routeId, setRouteId] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [explainerOpen, setExplainerOpen] = useState(false);
+  const wake = useWakeLockStatus();
+  const pings = usePingStreamStatus();
 
   const activeRun = data?.active_run;
   const routes = data?.routes ?? [];
@@ -103,6 +112,10 @@ export function DriverRunPage() {
     fixCapture.arm();
     try {
       await postDriverAction("/api/runs/driver/start", { route_id: routeId }, { runId: null });
+      // The screen wake lock (GPS plan U14/R25): asked for here, in the
+      // tap's own gesture chain once the run exists; the layout keeps it
+      // for as long as the context reports the run.
+      void wakeLock.request();
       await refresh();
     } catch (err) {
       // No run to watch for.
@@ -236,6 +249,26 @@ export function DriverRunPage() {
                 <div className="h-full bg-primary" style={{ width: `${activeRun.total_stops ? (activeRun.stops_completed / activeRun.total_stops) * 100 : 0}%` }} />
               </div>
               <p className="text-sm text-muted-foreground">{activeRun.stops_completed}/{activeRun.total_stops} stops completed</p>
+              {/* Two one-line hints (GPS plan U14), never blocking: the
+                  browser would not keep the screen on; the ping stream is
+                  paused because another sign-in started this run. */}
+              {showWakeLockHint(wake) && (
+                <p
+                  className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950/30"
+                  data-testid="wake-lock-hint"
+                  data-reason={wake.reason ?? ""}
+                >
+                  {WAKE_LOCK_HINT}
+                </p>
+              )}
+              {pings.suspended && (
+                <p
+                  className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950/30"
+                  data-testid="ping-hint"
+                >
+                  {PING_PAUSED_HINT}
+                </p>
+              )}
             </CardContent>
           </Card>
 

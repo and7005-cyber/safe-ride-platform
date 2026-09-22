@@ -94,5 +94,30 @@ class TooManyRequestsError(SafeRideError):
     status_code = 429
 
 
+class PingRefusedError(ConflictError):
+    """A ping batch the run cannot take (GPS plan U14/R28). ``code`` is
+    machine-readable like the other 409s: ``run-not-active`` for a completed
+    or prior-day run (AE15), ``session-mismatch`` when the caller's auth
+    session is not the one bound to the run — the client stops pinging until
+    its next tapped action re-binds it. Nothing was inserted either way."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+class PingPacedError(TooManyRequestsError):
+    """A ping batch that arrived while the run's newest ping is younger than
+    half the school's ping interval (GPS plan U14/R28). ``retry_after_s`` is
+    how long until the stream is inside its pace again; the client waits one
+    interval regardless. Nothing was inserted."""
+
+    code = "ping-too-soon"
+
+    def __init__(self, message: str, *, retry_after_s: float):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
 def to_http_exception(error: SafeRideError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=str(error))

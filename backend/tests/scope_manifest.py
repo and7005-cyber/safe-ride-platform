@@ -95,6 +95,7 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/runs/driver/handover"): "driver-scoped",
     ("POST", "/api/runs/driver/reverse"): "driver-scoped",
     ("POST", "/api/runs/driver/absent"): "driver-scoped",
+    ("POST", "/api/runs/driver/pings"): "driver-scoped",
     ("GET", "/api/incidents"): "school-scoped",
     ("GET", "/api/incidents/unread-count"): "school-scoped",
     ("GET", "/api/incidents/today-count"): "school-scoped",

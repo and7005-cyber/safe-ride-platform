@@ -20,6 +20,14 @@ GPS_PURGE_STATEMENT_TIMEOUT_MS = 2000
 GPS_ACTION_KEY_TTL_DAYS = 7          # idempotency keys purged after this
 GPS_KEY_LOCK_TIMEOUT_MS = 2000       # wait on an in-flight duplicate before 409
 GPS_CLOCK_SKEW_TOLERANCE_S = 30      # capture time this far ahead of receipt is skew
+# Phase 2 pings (GPS plan U14): the batch cap the route enforces before any
+# SQL, and the run's capture-time window — from a minute before the run row
+# was created to this far past receipt. A capture ahead of receipt by more
+# than the skew tolerance but inside the window is stored flagged and never
+# served; past the window it is dropped and counted.
+GPS_PING_MAX_BATCH = 6
+GPS_PING_RUN_START_GRACE_S = 60
+GPS_PING_FUTURE_WINDOW_S = 300
 
 
 def _maybe_b64_json(value: str) -> str:

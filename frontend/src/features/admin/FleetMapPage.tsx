@@ -104,6 +104,9 @@ export function FleetMapPage() {
   // Buses with a served position. Re-rendered on a 5 s tick as well as on
   // each poll so the freshness lines keep counting (GPS plan U8).
   const located = (buses as any[]).filter((b): b is LocatedBus => b.position != null);
+  // Stale positions are counted in the header too (R27, U14): a dimmed dot
+  // among several is easy to miss; a number beside "active" is not.
+  const staleCount = located.filter((b) => b.position.stale).length;
   const now = useNow();
   const [selectedBus, setSelectedBus] = useState<string | null>(null);
 
@@ -398,8 +401,11 @@ export function FleetMapPage() {
     <div className="space-y-6">
       <div>
         <h1 className="font-heading text-2xl font-bold">Fleet Map</h1>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-muted-foreground" data-testid="fleet-map-summary">
           Live bus positions · {located.length} active{located.length === 1 ? " bus" : " buses"}
+          {staleCount > 0 && (
+            <span className="text-amber-700"> · {staleCount} last seen a while ago</span>
+          )}
         </p>
       </div>
 
@@ -529,9 +535,13 @@ export function FleetMapPage() {
                     <span className="font-medium">{bus.name}</span>
                     <span className="ml-auto text-right text-xs text-muted-foreground">
                       <span className="block">{bus.position.label ?? "Live"}</span>
+                      {/* "last seen X ago" in amber once the server says
+                          stale (R27, U14) — the same 5 s tick as the info
+                          window, so the two never disagree. */}
                       <span
-                        className={`block ${bus.position.stale ? "text-amber-700" : ""}`}
+                        className={`block ${bus.position.stale ? "font-medium text-amber-700" : ""}`}
                         data-testid="bus-row-freshness"
+                        data-stale={bus.position.stale ? "true" : "false"}
                       >
                         {freshnessLabel(bus.position, now) ?? "time unknown"}
                       </span>

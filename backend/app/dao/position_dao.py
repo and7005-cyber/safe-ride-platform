@@ -30,30 +30,45 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from psycopg import sql
 
 from app.core.config import (
     GPS_ACTION_KEY_TTL_DAYS,
+    GPS_CLOCK_SKEW_TOLERANCE_S,
+    GPS_PING_FUTURE_WINDOW_S,
+    GPS_PING_RUN_START_GRACE_S,
     GPS_PURGE_BATCH_ROWS,
     GPS_PURGE_STATEMENT_TIMEOUT_MS,
     get_settings,
 )
 from app.core.db import get_connection
+from app.core.errors import (
+    ForbiddenError,
+    NotFoundError,
+    PingPacedError,
+    PingRefusedError,
+)
 from app.core.scope import SchoolScope
 from app.dao import idempotency_dao
+from app.dao.school_thresholds import resolve_school_thresholds
 from app.services.position_rules import (
+    FIX_REASON_COARSE,
     FLAG_CLASSIFICATION_FAILED,
+    FLAG_REPEAT_COORDINATES,
     PLAUSIBILITY_FLAGS,
     NormalisedFix,
     StoredFix,
+    normalise_fix,
 )
 
 logger = logging.getLogger("saferide.positions")
 
 SOURCE_ACTION = "action"
 SOURCE_CHECKPOINT = "checkpoint"
+SOURCE_PING = "ping"
 
 # pg_try_advisory_xact_lock(class, hashtext(school_id)): the class number is
 # the migration that introduced the tables, so no other lock in the product
@@ -106,6 +121,60 @@ def append_action_row(
         ),
     ).fetchone()
     return str(row["id"])
+
+
+def append_ping_row(
+    conn,
+    *,
+    school_id: str,
+    run_id: str,
+    bus_id: str,
+    session_id: str | None,
+    device_id: str | None,
+    fix: NormalisedFix,
+) -> str | None:
+    """One ``run_positions`` row per accepted ping (GPS plan U14): source
+    ``ping``, no action kind or key, the session and device that sent it,
+    the fix and its reason (``coarse`` above the school's cap, else
+    ``none``) and the boundary's flags. Keyed on (run, capture time) by
+    016's partial unique index: a capture time the run already holds — a
+    retried batch, two phones on one session — inserts nothing and returns
+    None, which the batch counts as a duplicate. ``fix.fix`` must be set."""
+    stored = fix.fix
+    assert stored is not None
+    row = conn.execute(
+        """
+        insert into run_positions
+            (school_id, run_id, bus_id, source, session_id, device_id,
+             lat, lng, accuracy_m, captured_at, fix_reason, flags)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (run_id, captured_at) where source = 'ping' do nothing
+        returning id
+        """,
+        (
+            school_id, run_id, bus_id, SOURCE_PING, session_id, device_id,
+            stored.lat, stored.lng, stored.accuracy_m, stored.captured_at,
+            fix.reason, list(fix.flags),
+        ),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
+def newest_ping_age_s(conn, run_id: str) -> float | None:
+    """Seconds since the run's newest ping row was received (server clock
+    both sides), or None when the run has no ping yet — the pacing input
+    (U14/R28). Taps are not counted: the pace bounds the ping stream, never
+    the driver's actions."""
+    row = conn.execute(
+        """
+        select extract(epoch from now() - max(received_at)) as age_s
+        from run_positions
+        where run_id = %s and source = %s
+        """,
+        (run_id, SOURCE_PING),
+    ).fetchone()
+    age = row["age_s"] if row else None
+    return float(age) if age is not None else None
 
 
 def add_flag(conn, row_id: str, flag: str) -> None:
@@ -252,6 +321,26 @@ def write_action_position(conn, bus_id: str, fix: StoredFix) -> None:
     )
 
 
+def write_ping_position(conn, bus_id: str, fix: StoredFix) -> bool:
+    """The served position from a ping (U14, R7): the five columns in one
+    statement with source ``ping`` — and only forward in capture time. A
+    ping captured before the bus's current ``position_at`` (a late batch, a
+    tap that landed in between) changes nothing; a pair with no time (the
+    legacy shape) is overwritten. Returns whether the position moved."""
+    return conn.execute(
+        """
+        update live_buses
+        set current_lat = %s, current_lng = %s, position_source = %s,
+            position_at = %s, position_accuracy_m = %s
+        where id = %s and (position_at is null or position_at < %s)
+        """,
+        (
+            fix.lat, fix.lng, SOURCE_PING, fix.captured_at, fix.accuracy_m,
+            bus_id, fix.captured_at,
+        ),
+    ).rowcount == 1
+
+
 def write_checkpoint_position(conn, bus_id: str, lat: float, lng: float) -> None:
     conn.execute(
         """
@@ -375,6 +464,21 @@ def purge_batch(
     }
 
 
+def _flag_classification_failed(conn, row_id: str) -> None:
+    """Mark a ping's trail row after one of its savepoints rolled back — its
+    own savepoint, so the bookkeeping never takes the batch down with it."""
+    try:
+        with conn.transaction():
+            add_flag(conn, row_id, FLAG_CLASSIFICATION_FAILED)
+    except Exception:
+        logger.exception("could not flag trail row %s", row_id)
+
+
+# "Judge the first ping of a batch against the trail" — the batch passes an
+# explicit previous fix for every ping after it.
+_PREVIOUS_FROM_TRAIL = object()
+
+
 class PositionDao:
     def purge_after_start(self, scope: SchoolScope) -> dict[str, Any] | None:
         """The post-Start-Run pass (R12): one batch on its own scoped
@@ -383,3 +487,219 @@ class PositionDao:
         failure — the router's wrapper logs and swallows, never the driver."""
         with get_connection(scope) as conn:
             return purge_batch(conn, scope.school_id)
+
+    # --- Phase 2 pings (GPS plan U14: R24, R26, R27, R28; F6) ----------------
+
+    def record_pings(
+        self, scope: SchoolScope, run_id: str, fixes: list[Any], device_id: Any = None,
+    ) -> dict[str, Any]:
+        """One ping batch for the caller's own in-progress run, on one scoped
+        connection; the trail insert is the whole of it (the plan's "a ping
+        is one insert" — no fan-out, no purge, no prompt).
+
+        Refusals, in order, and every one inserts nothing: a run the scope
+        cannot see is 404 (another school's, through RLS); a run this driver
+        does not own is 403; a completed or prior-day run is 409
+        ``run-not-active`` (AE15); a caller whose auth session is not the
+        one bound to the run (``started_session_id`` — Start Run stamps it,
+        any later tap re-binds it) is 409 ``session-mismatch``, and the run
+        is flagged for the office once per run when it is bound to a
+        different session (a run nobody's session started — created by the
+        office — is refused the same way but flags nothing, there being no
+        second session to report); a batch arriving while the run's newest
+        ping is younger than half the school's ping interval is 429
+        ``ping-too-soon``.
+
+        The batch: each fix is normalised leniently — a malformed one is
+        dropped and counted ``invalid``, never a 422; a capture time outside
+        the run's window (a minute before the run row was created … receipt
+        plus ``GPS_PING_FUTURE_WINDOW_S``) is dropped and counted
+        ``outside_window``; inside the window but ahead of receipt by more
+        than the skew tolerance is stored flagged ``clock-skew``. Rows are
+        inserted in capture order under the (run, capture time) key —
+        duplicates counted, not stored — with source ``ping``, the session,
+        the device id, ``coarse`` when above the school's cap, and judged by
+        the plausibility safeguard (U12) against the previous stored fix
+        (the ping before it in the batch, the trail for the first) in the
+        taps' savepoint style: flags on the row, a flagged ping listed on
+        the run's ``implausible-movement`` review row, a failed step marks
+        the row ``classification-failed`` and the batch goes on.
+        ``repeat-coordinates`` is not applied to pings: a parked phone's
+        stream legitimately repeats.
+
+        The served position moves forward only, by capture time: after the
+        batch, the newest accepted ping that is plain — judged, unflagged,
+        not coarse — is written as source ``ping`` when it is later than the
+        bus's current ``position_at`` (or that is null). Coarse, skewed,
+        flagged and unjudged pings are stored and never served; a dense
+        stream loses nothing by it.
+
+        Returns ``{accepted, dropped: {invalid, outside_window, duplicate},
+        flagged, served_at}``; ``served_at`` is the capture time now served,
+        or None when this batch did not move the position. The log line
+        carries the run id and counts — never a coordinate.
+        """
+        from app.dao import exception_dao  # lazy: exception_dao imports this module
+
+        driver_id = str(scope.user_id)
+        mismatch: str | None = None
+        outcome: dict[str, Any] | None = None
+        with get_connection(scope) as conn:
+            run = conn.execute(
+                """
+                select id, school_id, bus_id, driver_id, status, created_at, started_session_id,
+                       date = (now() at time zone 'Africa/Nairobi')::date as is_today
+                from live_runs
+                where id = %s and school_id = %s
+                for update
+                """,
+                (run_id, scope.school_id),
+            ).fetchone()
+            if not run:
+                raise NotFoundError("Run not found")
+            if (
+                run["driver_id"] is None
+                or str(run["driver_id"]) != driver_id
+                or run["bus_id"] is None
+            ):
+                raise ForbiddenError("Run is not owned by this driver")
+            if run["status"] == "completed" or not run["is_today"]:
+                raise PingRefusedError("Run is not in progress", code="run-not-active")
+            bound = run["started_session_id"]
+            if not scope.session_id or bound is None or str(bound) != str(scope.session_id):
+                if bound is not None and scope.session_id:
+                    # Flag first, refuse after: the refusal must not roll
+                    # the flag back, and a failing flag must not turn the
+                    # refusal into a 500.
+                    try:
+                        with conn.transaction():
+                            exception_dao.record_session_mismatch(
+                                conn, {"id": str(run["id"]), "school_id": str(run["school_id"])}
+                            )
+                    except Exception:
+                        logger.exception(
+                            "session-mismatch flag not recorded (run=%s)", run["id"]
+                        )
+                mismatch = (
+                    "bound to another sign-in" if bound is not None else "not bound to a sign-in"
+                )
+            else:
+                outcome = self._record_batch(conn, scope, dict(run), fixes, device_id)
+        if mismatch:
+            raise PingRefusedError(
+                f"This run is {mismatch}; a tapped action from this one re-binds it",
+                code="session-mismatch",
+            )
+        assert outcome is not None
+        return outcome
+
+    @staticmethod
+    def _record_batch(
+        conn, scope: SchoolScope, run: dict[str, Any], fixes: list[Any], device_id: Any,
+    ) -> dict[str, Any]:
+        from app.dao import exception_dao  # lazy, as above
+
+        run_id = str(run["id"])
+        school_id = str(run["school_id"])
+        bus_id = str(run["bus_id"])
+        thresholds = resolve_school_thresholds(conn, school_id)
+
+        # Pace the stream, not the taps: the newest PING row by receipt.
+        pace_s = thresholds.ping_interval_s / 2
+        age = newest_ping_age_s(conn, run_id)
+        if age is not None and age < pace_s:
+            raise PingPacedError(
+                "Pings are arriving faster than half the school's ping interval",
+                retry_after_s=pace_s - age,
+            )
+
+        now = datetime.now(timezone.utc)
+        window_start = run["created_at"] - timedelta(seconds=GPS_PING_RUN_START_GRACE_S)
+        window_end = now + timedelta(seconds=GPS_PING_FUTURE_WINDOW_S)
+        dropped = {"invalid": 0, "outside_window": 0, "duplicate": 0}
+        usable: list[NormalisedFix] = []
+        for raw in fixes:
+            normalised = normalise_fix(
+                raw, now=now, accuracy_cap_m=thresholds.fix_accuracy_cap_m,
+                skew_tolerance_s=GPS_CLOCK_SKEW_TOLERANCE_S,
+            )
+            if normalised.fix is None:
+                # Malformed, out of range, or a reason-only object: a ping
+                # without coordinates is not a ping.
+                dropped["invalid"] += 1
+                continue
+            if not (window_start <= normalised.fix.captured_at <= window_end):
+                dropped["outside_window"] += 1
+                continue
+            usable.append(normalised)
+        usable.sort(key=lambda item: item.fix.captured_at)  # type: ignore[union-attr]
+
+        run_ref = {"id": run_id, "school_id": school_id}
+        stops = planned_stops(conn, run_id)
+        device = idempotency_dao.device_id_of(device_id)
+        previous: Any = _PREVIOUS_FROM_TRAIL
+        accepted = flagged = unjudged = 0
+        servable: StoredFix | None = None
+        for normalised in usable:
+            stored = normalised.fix
+            assert stored is not None
+            row_id = append_ping_row(
+                conn, school_id=school_id, run_id=run_id, bus_id=bus_id,
+                session_id=scope.session_id, device_id=device, fix=normalised,
+            )
+            if row_id is None:
+                dropped["duplicate"] += 1
+                continue
+            accepted += 1
+            verdict = None
+            try:
+                with conn.transaction():
+                    explicit = {} if previous is _PREVIOUS_FROM_TRAIL else {"previous": previous}
+                    verdict = exception_dao.assess_plausibility(
+                        conn, run_ref, trail_row_id=row_id, fix=normalised,
+                        retention_days=thresholds.position_retention_days, stops=stops,
+                        exempt=(FLAG_REPEAT_COORDINATES,), **explicit,
+                    )
+            except Exception:
+                logger.exception(
+                    "ping plausibility not assessed; the row stays unserved (run=%s)", run_id
+                )
+                _flag_classification_failed(conn, row_id)
+                unjudged += 1
+            if verdict is not None and verdict.flagged:
+                flagged += 1
+                try:
+                    with conn.transaction():
+                        exception_dao.record_implausible_fix(
+                            conn, run_ref, fix=normalised, verdict=verdict,
+                            action_key=None, student_id=None,
+                        )
+                except Exception:
+                    logger.exception(
+                        "implausible ping not listed for review (run=%s flags=%s)",
+                        run_id, ",".join(verdict.flags),
+                    )
+                    _flag_classification_failed(conn, row_id)
+            previous = stored
+            if (
+                verdict is not None
+                and not verdict.flagged
+                and normalised.reason != FIX_REASON_COARSE
+            ):
+                servable = stored  # capture order: the last one standing is the newest
+
+        served_at = None
+        if servable is not None and write_ping_position(conn, bus_id, servable):
+            served_at = servable.captured_at
+        logger.info(
+            "ping batch recorded (run=%s accepted=%s flagged=%s unjudged=%s "
+            "invalid=%s outside_window=%s duplicate=%s served=%s)",
+            run_id, accepted, flagged, unjudged, dropped["invalid"],
+            dropped["outside_window"], dropped["duplicate"], served_at is not None,
+        )
+        return {
+            "accepted": accepted,
+            "dropped": dropped,
+            "flagged": flagged,
+            "served_at": served_at.isoformat() if served_at else None,
+        }

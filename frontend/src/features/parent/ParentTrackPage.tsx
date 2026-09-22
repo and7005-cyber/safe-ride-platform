@@ -116,14 +116,22 @@ export function ParentTrackPage() {
               the server says stale — the fleet map's wording (R27). */}
           {busLive && (
             <div className="flex flex-wrap items-center justify-center gap-2 py-2">
-              <Badge variant="outline" className="animate-pulse-dot">
+              {/* Stale (R27, U14): the badge stops pulsing and turns amber
+                  with the label — a dot that is not moving must not look
+                  live — but stays: the position is never hidden during a run. */}
+              <Badge
+                variant="outline"
+                className={position.stale ? "border-amber-500 text-amber-800" : "animate-pulse-dot"}
+                data-testid="track-live-badge"
+                data-stale={position.stale ? "true" : "false"}
+              >
                 {busName} is live
               </Badge>
               {freshness && (
                 <span
                   data-testid="track-freshness"
                   data-stale={position.stale ? "true" : "false"}
-                  className={`text-xs ${position.stale ? "text-amber-700" : "text-muted-foreground"}`}
+                  className={`text-xs ${position.stale ? "font-medium text-amber-700" : "text-muted-foreground"}`}
                 >
                   {freshness}
                 </span>
