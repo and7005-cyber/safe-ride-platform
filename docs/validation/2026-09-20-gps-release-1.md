@@ -97,3 +97,26 @@ construction (see the four properties above); the tables sit unused until
 Release 2. A failed Lambda apply rolls the whole file back with no marker —
 re-invoke. Deploy outside route hours: the CHECK widenings and hot-table
 column adds hold ACCESS EXCLUSIVE locks until commit.
+
+## Deployed
+
+- **2026-09-22, 17:49–17:56 UTC (20:49–20:56 EAT, outside route hours).**
+  Merged to `main` in order via PRs #11 (Release 1, `1f408e4`), #12
+  (Release 2, `40882e6`), #13 (Release 3, `6e57d87`) and #14 (Release 4,
+  `f8a22fe`); one `just release` from `main` at `f8a22fe` deployed all four
+  together: backend stack `saferide-backend` (af-south-1) `UPDATE_COMPLETE`,
+  migrate Lambda result `applied: ["016_gps_tracking"]` with every earlier
+  file skipped, frontend built against `https://api.saferidelive.co.ke`,
+  uploaded and CloudFront invalidated.
+- **Post-deploy verification:** `verify-db.sh migrations` lists
+  `016_gps_tracking` (2026-09-22 17:53 UTC); `verify-db.sh gps` returns zero
+  counts on every entry, `trail-rows-past-retention` 0 for both schools at
+  the 90-day default, and `check-widenings` true for all three CHECKs;
+  `GET /api/health` `{"status":"ok"}`; `https://saferidelive.co.ke` 200.
+- **Observation (pre-existing, not from this deploy):** the production
+  marker table also carries `015_tenancy_constraints_rls 2` and
+  `015_tenancy_constraints_rls 3` (2026-09-20 11:15 UTC) — duplicate copies
+  of the 015 file that were present at the Release 5 deploy and applied by
+  the migrate Lambda; 015 is idempotent, so the schema is unaffected, and
+  commit `1649d47` now refuses untracked migration files at deploy time.
+- The production go/no-go rows above are met: tenancy Release 5 was live, the double-apply rehearsals passed, the `gps` set is clean in production and the requirements are pinned.
