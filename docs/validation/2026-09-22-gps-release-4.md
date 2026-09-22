@@ -127,3 +127,26 @@ Code-only on top of Releases 1–3; rolling back to Release 3 leaves ping rows
 in the trail (purged by retention like any row) and the tap-based position
 model unchanged. The template's throttling parameters are additive with
 defaults.
+
+## Deployed
+
+- **2026-09-22, 17:49–17:56 UTC (20:49–20:56 EAT, outside route hours).**
+  Merged to `main` in order via PRs #11 (Release 1, `1f408e4`), #12
+  (Release 2, `40882e6`), #13 (Release 3, `6e57d87`) and #14 (Release 4,
+  `f8a22fe`); one `just release` from `main` at `f8a22fe` deployed all four
+  together: backend stack `saferide-backend` (af-south-1) `UPDATE_COMPLETE`,
+  migrate Lambda result `applied: ["016_gps_tracking"]` with every earlier
+  file skipped, frontend built against `https://api.saferidelive.co.ke`,
+  uploaded and CloudFront invalidated.
+- **Post-deploy verification:** `verify-db.sh migrations` lists
+  `016_gps_tracking` (2026-09-22 17:53 UTC); `verify-db.sh gps` returns zero
+  counts on every entry, `trail-rows-past-retention` 0 for both schools at
+  the 90-day default, and `check-widenings` true for all three CHECKs;
+  `GET /api/health` `{"status":"ok"}`; `https://saferidelive.co.ke` 200.
+- **Observation (pre-existing, not from this deploy):** the production
+  marker table also carries `015_tenancy_constraints_rls 2` and
+  `015_tenancy_constraints_rls 3` (2026-09-20 11:15 UTC) — duplicate copies
+  of the 015 file that were present at the Release 5 deploy and applied by
+  the migrate Lambda; 015 is idempotent, so the schema is unaffected, and
+  commit `1649d47` now refuses untracked migration files at deploy time.
+- Deployed together with Releases 1–3 at the user's decision; the field check for battery drain and screen-on willingness and the tracker-timeline note remain open follow-ups. First-weeks watch: `verify-db.sh gps` — `trail-rows-per-run-per-minute` (ping load), `fix-coverage-ratio-today` (nine in ten target after two weeks), `exceptions-by-kind-today`, `pending-prompts-on-completed-runs` and `call-now-due-unsent-over-10m` (both expected 0).
