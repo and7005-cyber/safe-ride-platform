@@ -48,7 +48,7 @@ The school list shows **counts only, never a roster**. To see or touch a school'
 - If the director's email is **new**, an account is created and its **temporary password is shown to you exactly once** — pass it to the director by a channel you trust. It expires unused after **72 hours**, and the director must replace it at first sign-in.
 - If the email **already has a SafeRide account** (the owner of an existing school, typically), no account and no password are created: the director role is **offered**, and the person accepts it at their next sign-in. Tell them the school code so they can check the offer is genuine.
 
-After that, the director does the rest in their own console (staff, drivers, buses, students, routes). Step in only if they ask for help.
+After that, the director does the rest in their own console (staff, drivers, buses, students, routes); the school's **Tracking** card starts on the platform defaults. Step in only if they ask for help. One thing stays with Kuumbai: every driver is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run, and the sign-off block is kept with the release's validation record.
 
 Nobody can delete a school from the app. A school created by mistake is removed operationally — flag it and leave it untouched.
 

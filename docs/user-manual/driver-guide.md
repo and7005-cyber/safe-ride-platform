@@ -14,7 +14,7 @@ This guide is for bus drivers. It explains how to sign in, run your morning and 
 
 ## Signing in
 
-Nothing about driver sign-in has changed: your PIN identifies you, and your school follows from your account.
+Your PIN identifies you, and your school follows from your account.
 
 1. Open `https://saferidelive.co.ke/auth`.
 2. Tap the **Driver PIN** tab.
@@ -108,7 +108,7 @@ Once the red panel is empty, **End Run** closes the run.
 
 **Between taps, while the app is on your screen, it also sends the bus's position on its own** — about every 10 seconds (your school can set this anywhere from 5 to 60 seconds), and less often while the bus is standing still. This is what lets the office and the families see the bus move along the road between stops instead of jumping from one stop to the next. It happens only while the run is in progress **and** the app is on the screen: nothing is sent when the screen is off, when the app is in the background or another app is in front, and nothing before Start Run or after End Run. When the screen does go dark, nothing breaks — the office and the families see the bus's last position with **"last seen"** beside it, and sending picks up again on its own as soon as you unlock the phone and come back to the app, or at your next tap.
 
-**Nothing outside a run.** The app asks for nothing before you tap Start Run and nothing after End Run. It does not track you between runs, it does not record where you are while the screen is off or the app is in the background, and it does not record where you are when the app is closed. Who sees the positions, and for how long, is in the [driver briefing](driver-gps-briefing.md), which your transport coordinator goes through with you before this version reaches you.
+**Nothing outside a run.** The app asks for nothing before you tap Start Run and nothing after End Run. It does not track you between runs, it does not record where you are while the screen is off or the app is in the background, and it does not record where you are when the app is closed. Who sees the positions, and for how long, is in the [driver briefing](driver-gps-briefing.md), which your transport coordinator goes through with you before your first run with it.
 
 **The run always starts, and every tap always completes**, whatever your phone says about location. A tap waits a few seconds for a position at most; if none arrives, the tap goes through without one and the office simply sees the planned stop instead of your phone.
 
