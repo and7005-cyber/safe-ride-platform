@@ -2,13 +2,13 @@
 
 SafeRide is a school transport safety platform for Nairobi private schools. It lets the school office manage buses, drivers, students and routes; lets drivers run their daily trips from a phone; and lets parents follow their child's bus and receive notifications at every step.
 
-This manual is split by role. Each guide is self-contained — share only the relevant guide with each audience.
+This manual is split by role. Each guide is self-contained — share only the relevant guide with each audience. It describes the app as deployed on **22 September 2026**, which includes phone-GPS bus tracking: the bus's position comes from the driver's phone during a run, at each tap and on its own between stops.
 
 | Guide | Audience | What it covers |
 | --- | --- | --- |
 | [School Staff Guide](admin-guide.md) | School directors and transport coordinators | Staff accounts and roles, buses, drivers, students and routes; daily attendance; monitoring live runs; alerts and parent broadcasts |
 | [Driver Guide](driver-guide.md) | Bus drivers | Signing in with a PIN, starting a run, recording boarding and drop-offs, the phone's location during a run, the prompts, reporting incidents |
-| [Driver GPS Briefing](driver-gps-briefing.md) | Bus drivers, delivered by Kuumbai before the GPS release reaches them | One page: what location data is collected, when, who sees it, how long it is kept, whom to ask; allowing location; the three prompts; sign-off |
+| [Driver GPS Briefing](driver-gps-briefing.md) | Bus drivers, delivered by Kuumbai before each driver's first run with location on | One page: what location data is collected, when, who sees it, how long it is kept, whom to ask; allowing location; the screen during a run; the four prompts; sign-off |
 | [Parent Guide](parent-guide.md) | Parents and guardians | Creating your account, connecting schools, following the bus live, notifications, cancelling a ride |
 | [Provider Guide](provider-guide.md) | Kuumbai Kenya staff (internal — do not share with schools) | Two-step sign-in, provisioning schools, stepping in to support a school, provider accounts, the audit reader |
 
@@ -27,7 +27,7 @@ SafeRide works on any modern browser (Chrome, Safari, Edge, Firefox) on phones, 
 
 ## The daily flow in one paragraph
 
-The office keeps students, routes and any absences up to date. In the morning the driver signs in, starts the morning route, and taps **Arrive Next Stop** at each stop; as students board, their parents are notified, and everyone can watch the run progress live — parents on their Track page, the office on the Fleet Map and Dashboard. The afternoon run works in reverse: students are checked off as they are dropped at their stops. Incidents reported by the driver reach the office's Alerts page and the affected parents immediately.
+The office keeps students, routes and any absences up to date. In the morning the driver signs in, starts the morning route, and taps **Arrive Next Stop** at each stop; as students board, their parents are notified, and everyone can watch the run progress live — parents on their Track page, the office on the Fleet Map and Dashboard — with the bus's position coming from the driver's phone, at each tap and on its own between stops while the app is on the driver's screen. The afternoon run works in reverse: students are checked off as they are dropped at their stops. Incidents reported by the driver reach the office's Alerts page and the affected parents immediately.
 
 **One rule runs through the staff, driver and parent guides:** the app only ever says what somebody actually recorded. A run will not finish while any child on the roster has nothing recorded against them — the driver has to say, for each one, that they were dropped at their stop, that they left the bus somewhere else, or that they were never aboard. When a driver genuinely cannot finish a run, the office closes it, and any child nobody could account for is recorded as **unaccounted** rather than quietly marked safe. Those families get a phone call from a person, not a notification.
 

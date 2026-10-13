@@ -252,7 +252,10 @@ describe("the guides describe the GPS release in the shipped words", () => {
     for (const line of ["Delivered by Kuumbai", "Confirmed by Kuumbai", "School informed"]) {
       expect(briefing).toContain(line);
     }
-    expect(briefing).toMatch(/before the Release 3 deploy/);
+    // The release is live; the briefing gates each driver's first run, not a deploy.
+    expect(briefing).toMatch(/before a driver's first run with location on/);
+    expect(briefing).not.toMatch(/the release that follows/i);
+    expect(briefing).not.toMatch(/before the Release 3 deploy/);
     // The notice's substance, not just its headings.
     expect(briefing).toMatch(/90 days/);
     expect(briefing).toMatch(/transport coordinator/);

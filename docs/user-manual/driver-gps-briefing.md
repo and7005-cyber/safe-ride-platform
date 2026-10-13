@@ -1,32 +1,36 @@
 # SafeRide Driver Briefing — Location During Runs
 
-**Read this with every driver before the GPS release is switched on.** This page is delivered to drivers by Kuumbai Kenya, which manages them, and confirmed by Kuumbai with the school informed. It is a go/no-go gate on the Release 3 deploy: the release does not go live for a school until the sign-off block at the bottom is complete for that school's drivers. It is also the notice to drivers, under Kenya's Data Protection Act, of what the app collects about them and why.
+**Read this with every driver before their first run with location on.** This page is delivered to drivers by Kuumbai Kenya, which manages them, and confirmed by Kuumbai with the school informed. The GPS release — positions at each tap and live tracking between taps — has been live since **22 September 2026**: a driver who has not yet been briefed is briefed before their next run, and the sign-off block at the bottom records it for the release's validation record. It is also the notice to drivers, under Kenya's Data Protection Act, of what the app collects about them and why.
 
 It takes about ten minutes. The driver should have their phone with them.
 
 ---
 
-## What is changing
+## What the app does with your phone's location
 
-Until now the app did not use your phone's location; the bus moved on the map only when you tapped **Arrive Next Stop**. From this release, **while a run is in progress, each tap also sends your phone's position**, so the office and the parents see where the bus actually was when you tapped. Nothing else about running a trip changes: the same taps, the same order, the same rules for ending a run.
+The app uses your phone's location **only while a run is in progress**. **Each tap sends your phone's position** — Start Run, Arrive, Board, Drop-off, Absent, Off-route, End Run — so the office and the parents see where the bus actually was when you tapped. **Between taps, while the run is on and the app is on your screen, it also sends the bus's position on its own, about every 10 seconds** — never with the screen off or the app in the background — so the office and the parents see the bus move between stops, and it **keeps your screen awake** for the run. Nothing outside a run: nothing before Start Run, nothing after End Run, nothing between runs or when the app is closed.
 
-**With live tracking** (the release that follows), the app also sends the bus's position **on its own, about every 10 seconds, while the run is on and the app is on your screen** — never with the screen off or the app in the background — so the office and the parents see the bus move between stops, and it **keeps your screen awake** for the run. Still nothing outside a run.
+Nothing else about running a trip changes: the same taps, the same order, the same rules for ending a run.
 
 ## The notice
 
-This is the text the app shows you before your phone asks for permission the first time, with the live-tracking lines added for this briefing.
+This is the text the app shows you, word for word, before your phone asks for permission the first time.
 
 **Share the bus's location during runs**
 
-**What** — Your phone's position — where, how accurate, and when — taken at each tap: Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run — and, with live tracking, the same reading between taps (see **When**).
+*Your browser will ask next. Whatever you choose, the run starts.*
 
-**When** — Only while a run is in progress. Nothing is asked for before Start Run or after End Run. The app does not track you between runs, at home, or when it is closed. With live tracking, also about every 10 seconds on its own while the run is on and the app is on your screen — never with the screen off, never with the app in the background.
+**What** — Your phone's position — where, how accurate, and when — taken at each tap: Start Run, Arrive, Board, Drop-off, Absent, Off-route and End Run — and, between taps, the same reading about every 10 seconds while this app is on your screen.
 
-**Who sees it** — Your school's transport office and the provider (Kuumbai Kenya), as the bus's position on their map and in the run's report. Parents see where the bus is, never your phone's details — not its accuracy, not its device, not the app's checks on your taps.
+**When** — Only while a run is in progress and this app is on your screen — never with the screen off or the app in the background. Nothing is asked for before Start Run or after End Run.
 
-**How long** — Positions stay with the run's record for the school's retention period — 90 days unless the school sets otherwise — then they are deleted. If you leave, your past runs keep their positions for the same period and no longer; the run stops naming you.
+**Who sees it** — Your school's transport office and the provider, as the bus's position on their map and in the run's report. Parents see where the bus is, never your phone's details.
 
-**Questions** — Ask your transport coordinator. The coordinator can escalate to Kuumbai.
+**How long** — Positions stay with the run's record for the school's retention period — 90 days unless the school sets otherwise — then they are deleted.
+
+**Questions** — Ask your transport coordinator.
+
+In plain terms: "the provider" is Kuumbai Kenya. "Your phone's details" means its accuracy, its device, and the app's checks on your taps — parents never see any of that. The app does not track you between runs, at home, or when it is closed. If you leave, your past runs keep their positions for the same period and no longer, and the run stops naming you. Your transport coordinator can escalate any question to Kuumbai.
 
 What the position is used for: showing the bus on the map, and checking whether a tap was made near the child's stop. It is not used to measure your speed, judge your route, or track you outside a run.
 
@@ -64,10 +68,10 @@ Sometimes a yellow card appears above the page. **Your tap has already gone thro
 
 | The card | What it asks | Your answers |
 | --- | --- | --- |
-| **A stop passed with nothing recorded** (tone and vibration) | *"{names} have no record. Mark boarded or absent?"* — you tapped Arrive at a later stop while a child at the previous stop had nothing recorded; with live tracking, also as soon as the bus drives away from that stop | Per child: **Boarded** (afternoon: **Dropped off**) or **Absent**. The card shrinks as you go |
+| **A stop passed with nothing recorded** (tone and vibration) | *"{names} have no record. Mark boarded or absent?"* — you tapped Arrive at a later stop while a child at the previous stop had nothing recorded, or the bus drove away from that stop with a child there unrecorded | Per child: **Boarded** (afternoon: **Dropped off**) or **Absent**. The card shrinks as you go |
 | **A boarding or drop-off far from the stop** (silent) | *"You marked {name} boarded about 1.8 km from their stop. Confirm, or undo?"* | **Confirm** if it is right; **Undo** if you tapped the wrong child — the family is told the mark was withdrawn |
 | **An absent marked away from the stop** (tone and vibration) | *"You marked {name} absent about 1.8 km from their stop. Did a parent or the office tell you {name} isn't coming?"* | **Yes — they told me** if a parent or the office told you; **No — I wasn't at the stop** if you did not reach the stop. Dismissing the card counts as no, and the family is asked to call the office |
-| **Arrive at a stop?** (silent; live tracking only) | *"Arrive at {stop}?" — "Your phone puts the bus at stop {n} and no arrival is recorded yet."* — the bus is at a stop you have not tapped Arrive for | **Arrive** if you are there — it records the arrival, like Arrive Next Stop; **✕** if you are not. It records nothing by itself |
+| **Arrive at a stop?** (silent) | *"Arrive at {stop}?" — "Your phone puts the bus at stop {n} and no arrival is recorded yet."* — the bus is at a stop you have not tapped Arrive for | **Arrive** if you are there — it records the arrival, like Arrive Next Stop; **✕** if you are not. It records nothing by itself |
 
 Answering honestly is all that is asked. A child who boarded somewhere else, a phoned-in absence marked from the road, a stop reached before the phone caught up — all normal, and **Confirm** or **Yes — they told me** is the right answer.
 
@@ -82,14 +86,14 @@ Answering honestly is all that is asked. A child who boarded somewhere else, a p
 - [ ] The driver knows location is used **only between Start Run and End Run**.
 - [ ] The driver has allowed location on their own phone (precise, on Android), or knows where the **How to turn it on** steps are.
 - [ ] The driver has seen the prompts and knows what each answer means — and that dismissing the absent prompt counts as "not at the stop".
-- [ ] With live tracking: the driver knows the app sends the bus's position about every 10 seconds while the run is on and the app is on screen — never with the screen off or the app in the background — and that the app keeps the screen awake for the run.
+- [ ] The driver knows the app sends the bus's position about every 10 seconds while the run is on and the app is on screen — never with the screen off or the app in the background — and that the app keeps the screen awake for the run.
 - [ ] The driver keeps the phone on its charger on the bus.
 - [ ] The driver knows a tap always completes and that retrying is safe.
 - [ ] The driver knows whom to ask: the school's transport coordinator.
 
 ## Sign-off
 
-Complete one block per school before that school's Release 3 deploy. Do not enter drivers' personal details beyond their name.
+Complete one block per school as its drivers are briefed — before each driver's first run with location on. Do not enter drivers' personal details beyond their name.
 
 | | Name | Date | Signature |
 | --- | --- | --- | --- |
@@ -99,4 +103,4 @@ Complete one block per school before that school's Release 3 deploy. Do not ente
 
 Drivers briefed (names): ____________________________________________________________________________
 
-This briefing must be delivered and confirmed **before the Release 3 deploy** for the school. Attach the completed block to the release's validation record under `docs/validation/`.
+This briefing must be delivered and confirmed **before a driver's first run with location on**. The release has been live since 22 September 2026, so for drivers already running it is delivered before their next run. Attach the completed block to the release's validation record, `docs/validation/2026-09-20-gps-release-3.md`, where the briefing is listed as an open gate.
