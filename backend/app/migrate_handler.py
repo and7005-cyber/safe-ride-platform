@@ -6,6 +6,10 @@ what has run in a ``saferide_migrations`` marker table so re-invocation is
 idempotent. Invoke it manually (or from the deploy script) after the stack is
 up; it is not wired to the API.
 
+Seeds are demo and snapshot data, so they apply only when ``APP_ENV`` is
+``local``. Anywhere else (the deployed function sets ``APP_ENV=production``)
+the seed files are listed by name in the report and never opened.
+
 SQL files are executed with libpq's simple-query protocol
 (``pgconn.exec_``) so multi-statement scripts and dollar-quoted ``do $$``
 blocks run exactly as ``psql`` would — naive semicolon splitting would break on
@@ -37,6 +41,8 @@ from pathlib import Path
 import psycopg
 from psycopg.pq import ExecStatus
 from psycopg.rows import dict_row
+
+from app.core.config import get_settings
 
 DB_DIR = Path(__file__).resolve().parent.parent / "db"
 MIGRATIONS_DIR = DB_DIR / "migrations"
@@ -111,10 +117,21 @@ def _apply_dir(conn: psycopg.Connection, directory: Path, prefix: str) -> dict[s
     return {"applied": applied, "skipped": skipped}
 
 
+def _apply_seeds(conn: psycopg.Connection) -> dict:
+    """Apply ``db/seeds`` locally; elsewhere name the files and leave them shut."""
+    settings = get_settings()
+    if not settings.is_local:
+        return {
+            "skipped": f"APP_ENV={settings.app_env}",
+            "files": [path.name for path in sorted(SEEDS_DIR.glob("*.sql"))],
+        }
+    return _apply_dir(conn, SEEDS_DIR, prefix="seed:")
+
+
 def handler(event=None, context=None) -> dict:
-    """Apply migrations then seeds, then the tenancy post-steps. Idempotent.
-    A named ``action`` in the event runs that action instead (see module
-    docstring)."""
+    """Apply migrations then (locally) seeds, then the tenancy post-steps.
+    Idempotent. A named ``action`` in the event runs that action instead (see
+    module docstring)."""
     action = (event or {}).get("action")
     if action == "gps-purge":
         return _gps_purge(event or {})
@@ -123,7 +140,7 @@ def handler(event=None, context=None) -> dict:
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         _ensure_marker_table(conn)
         migrations = _apply_dir(conn, MIGRATIONS_DIR, prefix="")
-        seeds = _apply_dir(conn, SEEDS_DIR, prefix="seed:")
+        seeds = _apply_seeds(conn)
         app_role = _sync_app_role(conn)
         bootstrap_data = _fetch_bootstrap()
         provider_bootstrap = (

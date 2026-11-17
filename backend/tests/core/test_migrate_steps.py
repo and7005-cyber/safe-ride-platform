@@ -1,12 +1,16 @@
 """Tenancy post-steps of the migrate handler (U2): bootstrap parsing and
-gating, role-sync skip. Pure unit tests — the fake connection records SQL."""
+gating, role-sync skip; the local-only seed gate (hardening U3). Pure unit
+tests — the fake connection records SQL."""
 
 import base64
 import json
+from pathlib import Path
 
 import pytest
+from psycopg.pq import ExecStatus
 
 from app import migrate_handler as mh
+from app.core.config import get_settings
 
 
 def _payload(version=1):
@@ -149,3 +153,121 @@ class TestGpsPurgeEvent:
         assert mh.handler({"action": "drop-everything"}) == {
             "status": "error", "reason": "unknown action 'drop-everything'",
         }
+
+
+# --- seeds are local-only (hardening U3) -------------------------------------
+
+
+class FakePgResult:
+    status = ExecStatus.COMMAND_OK
+    error_message = b""
+
+
+class FakePgConn:
+    """The libpq handle ``_run_script`` drives: records each script's text."""
+
+    def __init__(self, scripts):
+        self.scripts = scripts
+
+    def exec_(self, query: bytes):
+        self.scripts.append(query.decode("utf-8"))
+        return FakePgResult()
+
+
+class FakeMigrateConn(FakeConn):
+    """FakeConn as ``psycopg.connect`` hands it to the handler: a context
+    manager carrying a ``pgconn`` that records the scripts it runs."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.scripts: list[str] = []
+        self.pgconn = FakePgConn(self.scripts)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestSeedsAreLocalOnly:
+    @pytest.fixture
+    def db_tree(self, tmp_path, monkeypatch):
+        migrations = tmp_path / "migrations"
+        seeds = tmp_path / "seeds"
+        migrations.mkdir()
+        seeds.mkdir()
+        (migrations / "001_first.sql").write_text("select 'migration-one';")
+        (migrations / "002_second.sql").write_text("select 'migration-two';")
+        (seeds / "001_demo_seed.sql").write_text("select 'seed-demo';")
+        (seeds / "002_live_demo_seed.sql").write_text("select 'seed-live';")
+        monkeypatch.setattr(mh, "MIGRATIONS_DIR", migrations)
+        monkeypatch.setattr(mh, "SEEDS_DIR", seeds)
+        return seeds
+
+    @pytest.fixture
+    def conn(self, monkeypatch):
+        fake = FakeMigrateConn()
+        monkeypatch.setenv("DATABASE_URL", "postgresql://fake/fake")
+        monkeypatch.delenv("DB_APP_PASSWORD", raising=False)
+        monkeypatch.delenv("PROVIDER_BOOTSTRAP_SSM", raising=False)
+        monkeypatch.setattr(mh.psycopg, "connect", lambda *args, **kwargs: fake)
+        return fake
+
+    @pytest.fixture
+    def app_env(self, monkeypatch):
+        def _set(value):
+            monkeypatch.setenv("APP_ENV", value)
+            get_settings.cache_clear()
+
+        yield _set
+        get_settings.cache_clear()
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        """Every path read through ``Path.read_text`` while the handler runs."""
+        paths: list[Path] = []
+        real_read_text = Path.read_text
+
+        def spy(self, *args, **kwargs):
+            paths.append(self)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", spy)
+        return paths
+
+    @staticmethod
+    def _markers(conn):
+        return [
+            params[0] for sql, params in conn.statements
+            if sql.startswith("insert into public.saferide_migrations")
+        ]
+
+    def test_production_applies_migrations_and_names_each_skipped_seed(
+        self, db_tree, conn, app_env, opened,
+    ):
+        app_env("production")
+        report = mh.handler()
+
+        assert report["status"] == "ok"
+        assert report["migrations"] == {"applied": ["001_first", "002_second"], "skipped": []}
+        assert report["seeds"] == {
+            "skipped": "APP_ENV=production",
+            "files": ["001_demo_seed.sql", "002_live_demo_seed.sql"],
+        }
+        assert self._markers(conn) == ["001_first", "002_second"]
+        assert conn.scripts == ["select 'migration-one';", "select 'migration-two';"]
+        assert not [path for path in opened if path.parent == db_tree], "a seed file was opened"
+
+    def test_local_applies_migrations_and_seeds(self, db_tree, conn, app_env):
+        app_env("local")
+        report = mh.handler()
+
+        assert report["migrations"] == {"applied": ["001_first", "002_second"], "skipped": []}
+        assert report["seeds"] == {
+            "applied": ["seed:001_demo_seed", "seed:002_live_demo_seed"], "skipped": [],
+        }
+        assert self._markers(conn) == [
+            "001_first", "002_second", "seed:001_demo_seed", "seed:002_live_demo_seed",
+        ]
+        assert conn.scripts[2:] == ["select 'seed-demo';", "select 'seed-live';"]

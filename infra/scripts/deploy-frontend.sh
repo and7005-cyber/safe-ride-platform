@@ -8,6 +8,9 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
+# A committed tree on origin/main or a release/* tag (config.sh).
+require_clean_checkout
+
 [ -f "$STATE_DIR/certs.env" ] && source "$STATE_DIR/certs.env"
 CF_CERT_ARN="${CF_CERT_ARN:-}"
 API_BASE_URL="${VITE_API_BASE_URL:-https://${API_DOMAIN}}"
