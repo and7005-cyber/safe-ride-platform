@@ -207,6 +207,7 @@ class FakeAws:
         return subprocess.Popen(
             [BASH, str(SCRIPT), *args], env=self._env(SOURCE, env_extra),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+            preexec_fn=_default_signal_dispositions,
         )
 
     def _assert_no_leak(self, result) -> None:
@@ -216,6 +217,20 @@ class FakeAws:
             assert secret not in argv_text, "a value reached an aws argv"
             assert json.dumps(secret)[1:-1] not in argv_text, "a value reached an aws argv"
             assert secret not in result.stdout and secret not in result.stderr, "a value was printed"
+
+
+def _default_signal_dispositions() -> None:
+    """Give the script default handlers for the signals under test.
+
+    A signal that is ignored when a shell starts cannot be trapped, and that
+    disposition is inherited: under `nohup` (HUP ignored) or as a background
+    job of a non-interactive shell (INT and QUIT ignored) the script's trap
+    would never run and the signal tests would fail for reasons unrelated to
+    the script. Resetting them in the child keeps the tests about the script,
+    however the suite itself was launched.
+    """
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
 
 
 def _status_lines(stdout: str) -> dict[str, str]:
