@@ -511,13 +511,14 @@ Resources:
   # ---------------------------------------------------------------- Logging
   # One retained 90-day group per function (hardening U4); each function logs
   # JSON there through its LoggingConfig (application INFO, platform WARN).
-  # Retained so a failed update or a stack delete never takes the evidence
-  # with it: after a rollback that created them, import or delete the groups
-  # before re-deploying (D13). The functions' older /aws/lambda/* groups and
-  # the RDS export group get 90-day retention by hand (infra/README.md).
+  # RetainExceptOnCreate: a rollback of the update that CREATED them deletes
+  # them (no name clash on the retry), while a stack delete or a later update
+  # that removes them keeps the evidence — then delete or import them before
+  # re-deploying (D13, infra/README.md). The functions' older /aws/lambda/*
+  # groups and the RDS export group get 90-day retention by hand.
   ApiLogGroup:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /saferide/api
@@ -525,7 +526,7 @@ Resources:
 
   MigrateLogGroup:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /saferide/migrate
@@ -533,7 +534,7 @@ Resources:
 
   VerifyLogGroup:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /saferide/verify
@@ -1173,7 +1174,7 @@ Resources:
 
   SesIdentity:
     Type: AWS::SES::EmailIdentity
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       EmailIdentity: !Ref MailDomain

@@ -39,10 +39,12 @@ def _properties(logical_id: str) -> dict[str, str]:
     return dict(re.findall(r"^      (\w+): (.+?)\s*$", RESOURCES[logical_id], re.M))
 
 
-def _retained(logical_id: str) -> bool:
+def _retained(logical_id: str, deletion: str = "Retain") -> bool:
+    """Kept on stack delete and replacement. Fixed-name resources use
+    RetainExceptOnCreate so a rolled-back create cleans up after itself."""
     block = RESOURCES[logical_id]
     return (
-        re.search(r"^    DeletionPolicy: Retain$", block, re.M) is not None
+        re.search(rf"^    DeletionPolicy: {deletion}$", block, re.M) is not None
         and re.search(r"^    UpdateReplacePolicy: Retain$", block, re.M) is not None
     )
 
@@ -60,7 +62,7 @@ LOG_GROUPS = {
 def test_each_function_logs_json_to_its_own_retained_group(function, group, name):
     assert _type(group) == "AWS::Logs::LogGroup"
     assert _properties(group) == {"LogGroupName": name, "RetentionInDays": "90"}
-    assert _retained(group), group
+    assert _retained(group, "RetainExceptOnCreate"), group
     config = re.search(r"^      LoggingConfig:\n((?:        .*\n)+)", RESOURCES[function], re.M)
     assert config, f"{function} has no LoggingConfig"
     assert dict(re.findall(r"^        (\w+): (.+?)\s*$", config.group(1), re.M)) == {
@@ -170,7 +172,7 @@ def test_the_mail_records_are_dkim_mail_from_and_dmarc_without_rua():
     assert '"v=DMARC1; p=none"' in dmarc and "rua" not in dmarc  # D11
     assert '"v=spf1 include:amazonses.com ~all"' in RESOURCES["SesMailFromSpf"]
     assert "feedback-smtp.${AWS::Region}.amazonses.com" in RESOURCES["SesMailFromMx"]
-    assert _retained("SesIdentity")
+    assert _retained("SesIdentity", "RetainExceptOnCreate")
 
 
 def test_the_trail_bucket_is_retained_private_and_expires_after_90_days():

@@ -966,15 +966,17 @@ morning's first run.
 
 ### Retained resources after a failed or reverted Release 1a
 
-D13. A failed 1a update (CloudFormation rolls it back) or a rollback to
-`release/0` leaves these 1a resources in the account, outside the stack,
-because their `DeletionPolicy` is `Retain`:
+D13. The fixed-name 1a resources carry `DeletionPolicy: RetainExceptOnCreate`:
+if the 1a update itself fails and CloudFormation rolls it back, the log groups
+and the SES identity it had just created are deleted with the rollback, so
+the retry has nothing to clean up. A deliberate rollback to `release/0` (an
+update that removes them) or a stack delete keeps them, outside the stack:
 
-| Resource | Name | When 1a is deployed again |
+| Resource | Name | When 1a is deployed again after a rollback to `release/0` |
 |---|---|---|
 | `ApiLogGroup`, `MigrateLogGroup`, `VerifyLogGroup` | `/saferide/api`, `/saferide/migrate`, `/saferide/verify` | fixed names: the create fails ("already exists") and rolls the whole update back — delete or import them first |
 | `SesIdentity` | `saferidelive.co.ke` (SES, af-south-1) | fixed name: same failure — delete or import it first |
-| `TrailBucket` | `saferide-backend-trailbucket-…` (CloudFormation-named) | no clash: the next deploy creates a new bucket; the old one keeps its 90-day expiry and is left behind (delete it once empty) |
+| `TrailBucket` | `saferide-backend-trailbucket-…` (CloudFormation-named, plain `Retain`: a bucket holding objects cannot be deleted during a rollback) | no clash: the next deploy creates a new bucket; the old one keeps its 90-day expiry and is left behind after any rollback (delete it once empty) |
 
 ```bash
 aws logs describe-log-groups --region af-south-1 --log-group-name-prefix /saferide/ \
