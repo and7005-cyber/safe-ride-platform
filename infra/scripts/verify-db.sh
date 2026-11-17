@@ -9,6 +9,12 @@
 #   infra/scripts/verify-db.sh baseline   <school-uuid>
 #   infra/scripts/verify-db.sh post-apply <school-uuid>
 #   infra/scripts/verify-db.sh gps
+#   infra/scripts/verify-db.sh hardening
+#   infra/scripts/verify-db.sh restore-compare <iso-8601-timestamp-with-offset>
+#
+# The second argument is the check set's parameter: a school uuid for the
+# school sets, the restore target time for restore-compare (with a UTC
+# offset, e.g. 2026-11-17T06:00:00+03:00 — a naive time is refused).
 #
 # Expected values per check live in the deployment checklists:
 # docs/work/validation/2026-08-20-fleet-plan-drafting.md and the plan's
@@ -17,10 +23,22 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 CHECKS="${1:-}"
-SCHOOL_ID="${2:-}"
+PARAM="${2:-}"
+USAGE="usage: $0 <migrations|migration-011|baseline|post-apply|gps|hardening> [school-uuid]
+       $0 restore-compare <iso-8601-timestamp-with-offset>"
 if [ -z "$CHECKS" ]; then
-  echo "usage: $0 <migrations|migration-011|baseline|post-apply|gps> [school-uuid]" >&2
+  echo "$USAGE" >&2
   exit 2
+fi
+# Which event key the second argument fills (the verify registry's parameter
+# kinds): the timestamp for restore-compare, the school_id otherwise.
+PARAM_KEY="school_id"
+if [ "$CHECKS" = "restore-compare" ]; then
+  PARAM_KEY="timestamp"
+  if [ -z "$PARAM" ]; then
+    echo "$USAGE" >&2
+    exit 2
+  fi
 fi
 
 VERIFY_FN="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" VerifyFunctionName)"
@@ -30,8 +48,8 @@ if [ -z "$VERIFY_FN" ] || [ "$VERIFY_FN" = "None" ]; then
 fi
 
 PAYLOAD="{\"checks\": \"$CHECKS\"}"
-if [ -n "$SCHOOL_ID" ]; then
-  PAYLOAD="{\"checks\": \"$CHECKS\", \"school_id\": \"$SCHOOL_ID\"}"
+if [ -n "$PARAM" ]; then
+  PAYLOAD="{\"checks\": \"$CHECKS\", \"$PARAM_KEY\": \"$PARAM\"}"
 fi
 
 OUT="$(mktemp)"

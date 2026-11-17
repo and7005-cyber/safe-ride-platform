@@ -601,9 +601,8 @@ def test_sandbox_teardown_survives_rows_in_all_four_gps_tables():
 def test_migration_016_double_applies_cleanly():
     from pathlib import Path
 
-    sql = (
-        Path(__file__).resolve().parents[2] / "db" / "migrations" / "016_gps_tracking.sql"
-    ).read_text()
+    migrations = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    sql = (migrations / "016_gps_tracking.sql").read_text()
     from psycopg.pq import ExecStatus
 
     with psycopg.connect(DSN, autocommit=True) as m:
@@ -611,3 +610,13 @@ def test_migration_016_double_applies_cleanly():
         assert result.status in (
             ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
         ), result.error_message.decode()
+        # 016 recreates the audit CHECK with ITS list, which 017 widened; the
+        # later idempotent files are re-applied in order so the shared local
+        # database ends at the current schema for the suites after this one
+        # (the test_tenancy_schema precedent).
+        for later in sorted(migrations.glob("*.sql")):
+            if later.name > "016_gps_tracking.sql":
+                result = m.pgconn.exec_(later.read_text().encode())
+                assert result.status in (
+                    ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
+                ), (later.name, result.error_message.decode())
