@@ -21,14 +21,26 @@ PY="$ROOT_DIR/.venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
 
 # 1. TOTP pepper: create once, never rotate silently (rotation re-enrols all).
+# Pinned to BACKEND_REGION like every /saferide/* parameter the deploy reads
+# (infra/README.md, Deploy safety). Before minting, look in the operator's
+# default CLI region too: an existing pepper there (the pre-hardening home of
+# this parameter) must be COPIED into BACKEND_REGION, never replaced by a new
+# one — a fresh pepper silently breaks every enrolled provider's codes.
 existing_pepper="$(aws ssm get-parameter --name /saferide/totp-pepper --with-decryption \
-  --query Parameter.Value --output text 2>/dev/null || true)"
+  --region "$BACKEND_REGION" --query Parameter.Value --output text 2>/dev/null || true)"
 if [ -z "$existing_pepper" ] || [ "$existing_pepper" = "None" ]; then
+  elsewhere="$(aws ssm get-parameter --name /saferide/totp-pepper \
+    --query Parameter.Name --output text 2>/dev/null || true)"
+  if [ -n "$elsewhere" ] && [ "$elsewhere" != "None" ]; then
+    echo "ERROR: /saferide/totp-pepper exists in the default CLI region but not in $BACKEND_REGION." >&2
+    echo "       Copy it into $BACKEND_REGION (infra/README.md, Operator checklist) — do not mint a new one." >&2
+    exit 1
+  fi
   aws ssm put-parameter --name /saferide/totp-pepper --type SecureString \
-    --value "$(openssl rand -hex 32)" >/dev/null
-  echo "==> Created SSM /saferide/totp-pepper"
+    --region "$BACKEND_REGION" --value "$(openssl rand -hex 32)" >/dev/null
+  echo "==> Created SSM /saferide/totp-pepper ($BACKEND_REGION)"
 else
-  echo "==> SSM /saferide/totp-pepper already exists (unchanged)"
+  echo "==> SSM /saferide/totp-pepper ($BACKEND_REGION) already exists (unchanged)"
 fi
 
 # 2. Bootstrap payload: bump the version so the migrate Lambda re-keys the
