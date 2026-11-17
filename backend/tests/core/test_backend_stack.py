@@ -16,7 +16,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATE = (REPO / "infra" / "backend" / "template.yaml").read_text(encoding="utf-8")
-DEPLOY_SCRIPT = (REPO / "infra" / "scripts" / "deploy-backend.sh").read_text(encoding="utf-8")
+# The parity maps deploy-backend.sh sources (test_deploy_params.py runs them).
+PARITY_SCRIPT = (REPO / "infra" / "scripts" / "parity-params.sh").read_text(encoding="utf-8")
 
 RESOURCES_SECTION = TEMPLATE.split("\nResources:\n", 1)[1].split("\nOutputs:\n", 1)[0]
 _parts = re.split(r"^  (\w+):\n", RESOURCES_SECTION, flags=re.M)
@@ -137,8 +138,8 @@ def test_each_alert_address_is_an_optional_parameter_with_a_conditional_subscrip
     assert _properties(subscription) == {
         "TopicArn": "!Ref OpsTopic", "Protocol": "email", "Endpoint": f"!Ref {param}",
     }
-    assert f"{param}:{env}" in DEPLOY_SCRIPT
-    assert re.search(r'^for pair in .*"\$\{ALERT_PARAMS\[@\]\}"', DEPLOY_SCRIPT, re.M)
+    assert f"{param}:{env}" in PARITY_SCRIPT
+    assert re.search(r'^\s*for pair in .*"\$\{ALERT_PARAMS\[@\]\}"', PARITY_SCRIPT, re.M)
 
 
 # --- database ------------------------------------------------------------------

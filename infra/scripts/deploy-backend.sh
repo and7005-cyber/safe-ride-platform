@@ -10,12 +10,16 @@
 #   aborts the deploy: this script never generates a secret;
 # - the stack change set is reviewed before it executes: a master-password
 #   change on the database or any resource replacement aborts it.
-#   CONFIRM_CHANGESET=1 also asks the operator y/N before executing.
+#   CONFIRM_CHANGESET=1 also asks the operator y/N before executing;
+# - every live-parity parameter with a template Default is passed explicitly
+#   (scripts/parity-params.sh), so the live stack runs the template Default
+#   unless this deploy exports an override.
 #
 # Pass the API cert ARN via env (API_CERT_ARN=...) or infra/.state/certs.env to
 # enable the custom domain.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/parity-params.sh"
 
 require_clean_checkout
 
@@ -117,12 +121,9 @@ if [ -z "$FIREBASE_SA_JSON" ] && [ -z "$VAPID_PRIV" ]; then
   echo "WARN: no push credentials in SSM or backend/.env — push delivery stays simulated (feed still works)." >&2
 fi
 
-cd "$INFRA_DIR/backend"
-
-echo "==> sam build (containerized arm64)"
-sam build --use-container
-
-echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_ARN:-<none>}, version ${APP_VERSION})"
+# --- Stack parameters ----------------------------------------------------------
+# Assembled before the build, so a template the parity reader cannot parse stops
+# the deploy before anything is built.
 DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAppPassword=${DB_APP_PASSWORD_VAL}" "TotpPepper=${TOTP_PEPPER_VAL}" "GoogleMapsApiKey=${GOOGLE_MAPS_KEY}" "AppVersion=${APP_VERSION}")
 # SAM rejects empty Key= overrides, so only pass the cert ARN when we have one.
 [ -n "$API_CERT_ARN" ] && DEPLOY_PARAMS+=("ApiCertificateArn=${API_CERT_ARN}")
@@ -136,62 +137,22 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 [ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
 [ -n "$VAPID_SUBJ" ] && DEPLOY_PARAMS+=("VapidSubject=${VAPID_SUBJ}")
-# GPS tracking system defaults (GPS plan U11). The template Defaults equal the
-# app's Settings defaults; an operator changes one by exporting the same
-# variable name the app reads (e.g. GPS_CUSTODY_THRESHOLD_M=200) — never an
-# empty override (SAM rejects those). An omitted parameter is sent as
-# UsePreviousValue, so it keeps the stack's current value: an override STICKS
-# until a later export changes it (export the Default to undo one), and a
-# parameter new to the stack starts at its template Default. Schools override
-# the first five per school in School Settings; the last two are system-wide.
-# Each pair is TemplateParameter:ENV_NAME.
-GPS_PARAMS=(
-  GpsCustodyThresholdM:GPS_CUSTODY_THRESHOLD_M
-  GpsVicinityRadiusM:GPS_VICINITY_RADIUS_M
-  GpsFixAccuracyCapM:GPS_FIX_ACCURACY_CAP_M
-  GpsPositionRetentionDays:GPS_POSITION_RETENTION_DAYS
-  GpsPingIntervalS:GPS_PING_INTERVAL_S
-  GpsStaleAfterS:GPS_STALE_AFTER_S
-  GpsFixWaitBudgetS:GPS_FIX_WAIT_BUDGET_S
-)
-# API-stage throttling (GPS plan U14; sign-in and school lookup, hardening D6),
-# same shape and same rule: the template Defaults are the live values; export
-# the variable to override. These are API Gateway settings, not app Settings —
-# no GPS_ prefix, and the app never reads them.
-API_THROTTLE_PARAMS=(
-  ApiDefaultBurstLimit:API_DEFAULT_BURST_LIMIT
-  ApiDefaultRateLimit:API_DEFAULT_RATE_LIMIT
-  PingsRouteBurstLimit:API_PINGS_BURST_LIMIT
-  PingsRouteRateLimit:API_PINGS_RATE_LIMIT
-  PinLoginRouteBurstLimit:API_PIN_LOGIN_BURST_LIMIT
-  PinLoginRouteRateLimit:API_PIN_LOGIN_RATE_LIMIT
-  SchoolLookupRouteBurstLimit:API_SCHOOL_LOOKUP_BURST_LIMIT
-  SchoolLookupRouteRateLimit:API_SCHOOL_LOOKUP_RATE_LIMIT
-)
-# Transactional email settings (hardening U4), same rule under the names the
-# app's Settings read. Release 1b's sender reads them; MAIL_ENABLED stays
-# false until then. MailConfigurationSet names a create-only resource, so the
-# change-set gate refuses a rename (replacement).
-MAIL_PARAMS=(
-  MailFromAddress:MAIL_FROM_ADDRESS
-  MailReplyTo:MAIL_REPLY_TO
-  MailConfigurationSet:MAIL_CONFIGURATION_SET
-  MailEnabled:MAIL_ENABLED
-)
-# Alarm recipients (hardening U4, D19): each address set becomes one email
-# subscription to the ops topic, confirmed from that inbox. Export both on the
-# first deploy that should alert; later deploys keep them.
-ALERT_PARAMS=(
-  AlertEmailPrimary:ALERT_EMAIL_PRIMARY
-  AlertEmailSecondary:ALERT_EMAIL_SECONDARY
-)
-for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}" "${MAIL_PARAMS[@]}" "${ALERT_PARAMS[@]}"; do
-  param="${pair%%:*}"; var="${pair##*:}"
-  if [ -n "${!var:-}" ]; then
-    DEPLOY_PARAMS+=("${param}=${!var}")
-    echo "==> Parameter override: ${param}=${!var} (from \$${var})"
-  fi
-done
+# Live-parity parameters (scripts/parity-params.sh: the GPS, API-throttle, mail
+# and alarm maps). SAM sends UsePreviousValue for any parameter a deploy does
+# not pass, so each one with a template Default is passed on every deploy: the
+# exported variable under the name the app reads (e.g.
+# GPS_CUSTODY_THRESHOLD_M=200), otherwise the template Default. An export lasts
+# for that deploy only — repeat it, or change the Default in a release. The
+# alert addresses and MailReplyTo have empty Defaults: passed only when
+# exported (SAM rejects an empty override), otherwise the stack keeps its value.
+build_parity_params "$INFRA_DIR/backend/template.yaml"
+
+cd "$INFRA_DIR/backend"
+
+echo "==> sam build (containerized arm64)"
+sam build --use-container
+
+echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_ARN:-<none>}, version ${APP_VERSION})"
 
 # --- Change-set gate ----------------------------------------------------------
 # SAM only creates the change set; this script reviews it and executes it. It

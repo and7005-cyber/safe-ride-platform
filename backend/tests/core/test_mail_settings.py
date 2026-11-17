@@ -19,7 +19,8 @@ from app.core.config import Settings
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATE = (REPO / "infra" / "backend" / "template.yaml").read_text(encoding="utf-8")
-DEPLOY_SCRIPT = (REPO / "infra" / "scripts" / "deploy-backend.sh").read_text(encoding="utf-8")
+# The parity maps deploy-backend.sh sources (test_deploy_params.py runs them).
+PARITY_SCRIPT = (REPO / "infra" / "scripts" / "parity-params.sh").read_text(encoding="utf-8")
 ENV_EXAMPLE = (REPO / "backend" / ".env.example").read_text(encoding="utf-8")
 
 # Settings field -> (env alias, template parameter, default as text)
@@ -137,10 +138,10 @@ def test_the_configuration_set_is_named_by_the_parameter():
 
 @pytest.mark.parametrize("alias,param", [(v[0], v[1]) for v in MAIL_FIELDS.values()])
 def test_deploy_script_maps_each_alias_to_its_parameter(alias, param):
-    assert f"{param}:{alias}" in DEPLOY_SCRIPT
+    assert f"{param}:{alias}" in PARITY_SCRIPT
     # And the loop actually iterates the array the pair lives in.
-    loop = r'^for pair in "\$\{GPS_PARAMS\[@\]\}".*"\$\{MAIL_PARAMS\[@\]\}"'
-    assert re.search(loop, DEPLOY_SCRIPT, re.M)
+    loop = r'^\s*for pair in "\$\{GPS_PARAMS\[@\]\}".*"\$\{MAIL_PARAMS\[@\]\}"'
+    assert re.search(loop, PARITY_SCRIPT, re.M)
 
 
 @pytest.mark.parametrize("alias,default", [(v[0], v[2]) for v in MAIL_FIELDS.values()])

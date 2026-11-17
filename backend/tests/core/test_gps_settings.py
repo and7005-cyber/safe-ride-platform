@@ -3,8 +3,8 @@ fields, their env aliases, the per-school resolver, and live parity.
 
 Live parity: every GPS default the app reads is a template Parameter whose
 Default equals the Settings default, wired into the API function's env under
-the alias Settings reads, and passable from deploy-backend.sh under the same
-name — the rule learned from the geo escape (`b68c877`), enforced here so a
+the alias Settings reads, and passable from deploy-backend.sh (its maps live
+in infra/scripts/parity-params.sh) under the same name — the rule learned from the geo escape (`b68c877`), enforced here so a
 new knob cannot ship live at a value nobody set. The migrate and verify
 functions get the retention default too (the purge and the `gps` check set
 resolve it). Pure text inspection of the template: no YAML dependency and no
@@ -29,7 +29,8 @@ from app.dao.school_thresholds import (
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATE = (REPO / "infra" / "backend" / "template.yaml").read_text(encoding="utf-8")
-DEPLOY_SCRIPT = (REPO / "infra" / "scripts" / "deploy-backend.sh").read_text(encoding="utf-8")
+# The parity maps deploy-backend.sh sources (test_deploy_params.py runs them).
+PARITY_SCRIPT = (REPO / "infra" / "scripts" / "parity-params.sh").read_text(encoding="utf-8")
 MIGRATION_016 = (REPO / "backend" / "db" / "migrations" / "016_gps_tracking.sql").read_text(
     encoding="utf-8"
 )
@@ -213,7 +214,7 @@ def test_migrate_and_verify_functions_carry_the_retention_default():
 
 @pytest.mark.parametrize("alias,param", [(v[0], v[1]) for v in GPS_FIELDS.values()])
 def test_deploy_script_maps_each_alias_to_its_parameter(alias, param):
-    assert f"{param}:{alias}" in DEPLOY_SCRIPT
+    assert f"{param}:{alias}" in PARITY_SCRIPT
 
 
 @pytest.mark.parametrize("alias", [v[0] for v in GPS_FIELDS.values()])
@@ -334,9 +335,9 @@ def test_the_pin_login_throttle_binds_the_registered_sign_in_route():
 
 @pytest.mark.parametrize("param,env", [(p, v[0]) for p, v in THROTTLE_PARAMS.items()])
 def test_deploy_script_maps_each_throttle_parameter(param, env):
-    assert f"{param}:{env}" in DEPLOY_SCRIPT
+    assert f"{param}:{env}" in PARITY_SCRIPT
     # And the loop actually iterates the array the pair lives in.
-    assert 'for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"' in DEPLOY_SCRIPT
+    assert 'for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"' in PARITY_SCRIPT
 
 
 def test_no_reader_imports_a_retired_module_constant():

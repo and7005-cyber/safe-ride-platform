@@ -95,9 +95,10 @@ Parameters:
   # GPS tracking system defaults (GPS plan U11: R26, R31, R38). Each Default
   # equals the Settings default in backend/app/core/config.py (kept in step by
   # backend/tests/core/test_gps_settings.py) and is the value beneath a
-  # school's own setting; deploy-backend.sh passes an override only when the
-  # operator exports the matching GPS_* variable. Staleness and the fix-wait
-  # budget have no per-school column — these ARE their live values.
+  # school's own setting. deploy-backend.sh passes every one on every deploy
+  # (infra/scripts/parity-params.sh): the matching GPS_* variable when
+  # exported, otherwise this Default. Staleness and the fix-wait budget have no
+  # per-school column — these ARE their live values.
   GpsCustodyThresholdM:
     Type: Number
     Default: 150
@@ -145,8 +146,9 @@ Parameters:
   # console down: the pings route gets its own bound, well under the pool, and
   # the stage a generous default that still stops a runaway client. Numbers are
   # requests per second (rate) and the token bucket (burst); the Defaults are
-  # the live values, overridable per deploy from deploy-backend.sh. Kept in
-  # step by backend/tests/core/test_gps_settings.py.
+  # the live values, passed on every deploy by deploy-backend.sh unless an
+  # override is exported for that deploy. Kept in step by
+  # backend/tests/core/test_gps_settings.py.
   ApiDefaultBurstLimit:
     Type: Number
     Default: 100
@@ -210,7 +212,10 @@ Parameters:
   # Alerting (hardening U4, D12, D16, D19). Each address gets one email
   # subscription to OpsTopic, which must be confirmed from the inbox; an empty
   # address creates none. deploy-backend.sh passes ALERT_EMAIL_PRIMARY and
-  # ALERT_EMAIL_SECONDARY when exported.
+  # ALERT_EMAIL_SECONDARY when exported; otherwise the stack keeps the address
+  # it has (an empty Default is never passed). ConcurrencyAlarmThreshold is
+  # passed on every deploy: CONCURRENCY_ALARM_THRESHOLD when exported, else
+  # its Default.
   AlertEmailPrimary:
     Type: String
     Default: ""
@@ -236,8 +241,9 @@ Parameters:
   # MAIL FROM and DMARC records are written. The four Mail* settings follow
   # the live-parity rule: each Default equals the Settings default in
   # backend/app/core/config.py (backend/tests/core/test_mail_settings.py keeps
-  # them in step), lands in the API function's environment, and is
-  # overridable from deploy-backend.sh under the name the app reads.
+  # them in step), lands in the API function's environment, and is passed by
+  # deploy-backend.sh on every deploy under the name the app reads (the
+  # exported value, else this Default; MailReplyTo only when exported).
   MailDomain:
     Type: String
     Default: saferidelive.co.ke
