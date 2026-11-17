@@ -54,26 +54,8 @@ API_CERT_ARN="${API_CERT_ARN:-}"
 # functions' environment. Each must already exist in $BACKEND_REGION: a missing
 # one aborts the deploy, because a minted DB password, pepper or key would lock
 # the API out of the database or invalidate every PIN and second factor. The
-# value is never printed.
-ssm_required() { # name -> value (aborts the deploy when absent or unreadable)
-  local name="$1" val err
-  err="$(mktemp)"
-  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$BACKEND_REGION" \
-    --query Parameter.Value --output text 2>"$err" || true)"
-  if [ -z "$val" ] || [ "$val" = "None" ]; then
-    if [ -s "$err" ] && ! grep -q ParameterNotFound "$err"; then
-      # Credentials, permissions or network: not a miss, so say what AWS said.
-      echo "ERROR: could not read SSM $name ($BACKEND_REGION): $(tr '\n' ' ' < "$err")" >&2
-    else
-      echo "ERROR: SSM $name ($BACKEND_REGION) is missing — copy it into $BACKEND_REGION before deploying (see infra/README.md, Operator checklist)" >&2
-    fi
-    rm -f "$err"
-    exit 1
-  fi
-  rm -f "$err"
-  printf '%s' "$val"
-}
-
+# value is never printed. ssm_required lives in config.sh (shared with
+# deploy-frontend.sh); a failed read aborts here under set -e.
 DB_PASSWORD="$(ssm_required /saferide/db-password)"
 PIN_PEPPER="$(ssm_required /saferide/pin-pepper)"
 DB_APP_PASSWORD_VAL="$(ssm_required /saferide/db-app-password)"

@@ -5,23 +5,73 @@
 # Pass the CloudFront cert ARN via env (CF_CERT_ARN=...) or infra/.state/certs.env
 # to attach the custom domain + Route 53 records. Without it, the site is served
 # on the default *.cloudfront.net domain (useful for an early smoke test).
+#
+# CSP_MODE=report-only|enforce (default report-only) picks the content-security
+# policy header; ALERT_EMAIL_PRIMARY / ALERT_EMAIL_SECONDARY subscribe to the
+# us-east-1 alarm topic and the cost budget (infra/README.md, "Alarms" and
+# "Security headers").
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 # A committed tree on origin/main or a release/* tag (config.sh).
 require_clean_checkout
 
+# Checked before anything is read or built: CloudFormation would refuse any
+# other value only after the build.
+CSP_MODE="${CSP_MODE:-report-only}"
+case "$CSP_MODE" in
+  report-only|enforce) ;;
+  *)
+    echo "ERROR: CSP_MODE must be report-only or enforce (got '${CSP_MODE}')." >&2
+    exit 1
+    ;;
+esac
+
+# Production Maps values (hardening U16): the referrer-restricted browser key and
+# the Cloud-styled Map ID live only in the parameter store ($BACKEND_REGION, like
+# every /saferide/* parameter) and reach the bundle through the build
+# environment. Vite gives variables already set in the environment priority
+# over .env files, so frontend/.env.local (the development key and the demo Map
+# ID) cannot leak into this build. A missing parameter aborts here, naming it;
+# the operator creates both (infra/README.md, SSM parameters). The values are
+# never printed.
+MAPS_BROWSER_KEY="$(ssm_required /saferide/google-maps-browser-key)"
+MAPS_MAP_ID="$(ssm_required /saferide/google-maps-map-id)"
+
 [ -f "$STATE_DIR/certs.env" ] && source "$STATE_DIR/certs.env"
 CF_CERT_ARN="${CF_CERT_ARN:-}"
 API_BASE_URL="${VITE_API_BASE_URL:-https://${API_DOMAIN}}"
+# The stack's CSP connect-src and API probe use the origin this build calls.
+API_ORIGIN="${API_BASE_URL%/}"
 
-echo "==> Building frontend with VITE_API_BASE_URL=${API_BASE_URL}"
+echo "==> Building frontend with VITE_API_BASE_URL=${API_BASE_URL} and the production Maps key and Map ID from SSM (not printed)"
 cd "$REPO_DIR/frontend"
-VITE_API_BASE_URL="$API_BASE_URL" npm run build
+VITE_API_BASE_URL="$API_BASE_URL" \
+  VITE_GOOGLE_MAPS_API_KEY="$MAPS_BROWSER_KEY" \
+  VITE_GOOGLE_MAPS_MAP_ID="$MAPS_MAP_ID" \
+  npm run build
 
-echo "==> Deploying frontend stack (region ${CF_REGION}, cert: ${CF_CERT_ARN:-<none>})"
-FE_PARAMS=("DomainName=${DOMAIN}" "HostedZoneId=${HOSTED_ZONE_ID}")
+echo "==> Deploying frontend stack (region ${CF_REGION}, cert: ${CF_CERT_ARN:-<none>}, CspMode=${CSP_MODE})"
+# `aws cloudformation deploy` reuses a parameter's previous value when it is not
+# passed. CspMode is therefore passed on every deploy, so the header is always
+# the mode asked for now (report-only unless CSP_MODE=enforce), never a leftover;
+# the alert addresses, like the backend's, are passed when exported and kept
+# otherwise.
+FE_PARAMS=(
+  "DomainName=${DOMAIN}"
+  "HostedZoneId=${HOSTED_ZONE_ID}"
+  "ApiOrigin=${API_ORIGIN}"
+  "CspMode=${CSP_MODE}"
+)
 [ -n "$CF_CERT_ARN" ] && FE_PARAMS+=("CertificateArn=${CF_CERT_ARN}")
+if [ -n "${ALERT_EMAIL_PRIMARY:-}" ]; then
+  FE_PARAMS+=("AlertEmailPrimary=${ALERT_EMAIL_PRIMARY}")
+  echo "==> Parameter override: AlertEmailPrimary (from \$ALERT_EMAIL_PRIMARY)"
+fi
+if [ -n "${ALERT_EMAIL_SECONDARY:-}" ]; then
+  FE_PARAMS+=("AlertEmailSecondary=${ALERT_EMAIL_SECONDARY}")
+  echo "==> Parameter override: AlertEmailSecondary (from \$ALERT_EMAIL_SECONDARY)"
+fi
 aws cloudformation deploy \
   --region "$CF_REGION" \
   --stack-name "$FRONTEND_STACK" \

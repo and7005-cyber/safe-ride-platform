@@ -26,6 +26,32 @@ cfn_output() { # stack region key
 }
 export -f cfn_output
 
+# Read one /saferide/* parameter (decrypted) and print its value. Every such
+# parameter lives in $BACKEND_REGION whatever the operator's default CLI region,
+# so that is the default; pass a region only for a deliberate exception. A
+# missing or unreadable parameter prints why on stderr and returns 1, so
+# `VAR="$(ssm_required /saferide/x)"` aborts a `set -e` deploy: no deploy ever
+# mints a secret (infra/README.md, "Deploy safety"). The value is never printed.
+ssm_required() { # name [region] -> value
+  local name="$1" region="${2:-$BACKEND_REGION}" val err
+  err="$(mktemp)"
+  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$region" \
+    --query Parameter.Value --output text 2>"$err" || true)"
+  if [ -z "$val" ] || [ "$val" = "None" ]; then
+    if [ -s "$err" ] && ! grep -q ParameterNotFound "$err"; then
+      # Credentials, permissions or network: not a miss, so say what AWS said.
+      echo "ERROR: could not read SSM $name ($region): $(tr '\n' ' ' < "$err")" >&2
+    else
+      echo "ERROR: SSM $name ($region) is missing — copy or create it in $region before deploying (see infra/README.md, Operator checklist)" >&2
+    fi
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  printf '%s' "$val"
+}
+export -f ssm_required
+
 # Deploy only what was released: no modified or staged tracked files, and HEAD
 # is origin/main (after a fetch) or carries a release/* tag. Untracked files are
 # ignored here (.claude/ and justfile stay untracked on purpose); the backend

@@ -37,8 +37,9 @@ Set the domain's nameservers at Truehost to the four Route 53 values
 # 3. Build + deploy backend (change-set gate), run DB migrations
 ./scripts/deploy-backend.sh          # CONFIRM_CHANGESET=1 to answer y/N first
 
-# 4. Build frontend against the API, deploy S3+CloudFront, upload, invalidate
-./scripts/deploy-frontend.sh
+# 4. Build frontend against the API (Maps key + Map ID from SSM), deploy
+#    S3+CloudFront + headers, probes, alarms, budget; upload, invalidate
+./scripts/deploy-frontend.sh         # CSP_MODE=report-only (default) | enforce
 ```
 
 `scripts/config.sh` holds the shared config (domain, zone id, regions, stack
@@ -53,6 +54,8 @@ names). Cert ARNs land in `.state/certs.env` (gitignored).
 | `/saferide/pin-pepper` | af-south-1 | operator; **must pre-exist** | HMAC pepper for driver PINs |
 | `/saferide/totp-pepper` | af-south-1 | **`scripts/provider-bootstrap.sh` — must pre-exist** | derives every provider's TOTP secret |
 | `/saferide/google-maps-api-key` | af-south-1 | operator; **must pre-exist** | server-side Google Maps key (geocoding, places, routes) |
+| `/saferide/google-maps-browser-key` | af-south-1 | operator (Google Cloud); **must pre-exist** | browser Maps key restricted to the production origins; built into the frontend by `deploy-frontend.sh` |
+| `/saferide/google-maps-map-id` | af-south-1 | operator (Google Cloud); **must pre-exist** | production Map ID; built into the frontend by `deploy-frontend.sh` |
 | `/saferide/provider-bootstrap` | af-south-1 | **`scripts/provider-bootstrap.sh` — must pre-exist** | versioned payload the migrate Lambda uses to create/re-key the Kuumbai provider accounts |
 | `/saferide/provider-initial-password/<email-slug>` | af-south-1 | `scripts/provider-bootstrap.sh` | each bootstrap account's initial password, retrieved out-of-band by the operator |
 | `/saferide/firebase-*`, `/saferide/vapid-*` | af-south-1 | seeded once from `backend/.env` when absent | push (see docs/push-notifications.md) |
@@ -91,13 +94,15 @@ operator's default CLI region. There are two classes:
   it: `firebase-service-account-json` and `firebase-web-config-json` (API),
   `provider-bootstrap` (migrate).
 
-The five "must pre-exist" values are read with `ssm_required`: a missing one
-stops the deploy before `sam build` with
-`ERROR: SSM <name> (af-south-1) is missing — copy it into af-south-1 …`.
+The five backend "must pre-exist" values are read with `ssm_required`
+(`scripts/config.sh`, shared by both deploy scripts): a missing one stops the
+deploy before `sam build` with
+`ERROR: SSM <name> (af-south-1) is missing — copy or create it in af-south-1 …`.
 Copy it from where it lives today as the operator checklist describes; never
 re-create it, because a new pepper silently invalidates every driver PIN or
 provider second factor and a new database password rotates the master
-password under the running stack.
+password under the running stack. `deploy-frontend.sh` reads the two Maps
+values the same way before it builds (see "Security headers").
 
 **Clean checkout.** `require_clean_checkout` (`scripts/config.sh`) runs first
 in both deploy scripts. It fetches `origin`, refuses modified or staged
@@ -178,6 +183,30 @@ exception with a 500 response, so `ApiServerErrors` is the application alarm
 and Lambda `Errors` means init failures or timeouts. The retention heartbeat
 and the metric-filter alarms arrive in Release 1b.
 
+**us-east-1 (frontend stack).** Route 53 health-check, CloudFront and
+CloudFront-certificate metrics exist only in us-east-1, so the frontend stack
+has its own topic, `saferide-ops-us-east-1` (output `OpsTopicUsEast1Arn`),
+with the same two addresses: export `ALERT_EMAIL_PRIMARY` /
+`ALERT_EMAIL_SECONDARY` on a `deploy-frontend.sh` run too, so the two topics
+make four confirmations. Later deploys keep them (`aws cloudformation deploy`
+reuses unpassed parameters). Two Route 53 health checks (outputs
+`ApiHealthCheckId`, `SiteHealthCheckId`) probe over HTTPS every 30 seconds
+from us-east-1, eu-west-1 and ap-southeast-1 and count any 2xx or 3xx as
+healthy. In December nothing calls the API, so only the probes can report a
+dead stack: their alarms treat missing data as breaching.
+
+| Alarm | Means | First response |
+|---|---|---|
+| `ApiProbeFailing` | no healthy answer from `https://api…/api/health` for 3 minutes: the API or its database is down for everyone | curl the health endpoint; read the af-south-1 alarms and `/saferide/api`; roll back if a deploy just landed |
+| `SiteProbeFailing` | the site's home page has not loaded for 3 minutes | open the site; check the distribution and its S3 bucket; redeploy the frontend from the last release tag if a deploy just landed |
+| `SiteServerErrors` | over 5% of CloudFront responses were 5xx for 10 minutes | read the distribution's error graphs and the AWS Health Dashboard for CloudFront and S3 |
+| `SiteCertificateExpiry` | the CloudFront certificate expires in under 20 days (custom domain only) | check the apex and www validation CNAMEs in Route 53 and the renewal status in ACM (us-east-1) |
+
+The `saferide-monthly-cost` budget (`MonthlyBudgetUsd`, 60 USD, the whole
+account) mails the same addresses directly when actual spend passes 80% and
+when the month's forecast passes 100%; no confirmation is needed, and it
+exists only when at least one address is set.
+
 **Log retention by hand (operator step, once after the Release 1a deploy).**
 The functions now log JSON to `/saferide/api`, `/saferide/migrate` and
 `/saferide/verify` (90 days, retained). Their older `/aws/lambda/*` groups and
@@ -191,6 +220,33 @@ aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-g
 aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/lambda/<VerifyFunctionName>
 aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/rds/instance/<db-id>/postgresql
 ```
+
+## Security headers
+
+CloudFront adds a response-headers policy (output `ResponseHeadersPolicyId`)
+to every response of the site: HSTS for one year **including subdomains**
+(`api.`, `mail.`) and **not preloaded**, `nosniff`, `X-Frame-Options: DENY`,
+`strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(self),
+camera=(), microphone=()`, and the content-security policy written in
+`frontend/template.yaml` (self, the Maps and Fonts hosts, the API origin,
+inline styles, no framing).
+
+- **`CspMode`** picks the CSP header. `report-only` (the default, Release 1a)
+  sends `Content-Security-Policy-Report-Only`: violations appear in the browser
+  console and nothing is blocked. `enforce` sends `Content-Security-Policy`;
+  it is switched on in Release 2 after the Android Chrome and iOS Safari
+  standalone checks against the production Map ID, with the policy widened
+  only by what the report-only weeks showed.
+- **Switch back:** `export CSP_MODE=report-only` (or leave it unset) and run
+  `./scripts/deploy-frontend.sh` again. The script passes `CspMode` on every
+  deploy, so the header is always the mode asked for, never a leftover.
+  CloudFront takes a few minutes to propagate a policy change.
+- **Maps values:** before building, `deploy-frontend.sh` reads
+  `/saferide/google-maps-browser-key` and `/saferide/google-maps-map-id` from
+  af-south-1 with `ssm_required` and aborts naming whichever is missing. The
+  values are never printed. Vite gives variables already in the environment
+  priority over `.env` files, so `frontend/.env.local` (the development key,
+  and the demo Map ID by default) never reaches a production build.
 
 ## Tenancy runtime role and scope header
 
