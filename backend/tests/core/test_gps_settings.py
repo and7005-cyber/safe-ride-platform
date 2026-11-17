@@ -222,7 +222,7 @@ def test_env_example_documents_each_alias_with_its_default(alias):
     assert re.search(rf"^# {alias}={default}$", ENV_EXAMPLE, re.M), alias
 
 
-# --- API-stage throttling (GPS plan U14) -------------------------------------------
+# --- API-stage throttling (GPS plan U14; hardening D6) -----------------------------
 # Not app Settings — API Gateway stage settings — but the same live-parity
 # rule: a template Parameter with a Default (the live value), referenced from
 # the HTTP API's route settings, and passable from deploy-backend.sh under a
@@ -233,8 +233,19 @@ THROTTLE_PARAMS = {
     "ApiDefaultRateLimit": ("API_DEFAULT_RATE_LIMIT", 50),
     "PingsRouteBurstLimit": ("API_PINGS_BURST_LIMIT", 20),
     "PingsRouteRateLimit": ("API_PINGS_RATE_LIMIT", 10),
+    # Driver sign-in and the school lookup (hardening D6).
+    "PinLoginRouteBurstLimit": ("API_PIN_LOGIN_BURST_LIMIT", 40),
+    "PinLoginRouteRateLimit": ("API_PIN_LOGIN_RATE_LIMIT", 20),
+    "SchoolLookupRouteBurstLimit": ("API_SCHOOL_LOOKUP_BURST_LIMIT", 40),
+    "SchoolLookupRouteRateLimit": ("API_SCHOOL_LOOKUP_RATE_LIMIT", 20),
 }
 PINGS_ROUTE_KEY = "POST /api/runs/driver/pings"
+# Every route with its own throttle -> (burst parameter, rate parameter).
+ROUTE_THROTTLES = {
+    PINGS_ROUTE_KEY: ("PingsRouteBurstLimit", "PingsRouteRateLimit"),
+    "POST /api/auth/pin-login": ("PinLoginRouteBurstLimit", "PinLoginRouteRateLimit"),
+    "GET /api/auth/schools/{code}": ("SchoolLookupRouteBurstLimit", "SchoolLookupRouteRateLimit"),
+}
 
 
 def _resource_block(logical_id: str) -> str:
@@ -252,7 +263,7 @@ def test_throttle_parameter_has_a_numeric_default(param, env, default):
     assert int(entry["MinValue"]) >= 1
 
 
-def test_http_api_binds_the_stage_default_and_the_pings_route_to_the_parameters():
+def test_http_api_binds_the_stage_default_to_the_parameters():
     block = _resource_block("HttpApi")
     default = re.search(
         r"^      DefaultRouteSettings:\n((?:        .*\n)+)", block, re.M
@@ -262,32 +273,63 @@ def test_http_api_binds_the_stage_default_and_the_pings_route_to_the_parameters(
         "ThrottlingBurstLimit": "!Ref ApiDefaultBurstLimit",
         "ThrottlingRateLimit": "!Ref ApiDefaultRateLimit",
     }
+
+
+@pytest.mark.parametrize("route_key,burst,rate", [(k, *v) for k, v in ROUTE_THROTTLES.items()])
+def test_http_api_binds_each_throttled_route_to_its_parameters(route_key, burst, rate):
+    block = _resource_block("HttpApi")
     route = re.search(
-        rf'^        "{re.escape(PINGS_ROUTE_KEY)}":\n((?:          .*\n)+)', block, re.M
+        rf'^        "{re.escape(route_key)}":\n((?:          .*\n)+)', block, re.M
     )
-    assert route, f"HttpApi RouteSettings has no entry for {PINGS_ROUTE_KEY}"
+    assert route, f"HttpApi RouteSettings has no entry for {route_key}"
     assert dict(re.findall(r"^          (\w+): (.+?)\s*$", route.group(1), re.M)) == {
-        "ThrottlingBurstLimit": "!Ref PingsRouteBurstLimit",
-        "ThrottlingRateLimit": "!Ref PingsRouteRateLimit",
+        "ThrottlingBurstLimit": f"!Ref {burst}",
+        "ThrottlingRateLimit": f"!Ref {rate}",
     }
 
 
+def _declared_routes() -> list[tuple[str, str]]:
+    """(path, method) of every HttpApi event on the API function."""
+    block = _resource_block("ApiFunction")
+    events = re.search(r"^      Events:\n((?:        .*\n)+)", block, re.M)
+    assert events, "ApiFunction has no Events"
+    return re.findall(
+        r"^            Path: (\S+)\n            Method: (\S+)$", events.group(1), re.M
+    )
+
+
+def test_every_route_setting_has_a_declared_route_and_every_explicit_route_a_setting():
+    """A per-route setting binds only to a route key that exists, so each
+    throttled route is declared beside the proxy; and an explicit route
+    exists only to carry a throttle."""
+    declared = _declared_routes()
+    assert ("/{proxy+}", "ANY") in declared  # the proxy still serves the rest
+    explicit = {f"{method} {path}" for path, method in declared if path not in ("/", "/{proxy+}")}
+    assert explicit == set(ROUTE_THROTTLES)
+    block = _resource_block("HttpApi")
+    settings = re.findall(r'^        "([A-Z]+ /\S*)":$', block, re.M)
+    assert sorted(settings) == sorted(ROUTE_THROTTLES)
+
+
 def test_the_pings_route_is_a_declared_route_on_the_api_function_and_in_the_manifest():
-    """A per-route setting binds to a route key that exists: the pings route
-    is declared beside the proxy, and it is the manifest's driver-scoped
-    path, so the throttle can never drift from the registered route."""
+    """The pings throttle is the manifest's driver-scoped path, so it can
+    never drift from the registered route."""
     from tests.scope_manifest import MANIFEST
 
     method, path = PINGS_ROUTE_KEY.split(" ", 1)
     assert MANIFEST[(method, path)] == "driver-scoped"
-    block = _resource_block("ApiFunction")
-    events = re.search(r"^      Events:\n((?:        .*\n)+)", block, re.M)
-    assert events, "ApiFunction has no Events"
-    declared = re.findall(
-        r"^            Path: (\S+)\n            Method: (\S+)$", events.group(1), re.M
-    )
-    assert (path, method) in declared, declared
-    assert ("/{proxy+}", "ANY") in declared  # the proxy still serves the rest
+    assert (path, method) in _declared_routes()
+
+
+def test_the_pin_login_throttle_binds_the_registered_sign_in_route():
+    """PIN sign-in is the manifest's public auth route. The school lookup's
+    handler and manifest entry arrive with Release 1b (U10); until then its
+    declared route reaches the app's 404, as the proxy did."""
+    from tests.scope_manifest import MANIFEST
+
+    assert MANIFEST[("POST", "/api/auth/pin-login")] == "auth"
+    assert ("/api/auth/pin-login", "POST") in _declared_routes()
+    assert ("/api/auth/schools/{code}", "GET") in _declared_routes()
 
 
 @pytest.mark.parametrize("param,env", [(p, v[0]) for p, v in THROTTLE_PARAMS.items()])

@@ -155,11 +155,14 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
 [ -n "$VAPID_SUBJ" ] && DEPLOY_PARAMS+=("VapidSubject=${VAPID_SUBJ}")
 # GPS tracking system defaults (GPS plan U11). The template Defaults equal the
-# app's Settings defaults; an operator changes one for a deploy by exporting
-# the same variable name the app reads (e.g. GPS_CUSTODY_THRESHOLD_M=200) —
-# omitted means the template Default, never an empty override (SAM rejects
-# those). Schools override the first five per school in School Settings; the
-# last two are system-wide. Each pair is TemplateParameter:ENV_NAME.
+# app's Settings defaults; an operator changes one by exporting the same
+# variable name the app reads (e.g. GPS_CUSTODY_THRESHOLD_M=200) — never an
+# empty override (SAM rejects those). An omitted parameter is sent as
+# UsePreviousValue, so it keeps the stack's current value: an override STICKS
+# until a later export changes it (export the Default to undo one), and a
+# parameter new to the stack starts at its template Default. Schools override
+# the first five per school in School Settings; the last two are system-wide.
+# Each pair is TemplateParameter:ENV_NAME.
 GPS_PARAMS=(
   GpsCustodyThresholdM:GPS_CUSTODY_THRESHOLD_M
   GpsVicinityRadiusM:GPS_VICINITY_RADIUS_M
@@ -169,21 +172,42 @@ GPS_PARAMS=(
   GpsStaleAfterS:GPS_STALE_AFTER_S
   GpsFixWaitBudgetS:GPS_FIX_WAIT_BUDGET_S
 )
-# API-stage throttling (GPS plan U14), same shape and same rule: the template
-# Defaults are the live values; export the variable to override one deploy.
-# These are API Gateway settings, not app Settings — no GPS_ prefix, and the
-# app never reads them.
+# API-stage throttling (GPS plan U14; sign-in and school lookup, hardening D6),
+# same shape and same rule: the template Defaults are the live values; export
+# the variable to override. These are API Gateway settings, not app Settings —
+# no GPS_ prefix, and the app never reads them.
 API_THROTTLE_PARAMS=(
   ApiDefaultBurstLimit:API_DEFAULT_BURST_LIMIT
   ApiDefaultRateLimit:API_DEFAULT_RATE_LIMIT
   PingsRouteBurstLimit:API_PINGS_BURST_LIMIT
   PingsRouteRateLimit:API_PINGS_RATE_LIMIT
+  PinLoginRouteBurstLimit:API_PIN_LOGIN_BURST_LIMIT
+  PinLoginRouteRateLimit:API_PIN_LOGIN_RATE_LIMIT
+  SchoolLookupRouteBurstLimit:API_SCHOOL_LOOKUP_BURST_LIMIT
+  SchoolLookupRouteRateLimit:API_SCHOOL_LOOKUP_RATE_LIMIT
 )
-for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"; do
+# Transactional email settings (hardening U4), same rule under the names the
+# app's Settings read. Release 1b's sender reads them; MAIL_ENABLED stays
+# false until then. MailConfigurationSet names a create-only resource, so the
+# change-set gate refuses a rename (replacement).
+MAIL_PARAMS=(
+  MailFromAddress:MAIL_FROM_ADDRESS
+  MailReplyTo:MAIL_REPLY_TO
+  MailConfigurationSet:MAIL_CONFIGURATION_SET
+  MailEnabled:MAIL_ENABLED
+)
+# Alarm recipients (hardening U4, D19): each address set becomes one email
+# subscription to the ops topic, confirmed from that inbox. Export both on the
+# first deploy that should alert; later deploys keep them.
+ALERT_PARAMS=(
+  AlertEmailPrimary:ALERT_EMAIL_PRIMARY
+  AlertEmailSecondary:ALERT_EMAIL_SECONDARY
+)
+for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}" "${MAIL_PARAMS[@]}" "${ALERT_PARAMS[@]}"; do
   param="${pair%%:*}"; var="${pair##*:}"
   if [ -n "${!var:-}" ]; then
     DEPLOY_PARAMS+=("${param}=${!var}")
-    echo "==> GPS default override: ${param}=${!var} (from \$${var})"
+    echo "==> Parameter override: ${param}=${!var} (from \$${var})"
   fi
 done
 

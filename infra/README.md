@@ -146,6 +146,52 @@ because every migration is additive. `release/0`'s scripts still read the
 default-region parameter copies, which is why those copies stay until
 Release 2 is stable.
 
+## Alarms
+
+The backend stack sends every alarm, and its return to OK, to the SNS topic
+`saferide-ops` in af-south-1 (stack output `OpsTopicArn`); SES bounce,
+complaint, reject, rendering-failure and delivery-delay events land there
+too. Each address exported as `ALERT_EMAIL_PRIMARY` / `ALERT_EMAIL_SECONDARY`
+on a deploy gets an email subscription that must be confirmed from that
+inbox. Later deploys keep the addresses: SAM reuses a parameter's previous
+value when it is not passed, which holds for every override in
+`deploy-backend.sh`. Thresholds are counts, not rates, and missing data
+counts as OK.
+
+| Alarm | Means | First response |
+|---|---|---|
+| `ApiServerErrors` | at least one API 5xx in 5 minutes | find the ERROR lines in `/saferide/api` at that time; roll back if a deploy just landed |
+| `ApiClientErrorsBurst` | 50 or more API 4xx in 5 minutes | read `/saferide/api` for the paths and whether one client repeats (broken release, looping phone, sign-in probing) |
+| `ApiLatencyP95` | p95 over 3 s in 3 of 5 five-minute periods | check the database CPU and credit alarms and the API function's duration |
+| `ApiFunctionErrors` | the API function failed (init crash or timeout) | read the latest `/saferide/api` errors; roll back if a deploy just landed |
+| `ApiFunctionThrottles` | the API function was throttled in the last minute | check `AccountConcurrency` and the pings route for a looping client; raise the quota |
+| `MigrateFunctionErrors` | the migrate function failed | read `/saferide/migrate`; fix and re-run the migrate step (the live API may need it) |
+| `AccountConcurrency` | Lambda concurrency at `ConcurrencyAlarmThreshold` (80% of the account limit, 8 today) | find the runaway client; request a quota increase and raise the threshold with it |
+| `DbFreeStorageLow` | database free storage under 2 GiB | check the storage graph and that the position-trail purge runs |
+| `DbFreeableMemoryLow` | freeable memory under 100 MB for 15 minutes | check the connection count and slow statements in the postgresql log export |
+| `DbCpuHigh` | database CPU over 80% for 15 minutes | find the expensive statements in the postgresql log export and the routes that run them |
+| `DbCpuCreditsLow` | under 30 CPU credits for 15 minutes; the instance will be held to baseline | find what burns CPU; consider a larger class |
+| `ApiCertificateExpiry` | the API certificate expires in under 20 days (custom domain only) | check the api validation CNAME in Route 53 and the renewal status in ACM |
+
+Application exceptions surface as API 5xx: FastAPI answers an unhandled
+exception with a 500 response, so `ApiServerErrors` is the application alarm
+and Lambda `Errors` means init failures or timeouts. The retention heartbeat
+and the metric-filter alarms arrive in Release 1b.
+
+**Log retention by hand (operator step, once after the Release 1a deploy).**
+The functions now log JSON to `/saferide/api`, `/saferide/migrate` and
+`/saferide/verify` (90 days, retained). Their older `/aws/lambda/*` groups and
+the PostgreSQL export group (created when the export is first enabled) never
+expire until set; `<…FunctionName>` are the stack outputs of those names and
+`<db-id>` is the `Database` physical id (see Teardown):
+
+```bash
+aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/lambda/<ApiFunctionName>
+aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/lambda/<MigrateFunctionName>
+aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/lambda/<VerifyFunctionName>
+aws logs put-retention-policy --region af-south-1 --retention-in-days 90 --log-group-name /aws/rds/instance/<db-id>/postgresql
+```
+
 ## Tenancy runtime role and scope header
 
 - **The API runs as `saferide_app`**, a `LOGIN NOBYPASSRLS` role that is not
