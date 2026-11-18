@@ -5,9 +5,9 @@
   tip (cut from `main` at `a59756d`, with the requirements and plan in
   `e20f3d5`) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U1–U6, with
-  U16 moved into 1a (D8), as amended by the execution decisions D1–D26
+  U16 moved into 1a (D8), as amended by the execution decisions D1–D27
   (D20–D24 from the code review below, D25 the holiday deploy window, D26
-  the database stack policy).
+  the database stack policy, D27 the 017 rehearsal method).
 - **Surface:** migration 017 (additive account-hardening schema) and the
   read-only `hardening` and `restore-compare` verify sets; deploy fail-fast on
   a missing secret in af-south-1, clean-checkout rule, open-run refusal,
@@ -80,8 +80,8 @@
 | U1.7 alert addresses confirmed and exported for both deploys; the four confirmations within 48 hours, proved after the deploy (+1 h and +47 h) | 2026-11-18, the user: one address for now, the operator's own (the SES-verified identity); `ALERT_EMAIL_SECONDARY` stays unset, so each deploy subscribes one address and **two** confirmations arrive (one per topic) instead of four. A second person can be added later with a fresh confirmation | **open** (address **met**; the confirmations come after the deploy) |
 | U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | Day agreed 2026-11-18 (D25): schools closed until 2027-01-04, any day works. Read 2026-11-18: `open-runs` 0; current windows backup `05:59-06:29` UTC daily, maintenance `tue:09:23-tue:09:53` UTC, `PendingModifiedValues` empty, retention 7. Re-read both, and `gps` `trail-rows-per-run-today`, on the deploy day | **open** (day **met**; the deploy-day reads remain) |
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | 2026-11-18 on the user's go (infra/RESTORE.md A, the property dry run, B, C; E deferred so the 017 rehearsal can reuse the copy). Target `2026-11-18T15:26:38+00:00` (the latest restorable time; schools on holiday, so nothing ran). Decision 15:32:07Z → `saferide-restore-test` available 15:56:48Z (**24 min 41 s**) → 1a property set applied and read back 15:57:43Z (deletion protection on, retention 35, max storage 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, no log export, nothing pending; then deletion protection off) → verify function on the copy, first query answered 15:58:08Z: **restore to first query 26 min**, inside the one-hour target. Comparison, copy against production (production read after C, without the override): `migrations` (22 rows, up to `016_gps_tracking`, the two cosmetic 015 rows included), `gps` (9 checks) and `baseline` for Msingi Bora and Voluntari Academy (5 checks each): every check identical, no error rows | **met** |
-| **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | | **open** |
-| Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | Verify function: on the copy 15:57:43Z–15:58:08Z, put back by the script's always-run step C, read-back `MATCH`, and the production reads after it passed the verify-target check without the override. Migrate function: not touched yet (the 017 rehearsal's method is open) | **open** (verify **met**) |
+| **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | 2026-11-18 on the user's go, by D27 (a throwaway stack with 1a's migrate and verify code against the scratch copy; no production function changed). Build at `aecab54`, no `.env` in the package. `migrations` on the copy before: 22 rows, last `016_gps_tracking`. Migrate #1 16:05:21Z → 16:05:26Z (**4.9 s**, timeout 120 s): `status` `ok`, `migrations.applied` exactly `["017_account_hardening"]`, seeds skipped by name (`APP_ENV=production`), `app_role.synced` true, provider bootstrap skipped (already applied). After: 23 rows, last `017_account_hardening`; `hardening` 18 checks, no error rows: `017-objects-present` 15 of 15 true, `audit-check-widening-017` all six true, `schools-without-driver-code` 0, `drivers-with-several-driver-memberships` 0, `open-runs-and-today` 0/0. Migrate #2: `applied` `[]` (017 skipped). Production migrate function `CodeSha256` `nQzJ18OK…PtE=` (`LastModified` 2026-09-22T17:52:46Z) identical before and after. Cleanup: rehearsal stack and its log group deleted; scratch instance deleted 16:08:06Z (skip final snapshot, automated backups deleted), none retained | **met** |
+| Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | Verify function: on the copy 15:57:43Z–15:58:08Z, put back by the script's always-run step C, read-back `MATCH`, and the production reads after it passed the verify-target check without the override. Migrate function: never pointed elsewhere (D27 used a temporary function); `CodeSha256` unchanged. Read after both rehearsals: each function's `DATABASE_URL` host equals `DbEndpoint` (`saferide-backend-database-rto9a7nrm9ux…`) | **met** |
 | **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | Run 2026-11-18 on the user's go ("Gate dry run, 2026-11-18" below): the `Database` row lists exactly the five 1a properties and **no `MasterUserPassword`**; change set deleted, none left; stack `UPDATE_COMPLETE`, `LastUpdatedTime` 2026-09-22T17:52:33Z before and after. One `WARN`: `Database` replacement `Conditional`, from `BackupRetentionPeriod` and `PreferredMaintenanceWindow` (the only two of the five in the resource schema's `conditionalCreateOnlyProperties`) | **met** — `MasterUserPassword` absent; the `WARN` closed by D26: rehearsed in place on a throwaway stack, stack policy denying `Database` replacement set on `saferide-backend` |
 | Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | | **open** |
 | Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | | **open** |
@@ -208,6 +208,21 @@ back (`get-stack-policy`); the stack stayed `UPDATE_COMPLETE`,
 ]}
 ```
 
+
+### Production copy after 017, 2026-11-18 (a preview of the 1b baselines)
+
+From the `hardening` set on the restored copy (target 15:26:38Z) after 017;
+the real baselines are read on production after the 1a deploy. Driver PIN
+hashes: Msingi Bora 4 active driver memberships, Voluntari Academy 1, all
+`legacy_hmac` (none `salted_v2`, none without a PIN). Parents: 5, all with
+`consent_version` null; no unverified parent accounts (D1: existing parents
+are not asked to verify). Tokens: `reset` 1 used and unpurged over a day,
+TTL 60 minutes; no `verify` tokens. Stale sessions: `auth_sessions` 271
+expired over 7 days, `auth_preauth_tokens` 18. Notifications older than 90
+days: 1. Push subscriptions: none. `last-retention-run`,
+`parent-reset-audit-recent` and `temporary-passwords-outstanding` empty (new
+in 017). Instance: PostgreSQL 16.14, `max_connections` 79.
+
 ## Decisions taken during execution
 
 From the execution decisions (2026-11-17), all for Release 1a:
@@ -293,6 +308,16 @@ From the code review (2026-11-17/18):
   `Update:Replace` and `Update:Delete` on `Database` (infra/README.md,
   "Database stack policy"). The checklist expects that `WARN` and no other,
   and checks the policy before the deploy.
+- **D27** (2026-11-18, the user chose "temporary function") Migration 017
+  is rehearsed on the production copy through a throwaway stack
+  (`saferide-017-rehearsal-<date>`): two functions built from the 1a commit
+  with production's migrate and verify handlers, runtime, timeout, memory,
+  subnets, Lambda security group and the migrate function's SSM policy, their
+  environment set afterwards from a 0600 file to point at the scratch
+  instance; invoked, then the stack is deleted. It runs exactly 1a's code path
+  without changing production's migrate function's code or configuration
+  outside CloudFormation (the open question in infra/RESTORE.md, "017 on the
+  production copy"), and adds 1a's `hardening` set on the post-017 copy.
 
 Found and decided while finishing the unit (`0d953eb` and `ebdc123`):
 

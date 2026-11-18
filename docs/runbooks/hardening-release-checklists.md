@@ -289,8 +289,9 @@ day, items 6–10 on the day in the deploy session; operator steps 6 and 8
 4. The rehearsal on a production copy is done, timings recorded
    ([infra/RESTORE.md](../../infra/RESTORE.md), "Rehearsal"): the scratch
    restore, the property dry run, and migration 017 applied to the scratch
-   instance through the migrate function — `migrations.applied` exactly
-   `["017_account_hardening"]`, with its duration. Afterwards both functions
+   instance through 1a's migrate code in a throwaway stack (D27) —
+   `migrations.applied` exactly `["017_account_hardening"]`, with its
+   duration. Done 2026-11-18 (the validation record). Afterwards both functions
    are back on production: each read-back printed `MATCH`, and the host of
    each function's `DATABASE_URL` equals the stack's `DbEndpoint` output.
    `deploy-backend.sh` and `verify-db.sh` refuse when the verify function's

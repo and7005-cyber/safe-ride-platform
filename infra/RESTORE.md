@@ -404,23 +404,33 @@ in under one hour.
 **017 on the production copy** (before Release 1a, on the user's explicit
 go). Migration 017 widens a CHECK over the audit rows production holds and
 gives every existing school a driver code; the rehearsal applies it to the
-scratch copy through the migrate function, after B's comparison (which
-must see the copy without 017) and before C. The migrate function is
-pointed at the scratch instance the way B points the verify function, then
-put back and read back.
+scratch copy through 1a's migrate code, after B's comparison (which must
+see the copy without 017) and before C — by the throwaway stack agreed below
+(D27), which leaves production's migrate function untouched.
 
 The migrate function production runs today is `release/0`'s package:
 migrations up to 016 and no `APP_ENV` seed gate. Invoked as it stands it
 answers `migrations.applied: []`, which proves nothing. For the rehearsal
 it must run 1a's migrate package (the `MigrateFunction` build of the
 `release/1a` commit), which means changing a production function's code
-outside CloudFormation for the length of the rehearsal. **Open — agree it
-with the user before the rehearsal is scheduled:** how that package reaches
-the function and how the original goes back (for example, `sam package` of
-the `release/1a` build and `aws lambda update-function-code` pointing at
-its `MigrateFunction` object; back at the object the stack's processed
-template names). Whatever the means, read the code hash before, after the
-change and after the restore; the last must equal the first:
+outside CloudFormation for the length of the rehearsal. **Agreed instead
+(D27, 2026-11-18): a throwaway stack.** Build the 1a commit
+(`sam build --use-container`, no `samconfig.toml` beside the template, so
+nothing can aim it at `saferide-backend`) into a stack
+`saferide-017-rehearsal-<date>` with two functions using production's
+`app.migrate_handler.handler` and `app.verify_handler.handler`, the same
+runtime, architecture, timeout, memory, `SubnetA`/`SubnetB`,
+`LambdaSecurityGroup` and the migrate function's `ssm:GetParameter` /
+`kms:Decrypt` policy, plus a log group it deletes with the stack; check that
+no `.env` is in the build. Set both functions' environment afterwards with
+`update-function-configuration` from a 0600 file (`APP_ENV`, the scratch
+`DATABASE_URL` built as in B, `DB_APP_PASSWORD`, `PROVIDER_BOOTSTRAP_SSM`,
+`GPS_POSITION_RETENTION_DAYS`) so no secret reaches an argv or a stack
+parameter; invoke `migrations`, the migrate function, `migrations` and
+`hardening` again, and the migrate function a second time (it must apply
+nothing); then delete the stack, and E. Production's migrate function is only
+read: its code hash before and after must be equal —
+
 
 ```bash
 MIGRATE_FN="$(aws cloudformation describe-stacks --region $REGION --stack-name saferide-backend \
@@ -429,7 +439,9 @@ aws lambda get-function-configuration --region $REGION --function-name "$MIGRATE
   --query '[CodeSha256,LastModified]' --output text      # record
 ```
 
-Point it at the scratch instance — B's procedure for the migrate function
+The original idea, kept for reference and not needed with the throwaway
+stack, swapped production's migrate function onto the copy. Point it at the
+scratch instance — B's procedure for the migrate function
 (its configuration also carries the app-role password, so the saved copy
 stays in the private directory until the restore):
 
