@@ -49,7 +49,12 @@ VALUES = {
 OTHER = "a-different-value-0005"
 
 STUB = r'''#!/usr/bin/env python3
-import json, os, stat, sys
+import json, os, signal, stat, sys
+
+# The signal test sends SIGQUIT to the whole process group, this stub
+# included. SIGQUIT's default action dumps core, which on macOS raises a
+# "Python quit unexpectedly" dialog; exit with the shell's status instead.
+signal.signal(signal.SIGQUIT, lambda sig, frame: os._exit(128 + sig))
 
 root = os.environ["FAKE_AWS_ROOT"]
 args = sys.argv[1:]

@@ -48,7 +48,11 @@ FRONTEND_CHANGESET_ARN = (
 HEAD = "0123456789abcdef0123456789abcdef01234567"
 
 _COMMON = r'''
-import json, os, re, stat, sys
+import json, os, re, signal, stat, sys
+
+# SIGQUIT's default action dumps core, which on macOS raises a "Python quit
+# unexpectedly" dialog; exit with the shell's status for the signal instead.
+signal.signal(signal.SIGQUIT, lambda sig, frame: os._exit(128 + sig))
 
 root = os.environ["FAKE_CLI_ROOT"]
 args = sys.argv[1:]
