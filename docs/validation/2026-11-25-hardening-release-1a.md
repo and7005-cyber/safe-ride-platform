@@ -69,7 +69,7 @@
 | Every parity parameter reaches the stack on each deploy, both stacks | `test_deploy_params.py` 32 passed (backend and frontend templates, `deploy-frontend.sh` end to end) at `a305a50`; first recorded as 25 at `0d953eb`; 43 at `f41c5f3` | **met locally** |
 | SSM copy helper never writes in report mode, never overwrites, never exposes a value | `test_copy_ssm_script.py` 25 passed against a fake `aws` at `0d953eb`, again at `639954e` under `nohup` | **met locally** |
 | Templates lint clean | `sam validate --lint` (backend) at `a12bc01`: only the pre-existing W1011; frontend `validate-template` and SAM lint clean at `a12bc01` | **met locally** |
-| `scripts/certify.sh` green at the release commit | pending | **open** |
+| `scripts/certify.sh` green at the release commit | Green at `156ace9` on 2026-11-18: backend unit 756 passed, 561 skipped; API integration 561 passed, 2 skipped; typecheck clean; vitest 346 passed in 23 files; build passes; Playwright 102 passed. The one later code commit, `c7b0271`, changes only two test stubs; `tests/core` 514 passed there. Re-run at the commit that is tagged `release/1a` | **met locally** |
 | U1.1 SES production access requested (case id); both operator addresses verified | | **open** |
 | U1.2 Lambda concurrency quota (L-B99A9384) at least 100, or the request id | | **open** |
 | U1.3 `release/0` on `a59756d`, pushed | | **open** |
@@ -300,7 +300,7 @@ Residuals deferred:
 | `sam validate --lint` (infra/backend) at `a12bc01` | only the pre-existing W1011 (also at `0d953eb`, and again with this record's one-line template comment edit) |
 | `RUN_INTEGRATION=1 pytest tests/integration` | last recorded at `54ca7ba`: 561 passed, 2 skipped; `backend/app`, `backend/db` and the integration tests unchanged since |
 | Frontend (`tsc`, vitest, build) | last recorded at `2bafe24`: tsc clean, vitest 346 passed in 23 files, build passes |
-| `scripts/certify.sh` at the release commit | pending |
+| `scripts/certify.sh` at the release commit | green at `156ace9`: backend unit 756 passed / 561 skipped, integration 561 passed / 2 skipped, tsc clean, vitest 346 in 23 files, build, Playwright 102 passed; `tests/core` 514 passed at `c7b0271` (SIGQUIT stub fix, test-only) |
 
 ## Rollback position
 
