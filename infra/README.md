@@ -39,13 +39,15 @@ Set the domain's nameservers at Truehost to the four Route 53 values
 #    operator checklist step 4)
 ./scripts/copy-ssm-to-backend-region.sh
 
-# 4. Build + deploy backend (open-run refusal, change-set gate), run DB migrations
-#    ALERT_EMAIL_PRIMARY / ALERT_EMAIL_SECONDARY on the first alerting deploy
+# 4. Build + deploy backend (alert-address guard, open-run refusal, verify-target
+#    check, change-set gate), run DB migrations
+#    ALERT_EMAIL_PRIMARY / ALERT_EMAIL_SECONDARY until the stacks hold them
 ./scripts/deploy-backend.sh          # CONFIRM_CHANGESET=1 to answer y/N first
 
 # 5. Build frontend against the API (Maps key + Map ID from SSM), deploy
-#    S3+CloudFront + headers, probes, alarms, budget; upload, invalidate
-./scripts/deploy-frontend.sh         # CSP_MODE=report-only (default) | enforce
+#    S3+CloudFront + headers, probes, alarms, budget through the change-set
+#    gate; upload, invalidate
+./scripts/deploy-frontend.sh         # CSP_MODE=report-only (default) | enforce; CONFIRM_CHANGESET=1
 ```
 
 Backend first, then frontend — a release deploys both, in that order, and a
@@ -150,6 +152,20 @@ track, or when `git ls-files --others --exclude-standard backend/app
 backend/db` prints anything. Ignored files (`__pycache__`, `.env`) are
 outside this guard.
 
+**Alert-address guard.** Before building, both deploy scripts work out the
+primary alert address their stack will have: the exported
+`ALERT_EMAIL_PRIMARY`, else the stack's current `AlertEmailPrimary` value
+(`describe-stacks`). That value is empty when the stack or the parameter
+does not exist — SAM drops `UsePreviousValue` for a parameter the stack
+lacks, so after a rollback to `release/0` the template's empty Default
+applies. With no address every alarm would email no one, so the deploy
+refuses ("no alert address: alarms would email no one — export
+ALERT_EMAIL_PRIMARY"); `ALLOW_NO_ALERTS=1` deploys anyway behind a loud
+warning. When nothing is exported and the stack holds an address, the
+script passes that address explicitly, so a later change to the parameter
+set cannot drop it. `deploy-backend.sh` reads the backend stack,
+`deploy-frontend.sh` the frontend stack.
+
 **Open-run refusal.** A deploy restarts the API and migrates the database
 under any run in progress. Before it builds anything, `deploy-backend.sh`
 invokes the verify function the stack has today with its `tenancy-preflight`
@@ -160,7 +176,22 @@ with no `VerifyFunctionName` output (the first-ever deploy of a stack), a
 failed invoke, an answer whose status is not `ok`, or a missing or failed
 row. `ALLOW_OPEN_RUNS=1` deploys anyway behind a loud warning — for that
 first deploy, or an emergency fix or rollback that cannot wait for the runs
-to end. Only the count is printed.
+to end. Only the count is printed. The check runs a second time immediately
+before the change set executes — after the gate and any `CONFIRM_CHANGESET`
+prompt, which can take minutes — with the same rule and override: a run
+opened meanwhile deletes the change set and stops the deploy.
+
+**Verify-target check.** The count means something only if the verify
+function reads production. The open-run check in `deploy-backend.sh`, and
+`verify-db.sh` before every invoke, compare the host of the verify
+function's `DATABASE_URL` with the stack's `DbEndpoint` output and refuse
+when they differ — the function still points at a scratch restore
+([RESTORE.md](RESTORE.md), step B). Only the host is read
+(`get-function-configuration --query Environment.Variables.DATABASE_URL`
+piped into python3's `urlsplit`); the URL, which carries the master
+password, is never printed. `ALLOW_VERIFY_TARGET_MISMATCH=1` overrides it,
+for the runbook's reads against a scratch instance; a deploy has no reason
+to.
 
 **Change-set gate.** Every backend deploy runs
 `sam deploy --no-execute-changeset` with `--stack-name "$BACKEND_STACK"
@@ -183,10 +214,13 @@ executes — when:
   - the logical ids named in `ALLOW_REPLACE=<LogicalId,...>`, for this
     deploy only: a loud `WARN` block, and the deploy goes on. An
     `ALLOW_REPLACE` id the change set does not replace is a `WARN` too.
-    `ALLOW_REPLACE` never applies to the database: an `AWS::RDS::DBInstance`
-    replacement aborts even when named, because the replacement is a new,
-    empty instance (`DeletionPolicy: Snapshot` only snapshots the old one);
-    a restore follows [RESTORE.md](RESTORE.md) instead.
+    `ALLOW_REPLACE` never applies to the never-replaceable types
+    `AWS::RDS::DBInstance`, `AWS::CloudFront::Distribution` and
+    `AWS::S3::Bucket`: their replacement aborts even when named. A replaced
+    database is a new, empty instance (`DeletionPolicy: Snapshot` only
+    snapshots the old one) — a restore follows [RESTORE.md](RESTORE.md)
+    instead; a replaced distribution gets a new domain name under the
+    site's records, and a replaced bucket starts empty.
 
 `Replacement: Conditional` prints a `WARN` and continues. With
 `CONFIRM_CHANGESET=1` exported the script asks `y/N` before executing (the
@@ -198,8 +232,23 @@ clock skew) that is `CREATE_COMPLETE` and `AVAILABLE`. A failed stack update
 prints the latest stack events and exits before migrating.
 `backend/tests/core/test_changeset_gate.py` runs the gate on table-driven
 payloads and `deploy-backend.sh` end to end against fake `aws`, `sam` and
-`git`. The frontend deploy (`aws cloudformation deploy`) has no change-set
-gate.
+`git`.
+
+**Frontend change-set gate.** `deploy-frontend.sh` reviews its stack the
+same way. After the build it runs `aws cloudformation deploy
+--no-execute-changeset` with the same parameters, finds the change set (the
+ARN the command prints, else the newest one created since the deploy
+started, from `list-change-sets`) and pipes `describe-change-set` into
+`changeset_gate.py review`. The backend's rules apply except the
+`Database` master-password rule, which has nothing to match here:
+`Replacement: True` aborts except for the stateless types, `ALLOW_REPLACE`
+names ids to let through for one deploy, the `Distribution` and
+`SiteBucket` are never replaceable, and `CONFIRM_CHANGESET=1` asks `y/N`
+before executing. An aborted or declined change set is deleted, never
+executed. The script then executes it and waits for
+`stack-update-complete` (`stack-create-complete` on a first deploy),
+printing the latest stack events on a failure; "no changes" goes straight
+to the upload.
 
 **Live-parity parameters.** SAM CLI (1.162.1) and `aws cloudformation
 deploy` both send `UsePreviousValue` for every parameter a deploy does not
@@ -222,9 +271,12 @@ the two alert addresses):
   and `CspMode` the validated `CSP_MODE` (report-only unless `enforce`). The
   deploy log prints each override and the list of Defaults it passed.
 - **Empty template Default** (`AlertEmailPrimary`, `AlertEmailSecondary`,
-  `MailReplyTo`): passed only when exported, because SAM refuses an empty
-  override. Otherwise the stack keeps its current value, so a stale value is
-  replaced only by exporting a new one; no deploy can clear it back to empty.
+  `MailReplyTo`): passed when exported, never empty, because SAM refuses an
+  empty override. Otherwise the stack keeps its current value, so a stale
+  value is replaced only by exporting a new one; no deploy can clear it back
+  to empty. `AlertEmailPrimary` is the exception to "keeps": with nothing
+  exported the alert-address guard passes the stack's value explicitly, and
+  refuses when there is none.
 
 The certificate parameters stay outside the lists: `ApiCertificateArn` and
 the frontend's `CertificateArn` are passed only when a certificate ARN is
@@ -264,8 +316,11 @@ complaint, reject, rendering-failure and delivery-delay events land there
 too. Each address exported as `ALERT_EMAIL_PRIMARY` / `ALERT_EMAIL_SECONDARY`
 on a deploy gets an email subscription that must be confirmed from that
 inbox. Later deploys keep the addresses: their template Default is empty, so
-the deploy passes them only when exported and the stack keeps its value
-otherwise ("Live-parity parameters" above). Changing one means exporting the
+the deploy passes them when exported and keeps the stack's value otherwise
+— the primary one passed explicitly, and a deploy with no primary address
+at all refused ("Alert-address guard", "Live-parity parameters" above). An
+unconfirmed subscription delivers nothing: until its inbox confirms, the
+alarms do not reach that address. Changing one means exporting the
 new address on the next deploy, and it *replaces* that email subscription:
 the change-set gate prints a `WARN` for the replaced `AWS::SNS::Subscription`
 (a stateless type) and lets it through, and the new inbox must confirm the
@@ -275,7 +330,7 @@ counts as OK.
 | Alarm | Means | First response |
 |---|---|---|
 | `ApiServerErrors` | at least one API 5xx in 5 minutes | find the ERROR lines in `/saferide/api` at that time; roll back if a deploy just landed |
-| `ApiClientErrorsBurst` | 50 or more API 4xx in 5 minutes | read `/saferide/api` for the paths and whether one client repeats (broken release, looping phone, sign-in probing) |
+| `ApiClientErrorsBurst` | 50 or more API 4xx in 5 minutes | read `/saferide/api` for the paths and whether one client repeats (broken release, looping phone, sign-in probing); a throttled request (429) never reaches the function or its log and there is no access log, so if the log is quiet read the API's `4xx` metric and ask the drivers |
 | `ApiLatencyP95` | p95 over 3 s in 3 of 5 five-minute periods | check the database CPU and credit alarms and the API function's duration |
 | `ApiFunctionErrors` | the API function failed (init crash or timeout) | read the latest `/saferide/api` errors; roll back if a deploy just landed |
 | `ApiFunctionThrottles` | the API function was throttled in the last minute | check `AccountConcurrency` and the pings route for a looping client; raise the quota |
@@ -300,7 +355,8 @@ has its own topic, `saferide-ops-us-east-1` (output `OpsTopicUsEast1Arn`),
 with the same two addresses: export `ALERT_EMAIL_PRIMARY` /
 `ALERT_EMAIL_SECONDARY` on a `deploy-frontend.sh` run too, so the two topics
 make four confirmations. Later deploys keep them (`aws cloudformation deploy`
-reuses unpassed parameters); changing one replaces the us-east-1
+reuses unpassed parameters, and the alert-address guard passes the held
+primary address explicitly); changing one replaces the us-east-1
 subscription (a fresh confirmation) and the budget below. Two Route 53 health
 checks (outputs `ApiHealthCheckId`, `SiteHealthCheckId`) probe over HTTPS
 every 30 seconds from us-east-1, eu-west-1 and ap-southeast-1 and count any
@@ -373,17 +429,20 @@ inline styles, no framing).
 The operator checklist before Release 1a (SES production access, the Lambda
 quota, the `release/0` tag, the secret copy to af-south-1, the production
 Maps key and Map ID, the Route 53 preflight, the alert addresses, the deploy
-day) and the Release 1a deploy checklist (the gates before the deploy, what
-to watch in both deploys, the verification after it) are in
+day and window) and the Release 1a deploy checklist (the gates before the
+deploy — the 017 rehearsal on a production copy, the gate dry run, the
+fixed-name pre-checks, the baselines — what to watch in both deploys, the
+verification after it and the first 48 hours) are in
 [docs/runbooks/hardening-release-checklists.md](../docs/runbooks/hardening-release-checklists.md).
 
 ## Restore and rollback
 
 The restore and rollback runbook is [RESTORE.md](RESTORE.md): the decision
 between a code rollback, a data restore and a pepper rotation; code rollback
-by release tag (and what rolling back to `release/0` takes away);
-point-in-time restore into a scratch instance checked through the verify
-function; the rename swap that replaces production; the rehearsal; retained
+by release tag (and what rolling back to `release/0` takes away, the checks
+immediately before and after it); point-in-time restore into a scratch
+instance checked through the verify function; the rename swap that replaces
+production; the rehearsal, with 017 applied to the production copy; retained
 resources after a failed or reverted Release 1a; pepper rotation; who may run
 each step and what to record.
 
@@ -394,20 +453,28 @@ check set through the verify function (the database has no public endpoint)
 and prints its answer. The parameter is a school uuid for the school sets and
 the restore target, with a UTC offset, for `restore-compare`; it is sent
 as both `school_id` and `timestamp`, and the set reads the one it binds.
-The exit status comes after the answer (D24):
+Before the invoke it runs the verify-target check ("Deploy safety"): it
+refuses, with a non-zero exit, while the verify function points at another
+database than the stack's `DbEndpoint`, unless
+`ALLOW_VERIFY_TARGET_MISMATCH=1`. The invoke
+passes `--cli-read-timeout 0`: the CLI's default 60-second read timeout
+equals the verify function's `Timeout`, so a slow set would otherwise be
+cut off by the CLI and read as a failure. The exit status comes after the
+answer (D24):
 
 | Exit | Means |
 |---|---|
 | 0 | the verify function answered status `ok` |
 | 1 | no verify function on the stack, or it failed (`FunctionError`) |
 | 2 | usage |
-| 3 | the answer's status is not `ok` (unknown set, missing or invalid parameter) |
+| 3 | the answer's status is not `ok` (unknown set, missing or invalid parameter), or the answer is not JSON |
 | 4 | `--strict` only: status `ok`, but at least one check returned an `error` row instead of rows (the labels are named on stderr) |
+| other | the `aws` call itself failed: the CLI's own exit code (for example 255) |
 
-`--strict` goes first. An `error` row is an observation, not always a fault —
-on a database before 017, `hardening`'s 017 rows come back as errors, which is
-how "017 is not applied" reads — so the checklists say where `--strict`
-applies. The expected values live in the
+**In a checklist gate, any non-zero exit is a No-Go.** `--strict` goes
+first. An `error` row is an observation, not always a fault — on a database
+before 017, `hardening`'s 017 rows come back as errors, which is how "017 is
+not applied" reads — so the checklists say where `--strict` applies. The expected values live in the
 [release checklists](../docs/runbooks/hardening-release-checklists.md), the
 comments of each set in `backend/app/verify_handler.py` and the plans'
 Operational Notes; the script reports, the operator judges.

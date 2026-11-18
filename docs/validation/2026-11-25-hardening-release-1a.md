@@ -10,8 +10,9 @@
 - **Surface:** migration 017 (additive account-hardening schema) and the
   read-only `hardening` and `restore-compare` verify sets; deploy fail-fast on
   a missing secret in af-south-1, clean-checkout rule, open-run refusal,
-  change-set gate (`infra/scripts/changeset_gate.py`), production seed gate
-  and version stamp; `verify-db.sh` exit codes and `--strict`; the backend
+  change-set gate (`infra/scripts/changeset_gate.py`) on both stacks,
+  alert-address guard, verify-target check, production seed gate and
+  version stamp; `verify-db.sh` exit codes and `--strict`; the backend
   stack's database hardening, JSON logs in retained 90-day groups (`httpx`
   and `httpcore` held at WARNING), passive alarms to two operators, SES
   identity and DNS, CloudTrail; the frontend stack's security headers (CSP
@@ -22,7 +23,7 @@
   Release 1a deploy checklist in
   `docs/runbooks/hardening-release-checklists.md` and the restore and
   rollback runbook in `infra/RESTORE.md` (both moved out of
-  `infra/README.md` in this record's commit). No user-facing behaviour
+  `infra/README.md` in `ca92d4e`). No user-facing behaviour
   changes: nothing reads 017's objects until Release 1b.
 - **Not deployed.** Local evidence only. Every operator and production row
   below is open; fill them in at the deploy.
@@ -47,7 +48,9 @@
 | `a305a50` | review B.5, B.6 | `FRONTEND_PARAMS` and one `PARITY_PAIRS` list, `deploy-frontend.sh` passes every frontend parameter with a Default (incl. `MonthlyBudgetUsd`); `verify-db.sh` exits 3 on a status other than `ok` and 4 under `--strict` on an error row (D24); fake-CLI tests |
 | `104985d` | review B.1–B.4, B.7, B.8 | Change-set gate as `changeset_gate.py` with the stateless-replacement rule and `ALLOW_REPLACE`; explicit `--stack-name`/`--region` on `sam deploy`; `provider-bootstrap` read with `ssm_required`; push seeding through a 0600 file; `provider-bootstrap.sh` refuses to mint on a read error; open-run refusal with `ALLOW_OPEN_RUNS`; behavioural deploy-guard tests |
 | `a16327e` | review B | `ALLOW_REPLACE` never covers an `AWS::RDS::DBInstance`; the superseded frontend parameter text test removed |
-| this record | review D, U1, U6 docs | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, with pointers left in `infra/README.md` and every reference re-pointed; the README, checklists and runbook describe the review fixes; this record brought up to date |
+| `ca92d4e` | review D, U1, U6 docs | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, with pointers left in `infra/README.md` and every reference re-pointed; the README, checklists and runbook describe the review fixes; this record brought up to date |
+| pending (parallel worktree) | review E-code | E1 alert-address guard (`ALLOW_NO_ALERTS`), E2 open-run re-check before execution, E3 frontend change-set gate (Distribution and Bucket never replaceable), E4 `verify-db.sh --cli-read-timeout 0`, E5 verify-target check (`ALLOW_VERIFY_TARGET_MISMATCH`); fake-CLI tests. Record the SHA when it lands |
+| this record | review E-docs | The deployment-verification review's corrections and the adversarial residuals in the checklists, `infra/RESTORE.md` and `infra/README.md`; E1–E5 documented; the gate dry run and the 017 production-copy rehearsal added as open gates |
 
 ## Go/No-Go gates (plan §Operational Notes, Release 1a checklist)
 
@@ -61,6 +64,7 @@
 | Change-set gate: master-password change and non-stateless replacement abort; stateless replacement, `Conditional` and `ALLOW_REPLACE` warn; `ALLOW_REPLACE` never covers the database; an aborted or declined change set is deleted, never executed | `test_changeset_gate.py` 49 passed (table-driven payloads plus `deploy-backend.sh` end to end against fake `aws`/`sam`/`git`) at `a16327e` | **met locally** |
 | Open-run refusal before `sam build`; `ALLOW_OPEN_RUNS=1` overrides | Same file: `open-runs` 1 refuses, 0 proceeds, the override proceeds, and every way the count can be unreadable refuses | **met locally** |
 | `verify-db.sh` exit codes 0/1/2/3/4 and `--strict` (D24) | `test_verify_db_script.py` 15 passed against a fake `aws` at `a305a50` | **met locally** |
+| Batch E-code: alert-address guard (`ALLOW_NO_ALERTS`), open-run re-check before execution, frontend change-set gate (Distribution and Bucket never replaceable), `verify-db.sh` read timeout and CLI-failure exit, verify-target check (`ALLOW_VERIFY_TARGET_MISMATCH`) | Implemented with fake-CLI tests in a parallel worktree; record the commit and the test counts when it lands | **open** |
 | Maps key and searched addresses kept out of INFO logs (D20) | `test_logging_hygiene.py` 6 passed (fresh interpreter per entry path, with a control showing bare `httpx` logs the key) at `54ca7ba` | **met locally** |
 | Every parity parameter reaches the stack on each deploy, both stacks | `test_deploy_params.py` 32 passed (backend and frontend templates, `deploy-frontend.sh` end to end) at `a305a50`; first recorded as 25 at `0d953eb` | **met locally** |
 | SSM copy helper never writes in report mode, never overwrites, never exposes a value | `test_copy_ssm_script.py` 25 passed against a fake `aws` at `0d953eb`, again at `639954e` under `nohup` | **met locally** |
@@ -72,25 +76,32 @@
 | U1.4 five `values MATCH` lines from `copy-ssm-to-backend-region.sh` | | **open** |
 | U1.5 production Map ID and restricted browser key stored in af-south-1 | | **open** |
 | U1.6 Route 53 preflight clean on the deploy day | clean on 2026-11-17 (D11); re-check due on the day | **open** |
-| U1.7 alert addresses confirmed and exported for both deploys | | **open** |
-| U1.8 no-run day agreed; `open-runs` 0 at the deploy (`tenancy-preflight` before 1a; the deploy's own open-run refusal reads the same row) | | **open** |
+| U1.7 alert addresses confirmed and exported for both deploys; the four confirmations within 48 hours, proved after the deploy (+1 h and +47 h) | | **open** |
+| U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | | **open** |
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | | **open** |
+| **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | | **open** |
+| Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | | **open** |
+| **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | | **open** |
+| Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | | **open** |
+| Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | | **open** |
+| Stray-variable check prints only the intended exports; no `ALLOW_*` | | **open** |
 | Live parity values read before the first explicit-parameter deploy | | **open** |
 | Manual pre-1a snapshot id recorded | | **open** |
-| `release/1a` tagged at the certified commit; HEAD on it | | **open** |
-| Change set: no `MasterUserPassword`, no replacement and no `WARN` line, no unexplained removal | | **open** |
+| `release/1a` tagged at the certified commit and pushed on the user's go; HEAD on it | | **open** |
+| Change set: no `MasterUserPassword`, no replacement and no `WARN` line, no unexplained removal, the same table as the dry run; override lines reconciled (only the addresses and a granted threshold); open-run re-check passed before execution | | **open** |
 | Migrate result: `017_account_hardening` applied; seeds skipped by name; `app_role.synced` | | **open** |
-| Frontend deployed with `CSP_MODE=report-only` | | **open** |
-| `verify-db.sh --strict migrations` exits 0 and lists 017 (with the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows); `--strict hardening` exits 0: `017-objects-present` all true, `schools-without-driver-code` 0; `instance-settings` recorded | | **open** |
+| Frontend change set: `Distribution` and the four alias records replacement `False`, no `WARN`; deployed with `CSP_MODE=report-only` | | **open** |
+| `verify-db.sh --strict migrations` exits 0 and, against the baseline, adds only 017 (the seed markers and the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows remain); `tenancy-preflight` `school-rows`, `users-by-role`, `audit-by-school` identical; `--strict hardening` exits 0: `017-objects-present` all true, `schools-without-driver-code` 0; `instance-settings` and the 1b baselines recorded | | **open** |
 | Headers on apex, www, a deep route and `/sw.js` (report-only CSP, no enforcing CSP) | | **open** |
 | RDS properties as set (maintenance `sun:00:00-sun:01:00`, no log export), `PendingModifiedValues` empty | | **open** |
-| Alarms `OK`/`INSUFFICIENT_DATA` in both regions; four subscriptions confirmed | | **open** |
+| Alarms `OK`/`INSUFFICIENT_DATA` in both regions (the probe alarms re-read after 10 minutes); `AccountConcurrency` threshold 800 or 8; four subscriptions confirmed | | **open** |
 | Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | | **open** |
 | SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | | **open** |
 | CloudTrail logging, objects in the bucket | | **open** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | | **open** |
 | Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | | **open** |
 | 90-day retention set on the three old `/aws/lambda/*` groups | | **open** |
+| First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | | **open** |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | | **open** |
 
 ## Decisions taken during execution
@@ -127,11 +138,13 @@ From the execution decisions (2026-11-17), all for Release 1a:
   CloudFront, the certificate and the budget.
 - **D13** The fixed-name resources (the three `/saferide/*` log groups, the
   SES identity) carry `RetainExceptOnCreate` (`566b136`): a failed 1a update
-  deletes what it had just created, so the retry has nothing to clean up; a
-  deliberate rollback to `release/0` or a stack delete leaves them behind,
-  to be deleted or imported before 1a is deployed again
-  (`infra/RESTORE.md`, "Retained resources"). The CloudFormation-named trail
-  bucket stays plain `Retain`.
+  deletes what it had just created — though Lambda can create a
+  `/saferide/*` group again if a function runs after that deletion, so the
+  log groups are checked and deleted before the retry (corrected after the
+  deployment-verification re-run); a deliberate rollback to `release/0` or a
+  stack delete leaves them behind, to be deleted or imported before 1a is
+  deployed again (`infra/RESTORE.md`, "Retained resources"). The
+  CloudFormation-named trail bucket stays plain `Retain`.
 - **D14** `restore-compare` binds a validated timestamp with an offset.
 - **D15** Secrets move between regions by pipe and file only, matched by
   digest; the default-region copies are deleted one week after Release 2 is
@@ -197,7 +210,8 @@ Found and decided while finishing the unit (`0d953eb` and `ebdc123`):
 - **A manual snapshot before the deploy** is in the checklist: a rollback to
   `release/0` would cut automated backups from 35 to 7 days.
 - **Retained resources after a failed or reverted 1a:** a failed 1a update
-  cleans up after itself (`RetainExceptOnCreate`); after a deliberate
+  cleans up after itself (`RetainExceptOnCreate`), except a `/saferide/*`
+  group Lambda re-creates after the rollback deleted it; after a deliberate
   rollback to `release/0` or a stack delete, the runbook's default is to
   delete the log groups (after copying what the incident needs) and the SES
   identity; importing them is described but unrehearsed.
@@ -217,7 +231,40 @@ batches, applied in order:
 | A1 — backend app, migration, integration test | `54ca7ba` | `httpx`/`httpcore` at WARNING (D20) with a fresh-interpreter test; the verify handler's import-time registry check removed (its unit test is the single home); 017 locks the most-referenced tables last (`live_schools` group last); 017 rehearsed over a populated pre-017 shape through `pgconn.exec_`; seeded-parent comment corrected |
 | A2 — templates and their tests | `a12bc01` | No RDS log export and no alarm description pointing at one (D21); maintenance `sun:00:00-sun:01:00` (D22); platform logs at INFO; generated budget name (D23); `ApiProbeFailing` says the probe is database-aware only from 1b; shared `template_text.py` reader with a vacuity guard; per-alarm property table, topic-policy and trail tests |
 | B — deploy scripts and behavioural tests | `a305a50`, `104985d`, `a16327e` | `changeset_gate.py` with the stateless-replacement rule and `ALLOW_REPLACE` (never the database); explicit stack and region on `sam deploy`; `provider-bootstrap` read with `ssm_required`; push seeding through a 0600 file, aborting on read errors; `provider-bootstrap.sh` refuses to mint on any read error; `ssm_required` always af-south-1; one `PARITY_PAIRS` list plus `FRONTEND_PARAMS` with `MONTHLY_BUDGET_USD`; `verify-db.sh` exit codes and `--strict` (D24); open-run refusal with `ALLOW_OPEN_RUNS`; fake-CLI tests for all of it |
-| D — documentation | this record | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, references re-pointed; README alarms, budget, logging, probe, gate, open-run, parity, seeding and `verify-db.sh` text brought in line with A1–B; the runbook checks `cli_history` first, re-applies the new property set without a log export and reads the `no_pin` column during a pepper rotation; the source-region delete uses the region the copy helper printed; this record |
+| D — documentation | `ca92d4e` | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, references re-pointed; README alarms, budget, logging, probe, gate, open-run, parity, seeding and `verify-db.sh` text brought in line with A1–B; the runbook checks `cli_history` first, re-applies the new property set without a log export and reads the `no_pin` column during a pepper rotation; the source-region delete uses the region the copy helper printed; this record |
+
+The re-run adversarial and deployment-verification reviewers (2026-11-18,
+against `ca92d4e`) were synthesised into a fifth batch:
+
+- **Adversarial:** no actionable findings. Its residuals are adopted: the
+  gate dry run on the real stack before the deploy day (how CloudFormation
+  reports the `NoEcho` master password), the open-run re-check immediately
+  before execution, a rollback's logging check (`release/0` has no `httpx`
+  pin), the `/saferide/*` groups Lambda can re-create after a failed 1a, and
+  the never-rehearsed HTTP API route removal on a rollback.
+- **Deployment verification:** its corrections are adopted (sections 1–4 of
+  its report): the post-deploy proofs of operator steps 2 and 7 and the
+  48-hour confirmation rule; "none created today" before 1a from `gps`;
+  017 rehearsed on a production copy through the migrate function, and the
+  "migrate fails" branch; the fixed-name pre-checks; both functions read
+  back on production; the stray-variable check and the override
+  reconciliation; the 16:30–22:30 UTC window; baselines before and diffs
+  after; the frontend change-set review; the tag push on the user's go;
+  the probe-alarm settling time; the 1b baselines; the `verify-db.sh` exit
+  table; the rollback preconditions, snapshot, read-backs and redeploy
+  exports; the first 48 hours' monitoring.
+
+| Batch | Commits | Fixed |
+|---|---|---|
+| E-code — deploy guards | pending (parallel worktree) | E1 alert-address guard on both deploys (`ALLOW_NO_ALERTS`; the held primary address passed explicitly); E2 open-run re-check before `execute-change-set`; E3 frontend change-set gate through `changeset_gate.py`, with `AWS::CloudFront::Distribution` and `AWS::S3::Bucket` never replaceable; E4 `verify-db.sh` invokes with `--cli-read-timeout 0` and exits with the CLI's code when the call fails; E5 verify-target check in the open-run check and `verify-db.sh` (`ALLOW_VERIFY_TARGET_MISMATCH`) |
+| E-docs — documentation | this record | The corrections above in the checklists, `infra/RESTORE.md` and `infra/README.md` ("Alert-address guard", "Verify-target check", "Frontend change-set gate", the `verify-db.sh` exit table); two new open gates: the gate dry run and the 017 production-copy rehearsal |
+
+The 017 rehearsal as reviewed swaps only the migrate function's
+`DATABASE_URL`, but the deployed migrate function is `release/0`'s package,
+which has no 017 file: it must also carry 1a's migrate package for the
+rehearsal. How that package reaches the function and goes back is an open
+decision for the user, recorded with the gate (`infra/RESTORE.md`, "017 on
+the production copy").
 
 Residuals deferred:
 
@@ -240,7 +287,8 @@ Residuals deferred:
 
 | Command | Result |
 |---|---|
-| `../.venv/bin/python -m pytest -q tests/core` (backend unit, from `backend/`, with this record's changes) | 464 passed |
+| `../.venv/bin/python -m pytest -q tests/core` (backend unit, from `backend/`, at `ca92d4e`) | 464 passed |
+| `../.venv/bin/python -m pytest -q tests/core` (backend unit, from `backend/`, with the E-docs changes, 2026-11-18) | 464 passed |
 | `pytest tests/core/test_changeset_gate.py`, `test_deploy_guards.py`, `test_verify_db_script.py`, `test_logging_hygiene.py`, `test_deploy_params.py`, `test_copy_ssm_script.py`, `test_backend_stack.py`, `test_frontend_stack.py` (2026-11-18, at `a16327e`) | 49, 37, 15, 6, 32, 25, 39 and 21 passed |
 | `.venv/bin/python -m pytest -q` (backend unit, from `backend/`, at `54ca7ba`) | 584 passed, 561 skipped (integration self-skips without `RUN_INTEGRATION`) |
 | `.venv/bin/python -m pytest -q` (backend unit, from `backend/`, at `0d953eb`) | 578 passed, 560 skipped |
@@ -260,21 +308,34 @@ Residuals deferred:
   that tag's own scripts (`infra/RESTORE.md`, "Code rollback"). Migration 017
   stays: it is additive, every new column is nullable or defaulted, the audit
   CHECK is a superset, and `release/0`'s code never reads the new objects.
-- **Preconditions:** the default-region secret copies exist and match
-  (`copy-ssm-to-backend-region.sh` in the deploying shell), because
-  `release/0`'s script reads them there and mints a missing one. After the
-  D15 deletion `release/0` is no longer a rollback target.
+- **Preconditions, immediately before the `release/0` deploy** (it has no
+  open-run refusal and no gate): `verify-db.sh hardening` →
+  `open-runs-and-today` 0 and the seed markers still listed by
+  `migrations` (`release/0`'s migrate step has no seed gate); the
+  default-region secret copies exist and match (`copy-ssm-to-backend-region.sh`
+  in the deploying shell), because `release/0`'s script reads them there and
+  mints a missing one; a fresh manual snapshot kept at least 35 days. After
+  the D15 deletion `release/0` is no longer a rollback target.
+- **After any rollback:** the three functions' `LoggingConfig` read; JSON at
+  INFO is set to WARN at once (`release/0` has no `httpx` pin); the
+  database windows and storage limit read back and recorded; a stack stuck
+  in `UPDATE_ROLLBACK_FAILED` on the never-rehearsed HTTP API route removal
+  is continued skipping the stage, on the user's go. A later 1a redeploy
+  re-exports the alert addresses, a granted concurrency threshold, any mail
+  or throttle override and the budget, and needs four confirmations again.
 - **What reverts with `release/0`'s templates:** the alarms, topics and
   subscriptions, the SES configuration set and mail records, the trail, the
   JSON logging, the headers policy, probes and budget; the database returns
   to 7-day backups with deletion protection off, so RDS drops automated
-  backups older than 7 days (the manual pre-1a snapshot stays). The frontend
+  backups older than 7 days (the manual snapshots stay); whether the windows
+  and storage limit revert is not asserted. The frontend
   build returns to `frontend/.env.local`'s development Maps key and demo Map
   ID.
 - **Retained resources (D13, `RetainExceptOnCreate`):** a failed 1a update
-  rolls back cleanly — the log groups and the SES identity it had just
-  created are deleted with it. A deliberate rollback to `release/0` or a
-  stack delete leaves the fixed-name `/saferide/*` log groups and SES
+  deletes the log groups and the SES identity it had just created, but a
+  function that runs after that can make Lambda re-create a `/saferide/*`
+  group: check and delete before the retry. A deliberate rollback to
+  `release/0` or a stack delete leaves the fixed-name `/saferide/*` log groups and SES
   identity behind, and they must be deleted or imported before 1a is
   deployed again; the CloudFormation-named trail bucket (plain `Retain`) is
   left behind after any rollback and never clashes.
@@ -284,7 +345,9 @@ Residuals deferred:
 
 ## Deployed
 
-Not deployed. At the deploy, record here: the window (UTC and EAT), the
-release commit and tag, the change-set table, the migrate result, the
-post-deploy rows above with their outputs, the alarm-drill times, the
-phone-check CSP lines, and the SES status at +24 h and +72 h.
+Not deployed. At the deploy, record here: the window (UTC and EAT) and the
+instance's windows read before it, the release commit and tag, the
+baselines and their diffs, both change-set tables, the migrate result, the
+post-deploy rows above with their outputs, the 1b baselines, the
+alarm-drill times, the phone-check CSP lines, the SES status at +24 h and
++72 h, and each of the first 48 hours' checks with its time.
