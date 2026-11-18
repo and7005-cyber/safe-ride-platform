@@ -145,7 +145,7 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 # for that deploy only — repeat it, or change the Default in a release. The
 # alert addresses and MailReplyTo have empty Defaults: passed only when
 # exported (SAM rejects an empty override), otherwise the stack keeps its value.
-build_parity_params "$INFRA_DIR/backend/template.yaml"
+build_parity_params "$INFRA_DIR/backend/template.yaml" "${PARITY_PAIRS[@]}"
 
 cd "$INFRA_DIR/backend"
 

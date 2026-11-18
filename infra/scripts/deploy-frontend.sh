@@ -8,10 +8,12 @@
 #
 # CSP_MODE=report-only|enforce (default report-only) picks the content-security
 # policy header; ALERT_EMAIL_PRIMARY / ALERT_EMAIL_SECONDARY subscribe to the
-# us-east-1 alarm topic and the cost budget (infra/README.md, "Alarms" and
+# us-east-1 alarm topic and the cost budget; MONTHLY_BUDGET_USD overrides the
+# budget's template Default for this deploy (infra/README.md, "Alarms" and
 # "Security headers").
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/parity-params.sh"
 
 # A committed tree on origin/main or a release/* tag (config.sh).
 require_clean_checkout
@@ -44,6 +46,20 @@ API_BASE_URL="${VITE_API_BASE_URL:-https://${API_DOMAIN}}"
 # The stack's CSP connect-src and API probe use the origin this build calls.
 API_ORIGIN="${API_BASE_URL%/}"
 
+# --- Stack parameters ----------------------------------------------------------
+# `aws cloudformation deploy` reuses a parameter's previous value when it is not
+# passed, so every frontend parameter with a template Default is passed on every
+# deploy (scripts/parity-params.sh, FRONTEND_PARAMS): CspMode is always the
+# mode asked for now (report-only unless CSP_MODE=enforce), never a leftover;
+# DomainName, HostedZoneId and ApiOrigin follow config.sh and this build;
+# MonthlyBudgetUsd is MONTHLY_BUDGET_USD when exported, else the template
+# Default. The alert addresses, like the backend's, are passed when exported
+# and kept otherwise. Assembled before the build, so a template the parity
+# reader cannot parse stops the deploy before anything is built.
+DEPLOY_PARAMS=()
+[ -n "$CF_CERT_ARN" ] && DEPLOY_PARAMS+=("CertificateArn=${CF_CERT_ARN}")
+build_parity_params "$INFRA_DIR/frontend/template.yaml" "${FRONTEND_PARAMS[@]}"
+
 echo "==> Building frontend with VITE_API_BASE_URL=${API_BASE_URL} and the production Maps key and Map ID from SSM (not printed)"
 cd "$REPO_DIR/frontend"
 VITE_API_BASE_URL="$API_BASE_URL" \
@@ -52,31 +68,11 @@ VITE_API_BASE_URL="$API_BASE_URL" \
   npm run build
 
 echo "==> Deploying frontend stack (region ${CF_REGION}, cert: ${CF_CERT_ARN:-<none>}, CspMode=${CSP_MODE})"
-# `aws cloudformation deploy` reuses a parameter's previous value when it is not
-# passed. CspMode is therefore passed on every deploy, so the header is always
-# the mode asked for now (report-only unless CSP_MODE=enforce), never a leftover;
-# the alert addresses, like the backend's, are passed when exported and kept
-# otherwise.
-FE_PARAMS=(
-  "DomainName=${DOMAIN}"
-  "HostedZoneId=${HOSTED_ZONE_ID}"
-  "ApiOrigin=${API_ORIGIN}"
-  "CspMode=${CSP_MODE}"
-)
-[ -n "$CF_CERT_ARN" ] && FE_PARAMS+=("CertificateArn=${CF_CERT_ARN}")
-if [ -n "${ALERT_EMAIL_PRIMARY:-}" ]; then
-  FE_PARAMS+=("AlertEmailPrimary=${ALERT_EMAIL_PRIMARY}")
-  echo "==> Parameter override: AlertEmailPrimary (from \$ALERT_EMAIL_PRIMARY)"
-fi
-if [ -n "${ALERT_EMAIL_SECONDARY:-}" ]; then
-  FE_PARAMS+=("AlertEmailSecondary=${ALERT_EMAIL_SECONDARY}")
-  echo "==> Parameter override: AlertEmailSecondary (from \$ALERT_EMAIL_SECONDARY)"
-fi
 aws cloudformation deploy \
   --region "$CF_REGION" \
   --stack-name "$FRONTEND_STACK" \
   --template-file "$INFRA_DIR/frontend/template.yaml" \
-  --parameter-overrides "${FE_PARAMS[@]}" \
+  --parameter-overrides "${DEPLOY_PARAMS[@]}" \
   --no-fail-on-empty-changeset
 
 BUCKET="$(cfn_output "$FRONTEND_STACK" "$CF_REGION" BucketName)"

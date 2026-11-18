@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
-# Live-parity parameters of the backend stack, sourced by deploy-backend.sh
-# (infra/README.md, "Deploy safety"). backend/tests/core/test_deploy_params.py
-# runs build_parity_params on its own.
+# Live-parity parameters of the backend and frontend stacks, sourced by
+# deploy-backend.sh and deploy-frontend.sh (infra/README.md, "Deploy safety").
+# backend/tests/core/test_deploy_params.py runs build_parity_params on its own.
 #
 # The rule: the live stack runs each parameter's template Default unless the
-# operator exports an override for this deploy. SAM CLI sends UsePreviousValue
-# for every parameter a deploy does not pass, so on an existing stack a changed
-# template Default never reached it and a one-off export stuck until another
-# export. build_parity_params therefore passes every parameter below that has a
+# operator exports an override for this deploy. SAM CLI and `aws
+# cloudformation deploy` both send UsePreviousValue for every parameter a
+# deploy does not pass, so on an existing stack a changed template Default
+# never reached it and a one-off export stuck until another export.
+# build_parity_params therefore passes every listed parameter that has a
 # non-empty template Default on EVERY deploy: the exported variable when it is
-# set and non-empty, otherwise the Default read from template.yaml. A
-# parameter whose Default is empty (the alert addresses, MailReplyTo) is passed
-# only when its variable is set, because SAM refuses an empty override: its
-# previous value stays until a new one is exported, and no deploy can clear it.
+# set and non-empty, otherwise the Default read from the template. A parameter
+# whose Default is empty (the alert addresses, MailReplyTo) is passed only when
+# its variable is set, because SAM refuses an empty override: its previous
+# value stays until a new one is exported, and no deploy can clear it.
 #
 # Each pair is TemplateParameter:ENV_NAME.
 
-# GPS tracking system defaults (GPS plan U11), under the names the app's
-# Settings read. Schools override the first five per school in School
-# Settings; the last two are system-wide.
-GPS_PARAMS=(
+# Backend stack (infra/backend/template.yaml), passed by deploy-backend.sh.
+PARITY_PAIRS=(
+  # GPS tracking system defaults (GPS plan U11), under the names the app's
+  # Settings read. Schools override the first five per school in School
+  # Settings; the last two are system-wide.
   GpsCustodyThresholdM:GPS_CUSTODY_THRESHOLD_M
   GpsVicinityRadiusM:GPS_VICINITY_RADIUS_M
   GpsFixAccuracyCapM:GPS_FIX_ACCURACY_CAP_M
@@ -27,11 +29,9 @@ GPS_PARAMS=(
   GpsPingIntervalS:GPS_PING_INTERVAL_S
   GpsStaleAfterS:GPS_STALE_AFTER_S
   GpsFixWaitBudgetS:GPS_FIX_WAIT_BUDGET_S
-)
-# API-stage throttling (GPS plan U14; sign-in and school lookup, hardening D6).
-# These are API Gateway settings, not app Settings — no GPS_ prefix, and the
-# app never reads them.
-API_THROTTLE_PARAMS=(
+  # API-stage throttling (GPS plan U14; sign-in and school lookup, hardening
+  # D6). These are API Gateway settings, not app Settings — no GPS_ prefix,
+  # and the app never reads them.
   ApiDefaultBurstLimit:API_DEFAULT_BURST_LIMIT
   ApiDefaultRateLimit:API_DEFAULT_RATE_LIMIT
   PingsRouteBurstLimit:API_PINGS_BURST_LIMIT
@@ -40,27 +40,43 @@ API_THROTTLE_PARAMS=(
   PinLoginRouteRateLimit:API_PIN_LOGIN_RATE_LIMIT
   SchoolLookupRouteBurstLimit:API_SCHOOL_LOOKUP_BURST_LIMIT
   SchoolLookupRouteRateLimit:API_SCHOOL_LOOKUP_RATE_LIMIT
-)
-# Transactional email settings (hardening U4) under the names the app's
-# Settings read. Release 1b's sender reads them; MAIL_ENABLED stays false until
-# then. MailConfigurationSet names a create-only resource, so the change-set
-# gate refuses a rename (replacement). MailReplyTo has an empty Default.
-MAIL_PARAMS=(
+  # Transactional email settings (hardening U4) under the names the app's
+  # Settings read. Release 1b's sender reads them; MAIL_ENABLED stays false
+  # until then. MailConfigurationSet names a create-only resource, so the
+  # change-set gate refuses a rename (replacement). MailReplyTo has an empty
+  # Default.
   MailFromAddress:MAIL_FROM_ADDRESS
   MailReplyTo:MAIL_REPLY_TO
   MailConfigurationSet:MAIL_CONFIGURATION_SET
   MailEnabled:MAIL_ENABLED
-)
-# Alarm recipients and the concurrency alarm (hardening U4, D16, D19). Each
-# address set becomes one email subscription to the ops topic, confirmed from
-# that inbox; both have empty Defaults, so export them on the first deploy that
-# should alert and they stay. ConcurrencyAlarmThreshold (Default 8, 80% of the
-# account's 10) follows the full rule: export CONCURRENCY_ALARM_THRESHOLD on
-# every deploy once the quota is raised, until a release raises the Default.
-ALERT_PARAMS=(
+  # Alarm recipients and the concurrency alarm (hardening U4, D16, D19). Each
+  # address set becomes one email subscription to the ops topic, confirmed
+  # from that inbox; both have empty Defaults, so export them on the first
+  # deploy that should alert and they stay. ConcurrencyAlarmThreshold (Default
+  # 8, 80% of the account's 10) follows the full rule: export
+  # CONCURRENCY_ALARM_THRESHOLD on every deploy once the quota is raised,
+  # until a release raises the Default.
   AlertEmailPrimary:ALERT_EMAIL_PRIMARY
   AlertEmailSecondary:ALERT_EMAIL_SECONDARY
   ConcurrencyAlarmThreshold:CONCURRENCY_ALARM_THRESHOLD
+)
+
+# Frontend stack (infra/frontend/template.yaml), passed by deploy-frontend.sh.
+# DOMAIN and HOSTED_ZONE_ID come from config.sh; deploy-frontend.sh sets
+# API_ORIGIN from the URL the build calls and CSP_MODE (report-only unless
+# exported) after validating it. MonthlyBudgetUsd follows the full rule:
+# export MONTHLY_BUDGET_USD on every deploy, or change the Default in a
+# release. The alert addresses are the backend's, passed when exported.
+# CertificateArn is not here: deploy-frontend.sh passes it only when a cert
+# ARN is known, like the backend's ApiCertificateArn.
+FRONTEND_PARAMS=(
+  DomainName:DOMAIN
+  HostedZoneId:HOSTED_ZONE_ID
+  ApiOrigin:API_ORIGIN
+  CspMode:CSP_MODE
+  MonthlyBudgetUsd:MONTHLY_BUDGET_USD
+  AlertEmailPrimary:ALERT_EMAIL_PRIMARY
+  AlertEmailSecondary:ALERT_EMAIL_SECONDARY
 )
 
 # template_parameter_defaults template name... -> one "Name=Default" line per
@@ -116,18 +132,26 @@ for name in names:
 PY
 }
 
-# build_parity_params template -> appends "Name=value" for every parity
-# parameter to the caller's DEPLOY_PARAMS array, by the rule at the top, and
-# says on stdout which values were exported and which are template Defaults.
-# Returns non-zero (nothing appended) when the template cannot be read.
+# build_parity_params template pair... -> appends "Name=value" for every
+# TemplateParameter:ENV_NAME pair to the caller's DEPLOY_PARAMS array, by the
+# rule at the top, and says on stdout which values were exported and which are
+# template Defaults. Returns non-zero (nothing appended) when no pair is given
+# or the template cannot be read.
+#   build_parity_params "$INFRA_DIR/backend/template.yaml" "${PARITY_PAIRS[@]}"
+#   build_parity_params "$INFRA_DIR/frontend/template.yaml" "${FRONTEND_PARAMS[@]}"
 build_parity_params() {
-  local template="$1" defaults pair param var default line
+  local template="${1:-}" defaults pair param var default line
   local names=() at_default=()
-  for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}" "${MAIL_PARAMS[@]}" "${ALERT_PARAMS[@]}"; do
+  if [ "$#" -lt 2 ]; then
+    echo "ERROR: build_parity_params needs a template and at least one Parameter:ENV pair" >&2
+    return 1
+  fi
+  shift
+  for pair in "$@"; do
     names+=("${pair%%:*}")
   done
   defaults="$(template_parameter_defaults "$template" "${names[@]}")" || return 1
-  for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}" "${MAIL_PARAMS[@]}" "${ALERT_PARAMS[@]}"; do
+  for pair in "$@"; do
     param="${pair%%:*}"; var="${pair##*:}"
     default=""
     while IFS= read -r line; do
