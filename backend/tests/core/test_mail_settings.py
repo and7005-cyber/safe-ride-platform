@@ -6,19 +6,19 @@ equals the Settings default, lands in the API function's environment under
 the alias Settings reads, is passable from deploy-backend.sh under that same
 name, and is documented in backend/.env.example. The live-parity rule of
 test_gps_settings.py, for string parameters. No code sends mail yet, so
-MAIL_ENABLED is false everywhere. Pure text inspection of the template.
+MAIL_ENABLED is false everywhere. Pure text inspection of the template
+(template_text.py).
 """
 
 import re
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from tests.core.template_text import REPO, load, unquote
 
-REPO = Path(__file__).resolve().parents[3]
-TEMPLATE = (REPO / "infra" / "backend" / "template.yaml").read_text(encoding="utf-8")
+T = load("backend")
 # The parity maps deploy-backend.sh sources (test_deploy_params.py runs them).
 PARITY_SCRIPT = (REPO / "infra" / "scripts" / "parity-params.sh").read_text(encoding="utf-8")
 ENV_EXAMPLE = (REPO / "backend" / ".env.example").read_text(encoding="utf-8")
@@ -54,36 +54,6 @@ def _as_template_text(value) -> str:
     return str(value)
 
 
-def _unquote(text: str) -> str:
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        return text[1:-1]
-    return text
-
-
-def _template_parameter(name: str) -> dict[str, str]:
-    """The `Key: value` lines of one Parameters entry, by indentation."""
-    match = re.search(rf"^  {name}:\n((?:    .*\n)+)", TEMPLATE, re.M)
-    assert match, f"template Parameter {name} missing"
-    return dict(re.findall(r"^    (\w+): (.+?)\s*$", match.group(1), re.M))
-
-
-def _resource_block(logical_id: str) -> str:
-    start = TEMPLATE.index(f"\n  {logical_id}:\n")
-    tail = TEMPLATE[start + 1:]
-    end = re.search(r"^  \w+:\n", tail[1:], re.M)
-    return tail[: end.start() + 1] if end else tail
-
-
-def _function_env(logical_id: str) -> dict[str, str]:
-    variables = re.search(
-        r"^      Environment:\n        Variables:\n((?:          .*\n)+)",
-        _resource_block(logical_id),
-        re.M,
-    )
-    assert variables, f"{logical_id} has no Environment.Variables block"
-    return dict(re.findall(r"^          (\w+): (.+?)\s*$", variables.group(1), re.M))
-
-
 # --- Settings fields -----------------------------------------------------------
 
 
@@ -114,34 +84,31 @@ def test_mail_enabled_reads_the_strings_the_template_passes():
 
 @pytest.mark.parametrize("field,alias,param,default", [(f, *v) for f, v in MAIL_FIELDS.items()])
 def test_template_parameter_default_equals_settings_default(field, alias, param, default):
-    entry = _template_parameter(param)
+    entry = T.parameter(param)
     assert entry["Type"] == "String"
-    assert _unquote(entry["Default"]) == default == _as_template_text(getattr(_settings(), field))
+    assert unquote(entry["Default"]) == default == _as_template_text(getattr(_settings(), field))
 
 
 def test_mail_enabled_parameter_allows_only_true_or_false():
-    assert _template_parameter("MailEnabled")["AllowedValues"] == '["true", "false"]'
+    assert T.parameter("MailEnabled")["AllowedValues"] == '["true", "false"]'
 
 
 @pytest.mark.parametrize("alias,expected", ENV_VALUES.items())
 def test_api_function_env_carries_every_alias(alias, expected):
-    assert _function_env("ApiFunction")[alias] == expected
+    assert T.function_env("ApiFunction")[alias] == expected
 
 
 def test_the_configuration_set_is_named_by_the_parameter():
     """The env names the resource; the resource is named by the parameter,
     so the three can never disagree."""
-    block = _resource_block("SesConfigSet")
-    assert re.search(r"^    Type: AWS::SES::ConfigurationSet$", block, re.M)
-    assert re.search(r"^      Name: !Ref MailConfigurationSet$", block, re.M)
+    assert T.type_of("SesConfigSet") == "AWS::SES::ConfigurationSet"
+    assert T.properties("SesConfigSet") == {"Name": "!Ref MailConfigurationSet"}
 
 
 @pytest.mark.parametrize("alias,param", [(v[0], v[1]) for v in MAIL_FIELDS.values()])
 def test_deploy_script_maps_each_alias_to_its_parameter(alias, param):
+    # test_deploy_params.py runs the maps and shows each pair reaches the deploy.
     assert f"{param}:{alias}" in PARITY_SCRIPT
-    # And the loop actually iterates the array the pair lives in.
-    loop = r'^\s*for pair in "\$\{GPS_PARAMS\[@\]\}".*"\$\{MAIL_PARAMS\[@\]\}"'
-    assert re.search(loop, PARITY_SCRIPT, re.M)
 
 
 @pytest.mark.parametrize("alias,default", [(v[0], v[2]) for v in MAIL_FIELDS.values()])
@@ -150,7 +117,7 @@ def test_env_example_documents_each_alias_with_its_default(alias, default):
 
 
 def test_send_permission_is_scoped_to_the_identity_the_set_and_the_from_address():
-    block = _resource_block("ApiFunction")
+    block = T.block("ApiFunction")
     grant = re.search(
         r"^            - Effect: Allow\n              Action: ses:SendEmail\n((?:              .*\n)+)",
         block,
@@ -161,4 +128,4 @@ def test_send_permission_is_scoped_to_the_identity_the_set_and_the_from_address(
     assert ":identity/${SesIdentity}" in body
     assert ":configuration-set/${SesConfigSet}" in body
     assert "ses:FromAddress: !Ref MailFromAddress" in body
-    assert TEMPLATE.count("Action: ses:") == 1  # no other function or action can send
+    assert T.text.count("Action: ses:") == 1  # no other function or action can send

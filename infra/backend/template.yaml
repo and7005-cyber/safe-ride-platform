@@ -465,18 +465,18 @@ Resources:
       MultiAZ: false
       # Hardening U4: every property below updates in place; none replaces the
       # instance. No Performance Insights: not offered on db.t4g.micro (D18).
+      # No PostgreSQL log export (D21): error DETAIL lines can carry parents'
+      # email addresses and the app-role password literal, and a terser
+      # parameter group needs a reboot; revisit later.
       # Windows are UTC. Kenya runs on EAT = UTC+3 with no DST, and routes run
       # 05:30-19:00 EAT (02:30-16:00 UTC), so both windows sit in the night:
-      # backups 02:00-02:30 EAT daily, maintenance Sunday 02:30-03:30 EAT.
+      # backups 02:00-02:30 EAT daily, maintenance Sunday 03:00-04:00 EAT, half
+      # an hour clear of Saturday night's backup rather than on its end (D22).
       BackupRetentionPeriod: 35
       PreferredBackupWindow: "23:00-23:30"
-      PreferredMaintenanceWindow: "sat:23:30-sun:00:30"
+      PreferredMaintenanceWindow: "sun:00:00-sun:01:00"
       # Storage autoscaling ceiling (GiB) above DbAllocatedStorage.
       MaxAllocatedStorage: 100
-      # Lands in /aws/rds/instance/<id>/postgresql; 90-day retention is set on
-      # that group by hand (infra/README.md, Alarms).
-      EnableCloudwatchLogsExports:
-        - postgresql
       DeletionProtection: true
       Tags:
         - Key: Name
@@ -510,12 +510,15 @@ Resources:
 
   # ---------------------------------------------------------------- Logging
   # One retained 90-day group per function (hardening U4); each function logs
-  # JSON there through its LoggingConfig (application INFO, platform WARN).
+  # JSON there through its LoggingConfig, application and platform at INFO:
+  # the platform's START, END and REPORT lines carry the duration, memory,
+  # init and timeout diagnostics the alarm descriptions send operators to, and
+  # WARN would drop them.
   # RetainExceptOnCreate: a rollback of the update that CREATED them deletes
   # them (no name clash on the retry), while a stack delete or a later update
   # that removes them keeps the evidence — then delete or import them before
   # re-deploying (D13, infra/README.md). The functions' older /aws/lambda/*
-  # groups and the RDS export group get 90-day retention by hand.
+  # groups get 90-day retention by hand.
   ApiLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: RetainExceptOnCreate
@@ -549,7 +552,7 @@ Resources:
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: INFO
-        SystemLogLevel: WARN
+        SystemLogLevel: INFO
         LogGroup: !Ref ApiLogGroup
       # No ReservedConcurrentExecutions: af-south-1 starts with an account
       # concurrency limit of 10, so reserving any would drop unreserved below
@@ -673,7 +676,7 @@ Resources:
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: INFO
-        SystemLogLevel: WARN
+        SystemLogLevel: INFO
         LogGroup: !Ref MigrateLogGroup
       VpcConfig:
         SecurityGroupIds:
@@ -719,7 +722,7 @@ Resources:
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: INFO
-        SystemLogLevel: WARN
+        SystemLogLevel: INFO
         LogGroup: !Ref VerifyLogGroup
       VpcConfig:
         SecurityGroupIds:
@@ -1044,8 +1047,8 @@ Resources:
     Properties:
       AlarmDescription: >-
         Database freeable memory stayed under 100 MB for fifteen minutes;
-        first, check the connection count and the slow statements in the
-        postgresql log export.
+        first, compare the DatabaseConnections graph in RDS with the API's
+        request count for a surge of connections.
       Namespace: AWS/RDS
       MetricName: FreeableMemory
       Dimensions:
@@ -1067,9 +1070,9 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmDescription: >-
-        Database CPU stayed above 80% for fifteen minutes; first, find the
-        expensive statements in the postgresql log export and the API routes
-        that run them.
+        Database CPU stayed above 80% for fifteen minutes; first, line the CPU
+        graph up with the API's request count and latency and with any migrate
+        or verify run at that time to find what drove it.
       Namespace: AWS/RDS
       MetricName: CPUUtilization
       Dimensions:
@@ -1093,8 +1096,8 @@ Resources:
       AlarmDescription: >-
         The burstable database has under 30 CPU credits left for fifteen
         minutes and will soon be held to its baseline; first, find what is
-        burning CPU (DbCpuHigh, the postgresql log), then consider a larger
-        instance class.
+        burning CPU (DbCpuHigh, the API's request count, any migrate or verify
+        run), then consider a larger instance class.
       Namespace: AWS/RDS
       MetricName: CPUCreditBalance
       Dimensions:

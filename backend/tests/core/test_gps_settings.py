@@ -7,12 +7,11 @@ the alias Settings reads, and passable from deploy-backend.sh (its maps live
 in infra/scripts/parity-params.sh) under the same name — the rule learned from the geo escape (`b68c877`), enforced here so a
 new knob cannot ship live at a value nobody set. The migrate and verify
 functions get the retention default too (the purge and the `gps` check set
-resolve it). Pure text inspection of the template: no YAML dependency and no
-CloudFormation tag handling needed.
+resolve it). Pure text inspection of the template (template_text.py): no YAML
+dependency and no CloudFormation tag handling needed.
 """
 
 import re
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -26,9 +25,9 @@ from app.dao.school_thresholds import (
     system_defaults,
     thresholds_from_row,
 )
+from tests.core.template_text import REPO, load
 
-REPO = Path(__file__).resolve().parents[3]
-TEMPLATE = (REPO / "infra" / "backend" / "template.yaml").read_text(encoding="utf-8")
+T = load("backend")
 # The parity maps deploy-backend.sh sources (test_deploy_params.py runs them).
 PARITY_SCRIPT = (REPO / "infra" / "scripts" / "parity-params.sh").read_text(encoding="utf-8")
 MIGRATION_016 = (REPO / "backend" / "db" / "migrations" / "016_gps_tracking.sql").read_text(
@@ -51,25 +50,6 @@ GPS_FIELDS = {
 def _settings(**env) -> Settings:
     # No dotenv: the repo's backend/.env must not leak into these assertions.
     return Settings(_env_file=None, **env)
-
-
-def _template_parameter(name: str) -> dict[str, str]:
-    """The `Key: value` lines of one Parameters entry, by indentation."""
-    match = re.search(rf"^  {name}:\n((?:    .*\n)+)", TEMPLATE, re.M)
-    assert match, f"template Parameter {name} missing"
-    block = match.group(1)
-    return dict(re.findall(r"^    (\w+): (.+?)\s*$", block, re.M))
-
-
-def _function_env(logical_id: str) -> dict[str, str]:
-    """The Environment.Variables of one function resource, as text pairs."""
-    start = TEMPLATE.index(f"\n  {logical_id}:\n")
-    tail = TEMPLATE[start + 1:]
-    end = re.search(r"^  \w+:\n", tail[1:], re.M)
-    body = tail[: end.start() + 1] if end else tail
-    variables = re.search(r"^      Environment:\n        Variables:\n((?:          .*\n)+)", body, re.M)
-    assert variables, f"{logical_id} has no Environment.Variables block"
-    return dict(re.findall(r"^          (\w+): (.+?)\s*$", variables.group(1), re.M))
 
 
 # --- Settings fields -----------------------------------------------------------
@@ -194,7 +174,7 @@ def test_school_payload_rejects_values_outside_the_bounds(knob):
 
 @pytest.mark.parametrize("field,alias,param,default", [(f, *v) for f, v in GPS_FIELDS.items()])
 def test_template_parameter_default_equals_settings_default(field, alias, param, default):
-    entry = _template_parameter(param)
+    entry = T.parameter(param)
     assert entry["Type"] == "Number"
     assert int(entry["Default"]) == default == getattr(_settings(), field)
     meta = {type(m).__name__: m for m in Settings.model_fields[field].metadata}
@@ -203,12 +183,12 @@ def test_template_parameter_default_equals_settings_default(field, alias, param,
 
 @pytest.mark.parametrize("alias,param", [(v[0], v[1]) for v in GPS_FIELDS.values()])
 def test_api_function_env_carries_every_alias(alias, param):
-    assert _function_env("ApiFunction")[alias] == f"!Ref {param}"
+    assert T.function_env("ApiFunction")[alias] == f"!Ref {param}"
 
 
 def test_migrate_and_verify_functions_carry_the_retention_default():
     for logical_id in ("MigrateFunction", "VerifyFunction"):
-        env = _function_env(logical_id)
+        env = T.function_env(logical_id)
         assert env["GPS_POSITION_RETENTION_DAYS"] == "!Ref GpsPositionRetentionDays", logical_id
 
 
@@ -249,23 +229,16 @@ ROUTE_THROTTLES = {
 }
 
 
-def _resource_block(logical_id: str) -> str:
-    start = TEMPLATE.index(f"\n  {logical_id}:\n")
-    tail = TEMPLATE[start + 1:]
-    end = re.search(r"^  \w+:\n", tail[1:], re.M)
-    return tail[: end.start() + 1] if end else tail
-
-
 @pytest.mark.parametrize("param,env,default", [(p, *v) for p, v in THROTTLE_PARAMS.items()])
 def test_throttle_parameter_has_a_numeric_default(param, env, default):
-    entry = _template_parameter(param)
+    entry = T.parameter(param)
     assert entry["Type"] == "Number"
     assert int(entry["Default"]) == default
     assert int(entry["MinValue"]) >= 1
 
 
 def test_http_api_binds_the_stage_default_to_the_parameters():
-    block = _resource_block("HttpApi")
+    block = T.block("HttpApi")
     default = re.search(
         r"^      DefaultRouteSettings:\n((?:        .*\n)+)", block, re.M
     )
@@ -278,7 +251,7 @@ def test_http_api_binds_the_stage_default_to_the_parameters():
 
 @pytest.mark.parametrize("route_key,burst,rate", [(k, *v) for k, v in ROUTE_THROTTLES.items()])
 def test_http_api_binds_each_throttled_route_to_its_parameters(route_key, burst, rate):
-    block = _resource_block("HttpApi")
+    block = T.block("HttpApi")
     route = re.search(
         rf'^        "{re.escape(route_key)}":\n((?:          .*\n)+)', block, re.M
     )
@@ -291,7 +264,7 @@ def test_http_api_binds_each_throttled_route_to_its_parameters(route_key, burst,
 
 def _declared_routes() -> list[tuple[str, str]]:
     """(path, method) of every HttpApi event on the API function."""
-    block = _resource_block("ApiFunction")
+    block = T.block("ApiFunction")
     events = re.search(r"^      Events:\n((?:        .*\n)+)", block, re.M)
     assert events, "ApiFunction has no Events"
     return re.findall(
@@ -307,7 +280,7 @@ def test_every_route_setting_has_a_declared_route_and_every_explicit_route_a_set
     assert ("/{proxy+}", "ANY") in declared  # the proxy still serves the rest
     explicit = {f"{method} {path}" for path, method in declared if path not in ("/", "/{proxy+}")}
     assert explicit == set(ROUTE_THROTTLES)
-    block = _resource_block("HttpApi")
+    block = T.block("HttpApi")
     settings = re.findall(r'^        "([A-Z]+ /\S*)":$', block, re.M)
     assert sorted(settings) == sorted(ROUTE_THROTTLES)
 
@@ -335,9 +308,8 @@ def test_the_pin_login_throttle_binds_the_registered_sign_in_route():
 
 @pytest.mark.parametrize("param,env", [(p, v[0]) for p, v in THROTTLE_PARAMS.items()])
 def test_deploy_script_maps_each_throttle_parameter(param, env):
+    # test_deploy_params.py runs the maps and shows each pair reaches the deploy.
     assert f"{param}:{env}" in PARITY_SCRIPT
-    # And the loop actually iterates the array the pair lives in.
-    assert 'for pair in "${GPS_PARAMS[@]}" "${API_THROTTLE_PARAMS[@]}"' in PARITY_SCRIPT
 
 
 def test_no_reader_imports_a_retired_module_constant():

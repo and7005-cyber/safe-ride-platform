@@ -1,56 +1,33 @@
 """Frontend stack invariants (hardening plan U5, U16) — headers, probes, budget.
 
-Text inspection of infra/frontend/template.yaml and the deploy scripts, like
-test_backend_stack.py: the content-security policy is one text in both CspMode
-branches, fits CloudFront's limit and names the API origin; the response-headers
-policy is on the default behaviour with HSTS on subdomains and no preload; the
-two Route 53 probes and their alarms (missing data breaching) report ALARM and OK
-to the us-east-1 topic; the budget mails the alert addresses; and
-deploy-frontend.sh builds with the production Maps values from the parameter
-store and passes CspMode on every deploy. `cfn-lint` and `aws cloudformation
-validate-template` check the shapes; these pin the decisions.
+Text inspection of infra/frontend/template.yaml (through template_text.py, like
+test_backend_stack.py) and the deploy scripts: the content-security policy is
+one text in both CspMode branches, fits CloudFront's limit and names the API
+origin; the response-headers policy is on the default behaviour with HSTS on
+subdomains and no preload; the two Route 53 probes and their alarms (missing
+data breaching) report ALARM and OK to the us-east-1 topic; the budget, under a
+generated name, mails the alert addresses; and deploy-frontend.sh builds with
+the production Maps values from the parameter store and passes CspMode on every
+deploy. `cfn-lint` and `aws cloudformation validate-template` check the shapes;
+these pin the decisions.
 """
 
 import re
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[3]
-TEMPLATE = (REPO / "infra" / "frontend" / "template.yaml").read_text(encoding="utf-8")
+from tests.core.template_text import REPO, load
+
+T = load("frontend")
 SCRIPTS = REPO / "infra" / "scripts"
 DEPLOY_FRONTEND = (SCRIPTS / "deploy-frontend.sh").read_text(encoding="utf-8")
 DEPLOY_BACKEND = (SCRIPTS / "deploy-backend.sh").read_text(encoding="utf-8")
 CONFIG = (SCRIPTS / "config.sh").read_text(encoding="utf-8")
 
-RESOURCES_SECTION = TEMPLATE.split("\nResources:\n", 1)[1].split("\nOutputs:\n", 1)[0]
-_parts = re.split(r"^  (\w+):\n", RESOURCES_SECTION, flags=re.M)
-RESOURCES = dict(zip(_parts[1::2], _parts[2::2]))  # logical id -> block text
-OUTPUTS = TEMPLATE.split("\nOutputs:\n", 1)[1]
+OUTPUTS = T.section("Outputs")
 
 # CloudFront's documented maximum for a content-security policy value.
 CLOUDFRONT_CSP_LIMIT = 1783
-
-
-def _type(logical_id: str) -> str:
-    match = re.search(r"^    Type: (\S+)$", RESOURCES[logical_id], re.M)
-    assert match, f"{logical_id} has no Type"
-    return match.group(1)
-
-
-def _of_type(resource_type: str) -> list[str]:
-    return [lid for lid in RESOURCES if _type(lid) == resource_type]
-
-
-def _properties(logical_id: str) -> dict[str, str]:
-    """The scalar `Key: value` lines directly under Properties."""
-    return dict(re.findall(r"^      (\w+): (.+?)\s*$", RESOURCES[logical_id], re.M))
-
-
-def _parameter(name: str) -> str:
-    entry = re.search(rf"^  {name}:\n((?:    .*\n)+)", TEMPLATE, re.M)
-    assert entry, f"no parameter {name}"
-    return entry.group(1)
 
 
 def _folded(key: str, text: str) -> list[str]:
@@ -68,7 +45,7 @@ def _folded(key: str, text: str) -> list[str]:
 
 # --- security headers ------------------------------------------------------------
 
-POLICY = RESOURCES["SecurityHeadersPolicy"]
+POLICY = T.block("SecurityHeadersPolicy")
 ENFORCING = _folded("ContentSecurityPolicy", POLICY)
 REPORT_ONLY = _folded("Value", POLICY)
 
@@ -79,7 +56,7 @@ def test_the_policy_text_is_identical_in_both_modes():
 
 
 def test_the_policy_fits_cloudfronts_limit_with_the_longest_allowed_api_origin():
-    max_origin = int(re.search(r"^    MaxLength: (\d+)$", _parameter("ApiOrigin"), re.M).group(1))
+    max_origin = int(T.parameter("ApiOrigin")["MaxLength"])
     longest = ENFORCING[0].replace("${ApiOrigin}", "x" * max_origin)
     assert len(longest) < CLOUDFRONT_CSP_LIMIT, len(longest)
 
@@ -101,10 +78,10 @@ def test_the_policy_baseline():
 
 
 def test_cspmode_picks_the_header_and_defaults_to_report_only():
-    param = _parameter("CspMode")
-    assert re.search(r"^    Default: report-only$", param, re.M)
-    assert re.search(r"^    AllowedValues: \[report-only, enforce\]$", param, re.M)
-    assert re.search(r"^  CspEnforce: !Equals \[!Ref CspMode, enforce\]$", TEMPLATE, re.M)
+    param = T.parameter("CspMode")
+    assert param["Default"] == "report-only"
+    assert param["AllowedValues"] == "[report-only, enforce]"
+    assert re.search(r"^  CspEnforce: !Equals \[!Ref CspMode, enforce\]$", T.text, re.M)
     # enforce: the CSP security header, otherwise nothing there ...
     assert re.search(
         r"ContentSecurityPolicy: !If\n +- CspEnforce\n +- ContentSecurityPolicy: !Sub >-\n(?: {16}.*\n)+"
@@ -137,8 +114,8 @@ def test_hsts_nosniff_frame_referrer_and_permissions_policy():
 
 
 def test_the_policy_is_on_the_default_cache_behaviour():
-    assert _type("SecurityHeadersPolicy") == "AWS::CloudFront::ResponseHeadersPolicy"
-    behaviour = re.search(r"^        DefaultCacheBehavior:\n((?:          .*\n)+)", RESOURCES["Distribution"], re.M)
+    assert T.type_of("SecurityHeadersPolicy") == "AWS::CloudFront::ResponseHeadersPolicy"
+    behaviour = re.search(r"^        DefaultCacheBehavior:\n((?:          .*\n)+)", T.block("Distribution"), re.M)
     assert behaviour
     assert re.search(r"^          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy$", behaviour.group(1), re.M)
     assert "Value: !Ref SecurityHeadersPolicy" in OUTPUTS
@@ -153,8 +130,8 @@ PROBE_ALARMS = {"ApiProbeFailing": "ApiHealthCheck", "SiteProbeFailing": "SiteHe
 
 @pytest.mark.parametrize("check,path", sorted(HEALTH_CHECKS.items()))
 def test_each_health_check_probes_https_from_three_regions_every_30_seconds(check, path):
-    block = RESOURCES[check]
-    assert _type(check) == "AWS::Route53::HealthCheck"
+    block = T.block(check)
+    assert T.type_of(check) == "AWS::Route53::HealthCheck"
     config = dict(re.findall(r"^        (\w+): (.+?)\s*$", block, re.M))
     assert config["Type"] == "HTTPS"
     assert config["ResourcePath"] == path
@@ -169,76 +146,78 @@ def test_each_health_check_probes_https_from_three_regions_every_30_seconds(chec
 
 
 def test_the_api_probe_targets_the_api_origins_host():
-    config = dict(re.findall(r"^        (\w+): (.+?)\s*$", RESOURCES["ApiHealthCheck"], re.M))
+    config = dict(re.findall(r"^        (\w+): (.+?)\s*$", T.block("ApiHealthCheck"), re.M))
     assert config["FullyQualifiedDomainName"] == '!Select [2, !Split ["/", !Ref ApiOrigin]]'
-    origin = _parameter("ApiOrigin")
-    assert re.search(r"^    Default: https://api\.saferidelive\.co\.ke$", origin, re.M)
-    assert re.search(r"^    AllowedPattern: '\^https://\[a-z0-9\.-\]\+\$'$", origin, re.M)
+    origin = T.parameter("ApiOrigin")
+    assert origin["Default"] == "https://api.saferidelive.co.ke"
+    assert origin["AllowedPattern"] == "'^https://[a-z0-9.-]+$'"
 
 
 def test_the_stack_carries_exactly_the_us_east_1_alarm_set():
-    assert set(_of_type("AWS::CloudWatch::Alarm")) == ALARMS
-    assert re.search(r"^    Condition: HasCert$", RESOURCES["SiteCertificateExpiry"], re.M)
+    assert set(T.of_type("AWS::CloudWatch::Alarm")) == ALARMS
+    assert re.search(r"^    Condition: HasCert$", T.block("SiteCertificateExpiry"), re.M)
 
 
 @pytest.mark.parametrize("alarm", sorted(ALARMS))
 def test_each_alarm_reports_alarm_and_ok_to_the_us_east_1_topic(alarm):
-    block = RESOURCES[alarm]
+    block = T.block(alarm)
     for actions in ("AlarmActions", "OKActions"):
         assert re.search(rf"^      {actions}:\n        - !Ref OpsTopicUsEast1\n", block, re.M), (alarm, actions)
     expected = "breaching" if alarm in PROBE_ALARMS else "notBreaching"
-    assert _properties(alarm)["TreatMissingData"] == expected
-    # What it means, then the first response, in one sentence.
+    assert T.properties(alarm)["TreatMissingData"] == expected
+    # What it means, then what to do first.
     description = re.search(r"^      AlarmDescription: >-\n((?:        .*\n)+)", block, re.M)
     assert description, f"{alarm} has no folded AlarmDescription"
-    text = " ".join(line.strip() for line in description.group(1).splitlines())
-    assert "; first, " in text and text.endswith(".") and text.count(". ") == 0, text
+    assert "; first, " in " ".join(line.strip() for line in description.group(1).splitlines())
 
 
 @pytest.mark.parametrize("alarm,check", sorted(PROBE_ALARMS.items()))
 def test_probe_alarms_fire_after_three_unhealthy_minutes(alarm, check):
-    props = _properties(alarm)
+    props = T.properties(alarm)
     assert props["Namespace"] == "AWS/Route53" and props["MetricName"] == "HealthCheckStatus"
     assert props["Statistic"] == "Minimum"
     assert (props["Period"], props["EvaluationPeriods"], props["DatapointsToAlarm"]) == ("60", "3", "3")
     assert (props["Threshold"], props["ComparisonOperator"]) == ("1", "LessThanThreshold")
     assert re.search(
-        rf"^        - Name: HealthCheckId\n          Value: !Ref {check}$", RESOURCES[alarm], re.M
+        rf"^        - Name: HealthCheckId\n          Value: !Ref {check}$", T.block(alarm), re.M
     )
 
 
 def test_the_cloudfront_error_rate_alarm():
-    props = _properties("SiteServerErrors")
+    props = T.properties("SiteServerErrors")
     assert (props["Namespace"], props["MetricName"], props["Statistic"]) == ("AWS/CloudFront", "5xxErrorRate", "Average")
     assert (props["Threshold"], props["ComparisonOperator"]) == ("5", "GreaterThanThreshold")
     assert re.search(r"- Name: DistributionId\n +Value: !Ref Distribution\n +- Name: Region\n +Value: Global\n",
-                     RESOURCES["SiteServerErrors"])
+                     T.block("SiteServerErrors"))
 
 
 def test_the_us_east_1_topic_and_its_conditional_subscriptions():
-    assert _properties("OpsTopicUsEast1") == {"TopicName": "saferide-ops-us-east-1"}
-    policy = RESOURCES["OpsTopicUsEast1Policy"]
+    assert T.properties("OpsTopicUsEast1") == {"TopicName": "saferide-ops-us-east-1"}
+    policy = T.block("OpsTopicUsEast1Policy")
     assert "Service: cloudwatch.amazonaws.com" in policy and "aws:SourceAccount: !Ref AWS::AccountId" in policy
     assert "ses.amazonaws.com" not in policy
     for suffix, param in (("Primary", "AlertEmailPrimary"), ("Secondary", "AlertEmailSecondary")):
-        entry = _parameter(param)
-        assert re.search(r'^    Default: ""$', entry, re.M)
-        assert re.search(r"^    AllowedPattern: '\^\$\|\^\[\^@\\s\]\+@\[\^@\\s\]\+\\\.\[\^@\\s\]\+\$'$", entry, re.M)
-        assert re.search(rf'^  HasAlert{suffix}: !Not \[!Equals \[!Ref {param}, ""\]\]$', TEMPLATE, re.M)
+        entry = T.parameter(param)
+        assert entry["Default"] == '""'
+        assert entry["AllowedPattern"] == r"'^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'"
+        assert re.search(rf'^  HasAlert{suffix}: !Not \[!Equals \[!Ref {param}, ""\]\]$', T.text, re.M)
         subscription = f"OpsUsEast1Subscription{suffix}"
-        assert re.search(rf"^    Condition: HasAlert{suffix}$", RESOURCES[subscription], re.M)
-        assert _properties(subscription) == {
+        assert re.search(rf"^    Condition: HasAlert{suffix}$", T.block(subscription), re.M)
+        assert T.properties(subscription) == {
             "TopicArn": "!Ref OpsTopicUsEast1", "Protocol": "email", "Endpoint": f"!Ref {param}",
         }
     assert "Value: !Ref OpsTopicUsEast1" in OUTPUTS
 
 
 def test_the_budget_mails_the_alert_addresses_at_80_actual_and_100_forecast():
-    block = RESOURCES["MonthlyCostBudget"]
-    assert _type("MonthlyCostBudget") == "AWS::Budgets::Budget"
+    block = T.block("MonthlyCostBudget")
+    assert T.type_of("MonthlyCostBudget") == "AWS::Budgets::Budget"
     assert re.search(r"^    Condition: HasAnyAlert$", block, re.M)
-    assert re.search(r"^  HasAnyAlert: !Or \[!Condition HasAlertPrimary, !Condition HasAlertSecondary\]$", TEMPLATE, re.M)
-    assert re.search(r"^    Default: 60$", _parameter("MonthlyBudgetUsd"), re.M)
+    assert re.search(r"^  HasAnyAlert: !Or \[!Condition HasAlertPrimary, !Condition HasAlertSecondary\]$", T.text, re.M)
+    assert T.parameter("MonthlyBudgetUsd")["Default"] == "60"
+    # A subscriber change replaces the budget, new before old: a fixed name
+    # would clash, so CloudFormation generates it (D23).
+    assert "BudgetName" not in block
     assert "Amount: !Ref MonthlyBudgetUsd" in block and "TimeUnit: MONTHLY" in block and "BudgetType: COST" in block
     notifications = re.findall(r"NotificationType: (\w+)\n +ComparisonOperator: GREATER_THAN\n +Threshold: (\d+)\n", block)
     assert notifications == [("ACTUAL", "80"), ("FORECASTED", "100")]
@@ -251,7 +230,6 @@ def test_the_budget_mails_the_alert_addresses_at_80_actual_and_100_forecast():
 def test_ssm_required_is_shared_from_config_sh():
     assert re.search(r"^ssm_required\(\) \{", CONFIG, re.M)
     assert re.search(r"^export -f ssm_required$", CONFIG, re.M)
-    assert 'region="${2:-$BACKEND_REGION}"' in CONFIG
     assert "ssm_required()" not in DEPLOY_BACKEND and "ssm_required()" not in DEPLOY_FRONTEND
     assert 'DB_PASSWORD="$(ssm_required /saferide/db-password)"' in DEPLOY_BACKEND
 

@@ -393,10 +393,11 @@ Resources:
     Properties:
       AlarmDescription: >-
         Route 53 probes in three regions have not had a healthy answer from
-        the API's /api/health for three minutes, so the API or its database
-        is down for everyone; first, curl the health endpoint, then read the
-        af-south-1 alarms and /saferide/api and roll back if a deploy just
-        landed.
+        the API's /api/health for three minutes, so the API function is not
+        answering anyone (the probe checks that the function answers; it
+        becomes database-aware with Release 1b's health check); first, curl
+        the health endpoint, then read the af-south-1 alarms and /saferide/api
+        and roll back if a deploy just landed.
       Namespace: AWS/Route53
       MetricName: HealthCheckStatus
       Dimensions:
@@ -497,12 +498,14 @@ Resources:
 
   # The budget covers the whole account (every service, both regions). Budgets
   # mails its subscribers directly; it needs at least one, hence HasAnyAlert.
+  # No BudgetName (D23): a subscriber change replaces the budget, and
+  # CloudFormation creates the new one before deleting the old, so a fixed
+  # name would clash; the generated name lets the replacement go through.
   MonthlyCostBudget:
     Type: AWS::Budgets::Budget
     Condition: HasAnyAlert
     Properties:
       Budget:
-        BudgetName: saferide-monthly-cost
         BudgetType: COST
         TimeUnit: MONTHLY
         BudgetLimit:
