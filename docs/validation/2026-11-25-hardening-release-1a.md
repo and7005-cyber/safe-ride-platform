@@ -88,7 +88,7 @@
 | Stray-variable check prints only the intended exports; no `ALLOW_*` | | **open** |
 | Live parity values read before the first explicit-parameter deploy | | **open** |
 | Manual pre-1a snapshot id recorded | | **open** |
-| `release/1a` tagged at the certified commit and pushed on the user's go; HEAD on it | | **open** |
+| `release/1a` tagged at the certified commit and pushed on the user's go; HEAD on it | 2026-11-18 on the user's go: annotated tag `25e7860` on `a66d53b` (the final certify run), pushed alone (no branch); `git ls-remote --tags origin 'refs/tags/release/*'` shows `release/1a` peeled to `a66d53b804e87de38fbf98e25b7fb6b7b6d2ab62`. HEAD moves onto it (`git checkout release/1a`) in the deploy session | **met** (tag); HEAD on it at the deploy |
 | Change set: no `MasterUserPassword`, no replacement and exactly one `WARN` line — `Database` replacement `Conditional` (D26) — no unexplained removal, the same table as the dry run; override lines reconciled (only the addresses and the granted threshold, 800); open-run re-check passed before execution | | **open** |
 | Migrate result: `017_account_hardening` applied; seeds skipped by name; `app_role.synced` | | **open** |
 | Frontend change set: `Distribution` and the four alias records replacement `False`, no `WARN`; deployed with `CSP_MODE=report-only` | | **open** |
