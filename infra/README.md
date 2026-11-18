@@ -469,6 +469,7 @@ answer (D24):
 | 2 | usage |
 | 3 | the answer's status is not `ok` (unknown set, missing or invalid parameter), or the answer is not JSON |
 | 4 | `--strict` only: status `ok`, but at least one check returned an `error` row instead of rows (the labels are named on stderr) |
+| 5 | the verify-target check refused: the verify function points at another database than the stack's `DbEndpoint` (overridden by `ALLOW_VERIFY_TARGET_MISMATCH=1`) |
 | other | the `aws` call itself failed: the CLI's own exit code (for example 255) |
 
 **In a checklist gate, any non-zero exit is a No-Go.** `--strict` goes
