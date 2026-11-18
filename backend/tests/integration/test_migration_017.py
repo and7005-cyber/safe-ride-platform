@@ -5,17 +5,23 @@ PIN-failure window (D3) and the job-run witness (D4), and the audit CHECK
 widening (D5).
 
 Every probe that writes runs inside a transaction that is rolled back, so the
-shared local database is left exactly as the reset script made it. The
-double-apply rehearsal lives in test_tenancy_schema.py with the other
-re-apply checks.
+shared local database is left exactly as the reset script made it. The local
+reset applies migrations BEFORE seeds, so every seeded row was inserted after
+017 and only shows the column defaults; the populated-apply rehearsal at the
+end of this file puts the tables back in their pre-017 shape inside such a
+transaction, inserts rows, and applies 017 over them the way the migrate
+Lambda does. The double-apply against the reset database lives in
+test_tenancy_schema.py with the other re-apply checks.
 """
 
 import os
 import re
+from pathlib import Path
 
 import psycopg
 import pytest
 from psycopg import errors
+from psycopg.pq import ExecStatus
 
 from conftest import DSN, SCHOOL_A_ID
 
@@ -27,8 +33,12 @@ pytestmark = pytest.mark.skipif(
 APP_DSN = os.environ.get(
     "APP_DATABASE_URL", "postgresql://saferide_app:saferide@localhost:5432/saferide"
 )
-# Seeded parent (backend/db/seeds/003_local_snapshot.sql), present before 017
-# ran on every local reset.
+MIGRATION_017 = (
+    Path(__file__).resolve().parents[2] / "db/migrations/017_account_hardening.sql"
+)
+# Seeded parent (backend/db/seeds/003_local_snapshot.sql). Seeds apply after
+# migrations in scripts/reset-local-db.sh, so this row was inserted after 017
+# and took its column defaults on insert.
 SEEDED_PARENT_ID = "a0000000-0000-0000-0000-000000000002"
 CROCKFORD = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 NEW_ACTIONS = (
@@ -82,8 +92,10 @@ def test_new_columns_exist_with_their_defaults(conn):
 
 
 def test_existing_accounts_are_grandfathered_not_backfilled(conn):
-    # D1: no backfill. A parent that existed before 017 is neither required
-    # to verify nor marked verified; only 1b's code sets the flag.
+    # D1: no backfill. The seeded parent (inserted after 017 locally) is
+    # neither required to verify nor marked verified; only 1b's code sets the
+    # flag. A parent that existed BEFORE 017 is covered by the populated-apply
+    # rehearsal at the end of this file.
     row = conn.execute(
         "select email_verification_required, email_verified_at, consent_version, consented_at "
         "from app_users where id = %s",
@@ -287,3 +299,120 @@ def test_the_runtime_role_can_read_the_driver_code_and_draw_one(conn):
         "'driver_code', 'select'), has_function_privilege('saferide_app', "
         "'public.saferide_new_driver_code()', 'execute')"
     ).fetchone() == (True, True)
+
+
+# --- populated apply: 017 over rows that existed before it -------------------------
+
+# Everything 017 adds, removed again inside the test's transaction: the two
+# new tables, the driver-code column (its unique index goes with it) and its
+# generator, the app_users columns, the token purpose (its index goes with
+# it) and the feed index. The audit CHECK is dropped and recreated by 017
+# unconditionally, so it is exercised as it stands.
+_PRE_017 = (
+    "drop table pin_login_failures",
+    "drop table ops_job_runs",
+    "alter table live_schools drop column driver_code",
+    "drop function saferide_new_driver_code()",
+    "alter table app_users drop column email_verification_required,"
+    " drop column email_verified_at, drop column consent_version,"
+    " drop column consented_at",
+    "alter table password_reset_tokens drop column purpose",
+    "drop index live_notifications_created_idx",
+)
+
+
+def _apply_017(tx):
+    # The migrate Lambda's path: the whole file through simple-query exec_.
+    # The test's transaction is already open, so 017 runs inside it (SET
+    # LOCAL included) and the fixture's rollback undoes it.
+    result = tx.pgconn.exec_(MIGRATION_017.read_text().encode())
+    assert result.status in (
+        ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
+    ), result.error_message.decode()
+
+
+def _shape(tx, school_ids, parent_id):
+    return {
+        "codes": tx.execute(
+            "select id, driver_code from live_schools order by id"
+        ).fetchall(),
+        "driver_code": _column(tx, "live_schools", "driver_code"),
+        "unique": tx.execute(
+            "select indisunique from pg_index"
+            " where indexrelid = to_regclass('public.live_schools_driver_code_key')"
+        ).fetchone(),
+        "new": tx.execute(
+            "select driver_code from live_schools where id = any(%s) order by id",
+            (school_ids,),
+        ).fetchall(),
+        "parent": tx.execute(
+            "select email_verification_required, email_verified_at,"
+            " consent_version, consented_at from app_users where id = %s",
+            (parent_id,),
+        ).fetchone(),
+        "tokens": tx.execute(
+            "select purpose from password_reset_tokens where user_id = %s",
+            (parent_id,),
+        ).fetchall(),
+    }
+
+
+def test_017_applies_over_a_populated_pre_017_database_and_reapplies_as_a_noop(tx):
+    tx.execute("set local lock_timeout = '5s'")
+    for statement in _PRE_017:
+        tx.execute(statement)
+    assert _column(tx, "live_schools", "driver_code") is None
+    assert _column(tx, "app_users", "email_verification_required") is None
+
+    school_ids = [
+        tx.execute(
+            "insert into live_schools (name, code, lat, lng) values (%s, %s, -1.3, 36.8)"
+            " returning id",
+            (f"IT 017 Populated {n}", f"I17-P0{n}"),
+        ).fetchone()[0]
+        for n in range(2)
+    ]
+    parent_id = tx.execute(
+        "insert into app_users (email, password_hash, full_name)"
+        " values ('it-017-populated@saferide.test', 'not-a-hash', 'IT 017 Parent')"
+        " returning id"
+    ).fetchone()[0]
+    tx.execute(
+        "insert into app_user_roles (user_id, role) values (%s, 'parent')", (parent_id,)
+    )
+    tx.execute(
+        "insert into password_reset_tokens (user_id, token_hash, expires_at)"
+        " values (%s, 'it-017-populated', now() + interval '30 minutes')",
+        (parent_id,),
+    )
+
+    _apply_017(tx)
+    after = _shape(tx, school_ids, parent_id)
+
+    # Both schools that existed before 017 were filled with distinct codes,
+    # and so was every other school.
+    new_codes = [code for (code,) in after["new"]]
+    assert len(new_codes) == 2
+    assert all(CROCKFORD.match(code) for code in new_codes), new_codes
+    all_codes = [code for _, code in after["codes"]]
+    assert all(code is not None and CROCKFORD.match(code) for code in all_codes)
+    assert len(all_codes) == len(set(all_codes))
+    # NOT NULL, the default and the unique index restored.
+    assert after["driver_code"] == ("NO", "saferide_new_driver_code()", "text")
+    assert after["unique"] == (True,)
+    # D1: the existing parent is grandfathered, never backfilled.
+    assert after["parent"][:2] == (False, None)
+    assert after["parent"][2:] == (None, None)
+    # The existing token reads as the only kind the old code wrote.
+    assert after["tokens"] == [("reset",)]
+    # The new tables and grants are back.
+    assert tx.execute(
+        "select has_table_privilege('saferide_app', 'public.pin_login_failures', 'insert'),"
+        " has_table_privilege('saferide_app', 'public.ops_job_runs', 'select'),"
+        " has_function_privilege('saferide_app',"
+        " 'public.saferide_new_driver_code()', 'execute')"
+    ).fetchone() == (True, True, True)
+
+    # A second apply changes nothing: no code is re-drawn, no row moves.
+    _apply_017(tx)
+    assert _shape(tx, school_ids, parent_id) == after

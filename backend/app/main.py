@@ -24,6 +24,15 @@ from app.core.db import close_pool
 from app.core.errors import SafeRideError, to_http_exception
 from app.core.scope import current_scope
 
+# Hardening D20: httpx logs every request URL at INFO, and the geocoder
+# (app/services/geo_service.py) sends the server Maps key and the searched
+# home address as query parameters, so with Lambda logging at INFO both would
+# reach CloudWatch. Pinned at import, so every entry path inherits it: uvicorn
+# loads app.main:app and the Lambda handler imports this module. WARNING keeps
+# the libraries' own warnings and errors.
+for _library in ("httpx", "httpcore"):
+    logging.getLogger(_library).setLevel(logging.WARNING)
+
 _scope_logger = logging.getLogger("saferide.scope")
 
 

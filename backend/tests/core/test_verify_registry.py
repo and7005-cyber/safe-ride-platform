@@ -45,6 +45,9 @@ def no_conn(monkeypatch):
 
 
 def test_every_entry_declares_a_known_kind_and_binds_only_with_a_placeholder():
+    # The single home of the registry invariant (the handler does not assert
+    # it at import). NO_PARAM SQL is sent verbatim, so a stray %s there would
+    # reach the server unbound.
     assert vh.PARAM_KINDS == ("none", "school", "timestamp")
     for name, entries in vh._CHECK_SETS.items():
         labels = [label for label, _, _ in entries]

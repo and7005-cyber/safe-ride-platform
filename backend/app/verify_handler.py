@@ -743,19 +743,9 @@ _CHECK_SETS["restore-compare"] = [
 ]
 
 
-def _check_registry() -> None:
-    """Every entry names a known parameter kind, and an entry binds a value
-    exactly when its SQL has a placeholder for it (NO_PARAM SQL is sent
-    verbatim, so a stray %s there would reach the server unbound)."""
-    for name, entries in _CHECK_SETS.items():
-        labels = [label for label, _, _ in entries]
-        assert len(labels) == len(set(labels)), name
-        for label, sql, kind in entries:
-            assert kind in PARAM_KINDS, (name, label, kind)
-            assert (kind == NO_PARAM) == ("%s" not in sql), (name, label)
-
-
-_check_registry()
+# The registry's shape (known kinds, unique labels, a placeholder exactly
+# when a value is bound) is pinned by tests/core/test_verify_registry.py, not
+# asserted here: an import-time failure would take the whole verify Lambda down.
 
 # The canonical list and the generated SQL must not drift.
 assert set(SCHOOL_OWNED_TABLES) == {'live_buses', 'live_routes', 'live_students', 'live_runs', 'live_fleet_plans', 'live_incidents', 'live_student_absences', 'live_communicated_stops', 'live_student_routes', 'live_route_stops', 'run_stops', 'run_absences', 'run_participation', 'run_positions', 'run_exceptions', 'run_exception_events', 'driver_action_keys'}
