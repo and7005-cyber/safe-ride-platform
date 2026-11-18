@@ -230,6 +230,33 @@ name the change set, `changeset_gate.py newest-since` picks the newest
 `samcli-deploy*` change set created since the deploy started (allowing 5 s of
 clock skew) that is `CREATE_COMPLETE` and `AVAILABLE`. A failed stack update
 prints the latest stack events and exits before migrating.
+
+**Database stack policy.** `saferide-backend` carries a CloudFormation stack
+policy (set 2026-11-18, decision D26 in the Release 1a validation record)
+that allows every update except replacing or deleting `Database`:
+
+```json
+{"Statement": [
+  {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+  {"Effect": "Deny", "Action": ["Update:Replace", "Update:Delete"], "Principal": "*", "Resource": "LogicalResourceId/Database"}
+]}
+```
+
+It is the guard the gate cannot be for a `Conditional` row: changing
+`BackupRetentionPeriod` or `PreferredMaintenanceWindow` (as Release 1a does)
+always shows `Database` as `Replacement: Conditional`, because the
+`AWS::RDS::DBInstance` schema lists both as conditionally create-only, and the
+gate only warns. Should CloudFormation decide at execution to replace the
+instance anyway, the policy fails the update and it rolls back, before an
+empty database exists. A throwaway-stack rehearsal (2026-11-18) applied
+exactly 1a's five database changes under this policy: updated in place, same
+instance, in about 35 seconds. The policy governs stack updates only, not
+`delete-stack` (see "Teardown"), and is unaffected by deploys; read it with
+`aws cloudformation get-stack-policy --region af-south-1 --stack-name
+saferide-backend`. A deliberate replacement of `Database` would need
+`--stack-policy-during-update-body` on that one update, on the user's explicit
+go — but the restore runbook's primary path (the rename swap) never updates
+the stack.
 `backend/tests/core/test_changeset_gate.py` runs the gate on table-driven
 payloads and `deploy-backend.sh` end to end against fake `aws`, `sam` and
 `git`.

@@ -365,7 +365,8 @@ snapshot (or point-in-time restore, then snapshot), set `DBSnapshotIdentifier`
 on `Database`, and deploy. It is not the primary path: CloudFormation
 *replaces* the instance (new identifier and endpoint), which the change-set
 gate refuses by design, and `ALLOW_REPLACE` cannot override for a database
-(`AWS::RDS::DBInstance`); a snapshot only offers snapshot instants, so a
+(`AWS::RDS::DBInstance`); the stack policy denies replacing `Database` too
+([README](README.md), "Database stack policy"); a snapshot only offers snapshot instants, so a
 point-in-time target costs a restore and a snapshot first; the old instance's
 deletion protection makes the replacement's clean-up fail and leaves it
 behind; and the property must then stay in the template for the life of the

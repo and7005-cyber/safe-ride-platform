@@ -355,6 +355,16 @@ day, items 6–10 on the day in the deploy session; operator steps 6 and 8
 
    A hit is left over from an earlier attempt: resolve it first
    ([infra/RESTORE.md](../../infra/RESTORE.md), "Retained resources").
+
+   And the stack policy that denies replacing or deleting `Database` is in
+   place (D26) — the `Deny` statement on `LogicalResourceId/Database` with
+   `Update:Replace` and `Update:Delete`; without it, answer `N` at the
+   change set:
+
+   ```bash
+   aws cloudformation get-stack-policy --region af-south-1 --stack-name saferide-backend \
+     --query StackPolicyBody --output text
+   ```
 7. The live parity values are read. From this deploy on every parity
    parameter is passed explicitly, so a live value an earlier one-off export
    left behind returns to the template Default unless it is exported again:
@@ -442,7 +452,7 @@ day, items 6–10 on the day in the deploy session; operator steps 6 and 8
      stops here otherwise, and also when the verify function does not point
      at the stack's database: "Verify-target check");
    - the change-set table. Expected among the rows: `Modify Database`
-     with replacement `False` and the changed properties
+     with replacement `Conditional` and the changed properties
      `BackupRetentionPeriod`, `DeletionProtection`, `MaxAllocatedStorage`,
      `PreferredBackupWindow`, `PreferredMaintenanceWindow` — and never
      `MasterUserPassword`; `Add` rows for the log groups, the ops topic and
@@ -450,9 +460,15 @@ day, items 6–10 on the day in the deploy session; operator steps 6 and 8
      with its bucket. The gate itself aborts (and deletes the change set) on
      `MasterUserPassword` or on any `Replacement: True` other than the
      stateless types (SNS subscription, alarm, metric filter), which print a
-     `WARN`. Everything new in 1a is an `Add`, so no `WARN` is expected:
-     answer `y` only when there is no `WARN` line and no `Remove` row you
-     cannot explain, and the table matches the gate dry run;
+     `WARN`. Exactly one `WARN` is expected —
+     `WARN: Database (AWS::RDS::DBInstance) may be replaced (Replacement:
+     Conditional)` — because `BackupRetentionPeriod` and
+     `PreferredMaintenanceWindow` are conditionally create-only in the
+     resource schema; it was rehearsed in place, and the stack policy denies
+     an actual replacement (D26; infra/README.md, "Database stack policy").
+     Everything new in 1a is an `Add`: answer `y` only when that is the only
+     `WARN` line, there is no `Remove` row you cannot explain, and the table
+     matches the gate dry run;
    - after the `y`, the open-run check runs once more before the change set
      executes; a run opened while you read the table deletes the change set
      and stops the deploy;

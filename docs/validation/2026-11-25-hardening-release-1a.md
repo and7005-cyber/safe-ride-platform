@@ -5,8 +5,9 @@
   tip (cut from `main` at `a59756d`, with the requirements and plan in
   `e20f3d5`) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U1–U6, with
-  U16 moved into 1a (D8), as amended by the execution decisions D1–D25
-  (D20–D24 from the code review below, D25 the holiday deploy window).
+  U16 moved into 1a (D8), as amended by the execution decisions D1–D26
+  (D20–D24 from the code review below, D25 the holiday deploy window, D26
+  the database stack policy).
 - **Surface:** migration 017 (additive account-hardening schema) and the
   read-only `hardening` and `restore-compare` verify sets; deploy fail-fast on
   a missing secret in af-south-1, clean-checkout rule, open-run refusal,
@@ -81,7 +82,7 @@
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | | **open** |
 | **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | | **open** |
 | Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | | **open** |
-| **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | Run 2026-11-18 on the user's go ("Gate dry run, 2026-11-18" below): the `Database` row lists exactly the five 1a properties and **no `MasterUserPassword`**; change set deleted, none left; stack `UPDATE_COMPLETE`, `LastUpdatedTime` 2026-09-22T17:52:33Z before and after. One `WARN`: `Database` replacement `Conditional`, from `BackupRetentionPeriod` and `PreferredMaintenanceWindow` (the only two of the five in the resource schema's `conditionalCreateOnlyProperties`) | **met** for `MasterUserPassword`; the `WARN` is **open** (No-Go until resolved with the user) |
+| **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | Run 2026-11-18 on the user's go ("Gate dry run, 2026-11-18" below): the `Database` row lists exactly the five 1a properties and **no `MasterUserPassword`**; change set deleted, none left; stack `UPDATE_COMPLETE`, `LastUpdatedTime` 2026-09-22T17:52:33Z before and after. One `WARN`: `Database` replacement `Conditional`, from `BackupRetentionPeriod` and `PreferredMaintenanceWindow` (the only two of the five in the resource schema's `conditionalCreateOnlyProperties`) | **met** — `MasterUserPassword` absent; the `WARN` closed by D26: rehearsed in place on a throwaway stack, stack policy denying `Database` replacement set on `saferide-backend` |
 | Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | | **open** |
 | Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | | **open** |
 | Stray-variable check prints only the intended exports; no `ALLOW_*` | | **open** |
@@ -177,8 +178,35 @@ removed by applying them out of band. Were CloudFormation to replace the
 instance anyway, the template names no `DBInstanceIdentifier`, so it would
 create a new, empty database and snapshot then delete the old one
 (`UpdateReplacePolicy: Snapshot`); the live instance has no deletion
-protection yet, and the stack has no stack policy. How to close the `WARN`
-is the user's decision.
+protection yet, and the stack had no stack policy.
+
+**Closed (D26, the user's choice "rehearse and lock").** A throwaway stack
+`saferide-rds-rehearsal-20261118` (af-south-1, 15:10–15:21 UTC) created a
+`db.t4g.micro` PostgreSQL 16.14 instance in the live shape (retention 7, no
+explicit windows, no `MaxAllocatedStorage`, deletion protection off; password
+random, never printed), under the stack policy below, then applied a change
+set with exactly 1a's five database properties. The same gate printed the
+same row and `WARN`; the change set's details: `BackupRetentionPeriod` and
+`PreferredMaintenanceWindow` `RequiresRecreation: Conditionally`, the other
+three `Never`, all `Evaluation: Static`, `DirectModification`. Executed:
+`Database` `UPDATE_IN_PROGRESS` 15:18:23Z → `UPDATE_COMPLETE` 15:18:56Z, stack
+`UPDATE_COMPLETE`, no policy denial. The instance kept its `DbiResourceId`
+and `InstanceCreateTime` (the same instance, not a replacement), status
+`available`, `PendingModifiedValues` empty, and read retention 35, backup
+`23:00-23:30`, maintenance `sun:00:00-sun:01:00`, `MaxAllocatedStorage` 100,
+deletion protection on. Cleanup: deletion protection off, stack deleted,
+instance gone, no snapshot and no retained automated backup left.
+
+Then, on the same choice, the policy was set on `saferide-backend` and read
+back (`get-stack-policy`); the stack stayed `UPDATE_COMPLETE`,
+`LastUpdatedTime` 2026-09-22T17:52:33Z:
+
+```json
+{"Statement": [
+  {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+  {"Effect": "Deny", "Action": ["Update:Replace", "Update:Delete"], "Principal": "*", "Resource": "LogicalResourceId/Database"}
+]}
+```
 
 ## Decisions taken during execution
 
@@ -257,6 +285,14 @@ From the code review (2026-11-17/18):
   window protects route hours, which do not occur in the holiday. The
   open-run checks still run at the deploy, and the deploy's own refusal
   stays on.
+- **D26** (2026-11-18, the user chose "rehearse and lock") The `Database`
+  row's `Replacement: Conditional` is accepted as the one expected `WARN` of
+  the 1a change set, closed by evidence and a guard rather than by a code
+  change: a throwaway-stack rehearsal applied exactly 1a's five database
+  changes in place, and `saferide-backend` now carries a stack policy denying
+  `Update:Replace` and `Update:Delete` on `Database` (infra/README.md,
+  "Database stack policy"). The checklist expects that `WARN` and no other,
+  and checks the policy before the deploy.
 
 Found and decided while finishing the unit (`0d953eb` and `ebdc123`):
 
