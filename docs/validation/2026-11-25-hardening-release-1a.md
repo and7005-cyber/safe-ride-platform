@@ -5,8 +5,8 @@
   tip (cut from `main` at `a59756d`, with the requirements and plan in
   `e20f3d5`) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U1–U6, with
-  U16 moved into 1a (D8), as amended by the execution decisions D1–D24
-  (D20–D24 from the code review below).
+  U16 moved into 1a (D8), as amended by the execution decisions D1–D25
+  (D20–D24 from the code review below, D25 the holiday deploy window).
 - **Surface:** migration 017 (additive account-hardening schema) and the
   read-only `hardening` and `restore-compare` verify sets; deploy fail-fast on
   a missing secret in af-south-1, clean-checkout rule, open-run refusal,
@@ -77,7 +77,7 @@
 | U1.5 production Map ID and restricted browser key stored in af-south-1 | 2026-11-18 14:47 UTC: `/saferide/google-maps-browser-key` and `/saferide/google-maps-map-id` stored as SecureString version 1 in af-south-1, read back: the key matches "Saferide production" (project `atomic-monument-499505-s4`; websites exactly `https://saferidelive.co.ke/*` and `https://www.saferidelive.co.ke/*`; API restriction only Maps JavaScript API, `maps-backend.googleapis.com` — the app loads only the `geometry` and `marker` libraries, address search and routing run server-side), the Map ID matches "Saferide" `72fcaa99aa3cbcc49ce6776f` (VECTOR). The unused, website-unrestricted "Maps Platform API Key" was deleted. Still in use: "SafeRide Web (browser)" (live site, `frontend/.env.local`) and "SafeRide Server (backend)" (live API, eu-west-2 SSM). The restriction itself is proved by the Release 1a phone checks | **met** |
 | U1.6 Route 53 preflight clean on the deploy day | clean on 2026-11-17 (D11); re-check due on the day | **open** |
 | U1.7 alert addresses confirmed and exported for both deploys; the four confirmations within 48 hours, proved after the deploy (+1 h and +47 h) | | **open** |
-| U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | | **open** |
+| U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | Day agreed 2026-11-18 (D25): schools closed until 2027-01-04, any day works. Read 2026-11-18: `open-runs` 0; current windows backup `05:59-06:29` UTC daily, maintenance `tue:09:23-tue:09:53` UTC, `PendingModifiedValues` empty, retention 7. Re-read both, and `gps` `trail-rows-per-run-today`, on the deploy day | **open** (day **met**; the deploy-day reads remain) |
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | | **open** |
 | **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | | **open** |
 | Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | | **open** |
@@ -173,6 +173,14 @@ From the code review (2026-11-17/18):
 - **D24** `verify-db.sh` exits non-zero when the verify Lambda answers a
   status other than `ok` (3), and under `--strict` when a check returns an
   error row (4).
+- **D25** (2026-11-18, the user) The schools are on holiday until
+  2027-01-04 and the provider is the operator, so no run is expected on any
+  day before then: Release 1a (and 1b and 2, while the holiday lasts) can
+  deploy on any day, at any hour clear of the database's backup window and
+  maintenance window as read on the day. The checklist's 16:30–22:30 UTC
+  window protects route hours, which do not occur in the holiday. The
+  open-run checks still run at the deploy, and the deploy's own refusal
+  stays on.
 
 Found and decided while finishing the unit (`0d953eb` and `ebdc123`):
 
