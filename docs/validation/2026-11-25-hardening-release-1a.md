@@ -5,20 +5,25 @@
   tip (cut from `main` at `a59756d`, with the requirements and plan in
   `e20f3d5`) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U1–U6, with
-  U16 moved into 1a (D8), as amended by the execution decisions D1–D19.
+  U16 moved into 1a (D8), as amended by the execution decisions D1–D24
+  (D20–D24 from the code review below).
 - **Surface:** migration 017 (additive account-hardening schema) and the
   read-only `hardening` and `restore-compare` verify sets; deploy fail-fast on
-  a missing secret in af-south-1, clean-checkout rule, change-set gate,
-  production seed gate and version stamp; the backend stack's database
-  hardening, JSON logs in retained 90-day groups, passive alarms to two
-  operators, SES identity and DNS, CloudTrail; the frontend stack's security
-  headers (CSP report-only), Route 53 probes, CloudFront and certificate
-  alarms and the cost budget; the production Map ID and browser key from the
-  parameter store; every live-parity parameter passed explicitly on each
-  deploy; the SSM copy helper; the operator checklist, Release 1a deploy
-  checklist and restore and rollback runbook in `infra/README.md`. No
-  user-facing behaviour changes: nothing reads 017's objects until
-  Release 1b.
+  a missing secret in af-south-1, clean-checkout rule, open-run refusal,
+  change-set gate (`infra/scripts/changeset_gate.py`), production seed gate
+  and version stamp; `verify-db.sh` exit codes and `--strict`; the backend
+  stack's database hardening, JSON logs in retained 90-day groups (`httpx`
+  and `httpcore` held at WARNING), passive alarms to two operators, SES
+  identity and DNS, CloudTrail; the frontend stack's security headers (CSP
+  report-only), Route 53 probes, CloudFront and certificate alarms and the
+  cost budget; the production Map ID and browser key from the parameter
+  store; every live-parity parameter passed explicitly on each deploy of
+  either stack; the SSM copy helper; the operator checklist and the
+  Release 1a deploy checklist in
+  `docs/runbooks/hardening-release-checklists.md` and the restore and
+  rollback runbook in `infra/RESTORE.md` (both moved out of
+  `infra/README.md` in this record's commit). No user-facing behaviour
+  changes: nothing reads 017's objects until Release 1b.
 - **Not deployed.** Local evidence only. Every operator and production row
   below is open; fill them in at the deploy.
 
@@ -34,7 +39,15 @@
 | `9fcc9d5` | U4 | Database property set (D18), three retained JSON log groups, pin-login and school-lookup route throttles (D6), `saferide-ops` topic with conditional subscriptions (D19) and twelve count-based alarms (D9, D16), SES identity, configuration set and mail records with DMARC `p=none` (D11), retained CloudTrail bucket and trail (D10), mail settings under live parity |
 | `2bafe24` | U5, U16 | CloudFront response-headers policy with `CspMode` (report-only default), us-east-1 topic (D12), two Route 53 probes, site 5xx and certificate alarms, 60 USD budget; `deploy-frontend.sh` builds with the Maps browser key and Map ID read from af-south-1 |
 | `0d953eb` | U3/U4 fixes, U1 tool | `parity-params.sh`: every parity parameter with a template Default passed on every deploy (the SAM `UsePreviousValue` finding below); `ConcurrencyAlarmThreshold` mapped; `copy-ssm-to-backend-region.sh` with its fake-`aws` test |
-| this record | U1, U6 docs | `infra/README.md`: operator checklist before Release 1a, Release 1a deploy checklist, restore and rollback runbook (replacing the snapshot sketch), live-parity rule, SSM, alarms and teardown notes; this record |
+| `ebdc123` | U1, U6 docs | `infra/README.md`: operator checklist before Release 1a, Release 1a deploy checklist, restore and rollback runbook (replacing the snapshot sketch), live-parity rule, SSM, alarms and teardown notes; the first draft of this record |
+| `566b136` | U4 fix | The fixed-name log groups and SES identity move from `Retain` to `RetainExceptOnCreate`, so a rolled-back first 1a create leaves nothing to clash on the retry; the trail bucket stays plain `Retain` |
+| `639954e` | U1 tool test | The copy helper's signal tests reset inherited signal dispositions in the child, so they pass under `nohup` and as a background job |
+| `54ca7ba` | review A1 | `httpx`/`httpcore` pinned to WARNING at app import (D20) with `test_logging_hygiene`; import-time registry check dropped from the verify handler; 017 reordered so `live_schools` is locked last; 017 rehearsed over a populated pre-017 shape through the Lambda path |
+| `a12bc01` | review A2 | No RDS log export (D21); maintenance `sun:00:00-sun:01:00` (D22); `SystemLogLevel` INFO; generated budget name (D23); `ApiProbeFailing` wording; shared `template_text.py` helper; per-alarm property table, topic-policy and trail tests |
+| `a305a50` | review B.5, B.6 | `FRONTEND_PARAMS` and one `PARITY_PAIRS` list, `deploy-frontend.sh` passes every frontend parameter with a Default (incl. `MonthlyBudgetUsd`); `verify-db.sh` exits 3 on a status other than `ok` and 4 under `--strict` on an error row (D24); fake-CLI tests |
+| `104985d` | review B.1–B.4, B.7, B.8 | Change-set gate as `changeset_gate.py` with the stateless-replacement rule and `ALLOW_REPLACE`; explicit `--stack-name`/`--region` on `sam deploy`; `provider-bootstrap` read with `ssm_required`; push seeding through a 0600 file; `provider-bootstrap.sh` refuses to mint on a read error; open-run refusal with `ALLOW_OPEN_RUNS`; behavioural deploy-guard tests |
+| `a16327e` | review B | `ALLOW_REPLACE` never covers an `AWS::RDS::DBInstance`; the superseded frontend parameter text test removed |
+| this record | review D, U1, U6 docs | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, with pointers left in `infra/README.md` and every reference re-pointed; the README, checklists and runbook describe the review fixes; this record brought up to date |
 
 ## Go/No-Go gates (plan §Operational Notes, Release 1a checklist)
 
@@ -43,10 +56,15 @@
 | Migration 017 applies and double-applies (psql and the Lambda's single-transaction path) | Recorded in `635c7db`: `reset-local-db.sh` clean with 017; psql and Lambda-path re-applies clean; `test_migration_017`, 017 double-apply in `test_tenancy_schema` | **met locally** |
 | `hardening` and `restore-compare` sets run on a local database | Integration `test_verify_handler` (`hardening` clean at 017; `restore-compare` refuses a malformed timestamp and returns one row per table) and unit `test_verify_registry`, in the run recorded in `635c7db` (integration 560 passed, 2 skipped) | **met locally** |
 | Seeds skipped outside local | Recorded in `d2f69b8` (migrate-handler unit tests, `APP_ENV=production` reports the skipped files) | **met locally** |
-| Deploy shell checks by hand (one parameter removed from af-south-1 aborts before `sam build` naming it; a modified tracked file aborts; a non-main HEAD without a release tag aborts) | Plan U3 asks for these before 1a; no hand run is recorded yet | **open** |
-| Every parity parameter reaches the stack on each deploy | `test_deploy_params.py` 25 passed under `/bin/bash` 3.2.57 at `0d953eb` | **met locally** |
-| SSM copy helper never writes in report mode, never overwrites, never exposes a value | `test_copy_ssm_script.py` 25 passed against a fake `aws` at `0d953eb` | **met locally** |
-| Templates lint clean | `sam validate --lint` (backend) at `0d953eb`: only the pre-existing W1011; frontend template cfn-lint and `validate-template` recorded in `2bafe24` | **met locally** |
+| 017 over a populated pre-017 shape, through the Lambda's single-transaction path | `test_migration_017` (rolled back): distinct Crockford codes for existing schools, NOT NULL/default/unique restored, the existing parent reads (False, NULL), a second apply changes nothing; integration 561 passed, 2 skipped at `54ca7ba` | **met locally** |
+| Deploy shell checks by hand (one parameter removed from af-south-1 aborts before `sam build` naming it; a modified tracked file aborts; a non-main HEAD without a release tag aborts) | Behaviour covered against fake `aws`/`git` by `test_deploy_guards.py` (37) at `104985d`; plan U3's hand run against the real account is not recorded yet | **open** |
+| Change-set gate: master-password change and non-stateless replacement abort; stateless replacement, `Conditional` and `ALLOW_REPLACE` warn; `ALLOW_REPLACE` never covers the database; an aborted or declined change set is deleted, never executed | `test_changeset_gate.py` 49 passed (table-driven payloads plus `deploy-backend.sh` end to end against fake `aws`/`sam`/`git`) at `a16327e` | **met locally** |
+| Open-run refusal before `sam build`; `ALLOW_OPEN_RUNS=1` overrides | Same file: `open-runs` 1 refuses, 0 proceeds, the override proceeds, and every way the count can be unreadable refuses | **met locally** |
+| `verify-db.sh` exit codes 0/1/2/3/4 and `--strict` (D24) | `test_verify_db_script.py` 15 passed against a fake `aws` at `a305a50` | **met locally** |
+| Maps key and searched addresses kept out of INFO logs (D20) | `test_logging_hygiene.py` 6 passed (fresh interpreter per entry path, with a control showing bare `httpx` logs the key) at `54ca7ba` | **met locally** |
+| Every parity parameter reaches the stack on each deploy, both stacks | `test_deploy_params.py` 32 passed (backend and frontend templates, `deploy-frontend.sh` end to end) at `a305a50`; first recorded as 25 at `0d953eb` | **met locally** |
+| SSM copy helper never writes in report mode, never overwrites, never exposes a value | `test_copy_ssm_script.py` 25 passed against a fake `aws` at `0d953eb`, again at `639954e` under `nohup` | **met locally** |
+| Templates lint clean | `sam validate --lint` (backend) at `a12bc01`: only the pre-existing W1011; frontend `validate-template` and SAM lint clean at `a12bc01` | **met locally** |
 | `scripts/certify.sh` green at the release commit | pending | **open** |
 | U1.1 SES production access requested (case id); both operator addresses verified | | **open** |
 | U1.2 Lambda concurrency quota (L-B99A9384) at least 100, or the request id | | **open** |
@@ -55,24 +73,24 @@
 | U1.5 production Map ID and restricted browser key stored in af-south-1 | | **open** |
 | U1.6 Route 53 preflight clean on the deploy day | clean on 2026-11-17 (D11); re-check due on the day | **open** |
 | U1.7 alert addresses confirmed and exported for both deploys | | **open** |
-| U1.8 no-run day agreed; `open-runs` 0 at the deploy (`tenancy-preflight` before 1a) | | **open** |
+| U1.8 no-run day agreed; `open-runs` 0 at the deploy (`tenancy-preflight` before 1a; the deploy's own open-run refusal reads the same row) | | **open** |
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | | **open** |
 | Live parity values read before the first explicit-parameter deploy | | **open** |
 | Manual pre-1a snapshot id recorded | | **open** |
 | `release/1a` tagged at the certified commit; HEAD on it | | **open** |
-| Change set: no `MasterUserPassword`, no replacement, no unexplained removal | | **open** |
+| Change set: no `MasterUserPassword`, no replacement and no `WARN` line, no unexplained removal | | **open** |
 | Migrate result: `017_account_hardening` applied; seeds skipped by name; `app_role.synced` | | **open** |
 | Frontend deployed with `CSP_MODE=report-only` | | **open** |
-| `verify-db.sh migrations` lists 017; `hardening`: `017-objects-present` all true, `schools-without-driver-code` 0 | | **open** |
+| `verify-db.sh --strict migrations` exits 0 and lists 017 (with the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows); `--strict hardening` exits 0: `017-objects-present` all true, `schools-without-driver-code` 0; `instance-settings` recorded | | **open** |
 | Headers on apex, www, a deep route and `/sw.js` (report-only CSP, no enforcing CSP) | | **open** |
-| RDS properties as set, `PendingModifiedValues` empty | | **open** |
+| RDS properties as set (maintenance `sun:00:00-sun:01:00`, no log export), `PendingModifiedValues` empty | | **open** |
 | Alarms `OK`/`INSUFFICIENT_DATA` in both regions; four subscriptions confirmed | | **open** |
 | Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | | **open** |
 | SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | | **open** |
 | CloudTrail logging, objects in the bucket | | **open** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | | **open** |
 | Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | | **open** |
-| 90-day retention set on the old `/aws/lambda/*` groups and the RDS export group | | **open** |
+| 90-day retention set on the three old `/aws/lambda/*` groups | | **open** |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | | **open** |
 
 ## Decisions taken during execution
@@ -93,7 +111,11 @@ From the execution decisions (2026-11-17), all for Release 1a:
 - **D6** Sign-in and school-lookup routes throttled at 20 rps, burst 40, as
   template parameters with deploy overrides.
 - **D7** Change-set gate on every backend deploy: abort on a
-  `MasterUserPassword` change or any replacement.
+  `MasterUserPassword` change on the database or any replacement. After the
+  review, a replacement of a stateless type (`AWS::SNS::Subscription`,
+  `AWS::CloudWatch::Alarm`, `AWS::Logs::MetricFilter`) is a `WARN`, and
+  `ALLOW_REPLACE=<LogicalId,...>` downgrades the named ids to a loud `WARN`
+  for one deploy — never an `AWS::RDS::DBInstance`.
 - **D8** U16 (production Map ID and browser key) ships in 1a, so the
   report-only weeks observe the policy against it.
 - **D9** The migrate function's errors alarm ships in 1a.
@@ -103,8 +125,13 @@ From the execution decisions (2026-11-17), all for Release 1a:
   `mail.` records on 2026-11-17.
 - **D12** Two topics: af-south-1 for the backend, us-east-1 for probes,
   CloudFront, the certificate and the budget.
-- **D13** Retained resources are imported or deleted before re-deploying
-  after a rollback — now the runbook's "Retained resources" section.
+- **D13** The fixed-name resources (the three `/saferide/*` log groups, the
+  SES identity) carry `RetainExceptOnCreate` (`566b136`): a failed 1a update
+  deletes what it had just created, so the retry has nothing to clean up; a
+  deliberate rollback to `release/0` or a stack delete leaves them behind,
+  to be deleted or imported before 1a is deployed again
+  (`infra/RESTORE.md`, "Retained resources"). The CloudFormation-named trail
+  bucket stays plain `Retain`.
 - **D14** `restore-compare` binds a validated timestamp with an offset.
 - **D15** Secrets move between regions by pipe and file only, matched by
   digest; the default-region copies are deleted one week after Release 2 is
@@ -117,7 +144,24 @@ From the execution decisions (2026-11-17), all for Release 1a:
 - **D19** Alert addresses are parameters with empty defaults; a subscription
   exists only for a set address.
 
-Found and decided while finishing the unit (`0d953eb` and this record):
+From the code review (2026-11-17/18):
+
+- **D20** The `httpx` and `httpcore` loggers are pinned to WARNING at app
+  import: with INFO logging, the geocoder's request URLs (the server Maps key
+  and searched home addresses) would reach CloudWatch.
+- **D21** No PostgreSQL log export in 1a: error DETAIL lines can carry email
+  addresses or the app-role password, and a terser parameter group needs a
+  reboot. Revisit later.
+- **D22** Maintenance window `sun:00:00-sun:01:00` UTC (Sunday 03:00–04:00
+  EAT), half an hour clear of the 23:00–23:30 backup window instead of on its
+  end.
+- **D23** The budget's name is generated by CloudFormation, so a subscriber
+  change (a replacement) can create the new budget before deleting the old.
+- **D24** `verify-db.sh` exits non-zero when the verify Lambda answers a
+  status other than `ok` (3), and under `--strict` when a check returns an
+  error row (4).
+
+Found and decided while finishing the unit (`0d953eb` and `ebdc123`):
 
 - **SAM `UsePreviousValue`.** SAM CLI 1.162.1 sends `UsePreviousValue` for
   every parameter a deploy does not pass, so a template Default change never
@@ -152,31 +196,70 @@ Found and decided while finishing the unit (`0d953eb` and this record):
   and checked with drift detection.
 - **A manual snapshot before the deploy** is in the checklist: a rollback to
   `release/0` would cut automated backups from 35 to 7 days.
-- **Retained resources after a failed or reverted 1a:** the runbook's
-  default is to delete the log groups (after copying what the incident
-  needs) and the SES identity; importing them is described but unrehearsed.
+- **Retained resources after a failed or reverted 1a:** a failed 1a update
+  cleans up after itself (`RetainExceptOnCreate`); after a deliberate
+  rollback to `release/0` or a stack delete, the runbook's default is to
+  delete the log groups (after copying what the incident needs) and the SES
+  identity; importing them is described but unrehearsed.
+
+## Code review (2026-11-17/18)
+
+The branch through `639954e` was reviewed by eleven reviewers: correctness,
+security, adversarial, testing, maintainability, project-standards,
+data-migration, reliability, agent-native, learnings and
+deployment-verification. A reboot on 2026-11-18 interrupted the adversarial
+and deployment-verification reviewers; both were re-run against the fixed
+tree. The other nine reviewers' findings were synthesised into four fix
+batches, applied in order:
+
+| Batch | Commits | Fixed |
+|---|---|---|
+| A1 — backend app, migration, integration test | `54ca7ba` | `httpx`/`httpcore` at WARNING (D20) with a fresh-interpreter test; the verify handler's import-time registry check removed (its unit test is the single home); 017 locks the most-referenced tables last (`live_schools` group last); 017 rehearsed over a populated pre-017 shape through `pgconn.exec_`; seeded-parent comment corrected |
+| A2 — templates and their tests | `a12bc01` | No RDS log export and no alarm description pointing at one (D21); maintenance `sun:00:00-sun:01:00` (D22); platform logs at INFO; generated budget name (D23); `ApiProbeFailing` says the probe is database-aware only from 1b; shared `template_text.py` reader with a vacuity guard; per-alarm property table, topic-policy and trail tests |
+| B — deploy scripts and behavioural tests | `a305a50`, `104985d`, `a16327e` | `changeset_gate.py` with the stateless-replacement rule and `ALLOW_REPLACE` (never the database); explicit stack and region on `sam deploy`; `provider-bootstrap` read with `ssm_required`; push seeding through a 0600 file, aborting on read errors; `provider-bootstrap.sh` refuses to mint on any read error; `ssm_required` always af-south-1; one `PARITY_PAIRS` list plus `FRONTEND_PARAMS` with `MONTHLY_BUDGET_USD`; `verify-db.sh` exit codes and `--strict` (D24); open-run refusal with `ALLOW_OPEN_RUNS`; fake-CLI tests for all of it |
+| D — documentation | this record | Checklists moved to `docs/runbooks/hardening-release-checklists.md` and the runbook to `infra/RESTORE.md`, references re-pointed; README alarms, budget, logging, probe, gate, open-run, parity, seeding and `verify-db.sh` text brought in line with A1–B; the runbook checks `cli_history` first, re-applies the new property set without a log export and reads the `no_pin` column during a pepper rotation; the source-region delete uses the region the copy helper printed; this record |
+
+Residuals deferred:
+
+| Residual | Why deferred |
+|---|---|
+| A `verify-db.sh` assert mode with expectations per label | The expectations differ per release and per school (counts that fall to 0 only after a job runs, rows that are informative); `--strict` already fails on error rows and the checklists carry the expectations. Revisit once 1b's expectations settle. |
+| `verify-target` and `compare-restore` scripts for the runbook's verify-function swap and the `restore-compare` reading | The rehearsal runs the runbook's commands by hand first; it shows which steps are worth scripting. |
+| A CSP report endpoint | Report-only violations are read from the phone consoles during the 1a weeks; an endpoint is new public surface and storage. Decide with Release 2's enforce step. |
+| A `check-headers` script | The checklist's curl loop over four URLs is the check, run once per release. |
+| A parity-diff script (live stack parameters against the template Defaults) | The checklist reads the live parameters once before the first explicit-parameter deploy; from then on every deploy passes every Default. |
+| An SES status script | One `get-email-identity` command, run at +24 h and +72 h. |
+| A Maps key restriction check through `gcloud` | `gcloud` is not in the deploy toolchain; the phone checks prove the restriction (no `RefererNotAllowedMapError` on either origin). |
+| Identity fields in `restore-compare` for the populated restore rehearsal | It compares counts and newest times per append-only table, not which rows; enough to judge a restore point. Revisit with the 1b rehearsal. |
+| `provider-bootstrap.sh` still reads the bootstrap payload with errors suppressed (a read error yields version 1) and mints the TOTP pepper and the initial passwords with `--value` in argv | A one-time operator script, already run in production and re-run only for lockout recovery on the operator's machine; the 0600-file treatment comes in a later pass. |
+| `ssm_seeded`'s temporary directory has no signal trap | It is removed on every return path and holds one push value for the length of one `put-parameter`; each parameter is seeded once. |
+| `samconfig.toml` and stack-name drift beyond B.2 | `sam deploy` now names the stack and region; `samconfig.toml` still supplies the capabilities, `resolve_s3` and the build image and names `saferide-backend` itself, which matters only if `BACKEND_STACK` is overridden. |
+| An RDS `DatabaseConnections` alarm | Its threshold needs `max_connections`, read from `hardening` → `instance-settings` after the 1a deploy. |
 
 ## Test evidence
 
 | Command | Result |
 |---|---|
-| `.venv/bin/python -m pytest -q` (backend unit, from `backend/`, at `0d953eb`) | 578 passed, 560 skipped (integration self-skips without `RUN_INTEGRATION`) |
-| `pytest tests/core/test_copy_ssm_script.py` | 25 passed — fake `aws` first on PATH; report, apply, mismatch, read errors in either region, lost put race, mixed statuses, region resolution, `cli_history`, `bash -x` trace, HUP/INT/QUIT/TERM during a put |
-| `pytest tests/core/test_deploy_params.py` | 25 passed under `/bin/bash` 3.2.57 |
-| Mutation checks (by hand, reverted) | removing the explicit Default, adding `--overwrite`, printing a read, dropping the cleanup trap, or dropping the HUP/QUIT traps each fails the tests |
-| `bash -n` on every `infra/scripts/*.sh` | clean |
+| `../.venv/bin/python -m pytest -q tests/core` (backend unit, from `backend/`, with this record's changes) | 464 passed |
+| `pytest tests/core/test_changeset_gate.py`, `test_deploy_guards.py`, `test_verify_db_script.py`, `test_logging_hygiene.py`, `test_deploy_params.py`, `test_copy_ssm_script.py`, `test_backend_stack.py`, `test_frontend_stack.py` (2026-11-18, at `a16327e`) | 49, 37, 15, 6, 32, 25, 39 and 21 passed |
+| `.venv/bin/python -m pytest -q` (backend unit, from `backend/`, at `54ca7ba`) | 584 passed, 561 skipped (integration self-skips without `RUN_INTEGRATION`) |
+| `.venv/bin/python -m pytest -q` (backend unit, from `backend/`, at `0d953eb`) | 578 passed, 560 skipped |
+| `pytest tests/core/test_copy_ssm_script.py` at `0d953eb` | 25 passed — fake `aws` first on PATH; report, apply, mismatch, read errors in either region, lost put race, mixed statuses, region resolution, `cli_history`, `bash -x` trace, HUP/INT/QUIT/TERM during a put |
+| `pytest tests/core/test_deploy_params.py` at `0d953eb` | 25 passed under `/bin/bash` 3.2.57 |
+| Mutation checks (by hand, reverted) | removing the explicit Default, adding `--overwrite`, printing a read, dropping the cleanup trap, or dropping the HUP/QUIT traps each fails the tests; at `104985d` the previous `config.sh`, `deploy-backend.sh`, `provider-bootstrap.sh` and `verify-db.sh` each fail the new tests |
+| `bash -n` on every `infra/scripts/*.sh` and `scripts/provider-bootstrap.sh` | clean (`104985d`; again with this record's reference-line edits) |
 | `git diff --check` | clean |
-| `sam validate --lint` (infra/backend) at `0d953eb` | only the pre-existing W1011 |
-| `RUN_INTEGRATION=1 pytest tests/integration` | last recorded at `9fcc9d5`: 560 passed, 2 skipped; `backend/app` and `backend/db` unchanged since |
+| `sam validate --lint` (infra/backend) at `a12bc01` | only the pre-existing W1011 (also at `0d953eb`, and again with this record's one-line template comment edit) |
+| `RUN_INTEGRATION=1 pytest tests/integration` | last recorded at `54ca7ba`: 561 passed, 2 skipped; `backend/app`, `backend/db` and the integration tests unchanged since |
 | Frontend (`tsc`, vitest, build) | last recorded at `2bafe24`: tsc clean, vitest 346 passed in 23 files, build passes |
 | `scripts/certify.sh` at the release commit | pending |
 
 ## Rollback position
 
 - **Code rollback to `release/0` (`a59756d`),** backend then frontend, with
-  that tag's own scripts (runbook, "Code rollback"). Migration 017 stays: it
-  is additive, every new column is nullable or defaulted, the audit CHECK is
-  a superset, and `release/0`'s code never reads the new objects.
+  that tag's own scripts (`infra/RESTORE.md`, "Code rollback"). Migration 017
+  stays: it is additive, every new column is nullable or defaulted, the audit
+  CHECK is a superset, and `release/0`'s code never reads the new objects.
 - **Preconditions:** the default-region secret copies exist and match
   (`copy-ssm-to-backend-region.sh` in the deploying shell), because
   `release/0`'s script reads them there and mints a missing one. After the
@@ -188,12 +271,16 @@ Found and decided while finishing the unit (`0d953eb` and this record):
   backups older than 7 days (the manual pre-1a snapshot stays). The frontend
   build returns to `frontend/.env.local`'s development Maps key and demo Map
   ID.
-- **Retained resources (D13):** the `/saferide/*` log groups and the SES
-  identity have fixed names and must be deleted or imported before 1a is
-  deployed again; the CloudFormation-named trail bucket is left behind.
+- **Retained resources (D13, `RetainExceptOnCreate`):** a failed 1a update
+  rolls back cleanly — the log groups and the SES identity it had just
+  created are deleted with it. A deliberate rollback to `release/0` or a
+  stack delete leaves the fixed-name `/saferide/*` log groups and SES
+  identity behind, and they must be deleted or imported before 1a is
+  deployed again; the CloudFormation-named trail bucket (plain `Retain`) is
+  left behind after any rollback and never clashes.
 - **Data:** nothing in 1a rewrites existing rows except filling the new
-  `driver_code` column; a data problem follows the runbook's point-in-time
-  restore and rename swap.
+  `driver_code` column; a data problem follows `infra/RESTORE.md`'s
+  point-in-time restore and rename swap.
 
 ## Deployed
 

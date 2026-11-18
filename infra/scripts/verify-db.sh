@@ -27,7 +27,8 @@
 #      row instead of rows (named on stderr)
 #
 # Expected values per check live in the deployment checklists:
-# docs/work/validation/2026-08-20-fleet-plan-drafting.md and the plan's
+# docs/runbooks/hardening-release-checklists.md (hardening, migrations),
+# docs/work/validation/2026-08-20-fleet-plan-drafting.md and the plans'
 # Operational Notes — this script reports observations; judgment is yours.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"

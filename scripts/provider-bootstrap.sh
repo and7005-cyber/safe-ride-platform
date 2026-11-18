@@ -43,7 +43,7 @@ if [ "$pepper_rc" -eq 3 ]; then
   if [ "$elsewhere_rc" -eq 0 ]; then
     rm -f "$elsewhere_err"
     echo "ERROR: /saferide/totp-pepper exists in the default CLI region but not in $BACKEND_REGION." >&2
-    echo "       Copy it into $BACKEND_REGION (infra/README.md, Operator checklist) — do not mint a new one." >&2
+    echo "       Copy it into $BACKEND_REGION (docs/runbooks/hardening-release-checklists.md, operator checklist step 4) — do not mint a new one." >&2
     exit 1
   fi
   if ! grep -q ParameterNotFound "$elsewhere_err"; then

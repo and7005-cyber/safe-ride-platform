@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Copy the five /saferide/* secrets the pre-hardening deploy read from the
 # operator's default CLI region into $BACKEND_REGION (af-south-1), and prove
-# the two copies equal by SHA-256 digest (infra/README.md, "Operator checklist
-# before Release 1a", step 4; hardening plan U1, decision D15).
+# the two copies equal by SHA-256 digest (docs/runbooks/hardening-release-checklists.md,
+# "Operator checklist before Release 1a", step 4; hardening plan U1, decision D15).
 #
 # Usage:
 #   infra/scripts/copy-ssm-to-backend-region.sh           # report only (read-only)

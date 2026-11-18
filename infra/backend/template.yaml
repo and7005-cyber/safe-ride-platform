@@ -517,7 +517,7 @@ Resources:
   # RetainExceptOnCreate: a rollback of the update that CREATED them deletes
   # them (no name clash on the retry), while a stack delete or a later update
   # that removes them keeps the evidence — then delete or import them before
-  # re-deploying (D13, infra/README.md). The functions' older /aws/lambda/*
+  # re-deploying (D13, infra/RESTORE.md). The functions' older /aws/lambda/*
   # groups get 90-day retention by hand.
   ApiLogGroup:
     Type: AWS::Logs::LogGroup

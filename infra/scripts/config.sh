@@ -58,7 +58,7 @@ ssm_required() { # name -> value
   local name="$1" val rc=0
   val="$(ssm_lookup "$name")" || rc=$?
   if [ "$rc" -eq 3 ]; then
-    echo "ERROR: SSM $name ($BACKEND_REGION) is missing — copy or create it in $BACKEND_REGION before deploying (see infra/README.md, Operator checklist)" >&2
+    echo "ERROR: SSM $name ($BACKEND_REGION) is missing — copy or create it in $BACKEND_REGION before deploying (see docs/runbooks/hardening-release-checklists.md, operator checklist step 4)" >&2
   fi
   [ "$rc" -eq 0 ] || return 1
   printf '%s' "$val"
