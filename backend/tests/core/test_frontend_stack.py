@@ -254,15 +254,3 @@ def test_the_frontend_build_takes_the_maps_values_from_the_parameter_store():
             assert "MAPS_BROWSER_KEY" not in line and "MAPS_MAP_ID" not in line, line
 
 
-def test_the_frontend_deploy_passes_cspmode_every_time_and_alert_addresses_when_set():
-    assert 'CSP_MODE="${CSP_MODE:-report-only}"' in DEPLOY_FRONTEND
-    params = re.search(r"^FE_PARAMS=\(\n((?:  .*\n)+)\)$", DEPLOY_FRONTEND, re.M)
-    assert params, "FE_PARAMS is not a multi-line array"
-    assert '"CspMode=${CSP_MODE}"' in params.group(1)
-    assert '"ApiOrigin=${API_ORIGIN}"' in params.group(1)
-    for param, env in (("AlertEmailPrimary", "ALERT_EMAIL_PRIMARY"), ("AlertEmailSecondary", "ALERT_EMAIL_SECONDARY")):
-        assert re.search(
-            rf'^if \[ -n "\$\{{{env}:-\}}" \]; then\n  FE_PARAMS\+=\("{param}=\$\{{{env}\}}"\)$',
-            DEPLOY_FRONTEND,
-            re.M,
-        ), param

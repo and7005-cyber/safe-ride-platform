@@ -45,6 +45,10 @@ STATELESS_TYPES = frozenset({
     "AWS::Logs::MetricFilter",
 })
 DATABASE_ID = "Database"
+# Never replaceable through ALLOW_REPLACE: a replaced database is a new, empty
+# instance (DeletionPolicy only snapshots the old one). Restores follow
+# infra/RESTORE.md instead.
+NEVER_REPLACEABLE_TYPES = frozenset({"AWS::RDS::DBInstance"})
 CLOCK_SKEW_S = 5
 BANNER = "!" * 76
 
@@ -91,6 +95,9 @@ def review(change_set, allow_replace):
             replaced.add(logical)
             if rtype in STATELESS_TYPES:
                 warnings.append("{} ({}) will be replaced: a stateless type, recreated from the template".format(
+                    logical, rtype))
+            elif rtype in NEVER_REPLACEABLE_TYPES:
+                aborts.append("{} ({}) would be REPLACED, and ALLOW_REPLACE never applies to a database".format(
                     logical, rtype))
             elif logical in allow_replace:
                 loud.append("{} ({}) WILL BE REPLACED: allowed by ALLOW_REPLACE for this deploy".format(
