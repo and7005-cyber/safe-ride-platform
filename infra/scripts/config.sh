@@ -26,28 +26,41 @@ cfn_output() { # stack region key
 }
 export -f cfn_output
 
-# Read one /saferide/* parameter (decrypted) and print its value. Every such
-# parameter lives in $BACKEND_REGION whatever the operator's default CLI region,
-# so that is the default; pass a region only for a deliberate exception. A
-# missing or unreadable parameter prints why on stderr and returns 1, so
-# `VAR="$(ssm_required /saferide/x)"` aborts a `set -e` deploy: no deploy ever
-# mints a secret (infra/README.md, "Deploy safety"). The value is never printed.
-ssm_required() { # name [region] -> value
-  local name="$1" region="${2:-$BACKEND_REGION}" val err
+# Read one /saferide/* parameter (decrypted) from $BACKEND_REGION — where every
+# such parameter lives, whatever the operator's default CLI region. On success
+# it prints the value and returns 0. It returns 3, printing nothing, when the
+# parameter does not exist (ParameterNotFound, or no value). Any other failure
+# (credentials, permissions, network, no region) is never mistaken for a miss:
+# it names AWS's error on stderr and returns 1.
+ssm_lookup() { # name -> value; status 0 found, 3 missing, 1 read error
+  local name="$1" val err rc=0
   err="$(mktemp)"
-  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$region" \
-    --query Parameter.Value --output text 2>"$err" || true)"
-  if [ -z "$val" ] || [ "$val" = "None" ]; then
-    if [ -s "$err" ] && ! grep -q ParameterNotFound "$err"; then
-      # Credentials, permissions or network: not a miss, so say what AWS said.
-      echo "ERROR: could not read SSM $name ($region): $(tr '\n' ' ' < "$err")" >&2
-    else
-      echo "ERROR: SSM $name ($region) is missing — copy or create it in $region before deploying (see infra/README.md, Operator checklist)" >&2
-    fi
+  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$BACKEND_REGION" \
+    --query Parameter.Value --output text 2>"$err")" || rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q ParameterNotFound "$err"; then
+    echo "ERROR: could not read SSM $name ($BACKEND_REGION): $(tr '\n' ' ' < "$err")(aws exit $rc)" >&2
     rm -f "$err"
     return 1
   fi
   rm -f "$err"
+  if [ "$rc" -ne 0 ] || [ -z "$val" ] || [ "$val" = "None" ]; then
+    return 3
+  fi
+  printf '%s' "$val"
+}
+export -f ssm_lookup
+
+# Read one /saferide/* parameter that must pre-exist and print its value. A
+# missing or unreadable parameter prints why on stderr and returns 1, so
+# `VAR="$(ssm_required /saferide/x)"` aborts a `set -e` deploy: no deploy ever
+# mints a secret (infra/README.md, "Deploy safety"). The value is never printed.
+ssm_required() { # name -> value
+  local name="$1" val rc=0
+  val="$(ssm_lookup "$name")" || rc=$?
+  if [ "$rc" -eq 3 ]; then
+    echo "ERROR: SSM $name ($BACKEND_REGION) is missing — copy or create it in $BACKEND_REGION before deploying (see infra/README.md, Operator checklist)" >&2
+  fi
+  [ "$rc" -eq 0 ] || return 1
   printf '%s' "$val"
 }
 export -f ssm_required

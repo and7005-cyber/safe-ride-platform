@@ -242,6 +242,7 @@ sys.exit(0)
 _TREE = [
     "infra/scripts/config.sh",
     "infra/scripts/parity-params.sh",
+    "infra/scripts/changeset_gate.py",
     "infra/scripts/deploy-backend.sh",
     "infra/scripts/deploy-frontend.sh",
     "infra/scripts/verify-db.sh",

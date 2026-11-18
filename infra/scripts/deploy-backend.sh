@@ -8,8 +8,14 @@
 #   packaged;
 # - every /saferide/* parameter is read from $BACKEND_REGION and a missing one
 #   aborts the deploy: this script never generates a secret;
-# - the stack change set is reviewed before it executes: a master-password
-#   change on the database or any resource replacement aborts it.
+# - no run may be open: before anything is built, the deployed verify Lambda's
+#   tenancy-preflight `open-runs` count must be 0. ALLOW_OPEN_RUNS=1 deploys
+#   anyway, with a loud warning;
+# - the stack change set is reviewed before it executes
+#   (scripts/changeset_gate.py): a master-password change on the database, or
+#   the replacement of anything but a stateless type (SNS subscription, alarm,
+#   metric filter), aborts it. ALLOW_REPLACE=<LogicalId,...> lets the named
+#   resources be replaced on this deploy, with a loud warning.
 #   CONFIRM_CHANGESET=1 also asks the operator y/N before executing;
 # - every live-parity parameter with a template Default is passed explicitly
 #   (scripts/parity-params.sh), so the live stack runs the template Default
@@ -20,6 +26,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/parity-params.sh"
+CHANGESET_GATE="$INFRA_DIR/scripts/changeset_gate.py"
 
 require_clean_checkout
 
@@ -70,12 +77,10 @@ GOOGLE_MAPS_KEY="$(ssm_required /saferide/google-maps-api-key)"
 
 # The provider bootstrap must PRE-EXIST too — a minted bootstrap would insert
 # garbage accounts. Create it with scripts/provider-bootstrap.sh.
-PROVIDER_BOOTSTRAP_RAW="$(aws ssm get-parameter --name /saferide/provider-bootstrap \
-  --region "$BACKEND_REGION" --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
-if [ -z "$PROVIDER_BOOTSTRAP_RAW" ] || [ "$PROVIDER_BOOTSTRAP_RAW" = "None" ]; then
-  echo "ERROR: SSM /saferide/provider-bootstrap ($BACKEND_REGION) is missing. Run scripts/provider-bootstrap.sh first." >&2
+PROVIDER_BOOTSTRAP_RAW="$(ssm_required /saferide/provider-bootstrap)" || {
+  echo "       (if it is missing, create it with scripts/provider-bootstrap.sh)" >&2
   exit 1
-fi
+}
 if ! printf '%s' "$PROVIDER_BOOTSTRAP_RAW" | python3 -c "
 import base64, json, sys
 raw = sys.stdin.read().strip()
@@ -88,26 +93,65 @@ assert isinstance(data['version'], int) and data['providers']
   exit 1
 fi
 
-# Push secrets: prefer SSM; seed each from backend/.env when missing (they are
-# provisioned once — Firebase service account, web config, VAPID pair). Empty
-# is fine: the code degrades (FCM off / web push off) and the in-app feed
-# still works.
+# Push secrets: prefer SSM; seed each from backend/.env when it is missing there
+# (they are provisioned once — Firebase service account, web config, VAPID
+# pair). Empty is fine: the code degrades (FCM off / web push off) and the
+# in-app feed still works. A read error other than ParameterNotFound aborts the
+# deploy: it is never taken for "missing", seeded over or deployed as empty.
 ssm_seeded() { # ssm_name env_key -> value ("" if neither SSM nor .env has it)
-  # Pinned to BACKEND_REGION: the two Firebase JSON params are read from SSM by
-  # the Lambda at runtime (in BACKEND_REGION), so they must live there — not in
-  # the operator's default CLI region. (ssm_required above reads the same region;
-  # its values flow through CFN params into the env instead.)
-  local name="$1" env_key="$2" val
-  val="$(aws ssm get-parameter --name "$name" --with-decryption --region "$BACKEND_REGION" \
-    --query Parameter.Value --output text 2>/dev/null || true)"
-  if [ -z "$val" ] || [ "$val" = "None" ]; then
-    val="$(sed -n "s/^${env_key}=//p" "$REPO_DIR/backend/.env" 2>/dev/null | head -1)"
-    if [ -n "$val" ]; then
-      aws ssm put-parameter --name "$name" --type SecureString --value "$val" \
-        --region "$BACKEND_REGION" >/dev/null
-      echo "==> Seeded SSM $name ($BACKEND_REGION) from backend/.env" >&2
-    fi
+  # Pinned to BACKEND_REGION (ssm_lookup, config.sh): the two Firebase JSON
+  # params are read from SSM by the Lambda at runtime (in BACKEND_REGION), so
+  # they must live there — not in the operator's default CLI region.
+  local name="$1" env_key="$2" val rc=0 dir
+  val="$(ssm_lookup "$name")" || rc=$?
+  case "$rc" in
+    0) printf '%s' "$val"; return 0 ;;
+    3) ;;
+    *) return 1 ;;
+  esac
+  # Missing in SSM: python3 reads the value from backend/.env and writes the
+  # put-parameter input (Name, Value, Type SecureString — no Overwrite, so a
+  # parameter created meanwhile is never replaced) into a 0600 file in a
+  # private directory: the value never reaches an argv. Exit 3: .env has no
+  # value either.
+  dir="$(mktemp -d)"
+  rc=0
+  python3 - "$REPO_DIR/backend/.env" "$env_key" "$name" "$dir/put.json" <<'PY' || rc=$?
+import json
+import os
+import sys
+
+env_path, key, name, out = sys.argv[1:5]
+try:
+    with open(env_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+except OSError:
+    sys.exit(3)
+prefix = key + "="
+value = next((line[len(prefix):] for line in lines if line.startswith(prefix)), "")
+if not value:
+    sys.exit(3)
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump({"Name": name, "Value": value, "Type": "SecureString"}, handle)
+PY
+  if [ "$rc" -eq 3 ]; then
+    rm -rf "$dir"
+    return 0
   fi
+  if [ "$rc" -ne 0 ] || ! aws ssm put-parameter --region "$BACKEND_REGION" \
+      --cli-input-json "file://$dir/put.json" --output json >/dev/null; then
+    rm -rf "$dir"
+    echo "ERROR: could not seed SSM $name ($BACKEND_REGION) from backend/.env" >&2
+    return 1
+  fi
+  rm -rf "$dir"
+  echo "==> Seeded SSM $name ($BACKEND_REGION) from backend/.env" >&2
+  # Re-read: the stack gets what SSM holds.
+  val="$(ssm_lookup "$name")" || {
+    echo "ERROR: SSM $name ($BACKEND_REGION) is not readable after seeding it" >&2
+    return 1
+  }
   printf '%s' "$val"
 }
 
@@ -137,15 +181,111 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 [ -n "$VAPID_PUB" ] && DEPLOY_PARAMS+=("VapidPublicKey=${VAPID_PUB}")
 [ -n "$VAPID_PRIV" ] && DEPLOY_PARAMS+=("VapidPrivateKey=${VAPID_PRIV}")
 [ -n "$VAPID_SUBJ" ] && DEPLOY_PARAMS+=("VapidSubject=${VAPID_SUBJ}")
-# Live-parity parameters (scripts/parity-params.sh: the GPS, API-throttle, mail
-# and alarm maps). SAM sends UsePreviousValue for any parameter a deploy does
-# not pass, so each one with a template Default is passed on every deploy: the
-# exported variable under the name the app reads (e.g.
-# GPS_CUSTODY_THRESHOLD_M=200), otherwise the template Default. An export lasts
-# for that deploy only — repeat it, or change the Default in a release. The
-# alert addresses and MailReplyTo have empty Defaults: passed only when
+# Live-parity parameters (scripts/parity-params.sh: PARITY_PAIRS holds the GPS,
+# API-throttle, mail and alarm parameters). SAM sends UsePreviousValue for any
+# parameter a deploy does not pass, so each one with a template Default is
+# passed on every deploy: the exported variable under the name the app reads
+# (e.g. GPS_CUSTODY_THRESHOLD_M=200), otherwise the template Default. An export
+# lasts for that deploy only — repeat it, or change the Default in a release.
+# The alert addresses and MailReplyTo have empty Defaults: passed only when
 # exported (SAM rejects an empty override), otherwise the stack keeps its value.
 build_parity_params "$INFRA_DIR/backend/template.yaml" "${PARITY_PAIRS[@]}"
+
+# --- Open-run guard ------------------------------------------------------------
+# A deploy swaps the API code and migrates the database under whatever runs are
+# in progress. Before anything is built, the verify Lambda the stack has today
+# answers its tenancy-preflight set, whose `open-runs` row counts live_runs not
+# yet completed; more than 0 refuses the deploy, and so does a stack without a
+# verify function or an answer without that row. ALLOW_OPEN_RUNS=1 deploys
+# anyway with a loud warning (an emergency fix, or the very first deploy). Only
+# the count is printed: the set's other rows are not this script's business.
+open_runs_check() { # -> prints a run count, or the reason no count was read
+  local fn fn_error out
+  fn="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" VerifyFunctionName || true)"
+  if [ -z "$fn" ] || [ "$fn" = "None" ]; then
+    echo "stack $BACKEND_STACK ($BACKEND_REGION) has no VerifyFunctionName output"
+    return 0
+  fi
+  out="$(mktemp)"
+  if ! fn_error="$(aws lambda invoke --region "$BACKEND_REGION" --function-name "$fn" \
+      --cli-binary-format raw-in-base64-out --payload '{"checks": "tenancy-preflight"}' \
+      "$out" --query FunctionError --output text)"; then
+    rm -f "$out"
+    echo "could not invoke $fn (see the AWS error above)"
+    return 0
+  fi
+  if [ "$fn_error" != "None" ] && [ -n "$fn_error" ]; then
+    rm -f "$out"
+    echo "$fn failed ($fn_error)"
+    return 0
+  fi
+  python3 - "$out" <<'PY' || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        payload = json.load(handle)
+except (OSError, ValueError):
+    print("the verify Lambda's answer is not JSON")
+    sys.exit()
+if not isinstance(payload, dict) or payload.get("status") != "ok":
+    reason = payload.get("reason", "") if isinstance(payload, dict) else ""
+    print("tenancy-preflight answered status {!r} {}".format(
+        payload.get("status") if isinstance(payload, dict) else None, reason).strip())
+    sys.exit()
+for result in payload.get("results") or []:
+    if isinstance(result, dict) and result.get("label") == "open-runs":
+        if "error" in result:
+            print("the open-runs check failed: {}".format(result["error"]))
+            sys.exit()
+        rows = result.get("rows") or [{}]
+        count = rows[0].get("open_runs") if isinstance(rows[0], dict) else None
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            print(count)
+        else:
+            print("the open-runs check returned no count")
+        sys.exit()
+print("tenancy-preflight has no open-runs row")
+PY
+  rm -f "$out"
+}
+
+loud_open_runs_override() { # what was found
+  {
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "WARNING: ALLOW_OPEN_RUNS=1 — deploying although $1."
+    echo "Runs in progress see the API restart and the migrations apply under them."
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  } >&2
+}
+
+echo "==> Checking for open runs (verify Lambda, tenancy-preflight: open-runs)"
+OPEN_RUNS="$(open_runs_check)"
+case "$OPEN_RUNS" in
+  0)
+    echo "    open-runs: 0"
+    ;;
+  ''|*[!0-9]*)
+    if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
+      loud_open_runs_override "no open-run count could be read: ${OPEN_RUNS:-no answer}"
+    else
+      echo "ERROR: cannot confirm that no run is open: ${OPEN_RUNS:-no answer}." >&2
+      echo "       Deploy outside route hours; ALLOW_OPEN_RUNS=1 skips this check (first deploy, emergency)." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
+      loud_open_runs_override "open-runs is ${OPEN_RUNS}"
+    else
+      echo "ERROR: ${OPEN_RUNS} run(s) are open (verify tenancy-preflight: open-runs; a run left open on an" >&2
+      echo "       earlier day counts too). Deploy once they are completed, outside route hours;" >&2
+      echo "       ALLOW_OPEN_RUNS=1 overrides in an emergency." >&2
+      exit 1
+    fi
+    ;;
+esac
 
 cd "$INFRA_DIR/backend"
 
@@ -155,89 +295,25 @@ sam build --use-container
 echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_ARN:-<none>}, version ${APP_VERSION})"
 
 # --- Change-set gate ----------------------------------------------------------
-# SAM only creates the change set; this script reviews it and executes it. It
-# aborts (and deletes the change set, so nothing runs) when the Database
-# resource lists a MasterUserPassword change — the /saferide/db-password copy
-# in $BACKEND_REGION does not match the live password — or when any resource
-# would be replaced. A Conditional replacement is printed as a warning.
+# SAM only creates the change set; scripts/changeset_gate.py reviews it and this
+# script executes it. The gate prints the change table and aborts (this script
+# then deletes the change set, so nothing runs) when the Database resource
+# lists a MasterUserPassword change — the /saferide/db-password copy in
+# $BACKEND_REGION does not match the live password — or when any resource but
+# a stateless type would be replaced and ALLOW_REPLACE does not name it. A
+# Conditional replacement, a stateless one and an allowed one are warnings.
+# The stack and region are passed explicitly, so samconfig.toml can never
+# point sam at another target than the one the gate reviews.
 
 newest_changeset_since() { # epoch -> id of the newest executable SAM change set created since
   aws cloudformation list-change-sets --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --output json | python3 -c '
-import json, re, sys
-from datetime import datetime
-
-def created(text):
-    text = text.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:  # fractional seconds this Python cannot parse
-        return datetime.fromisoformat(re.sub(r"\.\d+", "", text)).timestamp()
-
-since = float(sys.argv[1]) - 5  # tolerate a few seconds of clock skew
-best = None
-for summary in json.load(sys.stdin).get("Summaries", []):
-    if (summary.get("Status") != "CREATE_COMPLETE"
-            or summary.get("ExecutionStatus") != "AVAILABLE"
-            or not summary.get("ChangeSetName", "").startswith("samcli-deploy")):
-        continue
-    at = created(summary["CreationTime"])
-    if at >= since and (best is None or at > best[0]):
-        best = (at, summary["ChangeSetId"])
-print(best[1] if best else "")
-' "$1"
+    --output json | python3 "$CHANGESET_GATE" newest-since "$1"
 }
 
 review_changeset() { # change-set id -> prints the review; non-zero means abort
   aws cloudformation describe-change-set --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --change-set-name "$1" --output json | python3 -c '
-import json, sys
-
-change_set = json.load(sys.stdin)
-if change_set.get("Status") != "CREATE_COMPLETE" or change_set.get("ExecutionStatus") != "AVAILABLE":
-    print("ABORT: change set is {}/{}: {}".format(
-        change_set.get("Status"), change_set.get("ExecutionStatus"),
-        change_set.get("StatusReason", "")), file=sys.stderr)
-    sys.exit(2)
-
-rows, aborts, warnings = [], [], []
-for change in change_set.get("Changes", []):
-    resource = change.get("ResourceChange")
-    if not resource:
-        continue
-    logical = resource.get("LogicalResourceId", "?")
-    rtype = resource.get("ResourceType", "?")
-    replacement = resource.get("Replacement") or "-"
-    names = []
-    for detail in resource.get("Details", []):
-        target = detail.get("Target", {})
-        name = target.get("Name") if target.get("Attribute") == "Properties" else target.get("Attribute")
-        if name and name not in names:
-            names.append(name)
-    rows.append((resource.get("Action", "?"), logical, rtype, replacement, ", ".join(names) or "-"))
-    if logical == "Database" and any(
-            "MasterUserPassword" in (detail.get("Target", {}).get("Name") or "")
-            for detail in resource.get("Details", [])):
-        aborts.append("Database lists a MasterUserPassword change: SSM /saferide/db-password in this"
-                      " region does not match the live master password")
-    if replacement == "True":
-        aborts.append("{} ({}) would be REPLACED".format(logical, rtype))
-    elif replacement == "Conditional":
-        warnings.append("{} ({}) may be replaced (Replacement: Conditional)".format(logical, rtype))
-
-header = ("Action", "LogicalResourceId", "ResourceType", "Replacement", "Changed")
-widths = [max(len(row[i]) for row in rows + [header]) for i in range(4)]
-print()
-for row in [header] + rows:
-    print("  " + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:4])) + "  " + row[4])
-print()
-sys.stdout.flush()  # the table before the verdict, even when piped to a log
-for warning in warnings:
-    print("WARN: " + warning, file=sys.stderr)
-for abort in aborts:
-    print("ABORT: " + abort, file=sys.stderr)
-sys.exit(2 if aborts else 0)
-'
+    --change-set-name "$1" --output json \
+    | python3 "$CHANGESET_GATE" review --allow-replace "${ALLOW_REPLACE:-}"
 }
 
 discard_changeset() { # change-set id
@@ -251,7 +327,8 @@ discard_changeset() { # change-set id
 
 CHANGESET_SINCE="$(date -u +%s)"
 exec 3>&1
-SAM_OUT="$(sam deploy --no-execute-changeset --parameter-overrides "${DEPLOY_PARAMS[@]}" 2>&1 | tee /dev/fd/3)"
+SAM_OUT="$(sam deploy --no-execute-changeset --stack-name "$BACKEND_STACK" --region "$BACKEND_REGION" \
+  --parameter-overrides "${DEPLOY_PARAMS[@]}" 2>&1 | tee /dev/fd/3)"
 exec 3>&-
 
 CHANGESET_ID=""
@@ -263,7 +340,7 @@ fi
 if [ -z "$CHANGESET_ID" ] && [[ $SAM_OUT == *"No changes to deploy"* ]]; then
   echo "==> No stack changes: nothing to execute; continuing to the migrate step."
 else
-  [ -n "$CHANGESET_ID" ] || CHANGESET_ID="$(newest_changeset_since "$CHANGESET_SINCE")"
+  [ -n "$CHANGESET_ID" ] || CHANGESET_ID="$(newest_changeset_since "$CHANGESET_SINCE" || true)"
   if [ -z "$CHANGESET_ID" ]; then
     echo "ERROR: could not find the change set sam deploy created on ${BACKEND_STACK} (${BACKEND_REGION})." >&2
     exit 1
