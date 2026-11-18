@@ -71,7 +71,7 @@
 | Templates lint clean | `sam validate --lint` (backend) at `a12bc01`: only the pre-existing W1011; frontend `validate-template` and SAM lint clean at `a12bc01` | **met locally** |
 | `scripts/certify.sh` green at the release commit | Green at `156ace9` on 2026-11-18: backend unit 756 passed, 561 skipped; API integration 561 passed, 2 skipped; typecheck clean; vitest 346 passed in 23 files; build passes; Playwright 102 passed. The one later code commit, `c7b0271`, changes only two test stubs; `tests/core` 514 passed there. Re-run at the commit that is tagged `release/1a` | **met locally** |
 | U1.1 SES production access requested (case id); both operator addresses verified | Requested 2026-11-18 14:31 UTC (`put-account-details`, af-south-1, mail type TRANSACTIONAL, one additional contact): `ReviewDetails.Status` `PENDING`, case id not yet assigned. One operator address verified (`SUCCESS`); no second operator chosen yet (`ALERT_EMAIL_SECONDARY` is optional). Record the case id and the outcome | **open** |
-| U1.2 Lambda concurrency quota (L-B99A9384) at least 100, or the request id | | **open** |
+| U1.2 Lambda concurrency quota (L-B99A9384) at least 100, or the request id | Requested 2026-11-18 13:42 UTC for 1000: request `b7c5f73ce466470791de552c6e2831ffTzsJCgjU`, support case `179500939000289`, status `CASE_OPENED`; the limit is still 10. Record the granted value; once granted, export `CONCURRENCY_ALARM_THRESHOLD` (80% of it) on every backend deploy | **open** |
 | U1.3 `release/0` on `a59756d`, pushed | | **open** |
 | U1.4 five `values MATCH` lines from `copy-ssm-to-backend-region.sh` | | **open** |
 | U1.5 production Map ID and restricted browser key stored in af-south-1 | | **open** |
