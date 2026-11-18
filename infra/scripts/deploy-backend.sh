@@ -8,15 +8,24 @@
 #   packaged;
 # - every /saferide/* parameter is read from $BACKEND_REGION and a missing one
 #   aborts the deploy: this script never generates a secret;
-# - no run may be open: before anything is built, the deployed verify Lambda's
-#   tenancy-preflight `open-runs` count must be 0. ALLOW_OPEN_RUNS=1 deploys
-#   anyway, with a loud warning;
+# - the alarms must email someone: ALERT_EMAIL_PRIMARY is exported, or the
+#   stack holds an AlertEmailPrimary, which is then passed explicitly
+#   (alert_address_guard, parity-params.sh). ALLOW_NO_ALERTS=1 deploys without
+#   one, with a loud warning;
+# - no run may be open: before anything is built, and again just before the
+#   change set executes, the deployed verify Lambda's tenancy-preflight
+#   `open-runs` count must be 0. ALLOW_OPEN_RUNS=1 deploys anyway, with a loud
+#   warning. The verify Lambda must read this stack's database (its
+#   DATABASE_URL host is the DbEndpoint output: verify_target_guard in
+#   config.sh), not a scratch restore; ALLOW_VERIFY_TARGET_MISMATCH=1 waives
+#   that, with a loud warning;
 # - the stack change set is reviewed before it executes
 #   (scripts/changeset_gate.py): a master-password change on the database, or
 #   the replacement of anything but a stateless type (SNS subscription, alarm,
 #   metric filter), aborts it. ALLOW_REPLACE=<LogicalId,...> lets the named
-#   resources be replaced on this deploy, with a loud warning.
-#   CONFIRM_CHANGESET=1 also asks the operator y/N before executing;
+#   resources be replaced on this deploy, with a loud warning (never the
+#   database or an S3 bucket). CONFIRM_CHANGESET=1 also asks the operator y/N
+#   before executing;
 # - every live-parity parameter with a template Default is passed explicitly
 #   (scripts/parity-params.sh), so the live stack runs the template Default
 #   unless this deploy exports an override.
@@ -26,7 +35,6 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/parity-params.sh"
-CHANGESET_GATE="$INFRA_DIR/scripts/changeset_gate.py"
 
 require_clean_checkout
 
@@ -190,25 +198,30 @@ DEPLOY_PARAMS=("DbMasterPassword=${DB_PASSWORD}" "PinPepper=${PIN_PEPPER}" "DbAp
 # The alert addresses and MailReplyTo have empty Defaults: passed only when
 # exported (SAM rejects an empty override), otherwise the stack keeps its value.
 build_parity_params "$INFRA_DIR/backend/template.yaml" "${PARITY_PAIRS[@]}"
+# No deploy may leave the alarms emailing no one (hardening E1).
+alert_address_guard "$BACKEND_STACK" "$BACKEND_REGION" || exit 1
 
 # --- Open-run guard ------------------------------------------------------------
 # A deploy swaps the API code and migrates the database under whatever runs are
-# in progress. Before anything is built, the verify Lambda the stack has today
-# answers its tenancy-preflight set, whose `open-runs` row counts live_runs not
-# yet completed; more than 0 refuses the deploy, and so does a stack without a
-# verify function or an answer without that row. ALLOW_OPEN_RUNS=1 deploys
-# anyway with a loud warning (an emergency fix, or the very first deploy). Only
-# the count is printed: the set's other rows are not this script's business.
-open_runs_check() { # -> prints a run count, or the reason no count was read
-  local fn fn_error out
-  fn="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" VerifyFunctionName || true)"
-  if [ -z "$fn" ] || [ "$fn" = "None" ]; then
+# in progress. Before anything is built, and again just before the change set
+# executes (a run may start during the build), the verify Lambda the stack has
+# today answers its tenancy-preflight set, whose `open-runs` row counts
+# live_runs not yet completed; more than 0 refuses the deploy, and so does a
+# stack without a verify function or an answer without that row.
+# ALLOW_OPEN_RUNS=1 deploys anyway with a loud warning (an emergency fix, or the
+# very first deploy). Only the count is printed: the set's other rows are not
+# this script's business. A count is only worth reading from this stack's
+# database: verify_target_guard (config.sh) refuses first when the verify
+# function still points at a scratch restore.
+open_runs_check() { # verify function name ("" if none) -> prints a run count, or the reason no count was read
+  local fn="$1" fn_error out
+  if [ -z "$fn" ]; then
     echo "stack $BACKEND_STACK ($BACKEND_REGION) has no VerifyFunctionName output"
     return 0
   fi
   out="$(mktemp)"
   if ! fn_error="$(aws lambda invoke --region "$BACKEND_REGION" --function-name "$fn" \
-      --cli-binary-format raw-in-base64-out --payload '{"checks": "tenancy-preflight"}' \
+      --cli-read-timeout 0 --cli-binary-format raw-in-base64-out --payload '{"checks": "tenancy-preflight"}' \
       "$out" --query FunctionError --output text)"; then
     rm -f "$out"
     echo "could not invoke $fn (see the AWS error above)"
@@ -260,32 +273,44 @@ loud_open_runs_override() { # what was found
   } >&2
 }
 
+open_runs_guard() { # -> 0 to go on; 1 refused (why is on stderr)
+  local fn open_runs
+  fn="$(cfn_output "$BACKEND_STACK" "$BACKEND_REGION" VerifyFunctionName || true)"
+  if [ "$fn" = "None" ]; then
+    fn=""
+  fi
+  if [ -n "$fn" ] && ! verify_target_guard "$fn"; then
+    return 1
+  fi
+  open_runs="$(open_runs_check "$fn")"
+  case "$open_runs" in
+    0)
+      echo "    open-runs: 0"
+      ;;
+    ''|*[!0-9]*)
+      if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
+        loud_open_runs_override "no open-run count could be read: ${open_runs:-no answer}"
+      else
+        echo "ERROR: cannot confirm that no run is open: ${open_runs:-no answer}." >&2
+        echo "       Deploy outside route hours; ALLOW_OPEN_RUNS=1 skips this check (first deploy, emergency)." >&2
+        return 1
+      fi
+      ;;
+    *)
+      if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
+        loud_open_runs_override "open-runs is ${open_runs}"
+      else
+        echo "ERROR: ${open_runs} run(s) are open (verify tenancy-preflight: open-runs; a run left open on an" >&2
+        echo "       earlier day counts too). Deploy once they are completed, outside route hours;" >&2
+        echo "       ALLOW_OPEN_RUNS=1 overrides in an emergency." >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
 echo "==> Checking for open runs (verify Lambda, tenancy-preflight: open-runs)"
-OPEN_RUNS="$(open_runs_check)"
-case "$OPEN_RUNS" in
-  0)
-    echo "    open-runs: 0"
-    ;;
-  ''|*[!0-9]*)
-    if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
-      loud_open_runs_override "no open-run count could be read: ${OPEN_RUNS:-no answer}"
-    else
-      echo "ERROR: cannot confirm that no run is open: ${OPEN_RUNS:-no answer}." >&2
-      echo "       Deploy outside route hours; ALLOW_OPEN_RUNS=1 skips this check (first deploy, emergency)." >&2
-      exit 1
-    fi
-    ;;
-  *)
-    if [ "${ALLOW_OPEN_RUNS:-}" = "1" ]; then
-      loud_open_runs_override "open-runs is ${OPEN_RUNS}"
-    else
-      echo "ERROR: ${OPEN_RUNS} run(s) are open (verify tenancy-preflight: open-runs; a run left open on an" >&2
-      echo "       earlier day counts too). Deploy once they are completed, outside route hours;" >&2
-      echo "       ALLOW_OPEN_RUNS=1 overrides in an emergency." >&2
-      exit 1
-    fi
-    ;;
-esac
+open_runs_guard || exit 1
 
 cd "$INFRA_DIR/backend"
 
@@ -296,34 +321,15 @@ echo "==> sam deploy (region ${BACKEND_REGION}, custom-domain cert: ${API_CERT_A
 
 # --- Change-set gate ----------------------------------------------------------
 # SAM only creates the change set; scripts/changeset_gate.py reviews it and this
-# script executes it. The gate prints the change table and aborts (this script
-# then deletes the change set, so nothing runs) when the Database resource
-# lists a MasterUserPassword change — the /saferide/db-password copy in
-# $BACKEND_REGION does not match the live password — or when any resource but
-# a stateless type would be replaced and ALLOW_REPLACE does not name it. A
-# Conditional replacement, a stateless one and an allowed one are warnings.
-# The stack and region are passed explicitly, so samconfig.toml can never
-# point sam at another target than the one the gate reviews.
-
-newest_changeset_since() { # epoch -> id of the newest executable SAM change set created since
-  aws cloudformation list-change-sets --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --output json | python3 "$CHANGESET_GATE" newest-since "$1"
-}
-
-review_changeset() { # change-set id -> prints the review; non-zero means abort
-  aws cloudformation describe-change-set --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --change-set-name "$1" --output json \
-    | python3 "$CHANGESET_GATE" review --allow-replace "${ALLOW_REPLACE:-}"
-}
-
-discard_changeset() { # change-set id
-  if aws cloudformation delete-change-set --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-      --change-set-name "$1"; then
-    echo "    change set deleted; nothing was executed." >&2
-  else
-    echo "WARN: could not delete change set $1 — it was NOT executed; delete it in the console." >&2
-  fi
-}
+# script executes it (the changeset_* helpers in config.sh). The gate prints the
+# change table and aborts (the change set is then deleted, so nothing runs) when
+# the Database resource lists a MasterUserPassword change — the
+# /saferide/db-password copy in $BACKEND_REGION does not match the live
+# password — or when any resource but a stateless type would be replaced and
+# ALLOW_REPLACE does not name it. A Conditional replacement, a stateless one and
+# an allowed one are warnings. The stack and region are passed explicitly, so
+# samconfig.toml can never point sam at another target than the one the gate
+# reviews.
 
 CHANGESET_SINCE="$(date -u +%s)"
 exec 3>&1
@@ -340,43 +346,28 @@ fi
 if [ -z "$CHANGESET_ID" ] && [[ $SAM_OUT == *"No changes to deploy"* ]]; then
   echo "==> No stack changes: nothing to execute; continuing to the migrate step."
 else
-  [ -n "$CHANGESET_ID" ] || CHANGESET_ID="$(newest_changeset_since "$CHANGESET_SINCE" || true)"
+  [ -n "$CHANGESET_ID" ] || CHANGESET_ID="$(changeset_newest_since "$BACKEND_STACK" "$BACKEND_REGION" \
+    "$CHANGESET_SINCE" samcli-deploy || true)"
   if [ -z "$CHANGESET_ID" ]; then
     echo "ERROR: could not find the change set sam deploy created on ${BACKEND_STACK} (${BACKEND_REGION})." >&2
     exit 1
   fi
   echo "==> Reviewing change set ${CHANGESET_ID}"
-  if ! review_changeset "$CHANGESET_ID"; then
+  if ! changeset_review "$BACKEND_STACK" "$BACKEND_REGION" "$CHANGESET_ID"; then
     echo "ERROR: change-set gate refused this deploy (see ABORT above)." >&2
-    discard_changeset "$CHANGESET_ID"
+    changeset_discard "$BACKEND_STACK" "$BACKEND_REGION" "$CHANGESET_ID"
     exit 1
   fi
-  if [ "${CONFIRM_CHANGESET:-}" = "1" ]; then
-    answer=""
-    read -r -p "Execute this change set on ${BACKEND_STACK} (${BACKEND_REGION})? [y/N] " answer || true
-    case "$answer" in
-      y|Y|yes|YES|Yes) ;;
-      *)
-        echo "Deploy cancelled by the operator." >&2
-        discard_changeset "$CHANGESET_ID"
-        exit 1
-        ;;
-    esac
-  fi
-  # A first deploy leaves the new stack in REVIEW_IN_PROGRESS until executed.
-  STACK_WAITER=stack-update-complete
-  [ "$(aws cloudformation describe-stacks --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --query 'Stacks[0].StackStatus' --output text)" = "REVIEW_IN_PROGRESS" ] && STACK_WAITER=stack-create-complete
-  echo "==> Executing change set (waiting for ${STACK_WAITER}; database changes can take many minutes)"
-  aws cloudformation execute-change-set --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-    --change-set-name "$CHANGESET_ID"
-  if ! aws cloudformation wait "$STACK_WAITER" --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK"; then
-    echo "ERROR: ${BACKEND_STACK} did not reach ${STACK_WAITER#stack-}. Latest stack events:" >&2
-    aws cloudformation describe-stack-events --region "$BACKEND_REGION" --stack-name "$BACKEND_STACK" \
-      --max-items 20 --output table \
-      --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' >&2 || true
+  changeset_confirm "$BACKEND_STACK" "$BACKEND_REGION" "$CHANGESET_ID" || exit 1
+  # The build, the review and the prompt take minutes: a run opened meanwhile
+  # refuses the deploy here too, under the same rule and override (hardening E2).
+  echo "==> Re-checking for open runs before executing the change set"
+  if ! open_runs_guard; then
+    echo "ERROR: the open-run re-check refused this deploy; the change set was not executed." >&2
+    changeset_discard "$BACKEND_STACK" "$BACKEND_REGION" "$CHANGESET_ID"
     exit 1
   fi
+  changeset_execute "$BACKEND_STACK" "$BACKEND_REGION" "$CHANGESET_ID" || exit 1
   echo "==> Stack ${BACKEND_STACK} deployed"
 fi
 

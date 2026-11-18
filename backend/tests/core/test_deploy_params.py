@@ -12,6 +12,10 @@ alert addresses, MailReplyTo) are passed only when set. These tests run the
 real shell function in a subshell with a controlled environment, and
 deploy-frontend.sh end to end against fake `aws`, `git` and `npm`
 (tests/core/fake_cli.py); no AWS call is involved.
+
+alert_address_guard (hardening E1) requires a primary alert address on both
+deploys: the exported ALERT_EMAIL_PRIMARY, else the value the stack holds
+(passed explicitly); a missing stack holds none; ALLOW_NO_ALERTS=1 waives it.
 """
 
 import os
@@ -22,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.core.fake_cli import FakeCli
+from tests.core.fake_cli import HELD_ALERT, FakeCli, frontend_deploy_world
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "infra" / "scripts"
@@ -301,10 +305,7 @@ def test_one_frontend_export_overrides_only_its_parameter():
 
 def _deploy_frontend(tmp_path: Path, **env: str):
     fake = FakeCli(tmp_path)
-    for name in ("/saferide/google-maps-browser-key", "/saferide/google-maps-map-id"):
-        fake.put("af-south-1", name, f"value-of-{name.rsplit('/', 1)[1]}")
-    fake.world["stack"] = {"status": "UPDATE_COMPLETE", "outputs": {
-        "BucketName": "saferide-frontend-000000000000", "DistributionId": "E2FAKE", "SiteUrl": "https://example.org"}}
+    frontend_deploy_world(fake)  # the stack holds HELD_ALERT
     result = fake.run("infra/scripts/deploy-frontend.sh", **env)
     deploys = [call for call in fake.calls("aws") if call[:2] == ["cloudformation", "deploy"]]
     params = None
@@ -321,10 +322,14 @@ def test_deploy_frontend_passes_every_parameter_on_every_deploy(tmp_path):
     assert params == {
         "DomainName": "saferidelive.co.ke", "HostedZoneId": "Z0459820URO1AH08IO8T",
         "ApiOrigin": "https://api.saferidelive.co.ke", "CspMode": "report-only", "MonthlyBudgetUsd": "60",
+        "AlertEmailPrimary": HELD_ALERT,  # held by the stack, passed explicitly (E1)
     }
-    # Assembled before the build, like the backend's.
-    tools = [call[0] for call in fake.calls() if call[0] in ("npm", "aws") and call[1:3] != ["ssm", "get-parameter"]]
-    assert tools[0] == "npm"
+    # Assembled before the build, like the backend's: the only aws calls before
+    # it are the parameter-store reads and the alert-address read.
+    calls = [call for call in fake.calls() if call[0] in ("npm", "aws")]
+    build = calls.index(["npm", "run", "build"])
+    assert {tuple(call[1:3]) for call in calls[:build]} == {("ssm", "get-parameter"), ("cloudformation", "describe-stacks")}
+    assert calls.index(next(call for call in calls if call[1:3] == ["cloudformation", "deploy"])) > build
 
 
 def test_deploy_frontend_takes_exports_and_derives_the_api_origin(tmp_path):
@@ -347,3 +352,104 @@ def test_deploy_frontend_refuses_an_unknown_csp_mode_before_anything_else(tmp_pa
     assert "CSP_MODE must be report-only or enforce (got 'enforced')" in result.stderr
     assert params is None
     assert fake.calls("aws") == [] and fake.calls("npm") == []
+
+
+# --- alert_address_guard (E1) ------------------------------------------------------
+
+GUARD = (
+    'set -euo pipefail; source "$1"; source "$2"; DEPLOY_PARAMS=();'
+    ' alert_address_guard "$3" "$4";'
+    ' printf "param:%s\\n" ${DEPLOY_PARAMS[@]+"${DEPLOY_PARAMS[@]}"}'
+)
+
+
+def _guard(fake: FakeCli, stack: str = "saferide-backend", region: str = "af-south-1", **env: str):
+    scripts = fake.repo / "infra" / "scripts"
+    result = fake.bash(GUARD, str(scripts / "config.sh"), str(scripts / "parity-params.sh"), stack, region, **env)
+    assert list(fake.tmpdir.iterdir()) == []  # the stderr capture is removed
+    params = [line[len("param:"):] for line in result.stdout.splitlines() if line.startswith("param:") and line != "param:"]
+    return result, params
+
+
+def _stack_reads(fake: FakeCli) -> list[list[str]]:
+    return [call for call in fake.calls("aws") if call[:2] == ["cloudformation", "describe-stacks"]]
+
+
+@pytest.fixture
+def guard_fake(tmp_path):
+    fake = FakeCli(tmp_path, stubs=("aws",))
+    fake.world["stack"] = {"status": "UPDATE_COMPLETE", "outputs": {}, "parameters": {"AlertEmailPrimary": HELD_ALERT}}
+    return fake
+
+
+def test_an_exported_alert_address_passes_without_reading_the_stack(guard_fake):
+    result, params = _guard(guard_fake, ALERT_EMAIL_PRIMARY="ops-one@example.org")
+    assert result.returncode == 0, result.stderr
+    assert params == []  # build_parity_params passes the export
+    assert _stack_reads(guard_fake) == []
+
+
+@pytest.mark.parametrize("stack,region", [("saferide-backend", "af-south-1"), ("saferide-frontend", "us-east-1")])
+def test_a_held_alert_address_is_passed_explicitly(guard_fake, stack, region):
+    result, params = _guard(guard_fake, stack, region)
+    assert result.returncode == 0, result.stderr
+    assert params == [f"AlertEmailPrimary={HELD_ALERT}"]
+    assert f"==> Alert address kept: AlertEmailPrimary={HELD_ALERT} (held by {stack};" in result.stdout
+    [read] = _stack_reads(guard_fake)
+    assert read[read.index("--stack-name") + 1] == stack and read[read.index("--region") + 1] == region
+    assert "ParameterKey=='AlertEmailPrimary'" in read[read.index("--query") + 1]
+
+
+@pytest.mark.parametrize("breakage", ["parameter-absent", "parameter-empty", "stack-missing", "read-error"])
+def test_no_alert_address_refuses(guard_fake, breakage):
+    if breakage == "parameter-absent":
+        guard_fake.world["stack"]["parameters"] = {}
+    elif breakage == "parameter-empty":
+        guard_fake.world["stack"]["parameters"]["AlertEmailPrimary"] = ""
+    elif breakage == "stack-missing":
+        del guard_fake.world["stack"]
+    else:
+        guard_fake.world["stack"] = {"error": "AccessDenied"}
+    result, params = _guard(guard_fake)
+    assert result.returncode == 1
+    assert params == []
+    assert "ERROR: no alert address: alarms would email no one — export ALERT_EMAIL_PRIMARY." in result.stderr
+    assert "Stack saferide-backend (af-south-1) holds no AlertEmailPrimary" in result.stderr
+    assert "ALLOW_NO_ALERTS=1 deploys without one." in result.stderr
+    # A missing stack is "nothing held", silently; any other read error is named.
+    assert ("WARN: could not read parameter AlertEmailPrimary of stack saferide-backend (af-south-1)"
+            in result.stderr) == (breakage == "read-error")
+
+
+@pytest.mark.parametrize("breakage", ["parameter-absent", "stack-missing"])
+def test_allow_no_alerts_waives_the_address_loudly(guard_fake, breakage):
+    if breakage == "stack-missing":
+        del guard_fake.world["stack"]
+    else:
+        guard_fake.world["stack"]["parameters"] = {}
+    result, params = _guard(guard_fake, ALLOW_NO_ALERTS="1")
+    assert result.returncode == 0, result.stderr
+    assert params == []
+    assert "WARNING: ALLOW_NO_ALERTS=1 — deploying saferide-backend (af-south-1) with no alert address" in result.stderr
+    assert result.stderr.count("!" * 76) == 2
+
+
+def test_allow_no_alerts_takes_only_the_value_1(guard_fake):
+    guard_fake.world["stack"]["parameters"] = {}
+    result, _ = _guard(guard_fake, ALLOW_NO_ALERTS="yes")
+    assert result.returncode == 1
+
+
+def test_deploy_frontend_refuses_without_an_alert_address_before_the_build(tmp_path):
+    fake = FakeCli(tmp_path)
+    frontend_deploy_world(fake)
+    fake.world["stack"]["parameters"] = {}
+    result = fake.run("infra/scripts/deploy-frontend.sh")
+    assert result.returncode == 1
+    assert "ERROR: no alert address" in result.stderr
+    assert fake.calls("npm") == []
+    allowed = fake.run("infra/scripts/deploy-frontend.sh", ALLOW_NO_ALERTS="1")
+    assert allowed.returncode == 0, allowed.stderr
+    assert "WARNING: ALLOW_NO_ALERTS=1 — deploying saferide-frontend (us-east-1)" in allowed.stderr
+    [deploy] = [call for call in fake.calls("aws") if call[:2] == ["cloudformation", "deploy"]]
+    assert not [arg for arg in deploy if arg.startswith("AlertEmailPrimary=")]

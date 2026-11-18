@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""Change-set gate for infra/scripts/deploy-backend.sh (hardening decision D7).
+"""Change-set gate for infra/scripts/deploy-backend.sh and deploy-frontend.sh
+(hardening decisions D7 and E3).
 
-`sam deploy --no-execute-changeset` only creates the change set; the deploy
-script feeds the AWS CLI's JSON to this module and executes the change set
-only when `review` exits 0. System python3 (3.9 on macOS), stdlib only.
-backend/tests/core/test_changeset_gate.py runs it on table-driven payloads and
-runs deploy-backend.sh end to end against fake `aws`, `sam` and `git`.
+`sam deploy --no-execute-changeset` (backend) and `aws cloudformation deploy
+--no-execute-changeset` (frontend) only create the change set; the deploy
+scripts (through the changeset_* helpers in config.sh) feed the AWS CLI's JSON
+to this module and execute the change set only when `review` exits 0. System
+python3 (3.9 on macOS), stdlib only. backend/tests/core/test_changeset_gate.py
+runs it on table-driven payloads and runs both deploy scripts end to end
+against fake `aws`, `sam`, `git` and `npm`.
 
   changeset_gate.py review [--allow-replace Id1,Id2]
       stdin: `aws cloudformation describe-change-set --output json`.
       Prints the change table on stdout, then WARN and ABORT lines on stderr.
       Exit 0 to execute, 2 to abort. It aborts when
         - the change set is not CREATE_COMPLETE / AVAILABLE;
-        - the Database resource lists a MasterUserPassword change (the
-          /saferide/db-password copy the deploy read does not match the live
-          master password), whatever its Replacement value;
+        - the Database resource (backend stack) lists a MasterUserPassword
+          change (the /saferide/db-password copy the deploy read does not
+          match the live master password), whatever its Replacement value;
         - any resource has Replacement True, except
           * the stateless types in STATELESS_TYPES, recreated from the
             template with nothing to lose: a WARN line;
-          * the logical ids named in --allow-replace (deploy-backend.sh passes
-            $ALLOW_REPLACE): a loud WARN block, for this deploy only.
+          * the logical ids named in --allow-replace (the deploys pass
+            $ALLOW_REPLACE): a loud WARN block, for this deploy only. It never
+            applies to the types in NEVER_REPLACEABLE_TYPES (a database, the
+            CloudFront distribution, an S3 bucket), which always abort.
       Replacement Conditional prints a WARN line and passes.
 
-  changeset_gate.py newest-since EPOCH
+  changeset_gate.py newest-since EPOCH [--prefix NAME_PREFIX]
       stdin: `aws cloudformation list-change-sets --output json`.
-      Prints the id of the newest samcli-deploy* change set created at or
+      Prints the id of the newest change set whose name starts with
+      NAME_PREFIX (default samcli-deploy, SAM's; deploy-frontend.sh passes
+      awscli-cloudformation-package-deploy-, the AWS CLI's) created at or
       after EPOCH minus CLOCK_SKEW_S seconds that is CREATE_COMPLETE and
-      AVAILABLE, or nothing. Used when sam's output did not name the change set.
+      AVAILABLE, or nothing. Used when the deploy command's output did not
+      name the change set.
 """
 
 import argparse
@@ -45,10 +53,17 @@ STATELESS_TYPES = frozenset({
     "AWS::Logs::MetricFilter",
 })
 DATABASE_ID = "Database"
-# Never replaceable through ALLOW_REPLACE: a replaced database is a new, empty
-# instance (DeletionPolicy only snapshots the old one). Restores follow
-# infra/RESTORE.md instead.
-NEVER_REPLACEABLE_TYPES = frozenset({"AWS::RDS::DBInstance"})
+# Never replaceable through ALLOW_REPLACE, type -> what the abort line calls it.
+# A replaced database is a new, empty instance (DeletionPolicy only snapshots
+# the old one; restores follow infra/RESTORE.md instead). A replaced
+# distribution is a new *.cloudfront.net domain the alias records and the
+# certificate would have to follow; a replaced bucket is a new, empty one.
+NEVER_REPLACEABLE_TYPES = {
+    "AWS::RDS::DBInstance": "a database",
+    "AWS::CloudFront::Distribution": "a CloudFront distribution",
+    "AWS::S3::Bucket": "an S3 bucket",
+}
+DEFAULT_NAME_PREFIX = "samcli-deploy"
 CLOCK_SKEW_S = 5
 BANNER = "!" * 76
 
@@ -97,8 +112,8 @@ def review(change_set, allow_replace):
                 warnings.append("{} ({}) will be replaced: a stateless type, recreated from the template".format(
                     logical, rtype))
             elif rtype in NEVER_REPLACEABLE_TYPES:
-                aborts.append("{} ({}) would be REPLACED, and ALLOW_REPLACE never applies to a database".format(
-                    logical, rtype))
+                aborts.append("{} ({}) would be REPLACED, and ALLOW_REPLACE never applies to {}".format(
+                    logical, rtype, NEVER_REPLACEABLE_TYPES[rtype]))
             elif logical in allow_replace:
                 loud.append("{} ({}) WILL BE REPLACED: allowed by ALLOW_REPLACE for this deploy".format(
                     logical, rtype))
@@ -134,13 +149,13 @@ def _created(text):
         return datetime.fromisoformat(re.sub(r"\.\d+", "", text)).timestamp()
 
 
-def newest_since(listing, epoch):
+def newest_since(listing, epoch, prefix=DEFAULT_NAME_PREFIX):
     since = epoch - CLOCK_SKEW_S
     best = None
     for summary in listing.get("Summaries") or []:
         if (summary.get("Status") != "CREATE_COMPLETE"
                 or summary.get("ExecutionStatus") != "AVAILABLE"
-                or not summary.get("ChangeSetName", "").startswith("samcli-deploy")):
+                or not summary.get("ChangeSetName", "").startswith(prefix)):
             continue
         at = _created(summary["CreationTime"])
         if at >= since and (best is None or at > best[0]):
@@ -157,17 +172,20 @@ def _read_stdin_json(what):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Change-set gate for deploy-backend.sh")
+    parser = argparse.ArgumentParser(description="Change-set gate for deploy-backend.sh and deploy-frontend.sh")
     commands = parser.add_subparsers(dest="command", required=True)
     review_cmd = commands.add_parser("review", help="review describe-change-set JSON on stdin")
     review_cmd.add_argument("--allow-replace", default="",
                             help="comma-separated logical ids whose replacement is allowed (WARN)")
-    newest_cmd = commands.add_parser("newest-since", help="newest executable SAM change set (list-change-sets JSON on stdin)")
+    newest_cmd = commands.add_parser("newest-since",
+                                     help="newest executable change set by name prefix (list-change-sets JSON on stdin)")
     newest_cmd.add_argument("epoch", type=float)
+    newest_cmd.add_argument("--prefix", default=DEFAULT_NAME_PREFIX,
+                            help="change-set name prefix (default: %(default)s, SAM's)")
     args = parser.parse_args(argv)
 
     if args.command == "newest-since":
-        print(newest_since(_read_stdin_json("list-change-sets"), args.epoch))
+        print(newest_since(_read_stdin_json("list-change-sets"), args.epoch, args.prefix))
         return 0
 
     rows, warnings, loud, aborts = review(_read_stdin_json("describe-change-set"),

@@ -13,12 +13,19 @@ World keys (all optional):
   default_region  region of an aws call without --region (the CLI config);
                   AWS_REGION / AWS_DEFAULT_REGION win, as in the real CLI
   ssm             {region: {name: value | {"error": "AccessDeniedException"}}}
-  stack           {"status": ..., "outputs": {...}}; absent = no such stack
+  stack           {"status": ..., "outputs": {...}, "parameters": {...}}; absent =
+                  no such stack; {"error": "AccessDenied"} = describe-stacks fails
   change_set      the describe-change-set answer
   change_sets     the list-change-sets answer
-  lambda          {function name: {"payload": {...}, "function_error": str|None}}
+  lambda          {function name: answer | [answer, ...]}, an answer being
+                  {"payload": {...}, "function_error": str|None}; a list answers
+                  its items in turn, the last one for good
+  lambda_config   {function name: {environment variable: value}} for
+                  get-function-configuration; absent = no such function
   wait_fails      true: `aws cloudformation wait` fails
   sam_deploy      "changeset" (default) | "no-changes" | "unnamed"
+  cfn_deploy      `aws cloudformation deploy --no-execute-changeset`:
+                  "changeset" (default) | "no-changes" | "unnamed"
   git             {"head", "origin_main", "dirty", "staged", "tags"}
 """
 
@@ -33,6 +40,10 @@ REPO = Path(__file__).resolve().parents[3]
 BASH = "/bin/bash" if Path("/bin/bash").exists() else shutil.which("bash")
 CHANGESET_ARN = (
     "arn:aws:cloudformation:af-south-1:000000000000:changeSet/samcli-deploy1763460000/3f2a5b7c"
+)
+FRONTEND_CHANGESET_ARN = (
+    "arn:aws:cloudformation:us-east-1:000000000000:changeSet/"
+    "awscli-cloudformation-package-deploy-1763460000/9d8e7f6a"
 )
 HEAD = "0123456789abcdef0123456789abcdef01234567"
 
@@ -135,10 +146,15 @@ if args[:2] == ["cloudformation", "describe-stacks"]:
     stack = world.get("stack")
     if stack is None:
         fail(254, "ValidationError", "DescribeStacks", "Stack with id %s does not exist" % opt("--stack-name"))
+    if "error" in stack:
+        fail(254, stack["error"], "DescribeStacks", "not authorized to perform cloudformation:DescribeStacks")
     query = opt("--query") or ""
     output = re.search(r"OutputKey=='(\w+)'", query)
+    parameter = re.search(r"ParameterKey=='(\w+)'", query)
     if output:
         print(stack.get("outputs", {}).get(output.group(1), ""))
+    elif parameter:
+        print(stack.get("parameters", {}).get(parameter.group(1), ""))
     elif query == "Stacks[0].StackStatus":
         print(stack["status"])
     sys.exit(0)
@@ -159,7 +175,17 @@ if args[:2] == ["cloudformation", "wait"]:
     sys.exit(255 if world.get("wait_fails") else 0)
 
 if args[:2] == ["cloudformation", "deploy"]:
-    print("Successfully created/updated stack - %s" % opt("--stack-name"))
+    # The AWS CLI's own wording (awscli/customizations/cloudformation/deploy.py).
+    if "--no-execute-changeset" not in args:
+        print("Successfully created/updated stack - %s" % opt("--stack-name"))
+        sys.exit(0)
+    mode = world.get("cfn_deploy", "changeset")
+    print("\nWaiting for changeset to be created..")
+    if mode == "no-changes":
+        print("\nNo changes to deploy. Stack %s is up to date" % opt("--stack-name"))
+    elif mode == "changeset":
+        print("Changeset created successfully. Run the following command to review changes:")
+        print("aws cloudformation describe-change-set --change-set-name %s" % os.environ["FAKE_FRONTEND_CHANGESET_ARN"])
     sys.exit(0)
 
 if args[:2] in (["s3", "sync"], ["s3", "cp"]):
@@ -169,11 +195,28 @@ if args[:2] == ["cloudfront", "create-invalidation"]:
     print("I2FAKEINVALIDATION")
     sys.exit(0)
 
+if args[:2] == ["lambda", "get-function-configuration"]:
+    function = opt("--function-name")
+    config = world.get("lambda_config", {}).get(function)
+    if config is None:
+        fail(254, "ResourceNotFoundException", "GetFunctionConfiguration", "Function not found: %s" % function)
+    if opt("--query") == "Environment.Variables.DATABASE_URL":
+        print(config.get("DATABASE_URL") or "None")
+    else:
+        json.dump({"FunctionName": function, "Environment": {"Variables": config}}, sys.stdout)
+    sys.exit(0)
+
 if args[:2] == ["lambda", "invoke"]:
     function = opt("--function-name")
     answer = world.get("lambda", {}).get(function)
     if answer is None:
         fail(254, "ResourceNotFoundException", "Invoke", "Function not found: %s" % function)
+    if isinstance(answer, list):  # answered in turn; the last one stays
+        turn = answer[0]
+        if len(answer) > 1:
+            answer.pop(0)
+            save()
+        answer = turn
     with open(positional()[0], "w", encoding="utf-8") as handle:
         json.dump(answer["payload"], handle)
     print(answer.get("function_error") or "None")
@@ -310,6 +353,7 @@ class FakeCli:
             "LANG": "en_US.UTF-8",
             "FAKE_CLI_ROOT": str(self.root),
             "FAKE_CHANGESET_ARN": CHANGESET_ARN,
+            "FAKE_FRONTEND_CHANGESET_ARN": FRONTEND_CHANGESET_ARN,
             "FAKE_HEAD": HEAD,
         }
         env.update(extra)
@@ -349,6 +393,19 @@ SECRETS = {
 }
 # base64url of {"version": 2, "providers": [{"email": "ops@example.org"}]}, unpadded.
 BOOTSTRAP = "eyJ2ZXJzaW9uIjogMiwgInByb3ZpZGVycyI6IFt7ImVtYWlsIjogIm9wc0BleGFtcGxlLm9yZyJ9XX0"
+# The stack's DbEndpoint output and the verify function's DATABASE_URL (the
+# master password is URL-safe in production; this one must never be printed).
+DB_ENDPOINT = "saferide-db.abc123.af-south-1.rds.amazonaws.com"
+SCRATCH_ENDPOINT = "saferide-restore-test.abc123.af-south-1.rds.amazonaws.com"
+VERIFY_URL_PASSWORD = "url-safe-master-password-0006"
+
+
+def database_url(host: str = DB_ENDPOINT) -> str:
+    return f"postgresql://saferide_admin:{VERIFY_URL_PASSWORD}@{host}:5432/saferide"
+
+
+# The alert address each stack holds unless a test says otherwise.
+HELD_ALERT = "held-ops@example.org"
 
 
 def resource_change(logical, rtype, action="Modify", replacement="False", names=()):
@@ -395,8 +452,8 @@ def backend_deploy_world(fake: FakeCli, open_runs=0) -> None:
         "stack": {"status": "UPDATE_COMPLETE", "outputs": {
             "VerifyFunctionName": VERIFY_FN, "MigrateFunctionName": MIGRATE_FN,
             "HttpApiUrl": "https://abc123.execute-api.af-south-1.amazonaws.com",
-            "DbEndpoint": "db.example.internal", "ApiCustomDomainUrl": "None",
-        }},
+            "DbEndpoint": DB_ENDPOINT, "ApiCustomDomainUrl": "None",
+        }, "parameters": {"AlertEmailPrimary": HELD_ALERT}},
         "change_set": change_set(
             resource_change("Database", "AWS::RDS::DBInstance", names=["BackupRetentionPeriod"]),
             resource_change("OpsTopic", "AWS::SNS::Topic", action="Add", replacement=None),
@@ -405,4 +462,25 @@ def backend_deploy_world(fake: FakeCli, open_runs=0) -> None:
             VERIFY_FN: preflight(open_runs),
             MIGRATE_FN: {"payload": {"migrations": {"applied": []}}, "function_error": None},
         },
+        "lambda_config": {VERIFY_FN: {"DATABASE_URL": database_url(), "APP_ENV": "production"}},
+    })
+
+
+FRONTEND_REGION = "us-east-1"
+
+
+def frontend_deploy_world(fake: FakeCli) -> None:
+    """Everything deploy-frontend.sh needs for a clean, gated deploy and upload."""
+    for name in ("/saferide/google-maps-browser-key", "/saferide/google-maps-map-id"):
+        fake.put(BACKEND_REGION, name, f"value-of-{name.rsplit('/', 1)[1]}")
+    fake.world.update({
+        "stack": {"status": "UPDATE_COMPLETE", "outputs": {
+            "BucketName": "saferide-frontend-000000000000", "DistributionId": "E2FAKE",
+            "SiteUrl": "https://example.org",
+        }, "parameters": {"AlertEmailPrimary": HELD_ALERT}},
+        "change_set": {**change_set(
+            resource_change("SecurityHeadersPolicy", "AWS::CloudFront::ResponseHeadersPolicy",
+                            names=["ResponseHeadersPolicyConfig"]),
+            resource_change("OpsTopicUsEast1", "AWS::SNS::Topic", action="Add", replacement=None),
+        ), "ChangeSetId": FRONTEND_CHANGESET_ARN},
     })

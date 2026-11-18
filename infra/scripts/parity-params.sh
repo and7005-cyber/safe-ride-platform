@@ -52,7 +52,8 @@ PARITY_PAIRS=(
   # Alarm recipients and the concurrency alarm (hardening U4, D16, D19). Each
   # address set becomes one email subscription to the ops topic, confirmed
   # from that inbox; both have empty Defaults, so export them on the first
-  # deploy that should alert and they stay. ConcurrencyAlarmThreshold (Default
+  # deploy that should alert and they stay (alert_address_guard below refuses
+  # a deploy that would leave no primary address). ConcurrencyAlarmThreshold (Default
   # 8, 80% of the account's 10) follows the full rule: export
   # CONCURRENCY_ALARM_THRESHOLD on every deploy once the quota is raised,
   # until a release raises the Default.
@@ -172,4 +173,41 @@ EOF
   if [ "${#at_default[@]}" -gt 0 ]; then
     echo "==> Live-parity parameters at their template Default: ${at_default[*]}"
   fi
+}
+
+# alert_address_guard stack region (hardening E1) -> 0 when this deploy leaves
+# the stack with a primary alert address, or ALLOW_NO_ALERTS=1 waives it (loud
+# warning); 1, saying why on stderr, otherwise. Both deploys call it after
+# build_parity_params and before anything is built; it needs cfn_parameter
+# (config.sh). The address is the exported ALERT_EMAIL_PRIMARY (which
+# build_parity_params passes), else the value the stack holds now, which is
+# then appended to DEPLOY_PARAMS explicitly. SAM and `aws cloudformation
+# deploy` keep a previous value only for a parameter the stack already has:
+# after a rollback to a template without AlertEmailPrimary (release/0) the
+# stack holds none, and the empty Default would deploy alarms that email no
+# one. AlertEmailSecondary keeps the previous-value rule.
+alert_address_guard() {
+  local stack="$1" region="$2" held
+  if [ -n "${ALERT_EMAIL_PRIMARY:-}" ]; then
+    return 0
+  fi
+  held="$(cfn_parameter "$stack" "$region" AlertEmailPrimary)"
+  if [ -n "$held" ]; then
+    DEPLOY_PARAMS+=("AlertEmailPrimary=${held}")
+    echo "==> Alert address kept: AlertEmailPrimary=${held} (held by ${stack}; export ALERT_EMAIL_PRIMARY to change it)"
+    return 0
+  fi
+  if [ "${ALLOW_NO_ALERTS:-}" = "1" ]; then
+    {
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "WARNING: ALLOW_NO_ALERTS=1 — deploying ${stack} (${region}) with no alert address:"
+      echo "its alarms email no one until a deploy exports ALERT_EMAIL_PRIMARY."
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    } >&2
+    return 0
+  fi
+  echo "ERROR: no alert address: alarms would email no one — export ALERT_EMAIL_PRIMARY." >&2
+  echo "       Stack ${stack} (${region}) holds no AlertEmailPrimary (a first deploy, or after a rollback);" >&2
+  echo "       ALLOW_NO_ALERTS=1 deploys without one." >&2
+  return 1
 }
