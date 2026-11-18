@@ -81,7 +81,7 @@
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | | **open** |
 | **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | | **open** |
 | Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | | **open** |
-| **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | | **open** |
+| **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | Run 2026-11-18 on the user's go ("Gate dry run, 2026-11-18" below): the `Database` row lists exactly the five 1a properties and **no `MasterUserPassword`**; change set deleted, none left; stack `UPDATE_COMPLETE`, `LastUpdatedTime` 2026-09-22T17:52:33Z before and after. One `WARN`: `Database` replacement `Conditional`, from `BackupRetentionPeriod` and `PreferredMaintenanceWindow` (the only two of the five in the resource schema's `conditionalCreateOnlyProperties`) | **met** for `MasterUserPassword`; the `WARN` is **open** (No-Go until resolved with the user) |
 | Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | | **open** |
 | Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | | **open** |
 | Stray-variable check prints only the intended exports; no `ALLOW_*` | | **open** |
@@ -103,6 +103,82 @@
 | 90-day retention set on the three old `/aws/lambda/*` groups | | **open** |
 | First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | | **open** |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | | **open** |
+
+
+### Gate dry run, 2026-11-18
+
+On the user's go, from `feat/hardening-r1a` at `07856c5` with
+`ALLOW_UNRELEASED_DEPLOY=1` (the checklist runs it from the `release/1a` tag,
+which is not cut yet), `ALERT_EMAIL_PRIMARY` set to the one verified operator
+address, no other override exported, `open-runs` 0; `printf 'N\n'` answered the
+prompt. The build used the cached `sam/build-python3.12` arm64 image. The log
+(kept 0600 outside the repository) was scanned for every `/saferide/*` secret
+value: none present; SAM printed the `NoEcho` parameters as `*****`. The
+gate's output:
+
+```text
+  Action  LogicalResourceId                  ResourceType                                Replacement  Changed
+  Add     AccountConcurrency                 AWS::CloudWatch::Alarm                      -            -
+  Add     ApiCertificateExpiry               AWS::CloudWatch::Alarm                      -            -
+  Add     ApiClientErrorsBurst               AWS::CloudWatch::Alarm                      -            -
+  Add     ApiFunctionErrors                  AWS::CloudWatch::Alarm                      -            -
+  Add     ApiFunctionPinLoginPermission      AWS::Lambda::Permission                     -            -
+  Modify  ApiFunctionRole                    AWS::IAM::Role                              False        Policies
+  Add     ApiFunctionSchoolLookupPermission  AWS::Lambda::Permission                     -            -
+  Add     ApiFunctionThrottles               AWS::CloudWatch::Alarm                      -            -
+  Modify  ApiFunction                        AWS::Lambda::Function                       False        Environment, Code, LoggingConfig, Role
+  Add     ApiLatencyP95                      AWS::CloudWatch::Alarm                      -            -
+  Add     ApiLogGroup                        AWS::Logs::LogGroup                         -            -
+  Add     ApiServerErrors                    AWS::CloudWatch::Alarm                      -            -
+  Add     AuditTrail                         AWS::CloudTrail::Trail                      -            -
+  Modify  Database                           AWS::RDS::DBInstance                        Conditional  DeletionProtection, BackupRetentionPeriod, MaxAllocatedStorage, PreferredBackupWindow, PreferredMaintenanceWindow
+  Add     DbCpuCreditsLow                    AWS::CloudWatch::Alarm                      -            -
+  Add     DbCpuHigh                          AWS::CloudWatch::Alarm                      -            -
+  Add     DbFreeStorageLow                   AWS::CloudWatch::Alarm                      -            -
+  Add     DbFreeableMemoryLow                AWS::CloudWatch::Alarm                      -            -
+  Add     DmarcRecord                        AWS::Route53::RecordSet                     -            -
+  Modify  HttpApiApiGatewayDefaultStage      AWS::ApiGatewayV2::Stage                    False        RouteSettings
+  Modify  HttpApi                            AWS::ApiGatewayV2::Api                      False        Body
+  Add     MigrateFunctionErrors              AWS::CloudWatch::Alarm                      -            -
+  Modify  MigrateFunction                    AWS::Lambda::Function                       False        Environment, Code, LoggingConfig
+  Add     MigrateLogGroup                    AWS::Logs::LogGroup                         -            -
+  Add     OpsSubscriptionPrimary             AWS::SNS::Subscription                      -            -
+  Add     OpsTopicPolicy                     AWS::SNS::TopicPolicy                       -            -
+  Add     OpsTopic                           AWS::SNS::Topic                             -            -
+  Add     SesConfigSetEvents                 AWS::SES::ConfigurationSetEventDestination  -            -
+  Add     SesConfigSet                       AWS::SES::ConfigurationSet                  -            -
+  Add     SesDkimRecord1                     AWS::Route53::RecordSet                     -            -
+  Add     SesDkimRecord2                     AWS::Route53::RecordSet                     -            -
+  Add     SesDkimRecord3                     AWS::Route53::RecordSet                     -            -
+  Add     SesIdentity                        AWS::SES::EmailIdentity                     -            -
+  Add     SesMailFromMx                      AWS::Route53::RecordSet                     -            -
+  Add     SesMailFromSpf                     AWS::Route53::RecordSet                     -            -
+  Add     TrailBucketPolicy                  AWS::S3::BucketPolicy                       -            -
+  Add     TrailBucket                        AWS::S3::Bucket                             -            -
+  Modify  VerifyFunction                     AWS::Lambda::Function                       False        Environment, Code, LoggingConfig
+  Add     VerifyLogGroup                     AWS::Logs::LogGroup                         -            -
+WARN: Database (AWS::RDS::DBInstance) may be replaced (Replacement: Conditional)
+Deploy cancelled by the operator.
+    change set deleted; nothing was executed.
+```
+
+Why `Database` reads `Conditional`: of the five properties 1a changes, the
+`AWS::RDS::DBInstance` resource schema (`describe-type`) lists
+`BackupRetentionPeriod` and `PreferredMaintenanceWindow` in
+`conditionalCreateOnlyProperties`; `DeletionProtection`,
+`MaxAllocatedStorage` and `PreferredBackupWindow` are plain updates. The
+schema's own text says a maintenance-window update through CloudFormation "is
+applied immediately", and nothing in it makes a retention change from 7 to 35
+replace a standalone instance; the conditional cases are instances restored
+from a snapshot or acting as replicas, and this one is neither (no
+`DBSnapshotIdentifier`, no `SourceDBInstanceIdentifier`). The flag is static:
+it shows on every change set that touches either property, so it cannot be
+removed by applying them out of band. Were CloudFormation to replace the
+instance anyway, the template names no `DBInstanceIdentifier`, so it would
+create a new, empty database and snapshot then delete the old one
+(`UpdateReplacePolicy: Snapshot`); the live instance has no deletion
+protection yet, and the stack has no stack policy. How to close the `WARN`
+is the user's decision.
 
 ## Decisions taken during execution
 
