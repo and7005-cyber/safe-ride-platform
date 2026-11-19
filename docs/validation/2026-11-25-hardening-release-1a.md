@@ -28,8 +28,7 @@
   changes: nothing reads 017's objects until Release 1b.
 - **Deployed 2026-11-19, 09:15–09:25 UTC (12:15–12:25 EAT),** backend then
   frontend, from `release/1a`; details in "Deployed" below. Open after the
-  deploy: the sign-ins and phone checks (the user's), the retention on the
-  old `/aws/lambda/*` groups (awaiting the user's go), the first-48-hours
+  deploy: the sign-ins and phone checks (the user's), the first-48-hours
   checks and the post-1a restore rehearsal.
 
 ## Commits
@@ -104,7 +103,7 @@
 | CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | | **open** |
 | Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | | **open** |
-| 90-day retention set on the three old `/aws/lambda/*` groups | | **open** |
+| 90-day retention set on the three old `/aws/lambda/*` groups | 2026-11-19 09:47:20Z on the user's go (it drops their events older than 90 days): `put-retention-policy --retention-in-days 90` on the API, migrate and verify functions' `/aws/lambda/*` groups, each exit 0; read back: all three 90, and `/saferide/api`, `/saferide/migrate`, `/saferide/verify` 90 | **met** |
 | First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | | **open** |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | | **open** |
 
@@ -541,9 +540,8 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
   `open-runs-and-today` 0/0.
 - **Still open:** the three
   sign-ins and the phone checks with their CSP console lines (the user —
-  credentials are never typed into the live site from this session); 90-day
-  retention on the three `/aws/lambda/*` groups (it deletes their events
-  older than 90 days: awaiting the user's go); the first-48-hours checks —
+  credentials are never typed into the live site from this session); the
+  first-48-hours checks —
   subscriptions +1 h (10:25Z) and +47 h (2026-11-21 08:25Z), ERROR
   searches +1/+4/+24/+48 h, the first automated backup in tonight's
   23:00–23:30 UTC window with the instance's events, SES at +24 h and
