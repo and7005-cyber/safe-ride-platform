@@ -1,9 +1,9 @@
 # Validation record — production hardening Release 1a (schema and platform)
 
-- **Date:** 2026-11-25 (planned deploy day; record drafted 2026-11-17) ·
-  **Release commit:** to be tagged `release/1a` at the `feat/hardening-r1a`
-  tip (cut from `main` at `a59756d`, with the requirements and plan in
-  `e20f3d5`) · **Plan:**
+- **Date:** deployed 2026-11-19 (planned for 2026-11-25; record drafted
+  2026-11-17) · **Release commit:** `a66d53b`, tagged `release/1a` (tag
+  object `25e7860`), on `feat/hardening-r1a` (cut from `main` at `a59756d`,
+  with the requirements and plan in `e20f3d5`) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U1–U6, with
   U16 moved into 1a (D8), as amended by the execution decisions D1–D27
   (D20–D24 from the code review below, D25 the holiday deploy window, D26
@@ -26,8 +26,11 @@
   rollback runbook in `infra/RESTORE.md` (both moved out of
   `infra/README.md` in `ca92d4e`). No user-facing behaviour
   changes: nothing reads 017's objects until Release 1b.
-- **Not deployed.** Local evidence only. Every operator and production row
-  below is open; fill them in at the deploy.
+- **Deployed 2026-11-19, 09:15–09:25 UTC (12:15–12:25 EAT),** backend then
+  frontend, from `release/1a`; details in "Deployed" below. Open after the
+  deploy: the sign-ins and phone checks (the user's), the retention on the
+  old `/aws/lambda/*` groups (awaiting the user's go), the first-48-hours
+  checks and the post-1a restore rehearsal.
 
 ## Commits
 
@@ -76,29 +79,29 @@
 | U1.3 `release/0` on `a59756d`, pushed | 2026-11-18 on the user's go: annotated tag `f337b64` pushed; `git ls-remote --tags origin 'refs/tags/release/*'` shows `release/0` peeled to `a59756d7ac9379e068b4801968646dce515c6629` (Merge pull request #16, the head of `origin/main`) | **met** |
 | U1.4 five `values MATCH` lines from `copy-ssm-to-backend-region.sh` | 2026-11-18 on the user's go. The five secrets were only in **eu-west-2** (this machine's CLI default is `eu-central-1`, which holds none), so the helper ran with `SOURCE_REGION=eu-west-2`. Report: all five `missing in af-south-1`, exit 1. `--apply`: five `Copied … (SecureString)`, exit 0. Proof run: header `source eu-west-2 -> target af-south-1 (report only, read-only)`, five `present in both, values MATCH`, `All 5 parameters MATCH.`, exit 0; no temporary directory left. Cross-check by fingerprint against the live stack: the af-south-1 `pin-pepper`, `totp-pepper` and `google-maps-api-key` equal the API function's environment (eu-west-2's `pin-pepper` is at version 2, and its current value is the live one), `db-app-password` equals the API function's `DATABASE_URL` password and the migrate function's `DB_APP_PASSWORD`, `db-password` equals the migrate function's `DATABASE_URL` password. The eu-west-2 copies stay until one week after Release 2 is stable | **met** |
 | U1.5 production Map ID and restricted browser key stored in af-south-1 | 2026-11-18 14:47 UTC: `/saferide/google-maps-browser-key` and `/saferide/google-maps-map-id` stored as SecureString version 1 in af-south-1, read back: the key matches "Saferide production" (project `atomic-monument-499505-s4`; websites exactly `https://saferidelive.co.ke/*` and `https://www.saferidelive.co.ke/*`; API restriction only Maps JavaScript API, `maps-backend.googleapis.com` — the app loads only the `geometry` and `marker` libraries, address search and routing run server-side), the Map ID matches "Saferide" `72fcaa99aa3cbcc49ce6776f` (VECTOR). The unused, website-unrestricted "Maps Platform API Key" was deleted. Still in use: "SafeRide Web (browser)" (live site, `frontend/.env.local`) and "SafeRide Server (backend)" (live API, eu-west-2 SSM). The restriction itself is proved by the Release 1a phone checks | **met** |
-| U1.6 Route 53 preflight clean on the deploy day | clean on 2026-11-17 (D11); re-check due on the day | **open** |
-| U1.7 alert addresses confirmed and exported for both deploys; the four confirmations within 48 hours, proved after the deploy (+1 h and +47 h) | 2026-11-18, the user: one address for now, the operator's own (the SES-verified identity); `ALERT_EMAIL_SECONDARY` stays unset, so each deploy subscribes one address and **two** confirmations arrive (one per topic) instead of four. A second person can be added later with a fresh confirmation | **open** (address **met**; the confirmations come after the deploy) |
-| U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | Day agreed 2026-11-18 (D25): schools closed until 2027-01-04, any day works. Read 2026-11-18: `open-runs` 0; current windows backup `05:59-06:29` UTC daily, maintenance `tue:09:23-tue:09:53` UTC, `PendingModifiedValues` empty, retention 7. Re-read both, and `gps` `trail-rows-per-run-today`, on the deploy day | **open** (day **met**; the deploy-day reads remain) |
+| U1.6 Route 53 preflight clean on the deploy day | clean on 2026-11-17 (D11); again 2026-11-18 21:21Z and 2026-11-19 09:17Z, just before the backend change set executed: empty | **met** |
+| U1.7 alert addresses confirmed and exported for both deploys; the four confirmations within 48 hours, proved after the deploy (+1 h and +47 h) | 2026-11-18, the user: one address for now, the operator's own (the SES-verified identity); `ALERT_EMAIL_SECONDARY` stays unset, so each deploy subscribes one address and **two** confirmations arrive (one per topic) instead of four. A second person can be added later with a fresh confirmation. Exported in both deploy shells (`ALERT_EMAIL_PRIMARY`, the one email identity with sending enabled). Read 2026-11-19 09:25:17Z: both subscriptions (`saferide-ops` …`:4f9c0642-…`, `saferide-ops-us-east-1` …`:c58ad778-…`) carry a full ARN, none `PendingConfirmation` — the user had already clicked both | **met** (two of two confirmed at +0 h; the +47 h read stays in the first-48-hours list) |
+| U1.8 no-run day agreed; window 16:30–22:30 UTC Monday to Saturday, the instance's current windows read first; `open-runs` 0 (`tenancy-preflight`) and `trail-rows-per-run-today` empty (`gps`) with the schools' confirmation, at the deploy (the deploy's own open-run refusal reads `open-runs` before building and before executing) | Day agreed 2026-11-18 (D25): schools closed until 2027-01-04, any day works. Read 2026-11-18: `open-runs` 0; current windows backup `05:59-06:29` UTC daily, maintenance `tue:09:23-tue:09:53` UTC, `PendingModifiedValues` empty, retention 7. Deployed Thursday 2026-11-19 09:15–09:25 UTC — inside the checklist's route hours (02:30–16:00 UTC), which D25 sets aside for the holiday (no runs; the user is the provider) — and clear of both database windows. Read 2026-11-19 09:17:14Z: windows unchanged, instance `available`, nothing pending; `open-runs` 0; `trail-rows-per-run-today` empty. The deploy's own reads: `open-runs: 0` before the build (09:15Z) and again before executing (09:17:32Z) | **met** |
 | Scratch point-in-time restore and the 1a property set as a dry run, with timings | 2026-11-18 on the user's go (infra/RESTORE.md A, the property dry run, B, C; E deferred so the 017 rehearsal can reuse the copy). Target `2026-11-18T15:26:38+00:00` (the latest restorable time; schools on holiday, so nothing ran). Decision 15:32:07Z → `saferide-restore-test` available 15:56:48Z (**24 min 41 s**) → 1a property set applied and read back 15:57:43Z (deletion protection on, retention 35, max storage 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, no log export, nothing pending; then deletion protection off) → verify function on the copy, first query answered 15:58:08Z: **restore to first query 26 min**, inside the one-hour target. Comparison, copy against production (production read after C, without the override): `migrations` (22 rows, up to `016_gps_tracking`, the two cosmetic 015 rows included), `gps` (9 checks) and `baseline` for Msingi Bora and Voluntari Academy (5 checks each): every check identical, no error rows | **met** |
 | **017 production-copy rehearsal:** migrate function pointed at the scratch instance, `migrations.applied` exactly `["017_account_hardening"]`, duration recorded; environment read back `MATCH`, code hash back to its first value. Needs the user's go, and first an agreed way to put 1a's migrate package on the function (`infra/RESTORE.md`, "017 on the production copy") | 2026-11-18 on the user's go, by D27 (a throwaway stack with 1a's migrate and verify code against the scratch copy; no production function changed). Build at `aecab54`, no `.env` in the package. `migrations` on the copy before: 22 rows, last `016_gps_tracking`. Migrate #1 16:05:21Z → 16:05:26Z (**4.9 s**, timeout 120 s): `status` `ok`, `migrations.applied` exactly `["017_account_hardening"]`, seeds skipped by name (`APP_ENV=production`), `app_role.synced` true, provider bootstrap skipped (already applied). After: 23 rows, last `017_account_hardening`; `hardening` 18 checks, no error rows: `017-objects-present` 15 of 15 true, `audit-check-widening-017` all six true, `schools-without-driver-code` 0, `drivers-with-several-driver-memberships` 0, `open-runs-and-today` 0/0. Migrate #2: `applied` `[]` (017 skipped). Production migrate function `CodeSha256` `nQzJ18OK…PtE=` (`LastModified` 2026-09-22T17:52:46Z) identical before and after. Cleanup: rehearsal stack and its log group deleted; scratch instance deleted 16:08:06Z (skip final snapshot, automated backups deleted), none retained | **met** |
 | Both functions back on production after the rehearsal: verify and migrate read-backs `MATCH`, both `DATABASE_URL` hosts equal `DbEndpoint` | Verify function: on the copy 15:57:43Z–15:58:08Z, put back by the script's always-run step C, read-back `MATCH`, and the production reads after it passed the verify-target check without the override. Migrate function: never pointed elsewhere (D27 used a temporary function); `CodeSha256` unchanged. Read after both rehearsals: each function's `DATABASE_URL` host equals `DbEndpoint` (`saferide-backend-database-rto9a7nrm9ux…`) | **met** |
 | **Gate dry run** on the real stack (`CONFIRM_CHANGESET=1`, answered `N`, on the user's go): `Database` row without `MasterUserPassword`, change set deleted, stack status unchanged; the gate output pasted here | Run 2026-11-18 on the user's go ("Gate dry run, 2026-11-18" below): the `Database` row lists exactly the five 1a properties and **no `MasterUserPassword`**; change set deleted, none left; stack `UPDATE_COMPLETE`, `LastUpdatedTime` 2026-09-22T17:52:33Z before and after. One `WARN`: `Database` replacement `Conditional`, from `BackupRetentionPeriod` and `PreferredMaintenanceWindow` (the only two of the five in the resource schema's `conditionalCreateOnlyProperties`) | **met** — `MasterUserPassword` absent; the `WARN` closed by D26: rehearsed in place on a throwaway stack, stack policy denying `Database` replacement set on `saferide-backend` |
-| Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | | **open** |
-| Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | | **open** |
-| Stray-variable check prints only the intended exports; no `ALLOW_*` | | **open** |
-| Live parity values read before the first explicit-parameter deploy | | **open** |
-| Manual pre-1a snapshot id recorded | | **open** |
-| `release/1a` tagged at the certified commit and pushed on the user's go; HEAD on it | 2026-11-18 on the user's go: annotated tag `25e7860` on `a66d53b` (the final certify run), pushed alone (no branch); `git ls-remote --tags origin 'refs/tags/release/*'` shows `release/1a` peeled to `a66d53b804e87de38fbf98e25b7fb6b7b6d2ab62`. HEAD moves onto it (`git checkout release/1a`) in the deploy session | **met** (tag); HEAD on it at the deploy |
-| Change set: no `MasterUserPassword`, no replacement and exactly one `WARN` line — `Database` replacement `Conditional` (D26) — no unexplained removal, the same table as the dry run; override lines reconciled (only the addresses and the granted threshold, 800); open-run re-check passed before execution | | **open** |
-| Migrate result: `017_account_hardening` applied; seeds skipped by name; `app_role.synced` | | **open** |
-| Frontend change set: `Distribution` and the four alias records replacement `False`, no `WARN`; deployed with `CSP_MODE=report-only` | | **open** |
-| `verify-db.sh --strict migrations` exits 0 and, against the baseline, adds only 017 (the seed markers and the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows remain); `tenancy-preflight` `school-rows`, `users-by-role`, `audit-by-school` identical; `--strict hardening` exits 0: `017-objects-present` all true, `schools-without-driver-code` 0; `instance-settings` and the 1b baselines recorded | | **open** |
-| Headers on apex, www, a deep route and `/sw.js` (report-only CSP, no enforcing CSP) | | **open** |
-| RDS properties as set (maintenance `sun:00:00-sun:01:00`, no log export), `PendingModifiedValues` empty | | **open** |
-| Alarms `OK`/`INSUFFICIENT_DATA` in both regions (the probe alarms re-read after 10 minutes); `AccountConcurrency` threshold 800 or 8; four subscriptions confirmed | | **open** |
-| Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | | **open** |
-| SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | | **open** |
-| CloudTrail logging, objects in the bucket | | **open** |
+| Fixed-name pre-checks: `saferide-ops`, `saferide-ops-us-east-1`, `saferide-trail`, `saferide-transactional`, the `saferidelive.co.ke` identity, `/saferide/` log groups, `saferide-frontend-security-headers` — all NotFound or empty | 2026-11-18 21:21Z: both topics empty, `TrailNotFoundException`, configuration set and identity `NotFoundException`, no `/saferide/` group, no headers policy. Topics and log groups again empty 2026-11-19 09:17Z. Stack policy read both times: the `Deny` of `Update:Replace`/`Update:Delete` on `LogicalResourceId/Database` present (D26); no change set left on the stack | **met** |
+| Baselines before the deploy: `--strict migrations` (seed markers, the two cosmetic 015 rows, no 017), `tenancy-preflight`, database properties (retention 7, no deletion protection, no max storage) | 2026-11-18 21:21Z: `--strict migrations` exit 0, 22 rows, `seed:001_demo_seed`, `seed:002_live_demo_seed`, `seed:003_local_snapshot`, `015_tenancy_constraints_rls 2`/`3`, last `016_gps_tracking`, no 017; `tenancy-preflight` exit 0 (2 schools; users admin 1, driver 5, parent 5, none 5); properties: deletion protection `false`, retention 7, `maxStorage` `null`, backup `05:59-06:29`, maintenance `tue:09:23-tue:09:53`, no log export, nothing pending. `school-rows`, `users-by-role`, `audit-by-school` re-read identical 2026-11-19 09:17Z | **met** |
+| Stray-variable check prints only the intended exports; no `ALLOW_*` | The session shell held one match, `API_TIMEOUT_MS` (set by the Claude Code harness; nothing in the repository reads it), unset in both deploy shells. Printed inside them: backend `CONCURRENCY_ALARM_THRESHOLD`, `ALERT_EMAIL_PRIMARY`; frontend `CSP_MODE`, `ALERT_EMAIL_PRIMARY`. No `ALLOW_*` | **met** |
+| Live parity values read before the first explicit-parameter deploy | 2026-11-18 21:21Z, backend: `GpsCustodyThresholdM` 150, `GpsVicinityRadiusM` 100, `GpsFixAccuracyCapM` 200, `GpsPositionRetentionDays` 90, `GpsPingIntervalS` 10, `GpsStaleAfterS` 90, `GpsFixWaitBudgetS` 5, `ApiDefaultBurstLimit` 100, `ApiDefaultRateLimit` 50, `PingsRouteBurstLimit` 20, `PingsRouteRateLimit` 10 — every one its Default, so nothing to export; frontend `DomainName` `saferidelive.co.ke`, `HostedZoneId` `Z0459820URO1AH08IO8T` (as `scripts/config.sh`) | **met** |
+| Manual pre-1a snapshot id recorded | `saferide-pre-1a-20261118`: created 2026-11-18 21:22:28Z, `available` by 21:27:28Z, manual, encrypted, 20 GiB. Keep it at least 35 days (a rollback to `release/0` cuts the automated backups to 7) | **met** |
+| `release/1a` tagged at the certified commit and pushed on the user's go; HEAD on it | 2026-11-18 on the user's go: annotated tag `25e7860` on `a66d53b` (the final certify run), pushed alone (no branch); `git ls-remote --tags origin 'refs/tags/release/*'` shows `release/1a` peeled to `a66d53b804e87de38fbf98e25b7fb6b7b6d2ab62`. Both deploys printed `==> Clean checkout: HEAD a66d53b is tagged release/1a`, untracked only `.claude/` and `justfile`; `AppVersion` `a66d53b` | **met** |
+| Change set: no `MasterUserPassword`, no replacement and exactly one `WARN` line — `Database` replacement `Conditional` (D26) — no unexplained removal, the same table as the dry run; override lines reconciled (only the addresses and the granted threshold, 800); open-run re-check passed before execution | Change set `samcli-deploy1795079775/aae06e07-…`: the gate's table is **byte-identical** to the dry run's (39 rows: 32 `Add`, 7 `Modify`, no `Remove`), no `MasterUserPassword`, one `WARN` (`Database` `Conditional`). Override lines: `AlertEmailPrimary` and `ConcurrencyAlarmThreshold=800` only; every other parity value at its Default. Answered `y` 09:17:32Z; open-run re-check `open-runs: 0`; stack `UPDATE_IN_PROGRESS` 09:17:37Z → `UPDATE_COMPLETE` 09:20:34Z (`Database` 09:17:40Z → 09:18:13Z, 33 s); the same instance after it (`InstanceCreateTime` 2026-06-17T12:37:56Z) | **met** |
+| Migrate result: `017_account_hardening` applied; seeds skipped by name; `app_role.synced` | `{"status": "ok", "migrations": {"applied": ["017_account_hardening"], …}, "seeds": {"skipped": "APP_ENV=production", "files": ["001_demo_seed.sql", "002_live_demo_seed.sql", "003_local_snapshot.sql"]}, "app_role": {"role": "saferide_app", "synced": true}, "provider_bootstrap": {"skipped": "provider-bootstrap:v1 already applied"}}`; 017 `applied_at` 2026-11-19 09:20:48Z; backend deploy exit 0 at 09:20:51Z | **met** |
+| Frontend change set: `Distribution` and the four alias records replacement `False`, no `WARN`; deployed with `CSP_MODE=report-only` | Override lines `DomainName`, `HostedZoneId`, `ApiOrigin`, `CspMode=report-only`, `AlertEmailPrimary`; `MonthlyBudgetUsd=60` at its Default; build with the SSM Maps key and Map ID. 16 rows: 11 `Add` (`SecurityHeadersPolicy`, `OpsTopicUsEast1`, its policy, `OpsUsEast1SubscriptionPrimary`, `ApiHealthCheck`, `SiteHealthCheck`, `ApiProbeFailing`, `SiteProbeFailing`, `SiteServerErrors`, `SiteCertificateExpiry`, `MonthlyCostBudget`), 5 `Modify` with replacement `False` (`Distribution`, `ApexRecord`, `ApexRecordIpv6`, `WwwRecord`, `WwwRecordIpv6`), no `Remove`, no `WARN`. Answered `y` 09:23:18Z; `UPDATE_COMPLETE` 09:24:35Z; build uploaded, invalidation `I63LQ6UTQDGR6IVMEDT7UY9WLA` `Completed`; exit 0 at 09:25:00Z | **met** |
+| `verify-db.sh --strict migrations` exits 0 and, against the baseline, adds only 017 (the seed markers and the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows remain); `tenancy-preflight` `school-rows`, `users-by-role`, `audit-by-school` identical; `--strict hardening` exits 0: `017-objects-present` all true, `schools-without-driver-code` 0; `instance-settings` and the 1b baselines recorded | 2026-11-19 09:21Z: `--strict migrations` exit 0, 23 rows, the only addition `017_account_hardening`, nothing removed; `tenancy-preflight` all seven labels identical to the baseline; `--strict hardening` exit 0, 18 checks, no error row: `017-objects-present` 15 of 15, `audit-check-widening-017` all six true, `schools-without-driver-code` 0; `instance-settings` `max_connections` 79, server 16.14; the 1b baselines in "Deployed" | **met** |
+| Headers on apex, www, a deep route and `/sw.js` (report-only CSP, no enforcing CSP) | 2026-11-19 09:25Z, all four `HTTP/2 200` with `strict-transport-security: max-age=31536000; includeSubDomains` (no preload), `x-content-type-options: nosniff`, `x-frame-options: DENY`, `referrer-policy: strict-origin-when-cross-origin`, `permissions-policy: geolocation=(self), camera=(), microphone=()`, `content-security-policy-report-only: default-src 'self'; script-src 'self' https://maps.googleapis.com; …`, and no enforcing `content-security-policy` line | **met** |
+| RDS properties as set (maintenance `sun:00:00-sun:01:00`, no log export), `PendingModifiedValues` empty | 2026-11-19 09:21Z: deletion protection `true`, retention 35, `maxStorage` 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, `logExports` `null`, `pending` `{}`; the diff against the baseline is exactly those five properties | **met** |
+| Alarms `OK`/`INSUFFICIENT_DATA` in both regions (the probe alarms re-read after 10 minutes); `AccountConcurrency` threshold 800 or 8; four subscriptions confirmed | 2026-11-19 09:21Z, af-south-1: all 12 `OK`, `AccountConcurrency` threshold **800**. 09:25Z, us-east-1: `ApiProbeFailing`, `SiteProbeFailing`, `SiteCertificateExpiry` `OK`, `SiteServerErrors` `INSUFFICIENT_DATA` (no traffic errors yet). Re-read 09:35:05Z (10 minutes after the frontend deploy): all four us-east-1 alarms `OK`, every af-south-1 alarm `OK`, API `{"status":"ok"}`, site 200. Subscriptions: two of two confirmed (one address, see U1.7) | **met** |
+| Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | 2026-11-19, `set-alarm-state … "Release 1a alarm drill"` at 09:25:49Z on `saferide-backend-ApiServerErrors-alHRYjAu0mun` and `saferide-frontend-SiteServerErrors-pH54EODEjYMp`. History: backend OK→ALARM 09:25:48.86Z, `Successfully executed action …:saferide-ops` 09:25:48.89Z; ALARM→OK 09:26:40.04Z, action executed 09:26:40.07Z. Frontend INSUFFICIENT_DATA→ALARM 09:25:49.51Z, action `…:saferide-ops-us-east-1` 09:25:49.54Z; ALARM→OK 09:26:50.49Z, action 09:26:50.54Z. SNS delivery proved on both topics; the four mails (two ALARM, two OK) in the one inbox are for the user to confirm | **met** (SNS side); inbox receipt — the user |
+| SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. The +24 h and +72 h reads stay in the first-48-hours list. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h) |
+| CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | | **open** |
 | Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | | **open** |
 | 90-day retention set on the three old `/aws/lambda/*` groups | | **open** |
@@ -490,9 +493,61 @@ Residuals deferred:
 
 ## Deployed
 
-Not deployed. At the deploy, record here: the window (UTC and EAT) and the
-instance's windows read before it, the release commit and tag, the
-baselines and their diffs, both change-set tables, the migrate result, the
-post-deploy rows above with their outputs, the 1b baselines, the
-alarm-drill times, the phone-check CSP lines, the SES status at +24 h and
-+72 h, and each of the first 48 hours' checks with its time.
+**Release 1a is live since 2026-11-19 09:25 UTC** (the user's go at the
+end of the 2026-11-18 pre-checks; the deploy ran the next morning).
+
+- **Window:** Thursday 2026-11-19, backend 09:15:30Z–09:20:51Z, frontend
+  09:22:14Z–09:25:00Z (12:15–12:25 EAT). D25: schools on holiday, no runs;
+  the instance's windows read first (backup `05:59-06:29` UTC, maintenance
+  `tue:09:23-tue:09:53` UTC) and clear of the deploy.
+- **Release:** `release/1a` = `a66d53b` (tag `25e7860`), deployed from a
+  detached checkout of the tag; `AppVersion` `a66d53b`.
+- **Pre-checks:** 2026-11-18 21:21Z (Route 53, windows, open runs, gps,
+  both function hosts equal `DbEndpoint`, fixed names, stack policy, parity
+  values, baselines), re-read 2026-11-19 09:17Z while the backend change
+  set waited (stack policy, Route 53, topics, log groups, instance, open
+  runs 0, `trail-rows-per-run-today` empty, `tenancy-preflight` identical).
+  Manual snapshot `saferide-pre-1a-20261118`.
+- **Backend change set:** the "Gate dry run, 2026-11-18" table above, byte
+  for byte (39 rows, one `WARN` `Database` `Conditional`); overrides
+  `AlertEmailPrimary` and `ConcurrencyAlarmThreshold=800`. `Database`
+  modified in place in 33 s (09:17:40Z–09:18:13Z), same instance; stack
+  `UPDATE_COMPLETE` 09:20:34Z. Migrate: `017_account_hardening` only, at
+  09:20:48Z; seeds skipped by name; `app_role.synced` true.
+- **Frontend change set:** 16 rows (11 `Add`, 5 `Modify` replacement
+  `False`), no `WARN`; `UPDATE_COMPLETE` 09:24:35Z; invalidation
+  `I63LQ6UTQDGR6IVMEDT7UY9WLA` completed. `CspMode` `report-only`.
+- **After the deploy:** `--strict migrations` adds only 017;
+  `tenancy-preflight` identical; `--strict hardening` clean; database
+  properties as set, nothing pending; headers on all four URLs; API
+  `{"status":"ok"}`, site 200; CloudTrail logging with objects; SES
+  identity verified, DKIM and MAIL FROM `SUCCESS` at +0 h; both
+  subscriptions confirmed at +0 h; alarm drill delivered ALARM and OK on
+  both topics (times in the gate row).
+- **1b baselines (2026-11-19 09:21Z, `hardening`):**
+  `drivers-with-several-driver-memberships` 0 users;
+  `driver-last-sign-in-per-school`: five drivers, none null (Msingi Bora
+  2026-07-14 ×2, 2026-08-02, 2026-09-22; Voluntari Academy 2026-10-23);
+  `driver-pin-hash-versions-per-school`: Msingi Bora 4 `legacy_hmac`,
+  Voluntari Academy 1 `legacy_hmac`, `salted_v2` 0, `no_pin` 0;
+  `unverified-parent-accounts-by-age` every bucket 0; `consent-state`
+  `consent_version` null for 5 parents; `token-rows-by-purpose`: `reset` 0
+  live, 1 used and unpurged over a day, `verify` all 0;
+  `notifications-past-90-days` 1 (oldest 2026-07-08); `stale-sessions`
+  `auth_sessions` 271 and `auth_preauth_tokens` 18 expired over 7 days;
+  `last-retention-run` empty (no job before 1b); `pin-lock-state` no
+  failures; `push-subscriptions-by-kind` 0 web-push, 0 fcm;
+  `instance-settings` `max_connections` 79, PostgreSQL 16.14;
+  `open-runs-and-today` 0/0.
+- **Still open:** the three
+  sign-ins and the phone checks with their CSP console lines (the user —
+  credentials are never typed into the live site from this session); 90-day
+  retention on the three `/aws/lambda/*` groups (it deletes their events
+  older than 90 days: awaiting the user's go); the first-48-hours checks —
+  subscriptions +1 h (10:25Z) and +47 h (2026-11-21 08:25Z), ERROR
+  searches +1/+4/+24/+48 h, the first automated backup in tonight's
+  23:00–23:30 UTC window with the instance's events, SES at +24 h and
+  +72 h, `DatabaseConnections` against 79, trail delivery, spend; and the
+  post-1a restore rehearsal with `restore-compare` before 1b (R21). The
+  first school morning is 2027-01-04 (the 4xx, driver sign-in and trail
+  checks wait for it).
