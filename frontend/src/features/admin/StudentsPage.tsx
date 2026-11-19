@@ -402,7 +402,10 @@ export function StudentsPage() {
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-2xl">
-          <DialogHeader><DialogTitle>{editId ? "Edit Student" : "Add Student"}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{editId ? "Edit Student" : "Add Student"}</DialogTitle>
+            <DialogDescription className="sr-only">The student's grade, parents, pickup address, pickup time and routes.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2"><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>

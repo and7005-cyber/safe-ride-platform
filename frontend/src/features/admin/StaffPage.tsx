@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -311,6 +312,7 @@ export function StaffPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Add Staff</DialogTitle>
+            <DialogDescription className="sr-only">Add a coordinator or director to this school by email.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
@@ -375,11 +377,11 @@ export function StaffPage() {
           </DialogHeader>
           {reveal && (
             <div className="space-y-3">
-              <p className="text-sm text-muted-foreground">
+              <DialogDescription>
                 Share this password with {reveal.who} now — they sign in with
                 it and must set their own password immediately. For security it
                 is stored encrypted and can't be shown again.
-              </p>
+              </DialogDescription>
               <div className="flex items-center justify-between gap-2 rounded-md border bg-muted px-4 py-3">
                 <span
                   className="break-all font-mono text-lg font-semibold"

@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -379,7 +380,7 @@ export function PlanApplyStep({
             <DialogTitle>Restore the previous plan?</DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
-            <p className="text-sm text-muted-foreground">{RESTORE_CONFIRM_MESSAGE}</p>
+            <DialogDescription>{RESTORE_CONFIRM_MESSAGE}</DialogDescription>
             <div className="space-y-3" data-testid="restore-gate-list">
               <p className="text-sm font-semibold">
                 The school has changed since this plan was preserved

@@ -358,11 +358,11 @@ export function ProviderAccountsPage() {
           </DialogHeader>
           {reveal && (
             <div className="space-y-3">
-              <p className="text-sm text-muted-foreground">
+              <DialogDescription>
                 Share this password with {reveal.who} now — they sign in with
                 it and must set their own password immediately. For security it
                 is stored encrypted and can't be shown again.
-              </p>
+              </DialogDescription>
               <div className="flex items-center justify-between gap-2 rounded-md border bg-muted px-4 py-3">
                 <span
                   className="break-all font-mono text-lg font-semibold"

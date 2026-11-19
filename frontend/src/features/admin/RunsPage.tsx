@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -255,7 +256,10 @@ export function RunsPage() {
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>{editId ? "Edit Run" : "Add Run"}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{editId ? "Edit Run" : "Add Run"}</DialogTitle>
+            <DialogDescription className="sr-only">Set this run's bus, route, type, date and status.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>Bus</Label>
@@ -339,7 +343,10 @@ export function RunsPage() {
         {/* Wider than the form dialogs: the exceptions panel lays a stop and
             its children side by side. */}
         <DialogContent className="sm:max-w-2xl">
-          <DialogHeader><DialogTitle>Run Report</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>Run Report</DialogTitle>
+            <DialogDescription className="sr-only">The bus, driver, times, students, stops and absences recorded for this run.</DialogDescription>
+          </DialogHeader>
           {!report ? (
             <p className="text-sm text-muted-foreground">Loading report…</p>
           ) : (
