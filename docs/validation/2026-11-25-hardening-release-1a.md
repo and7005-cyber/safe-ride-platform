@@ -579,7 +579,7 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
   a Maps load on the apex origin (the user; before Release 2 enforces the
   CSP); the first-48-hours checks —
   subscriptions +47 h (2026-11-21 08:25Z), ERROR
-  searches +4/+24/+48 h, the first automated backup in tonight's
+  searches +24/+48 h, the first automated backup in tonight's
   23:00–23:30 UTC window with the instance's events, SES at +24 h and
   +72 h, `DatabaseConnections` against 79, trail delivery, spend; and the
   post-1a restore rehearsal with `restore-compare` before 1b (R21). The
@@ -590,3 +590,9 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
     alarm in both regions `OK`; ERROR search over `/saferide/api`,
     `/saferide/migrate`, `/saferide/verify` from 09:15Z to 10:25Z: 0 matches
     in 2,097 records scanned; API `{"status":"ok"}`, site 200.
+  - +4 h, run at 2026-11-19 14:29Z (an hour late): every alarm in both
+    regions `OK`; ERROR search over the three groups from 10:25:14Z to
+    14:29:17Z: 0 matches in 11,602 records scanned (the window holds the
+    phone checks: the sign-ins, the driver run, the parent sign-up and
+    push); trail logging, latest delivery 14:28:50Z, no delivery error;
+    API `{"status":"ok"}`, site 200.
