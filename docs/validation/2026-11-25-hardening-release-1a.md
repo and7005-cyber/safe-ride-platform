@@ -542,10 +542,15 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
   sign-ins and the phone checks with their CSP console lines (the user —
   credentials are never typed into the live site from this session); the
   first-48-hours checks —
-  subscriptions +1 h (10:25Z) and +47 h (2026-11-21 08:25Z), ERROR
-  searches +1/+4/+24/+48 h, the first automated backup in tonight's
+  subscriptions +47 h (2026-11-21 08:25Z), ERROR
+  searches +4/+24/+48 h, the first automated backup in tonight's
   23:00–23:30 UTC window with the instance's events, SES at +24 h and
   +72 h, `DatabaseConnections` against 79, trail delivery, spend; and the
   post-1a restore rehearsal with `restore-compare` before 1b (R21). The
   first school morning is 2027-01-04 (the 4xx, driver sign-in and trail
   checks wait for it).
+- **First 48 hours:**
+  - +1 h, 2026-11-19 10:25Z: both subscriptions confirmed (full ARNs); every
+    alarm in both regions `OK`; ERROR search over `/saferide/api`,
+    `/saferide/migrate`, `/saferide/verify` from 09:15Z to 10:25Z: 0 matches
+    in 2,097 records scanned; API `{"status":"ok"}`, site 200.
