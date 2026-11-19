@@ -205,6 +205,7 @@ export function CreateSchoolDialog({
         <DialogContent className="max-w-sm" data-testid="school-created-dialog">
           <DialogHeader>
             <DialogTitle>School created</DialogTitle>
+            <DialogDescription className="sr-only">The new school's code and how its director signs in.</DialogDescription>
           </DialogHeader>
           {result && (
             <div className="space-y-4">

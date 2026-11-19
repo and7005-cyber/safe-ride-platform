@@ -18,6 +18,7 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -545,7 +546,10 @@ export function RoutesPage() {
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>{editId ? "Edit Route" : "Add Route"}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{editId ? "Edit Route" : "Add Route"}</DialogTitle>
+            <DialogDescription className="sr-only">Set the route's name, type, bus, trip number and school gate time.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2"><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
             <div className="space-y-2">
@@ -624,9 +628,9 @@ export function RoutesPage() {
                 value={stopEdit.time}
                 onChange={(e) => setStopEdit({ ...stopEdit, time: e.target.value })}
               />
-              <p className="text-xs text-muted-foreground">
+              <DialogDescription className="text-xs">
                 Reorders the route by pickup time across all of this student's routes.
-              </p>
+              </DialogDescription>
             </div>
           )}
           <DialogFooter>
@@ -671,9 +675,9 @@ export function RoutesPage() {
             >
               {broadcastBody.length}/{BROADCAST_MAX_CHARS}
             </p>
-            <p className="text-xs text-muted-foreground">
+            <DialogDescription className="text-xs">
               Sent once to every parent with a child assigned to this route.
-            </p>
+            </DialogDescription>
           </div>
           <DialogFooter>
             <Button variant="outline" disabled={sending} onClick={() => setBroadcast(null)}>

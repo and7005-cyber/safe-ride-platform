@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -173,13 +174,13 @@ export function PlannerCsvDialog({
       <DialogContent>
         <DialogHeader><DialogTitle>Upload planner stops</DialogTitle></DialogHeader>
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
+          <DialogDescription>
             Upload a CSV or Excel file with a header row: <code>address</code> (required),{" "}
             <code>pickup_time</code> (optional, HH:MM), <code>lat</code>/<code>lng</code>{" "}
             (optional, together). Valid rows are added to the planner — up to{" "}
             {PLANNER_STOPS_CAP} stops in total. Addresses without coordinates are geocoded
             when you calculate the route.
-          </p>
+          </DialogDescription>
           <div className="flex gap-2">
             <Button variant="outline" onClick={downloadTemplate}>Download template</Button>
             <input

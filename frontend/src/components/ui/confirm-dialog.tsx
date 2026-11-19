@@ -76,7 +76,12 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
     <ConfirmContext.Provider value={confirm}>
       {children}
       <Dialog open={open} onOpenChange={(next) => (next ? null : settle(false))}>
-        <DialogContent className="max-w-md">
+        {/* Without a description the title says it all: tell Radix so, rather
+            than leave aria-describedby pointing at nothing. */}
+        <DialogContent
+          className="max-w-md"
+          {...(opts.description ? {} : { "aria-describedby": undefined })}
+        >
           <DialogHeader>
             <DialogTitle>{opts.title ?? "Are you sure you want to cancel?"}</DialogTitle>
             {opts.description && <DialogDescription>{opts.description}</DialogDescription>}

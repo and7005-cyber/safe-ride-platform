@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -266,13 +267,13 @@ export function BulkUploadDialog({ open, onOpenChange }: { open: boolean; onOpen
       <DialogContent className="max-w-2xl">
         <DialogHeader><DialogTitle>Bulk Upload Students</DialogTitle></DialogHeader>
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
+          <DialogDescription>
             Upload a CSV or Excel file. Each row needs a name, grade, and parent name, plus at
             least one parent phone and one parent email across the two parents
             (parent_phone/parent_phone2, parent_email/parent2_email). Routes are not part of
             the upload — they come from the fleet plan. Every imported student is enrolled at
             this school.
-          </p>
+          </DialogDescription>
           <div className="flex gap-2">
             <Button variant="outline" onClick={downloadTemplate}>Download template</Button>
             <input

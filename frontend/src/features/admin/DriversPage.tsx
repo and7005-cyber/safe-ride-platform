@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -158,7 +159,10 @@ export function DriversPage() {
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>{editId ? "Edit Driver" : "Add Driver"}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{editId ? "Edit Driver" : "Add Driver"}</DialogTitle>
+            <DialogDescription className="sr-only">The driver's name, contact details and sign-in credentials.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2"><Label>Full name</Label><Input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} /></div>
             <div className="space-y-2">
@@ -202,11 +206,11 @@ export function DriversPage() {
           <DialogHeader><DialogTitle>Driver PIN set</DialogTitle></DialogHeader>
           {pinReveal && (
             <div className="space-y-3">
-              <p className="text-sm text-muted-foreground">
+              <DialogDescription>
                 Share this PIN with {pinReveal.name || "the driver"} now — they sign in on the
                 <span className="font-medium"> Driver PIN</span> tab. For security it's stored
                 encrypted and can't be shown again.
-              </p>
+              </DialogDescription>
               <div className="flex items-center justify-between rounded-md border bg-muted px-4 py-3">
                 <span className="font-mono text-2xl font-semibold tracking-[0.3em]">{pinReveal.pin}</span>
                 <Button variant="outline" size="sm" onClick={() => copyPin(pinReveal.pin)}>

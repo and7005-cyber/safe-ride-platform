@@ -12,6 +12,7 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -872,7 +873,10 @@ export function FleetMapPage() {
       {/* Save-to-Routes dialog (R17): persists the selected option as a custom-stops route. */}
       <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>Save to Routes</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>Save to Routes</DialogTitle>
+            <DialogDescription className="sr-only">Save this planned route to the school's routes, with a name and a bus.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-1">
               <Label>Route name</Label>
@@ -919,10 +923,10 @@ export function FleetMapPage() {
               value={depotValue}
               onChange={setDepotValue}
             />
-            <p className="text-xs text-muted-foreground">
+            <DialogDescription className="text-xs">
               The bus begins its first morning trip and ends its last afternoon
               trip here. It never appears as a passenger stop. Leave empty for none.
-            </p>
+            </DialogDescription>
           </div>
           <DialogFooter>
             {depotBus && (depotBus.depot_lat != null || depotBus.depot_address) && (

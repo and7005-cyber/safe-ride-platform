@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -144,7 +145,10 @@ export function ParentsPage() {
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>Edit Parent</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>Edit Parent</DialogTitle>
+            <DialogDescription className="sr-only">Update this parent's name, email and phone.</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2"><Label>Full name</Label><Input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} /></div>
             <div className="space-y-2">

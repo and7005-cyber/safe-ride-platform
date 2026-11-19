@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -85,12 +86,12 @@ export function PlanApplyDialog({
           <DialogTitle>Apply this plan?</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
+          <DialogDescription>
             Applying replaces this school's live routes in one act and notifies
             every affected family ({notifiedFamilyCount}{" "}
             {notifiedFamilyCount === 1 ? "family" : "families"}). The previous
             routes are preserved and can be restored — one step back.
-          </p>
+          </DialogDescription>
           {firstApply && (
             <p className="text-sm font-medium" data-testid="apply-first-apply-copy">
               {FIRST_APPLY_MESSAGE}

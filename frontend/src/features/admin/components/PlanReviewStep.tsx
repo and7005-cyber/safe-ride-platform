@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -340,6 +341,7 @@ export function PlanReviewStep({
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Move {moveTarget?.student.name}</DialogTitle>
+            <DialogDescription className="sr-only">Move this child to another bus for one or both legs.</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1">
@@ -398,6 +400,7 @@ export function PlanReviewStep({
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Place {placeTarget?.name}</DialogTitle>
+            <DialogDescription className="sr-only">Place this child on a bus and choose their position on each leg.</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1">
