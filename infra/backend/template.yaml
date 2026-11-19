@@ -95,9 +95,10 @@ Parameters:
   # GPS tracking system defaults (GPS plan U11: R26, R31, R38). Each Default
   # equals the Settings default in backend/app/core/config.py (kept in step by
   # backend/tests/core/test_gps_settings.py) and is the value beneath a
-  # school's own setting; deploy-backend.sh passes an override only when the
-  # operator exports the matching GPS_* variable. Staleness and the fix-wait
-  # budget have no per-school column — these ARE their live values.
+  # school's own setting. deploy-backend.sh passes every one on every deploy
+  # (infra/scripts/parity-params.sh): the matching GPS_* variable when
+  # exported, otherwise this Default. Staleness and the fix-wait budget have no
+  # per-school column — these ARE their live values.
   GpsCustodyThresholdM:
     Type: Number
     Default: 150
@@ -145,8 +146,9 @@ Parameters:
   # console down: the pings route gets its own bound, well under the pool, and
   # the stage a generous default that still stops a runaway client. Numbers are
   # requests per second (rate) and the token bucket (burst); the Defaults are
-  # the live values, overridable per deploy from deploy-backend.sh. Kept in
-  # step by backend/tests/core/test_gps_settings.py.
+  # the live values, passed on every deploy by deploy-backend.sh unless an
+  # override is exported for that deploy. Kept in step by
+  # backend/tests/core/test_gps_settings.py.
   ApiDefaultBurstLimit:
     Type: Number
     Default: 100
@@ -167,6 +169,30 @@ Parameters:
     Default: 10
     MinValue: 1
     Description: Steady-state rate limit (requests per second) for POST /api/runs/driver/pings.
+  # Driver sign-in and the school lookup it starts from (hardening D6): their
+  # own bound at the gateway, so a scripted PIN guesser is capped before the
+  # function runs whatever the source addresses; the per-school failure lock
+  # (Release 1b) is the bound that counts attempts. Same live-parity rule.
+  PinLoginRouteBurstLimit:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    Description: Burst limit (requests) for POST /api/auth/pin-login.
+  PinLoginRouteRateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Steady-state rate limit (requests per second) for POST /api/auth/pin-login.
+  SchoolLookupRouteBurstLimit:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    Description: Burst limit (requests) for GET /api/auth/schools/{code}.
+  SchoolLookupRouteRateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Steady-state rate limit (requests per second) for GET /api/auth/schools/{code}.
   DbEngineVersion:
     Type: String
     Default: "16.14"
@@ -177,9 +203,82 @@ Parameters:
   DbAllocatedStorage:
     Type: Number
     Default: 20
+  AppVersion:
+    Type: String
+    Default: unknown
+    Description: >
+      Short git SHA of the deployed commit; deploy-backend.sh passes
+      git rev-parse --short HEAD. The API function exposes it as APP_VERSION.
+  # Alerting (hardening U4, D12, D16, D19). Each address gets one email
+  # subscription to OpsTopic, which must be confirmed from the inbox; an empty
+  # address creates none. deploy-backend.sh passes ALERT_EMAIL_PRIMARY and
+  # ALERT_EMAIL_SECONDARY when exported; otherwise the stack keeps the address
+  # it has (an empty Default is never passed). ConcurrencyAlarmThreshold is
+  # passed on every deploy: CONCURRENCY_ALARM_THRESHOLD when exported, else
+  # its Default.
+  AlertEmailPrimary:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: must be empty or one email address.
+    Description: First operator address subscribed to the backend alarm topic (empty = no subscription).
+  AlertEmailSecondary:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: must be empty or one email address.
+    Description: Second operator address subscribed to the backend alarm topic (empty = no subscription).
+  ConcurrencyAlarmThreshold:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    Description: >
+      Account-level Lambda ConcurrentExecutions (this region) at which the
+      AccountConcurrency alarm fires: 80% of the account limit, 8 of today's
+      10. Raise it with the quota (800 at a limit of 1000).
+  # Transactional email (hardening U4; Release 1b sends). MailDomain is the
+  # SES identity and must sit inside HostedZoneId's zone, where its DKIM,
+  # MAIL FROM and DMARC records are written. The four Mail* settings follow
+  # the live-parity rule: each Default equals the Settings default in
+  # backend/app/core/config.py (backend/tests/core/test_mail_settings.py keeps
+  # them in step), lands in the API function's environment, and is passed by
+  # deploy-backend.sh on every deploy under the name the app reads (the
+  # exported value, else this Default; MailReplyTo only when exported).
+  MailDomain:
+    Type: String
+    Default: saferidelive.co.ke
+    AllowedPattern: '^[a-z0-9.-]+\.[a-z]{2,}$'
+    Description: Domain verified as the SES sending identity (Easy DKIM, MAIL FROM mail.<domain>).
+  MailFromAddress:
+    Type: String
+    Default: "no-reply@saferidelive.co.ke"
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: must be one email address at MailDomain.
+    Description: From address of every transactional mail; the API's ses:SendEmail grant is conditioned on it.
+  MailReplyTo:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: must be empty or one email address.
+    Description: Reply-To address on transactional mail (empty = none).
+  MailConfigurationSet:
+    Type: String
+    Default: "saferide-transactional"
+    AllowedPattern: '^[a-zA-Z0-9_-]{1,64}$'
+    Description: >
+      Name of the SES configuration set (SesConfigSet) every send names. The
+      name is create-only: changing it replaces the set, which the deploy's
+      change-set gate refuses.
+  MailEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Whether the API sends mail through SES; false until Release 1b's sender ships.
 
 Conditions:
   HasApiCert: !Not [!Equals [!Ref ApiCertificateArn, ""]]
+  HasAlertPrimary: !Not [!Equals [!Ref AlertEmailPrimary, ""]]
+  HasAlertSecondary: !Not [!Equals [!Ref AlertEmailSecondary, ""]]
 
 Globals:
   Function:
@@ -364,8 +463,21 @@ Resources:
         - !Ref DbSecurityGroup
       PubliclyAccessible: false
       MultiAZ: false
-      BackupRetentionPeriod: 7
-      DeletionProtection: false
+      # Hardening U4: every property below updates in place; none replaces the
+      # instance. No Performance Insights: not offered on db.t4g.micro (D18).
+      # No PostgreSQL log export (D21): error DETAIL lines can carry parents'
+      # email addresses and the app-role password literal, and a terser
+      # parameter group needs a reboot; revisit later.
+      # Windows are UTC. Kenya runs on EAT = UTC+3 with no DST, and routes run
+      # 05:30-19:00 EAT (02:30-16:00 UTC), so both windows sit in the night:
+      # backups 02:00-02:30 EAT daily, maintenance Sunday 03:00-04:00 EAT, half
+      # an hour clear of Saturday night's backup rather than on its end (D22).
+      BackupRetentionPeriod: 35
+      PreferredBackupWindow: "23:00-23:30"
+      PreferredMaintenanceWindow: "sun:00:00-sun:01:00"
+      # Storage autoscaling ceiling (GiB) above DbAllocatedStorage.
+      MaxAllocatedStorage: 100
+      DeletionProtection: true
       Tags:
         - Key: Name
           Value: saferide
@@ -387,6 +499,49 @@ Resources:
         "POST /api/runs/driver/pings":
           ThrottlingBurstLimit: !Ref PingsRouteBurstLimit
           ThrottlingRateLimit: !Ref PingsRouteRateLimit
+        # Driver sign-in and the school lookup (hardening D6), each declared
+        # as its own route on ApiFunction below.
+        "POST /api/auth/pin-login":
+          ThrottlingBurstLimit: !Ref PinLoginRouteBurstLimit
+          ThrottlingRateLimit: !Ref PinLoginRouteRateLimit
+        "GET /api/auth/schools/{code}":
+          ThrottlingBurstLimit: !Ref SchoolLookupRouteBurstLimit
+          ThrottlingRateLimit: !Ref SchoolLookupRouteRateLimit
+
+  # ---------------------------------------------------------------- Logging
+  # One retained 90-day group per function (hardening U4); each function logs
+  # JSON there through its LoggingConfig, application and platform at INFO:
+  # the platform's START, END and REPORT lines carry the duration, memory,
+  # init and timeout diagnostics the alarm descriptions send operators to, and
+  # WARN would drop them.
+  # RetainExceptOnCreate: a rollback of the update that CREATED them deletes
+  # them (no name clash on the retry), while a stack delete or a later update
+  # that removes them keeps the evidence — then delete or import them before
+  # re-deploying (D13, infra/RESTORE.md). The functions' older /aws/lambda/*
+  # groups get 90-day retention by hand.
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /saferide/api
+      RetentionInDays: 90
+
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /saferide/migrate
+      RetentionInDays: 90
+
+  VerifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /saferide/verify
+      RetentionInDays: 90
 
   # ---------------------------------------------------------------- Functions
   ApiFunction:
@@ -394,6 +549,11 @@ Resources:
     Properties:
       CodeUri: ../../backend
       Handler: app.lambda_handler.handler
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+        LogGroup: !Ref ApiLogGroup
       # No ReservedConcurrentExecutions: af-south-1 starts with an account
       # concurrency limit of 10, so reserving any would drop unreserved below
       # the minimum. The function shares the unreserved pool. Request a Lambda
@@ -437,6 +597,13 @@ Resources:
           GPS_PING_INTERVAL_S: !Ref GpsPingIntervalS
           GPS_STALE_AFTER_S: !Ref GpsStaleAfterS
           GPS_FIX_WAIT_BUDGET_S: !Ref GpsFixWaitBudgetS
+          APP_VERSION: !Ref AppVersion
+          # Transactional email (hardening U4): wired now, read from Release
+          # 1b. The configuration set's Ref is its name (MailConfigurationSet).
+          MAIL_FROM_ADDRESS: !Ref MailFromAddress
+          MAIL_REPLY_TO: !Ref MailReplyTo
+          MAIL_CONFIGURATION_SET: !Ref SesConfigSet
+          MAIL_ENABLED: !Ref MailEnabled
       Policies:
         - Statement:
             - Effect: Allow
@@ -450,6 +617,16 @@ Resources:
               Condition:
                 StringEquals:
                   kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+            # Transactional email (hardening U4): send only through the domain
+            # identity and its configuration set, and only as MailFromAddress.
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource:
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesIdentity}"
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${SesConfigSet}"
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref MailFromAddress
       Events:
         Proxy:
           Type: HttpApi
@@ -472,6 +649,22 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /api/runs/driver/pings
             Method: POST
+        # Driver sign-in and the school lookup carry their own throttles
+        # (hardening D6), declared the same way. The lookup route's handler
+        # ships in Release 1b; until then the app answers it 404 exactly as
+        # the proxy did.
+        PinLogin:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/auth/pin-login
+            Method: POST
+        SchoolLookup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/auth/schools/{code}
+            Method: GET
 
   MigrateFunction:
     Type: AWS::Serverless::Function
@@ -480,6 +673,11 @@ Resources:
       Handler: app.migrate_handler.handler
       Timeout: 120
       MemorySize: 256
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+        LogGroup: !Ref MigrateLogGroup
       VpcConfig:
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
@@ -488,6 +686,8 @@ Resources:
           - !Ref SubnetB
       Environment:
         Variables:
+          # Seeds apply only when APP_ENV is local (migrate_handler).
+          APP_ENV: production
           DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
           # Tenancy (U2): runtime-role sync and provider bootstrap inputs.
           DB_APP_PASSWORD: !Ref DbAppPassword
@@ -519,6 +719,11 @@ Resources:
       Handler: app.verify_handler.handler
       Timeout: 60
       MemorySize: 256
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+        LogGroup: !Ref VerifyLogGroup
       VpcConfig:
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
@@ -527,6 +732,7 @@ Resources:
           - !Ref SubnetB
       Environment:
         Variables:
+          APP_ENV: production
           DATABASE_URL: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/saferide"
           # The `gps` check set reports trail rows past retention against the
           # same default the API and the purge resolve (GPS plan U11).
@@ -563,6 +769,556 @@ Resources:
         HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
         EvaluateTargetHealth: false
 
+  # ---------------------------------------------------------------- Alerting
+  # Hardening U4 (D9, D12, D16, D19). One topic in this region takes every
+  # backend alarm, its OK transition, and the SES feedback events; the two
+  # operator addresses subscribe by email. Thresholds are absolute counts, not
+  # rates: with under a hundred requests on most days, one 5xx is an event.
+  # Missing data is not breaching, so quiet days (December) stay OK; a dead
+  # stack is reported by the external probes (frontend stack), not here. The
+  # retention heartbeat and the metric-filter alarms ship in Release 1b with
+  # the metrics that feed them.
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: saferide-ops
+
+  OpsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OpsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The default owner statement, restated because this policy
+          # replaces the topic's default one.
+          - Sid: AccountOwnerManage
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:AddPermission
+              - sns:RemovePermission
+              - sns:DeleteTopic
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:Publish
+            Resource: !Ref OpsTopic
+          - Sid: CloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OpsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: SesEventsPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OpsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  OpsSubscriptionPrimary:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertPrimary
+    Properties:
+      TopicArn: !Ref OpsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailPrimary
+
+  OpsSubscriptionSecondary:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertSecondary
+    Properties:
+      TopicArn: !Ref OpsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailSecondary
+
+  # API Gateway counts every response the stage sends. FastAPI turns an
+  # application exception into a 500 response, so this is the application
+  # alarm; ApiFunctionErrors below means init failures and timeouts.
+  ApiServerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The API answered at least one 5xx in five minutes (an application
+        exception, a timeout or an integration failure); first, find the
+        ERROR lines in /saferide/api at that time and roll back if a deploy
+        just landed.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  ApiClientErrorsBurst:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The API answered fifty or more 4xx in five minutes (a broken client
+        release, a looping phone or someone probing sign-in); first, read
+        /saferide/api around that time for the paths and whether one client
+        repeats.
+      Namespace: AWS/ApiGateway
+      MetricName: 4xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  ApiLatencyP95:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        API p95 latency stayed above three seconds in three of the last five
+        five-minute periods; first, check the database CPU and credit alarms
+        and the API function's duration for a slow database or cold starts.
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 3000
+      ComparisonOperator: GreaterThanThreshold
+      EvaluateLowSampleCountPercentile: ignore
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  ApiFunctionErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The API function itself failed at least once in five minutes (an init
+        crash or a timeout; application exceptions surface as API 5xx
+        instead); first, read the latest /saferide/api errors and roll back
+        if a deploy just landed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  ApiFunctionThrottles:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The API function was throttled in the last minute because the
+        account's concurrency was exhausted, so requests were refused; first,
+        check AccountConcurrency and the pings route for a looping client,
+        then raise the concurrency quota.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  MigrateFunctionErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The migrate function failed (a migration or an on-demand action
+        raised), and the live API may depend on what did not apply; first,
+        read /saferide/migrate and re-run the migrate step once the cause is
+        fixed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MigrateFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # No dimensions: the account-level series for this region.
+  AccountConcurrency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Lambda concurrency in this region reached 80% of the account limit
+        (ConcurrencyAlarmThreshold), so throttling is close; first, look for a
+        runaway client on the pings route, then request a quota increase and
+        raise the threshold with it.
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref ConcurrencyAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  DbFreeStorageLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Database free storage fell under 2 GiB even with autoscaling to
+        MaxAllocatedStorage; first, check the storage graph and whether the
+        position-trail purge is running.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  DbFreeableMemoryLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Database freeable memory stayed under 100 MB for fifteen minutes;
+        first, compare the DatabaseConnections graph in RDS with the API's
+        request count for a surge of connections.
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 104857600
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  DbCpuHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Database CPU stayed above 80% for fifteen minutes; first, line the CPU
+        graph up with the API's request count and latency and with any migrate
+        or verify run at that time to find what drove it.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  DbCpuCreditsLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The burstable database has under 30 CPU credits left for fifteen
+        minutes and will soon be held to its baseline; first, find what is
+        burning CPU (DbCpuHigh, the API's request count, any migrate or verify
+        run), then consider a larger instance class.
+      Namespace: AWS/RDS
+      MetricName: CPUCreditBalance
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 30
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # ACM publishes DaysToExpiry once a day in the certificate's region (this
+  # one); a healthy managed certificate renews about 60 days ahead.
+  ApiCertificateExpiry:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasApiCert
+    Properties:
+      AlarmDescription: >-
+        The API certificate expires in under 20 days, so ACM's managed renewal
+        has not happened; first, check that the api validation CNAME is still
+        in Route 53 and read the certificate's renewal status in ACM.
+      Namespace: AWS/CertificateManager
+      MetricName: DaysToExpiry
+      Dimensions:
+        - Name: CertificateArn
+          Value: !Ref ApiCertificateArn
+      Statistic: Minimum
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 20
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # ---------------------------------------------------------------- Email (SES)
+  # Hardening U4 (D11, D13): the sending identity for transactional mail.
+  # Release 1b sends; MAIL_ENABLED stays false until then. Easy DKIM with
+  # 2048-bit keys, MAIL FROM on mail.<MailDomain> so SPF aligns, and DMARC at
+  # p=none with no rua (the zone has no mailbox; a report address on another
+  # domain is ignored without its authorisation record). Moving to
+  # p=quarantine once delivered mail shows DKIM pass is a readiness item. No
+  # record below existed in the zone at the 2026-11-17 preflight. The
+  # identity is retained because DKIM verification can take 72 hours: after a
+  # rollback that created it, import or delete it before re-deploying.
+  SesConfigSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Ref MailConfigurationSet
+
+  # Delivery problems reach the operators through the alarm topic.
+  SesConfigSetEvents:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn: OpsTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref SesConfigSet
+      EventDestination:
+        Name: ops-topic
+        Enabled: true
+        MatchingEventTypes:
+          - bounce
+          - complaint
+          - reject
+          - renderingFailure
+          - deliveryDelay
+        SnsDestination:
+          TopicARN: !Ref OpsTopic
+
+  SesIdentity:
+    Type: AWS::SES::EmailIdentity
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      EmailIdentity: !Ref MailDomain
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      MailFromAttributes:
+        MailFromDomain: !Sub "mail.${MailDomain}"
+        BehaviorOnMxFailure: USE_DEFAULT_VALUE
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref SesConfigSet
+
+  SesDkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt SesIdentity.DkimDNSTokenValue1
+
+  SesDkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt SesIdentity.DkimDNSTokenValue2
+
+  SesDkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt SesIdentity.DkimDNSTokenValue3
+
+  # MAIL FROM: bounces return to SES through this MX, and SPF for the
+  # envelope sender is checked here, not at the apex.
+  SesMailFromMx:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "mail.${MailDomain}"
+      Type: MX
+      TTL: "1800"
+      ResourceRecords:
+        - !Sub "10 feedback-smtp.${AWS::Region}.amazonses.com"
+
+  SesMailFromSpf:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "mail.${MailDomain}"
+      Type: TXT
+      TTL: "1800"
+      ResourceRecords:
+        - '"v=spf1 include:amazonses.com ~all"'
+
+  DmarcRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "_dmarc.${MailDomain}"
+      Type: TXT
+      TTL: "1800"
+      ResourceRecords:
+        - '"v=DMARC1; p=none"'
+
+  # ---------------------------------------------------------------- Audit trail
+  # Hardening U4 (D10): one multi-region trail of management events with
+  # log-file validation, into a CloudFormation-named bucket that is encrypted,
+  # fully private, owner-enforced and expires objects after 90 days. Retained
+  # so the evidence outlives a failed update or a stack delete. It is the
+  # account's only trail (2026-11-17), so management events cost nothing.
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-90-days
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # CloudTrail's documented delivery policy, bound to this trail only.
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/saferide-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/saferide-trail"
+
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: saferide-trail
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+
 Outputs:
   HttpApiUrl:
     Description: Default invoke URL for the HTTP API.
@@ -579,3 +1335,12 @@ Outputs:
     Value: !Ref VerifyFunction
   DbEndpoint:
     Value: !GetAtt Database.Endpoint.Address
+  OpsTopicArn:
+    Description: SNS topic for every backend alarm, its OK transition and SES feedback events.
+    Value: !Ref OpsTopic
+  SesIdentityName:
+    Description: SES domain identity (check DKIM and MAIL FROM status in SES).
+    Value: !Ref SesIdentity
+  TrailBucketName:
+    Description: Retained S3 bucket the saferide-trail CloudTrail writes to.
+    Value: !Ref TrailBucket

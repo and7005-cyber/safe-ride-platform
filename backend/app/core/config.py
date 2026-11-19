@@ -111,6 +111,17 @@ class Settings(BaseSettings):
     gps_fix_wait_budget_s: int = Field(
         default=5, ge=1, le=30, alias="GPS_FIX_WAIT_BUDGET_S"
     )  # how long a tap waits for a cold fix before posting without one (U6)
+    # Transactional email through SES (hardening plan U4 wires them; the
+    # Release 1b sender reads them). Mirrored as parameters + API env in
+    # infra/backend/template.yaml under the live-parity rule
+    # (tests/core/test_mail_settings.py keeps them in step). mail_enabled stays
+    # False until the sender ships.
+    mail_from_address: str = Field(default="no-reply@saferidelive.co.ke", alias="MAIL_FROM_ADDRESS")
+    mail_reply_to: str = Field(default="", alias="MAIL_REPLY_TO")
+    mail_configuration_set: str = Field(
+        default="saferide-transactional", alias="MAIL_CONFIGURATION_SET"
+    )
+    mail_enabled: bool = Field(default=False, alias="MAIL_ENABLED")
     # Maps provider for geocoding + route optimisation (#4, #9). When neither
     # key is set the app falls back to free OSM Nominatim geocoding and an
     # offline nearest-neighbour optimiser.

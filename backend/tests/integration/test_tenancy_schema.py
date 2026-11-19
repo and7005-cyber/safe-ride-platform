@@ -21,11 +21,12 @@ pytestmark = pytest.mark.skipif(
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "db/migrations"
 MIGRATION = MIGRATIONS_DIR / "013_tenancy_schema.sql"
 # 013 recreates constraints that later files widen (016 recreates the audit
-# action CHECK as 013's list plus its own value), so re-applying 013 alone
-# would leave the shared local database behind the current schema for every
-# suite that runs after this one. Every later idempotent file is re-applied in
-# order afterwards; 014 is the one-shot data move and is rehearsed on its own
-# scratch database (test_data_move_rehearsal.py).
+# action CHECK as 013's list plus its own value, 017 as 016's list plus four
+# more), so re-applying 013 alone would leave the shared local database behind
+# the current schema for every suite that runs after this one. Every later
+# idempotent file (015, 016, 017, ...) is re-applied in order afterwards; 014
+# is the one-shot data move and is rehearsed on its own scratch database
+# (test_data_move_rehearsal.py).
 LATER_MIGRATIONS = [
     path for path in sorted(MIGRATIONS_DIR.glob("*.sql"))
     if path.name > MIGRATION.name and not path.name.startswith("014_")
@@ -68,9 +69,31 @@ def test_tenancy_objects_exist(conn):
 def test_double_apply_is_a_noop(conn):
     # House rule: rehearse by re-applying to the populated database, then the
     # later files so the database ends at the current schema.
+    assert LATER_MIGRATIONS[-1].name >= "017_account_hardening.sql"
     for path in (MIGRATION, *LATER_MIGRATIONS):
         conn.pgconn.exec_(path.read_text().encode())
         assert not conn.pgconn.error_message, (path.name, conn.pgconn.error_message)
+
+
+def test_migration_017_double_applies_cleanly(conn):
+    # The migrate Lambda's path: the whole file as ONE implicit transaction
+    # (simple-query exec_, where SET LOCAL holds), against the populated
+    # database that already carries 017. The newest file, so nothing later
+    # needs re-applying afterwards.
+    from psycopg.pq import ExecStatus
+
+    sql = (MIGRATIONS_DIR / "017_account_hardening.sql").read_text()
+    codes_before = conn.execute(
+        "select id, driver_code from live_schools order by id"
+    ).fetchall()
+    result = conn.pgconn.exec_(sql.encode())
+    assert result.status in (
+        ExecStatus.COMMAND_OK, ExecStatus.TUPLES_OK, ExecStatus.EMPTY_QUERY
+    ), result.error_message.decode()
+    # A re-apply never re-draws an existing school's code.
+    assert conn.execute(
+        "select id, driver_code from live_schools order by id"
+    ).fetchall() == codes_before
 
 
 def test_existing_parent_links_defaulted_to_accepted(conn):

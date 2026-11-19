@@ -41,6 +41,7 @@ def test_unknown_check_set_is_rejected_with_the_valid_list(verify):
     assert set(result["valid_check_sets"]) == {
         "migrations", "migration-011", "baseline", "post-apply",
         "tenancy-preflight", "tenancy-post-move", "tenancy-rls", "gps",
+        "hardening", "restore-compare",
     }
 
 
@@ -205,3 +206,135 @@ def test_gps_check_set_runs_clean_on_a_database_at_016(verify):
     assert {r["name"] for r in retention} >= {"Greenfield Academy", "IT Second School"}
     assert all(r["retention_days"] == 90 or 7 <= r["retention_days"] <= 365 for r in retention)
     json.dumps(result)
+
+
+# --- Account hardening check sets (migration 017 / hardening U2) ---------------
+
+HARDENING_LABELS = [
+    "017-objects-present",
+    "audit-check-widening-017",
+    "unverified-parent-accounts-by-age",
+    "token-rows-by-purpose",
+    "driver-pin-hash-versions-per-school",
+    "drivers-with-several-driver-memberships",
+    "schools-without-driver-code",
+    "driver-last-sign-in-per-school",
+    "pin-lock-state",
+    "notifications-past-90-days",
+    "stale-sessions",
+    "last-retention-run",
+    "parent-reset-audit-recent",
+    "temporary-passwords-outstanding",
+    "consent-state",
+    "push-subscriptions-by-kind",
+    "instance-settings",
+    "open-runs-and-today",
+]
+RESTORE_COMPARE_TABLES = [
+    ("saferide_migrations", "applied_at"),
+    ("live_admin_audit", "created_at"),
+    ("run_positions", "received_at"),
+    ("live_runs", "created_at"),
+    ("live_incidents", "created_at"),
+    ("live_notifications", "created_at"),
+]
+
+
+def test_hardening_check_set_runs_clean_on_a_database_at_017(verify):
+    result = verify.handler({"checks": "hardening"})
+    assert result["status"] == "ok", result
+    assert [e["label"] for e in result["results"]] == HARDENING_LABELS
+    by_label = {e["label"]: e for e in result["results"]}
+    for label, entry in by_label.items():
+        assert "error" not in entry, f"{label}: {entry.get('error')}"
+    json.dumps(result)
+
+    # Every object 017 lands is present.
+    objects = by_label["017-objects-present"]["rows"]
+    assert len(objects) == 15
+    assert all(r["present"] is True for r in objects), objects
+    # The widening holds (an older file re-applied after 017 would show false).
+    assert by_label["audit-check-widening-017"]["rows"] == [{
+        "parent_password_reset": True, "parent_email_confirmed": True,
+        "parent_email_changed": True, "driver_code_regenerated": True,
+        "exception_reviewed": True, "plan_applied": True,
+    }]
+    assert by_label["schools-without-driver-code"]["rows"] == [{"schools": 0}]
+    # Both link states and both purposes always answer, even with no rows.
+    assert [r["has_link"] for r in by_label["unverified-parent-accounts-by-age"]["rows"]] == [
+        True, False,
+    ]
+    assert [r["purpose"] for r in by_label["token-rows-by-purpose"]["rows"]] == [
+        "reset", "verify",
+    ]
+    # One row per school for the per-school observations; ids, never people.
+    schools = {r["name"] for r in by_label["driver-pin-hash-versions-per-school"]["rows"]}
+    assert schools >= {"Greenfield Academy", "IT Second School"}
+    for row in by_label["driver-pin-hash-versions-per-school"]["rows"]:
+        # The three buckets are disjoint subsets of the active memberships.
+        assert row["salted_v2"] + row["legacy_hmac"] + row["no_pin"] <= (
+            row["active_driver_memberships"]
+        ), row
+    for row in by_label["driver-last-sign-in-per-school"]["rows"]:
+        assert set(row) == {"school_id", "user_id", "last_session_at"}
+    several = by_label["drivers-with-several-driver-memberships"]["rows"][0]
+    assert several["users"] == len(several["user_ids"])
+    assert {r["tbl"] for r in by_label["stale-sessions"]["rows"]} == {
+        "auth_sessions", "auth_preauth_tokens",
+    }
+    assert {r["kind"] for r in by_label["push-subscriptions-by-kind"]["rows"]} == {
+        "web-push", "fcm",
+    }
+    assert int(by_label["instance-settings"]["rows"][0]["max_connections"]) > 0
+    assert by_label["open-runs-and-today"]["rows"][0]["open_runs"] >= 0
+
+
+@pytest.mark.parametrize("timestamp", [
+    None, "", "yesterday", "2026-13-01T00:00:00+00:00", 1763359200,
+    # Naive and date-only values are refused rather than guessed (UTC or
+    # Nairobi would shift every count by hours).
+    "2026-11-17T06:00:00", "2026-11-17",
+])
+def test_restore_compare_refuses_a_malformed_timestamp(verify, timestamp):
+    payload = {"checks": "restore-compare"}
+    if timestamp is not None:
+        payload["timestamp"] = timestamp
+    result = verify.handler(payload)
+    assert result["status"] == "error"
+    assert "timestamp" in result["reason"]
+    assert "results" not in result
+
+
+def test_restore_compare_returns_one_row_per_table(verify):
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        newest_run = conn.execute("select max(created_at) from live_runs").fetchone()[0]
+        total_runs = conn.execute("select count(*) from live_runs").fetchone()[0]
+    result = verify.handler(
+        {"checks": "restore-compare", "timestamp": "2026-11-17T09:00:00+03:00"}
+    )
+    assert result["status"] == "ok", result
+    assert [e["label"] for e in result["results"]] == [t for t, _ in RESTORE_COMPARE_TABLES]
+    for (table, column), entry in zip(RESTORE_COMPARE_TABLES, result["results"]):
+        if table == "saferide_migrations" and "error" in entry:
+            # Only where the migrate Lambda has run (live, a restore); the
+            # local stack applies migrations with psql — same as `migrations`.
+            assert "saferide_migrations" in entry["error"]
+            continue
+        assert "error" not in entry, f"{table}: {entry.get('error')}"
+        assert len(entry["rows"]) == 1, table
+        row = entry["rows"][0]
+        assert row["time_column"] == column
+        assert row["cutoff"].startswith("2026-11-17 06:00:00")
+        assert 0 <= row["rows_at_or_before"] <= row["total_rows"], table
+    runs = result["results"][3]["rows"][0]
+    assert runs["total_rows"] == total_runs
+    assert (runs["max_time"] is None) == (newest_run is None)
+    json.dumps(result)
+
+    # A cutoff before any row counts nothing at or before it.
+    early = verify.handler(
+        {"checks": "restore-compare", "timestamp": "2000-01-01T00:00:00Z"}
+    )
+    for entry in early["results"]:
+        if "rows" in entry:
+            assert entry["rows"][0]["rows_at_or_before"] == 0, entry["label"]

@@ -24,8 +24,8 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 # Mirror of live_admin_audit_action_check as last widened — 013's list plus
-# 016's 'exception-reviewed' — kept in lockstep by
-# tests/core/test_audit_actions.py.
+# 016's 'exception-reviewed' plus 017's four account-hardening actions — kept
+# in lockstep by tests/core/test_audit_actions.py.
 ALLOWED_ACTIONS = frozenset({
     "plan-applied", "plan-restored", "pin-map-viewed",
     "staff-created", "staff-role-offered", "staff-offer-accepted",
@@ -46,6 +46,8 @@ ALLOWED_ACTIONS = frozenset({
     "provider-step-in", "provider-step-out",
     "provider-account-created", "provider-account-removed", "provider-totp-reset",
     "exception-reviewed",
+    "parent-password-reset", "parent-email-confirmed", "parent-email-changed",
+    "driver-code-regenerated",
 })
 
 PROVIDER_DISPLAY = "SafeRide"
@@ -96,7 +98,7 @@ def record_audit(
     """
     if action not in ALLOWED_ACTIONS:
         raise ValueError(
-            f"audit action {action!r} is not in the audit action vocabulary (013 + 016)"
+            f"audit action {action!r} is not in the audit action vocabulary (013 + 016 + 017)"
         )
 
     provider_actor = _is_provider_actor(actor, scope)

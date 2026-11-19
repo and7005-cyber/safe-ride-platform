@@ -21,14 +21,44 @@ PY="$ROOT_DIR/.venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
 
 # 1. TOTP pepper: create once, never rotate silently (rotation re-enrols all).
-existing_pepper="$(aws ssm get-parameter --name /saferide/totp-pepper --with-decryption \
-  --query Parameter.Value --output text 2>/dev/null || true)"
-if [ -z "$existing_pepper" ] || [ "$existing_pepper" = "None" ]; then
+# Pinned to BACKEND_REGION like every /saferide/* parameter the deploy reads
+# (infra/README.md, Deploy safety). Before minting, look in the operator's
+# default CLI region too: an existing pepper there (the pre-hardening home of
+# this parameter) must be COPIED into BACKEND_REGION, never replaced by a new
+# one — a fresh pepper silently breaks every enrolled provider's codes. Only a
+# ParameterNotFound answer counts as "absent": any other read error
+# (credentials, permissions, network, no default region) stops the script
+# instead of minting over a pepper it could not see.
+pepper_rc=0
+ssm_lookup /saferide/totp-pepper >/dev/null || pepper_rc=$?
+if [ "$pepper_rc" -eq 1 ]; then
+  echo "ERROR: cannot tell whether /saferide/totp-pepper exists in $BACKEND_REGION — not minting one." >&2
+  exit 1
+fi
+if [ "$pepper_rc" -eq 3 ]; then
+  elsewhere_err="$(mktemp)"
+  elsewhere_rc=0
+  aws ssm get-parameter --name /saferide/totp-pepper \
+    --query Parameter.Name --output text >/dev/null 2>"$elsewhere_err" || elsewhere_rc=$?
+  if [ "$elsewhere_rc" -eq 0 ]; then
+    rm -f "$elsewhere_err"
+    echo "ERROR: /saferide/totp-pepper exists in the default CLI region but not in $BACKEND_REGION." >&2
+    echo "       Copy it into $BACKEND_REGION (docs/runbooks/hardening-release-checklists.md, operator checklist step 4) — do not mint a new one." >&2
+    exit 1
+  fi
+  if ! grep -q ParameterNotFound "$elsewhere_err"; then
+    echo "ERROR: could not check the default CLI region for /saferide/totp-pepper: $(tr '\n' ' ' < "$elsewhere_err")(aws exit $elsewhere_rc)" >&2
+    echo "       Not minting one. Fix the credentials or set AWS_REGION to the region the pre-hardening" >&2
+    echo "       deploy used (the copy helper's source region), then re-run." >&2
+    rm -f "$elsewhere_err"
+    exit 1
+  fi
+  rm -f "$elsewhere_err"
   aws ssm put-parameter --name /saferide/totp-pepper --type SecureString \
-    --value "$(openssl rand -hex 32)" >/dev/null
-  echo "==> Created SSM /saferide/totp-pepper"
+    --region "$BACKEND_REGION" --value "$(openssl rand -hex 32)" >/dev/null
+  echo "==> Created SSM /saferide/totp-pepper ($BACKEND_REGION)"
 else
-  echo "==> SSM /saferide/totp-pepper already exists (unchanged)"
+  echo "==> SSM /saferide/totp-pepper ($BACKEND_REGION) already exists (unchanged)"
 fi
 
 # 2. Bootstrap payload: bump the version so the migrate Lambda re-keys the
