@@ -28,8 +28,8 @@
   changes: nothing reads 017's objects until Release 1b.
 - **Deployed 2026-11-19, 09:15–09:25 UTC (12:15–12:25 EAT),** backend then
   frontend, from `release/1a`; details in "Deployed" below. Open after the
-  deploy: the sign-ins and phone checks (the user's), the first-48-hours
-  checks and the post-1a restore rehearsal.
+  deploy: the Android phone checks (the user's; iOS Safari done), the
+  first-48-hours checks and the post-1a restore rehearsal.
 
 ## Commits
 
@@ -101,8 +101,8 @@
 | Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | 2026-11-19, `set-alarm-state … "Release 1a alarm drill"` at 09:25:49Z on `saferide-backend-ApiServerErrors-alHRYjAu0mun` and `saferide-frontend-SiteServerErrors-pH54EODEjYMp`. History: backend OK→ALARM 09:25:48.86Z, `Successfully executed action …:saferide-ops` 09:25:48.89Z; ALARM→OK 09:26:40.04Z, action executed 09:26:40.07Z. Frontend INSUFFICIENT_DATA→ALARM 09:25:49.51Z, action `…:saferide-ops-us-east-1` 09:25:49.54Z; ALARM→OK 09:26:50.49Z, action 09:26:50.54Z. SNS delivery proved on both topics; the user confirmed on 2026-11-19 that all four mails (two ALARM, two OK) reached the one inbox | **met** |
 | SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. The +24 h and +72 h reads stay in the first-48-hours list. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h) |
 | CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
-| Driver PIN, provider TOTP and staff password sign-ins after the deploy | | **open** |
-| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | | **open** |
+| Driver PIN, provider TOTP and staff password sign-ins after the deploy | 2026-11-19, the user on the iPhone: driver PIN sign-in at Voluntari Academy (driver's last session 10:44:19Z, read 10:45:45Z; no PIN failures) proves `pin-pepper`; provider password plus six-digit code proves `totp-pepper`; school admin password sign-in about 11:10Z proves the API's database path | **met** |
+| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android Chrome and Samsung Internet postponed: no Android phone to hand on 2026-11-19. They and a Maps load on the apex origin (only `www` was exercised, so the key's apex referrer is unproved) are due before Release 2 enforces the CSP, which the plan conditions on the Android Chrome check | **iOS met; Android open** |
 | 90-day retention set on the three old `/aws/lambda/*` groups | 2026-11-19 09:47:20Z on the user's go (it drops their events older than 90 days): `put-retention-policy --retention-in-days 90` on the API, migrate and verify functions' `/aws/lambda/*` groups, each exit 0; read back: all three 90, and `/saferide/api`, `/saferide/migrate`, `/saferide/verify` 90 | **met** |
 | First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | | **open** |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | | **open** |
@@ -538,10 +538,46 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
   failures; `push-subscriptions-by-kind` 0 web-push, 0 fcm;
   `instance-settings` `max_connections` 79, PostgreSQL 16.14;
   `open-runs-and-today` 0/0.
-- **Still open:** the three
-  sign-ins and the phone checks with their CSP console lines (the user —
-  credentials are never typed into the live site from this session); the
-  first-48-hours checks —
+- **Phone checks (iOS Safari, home-screen app on `www`, Web Inspector),**
+  2026-11-19, the user:
+  - Build `index-CtM7Urah.js`. Console logging of report-only violations
+    was proved with a deliberate `img-src` test against `example.com` (not
+    a finding). Every page load prints Safari's notice that the policy is
+    report-only without `report-to` (expected: no report endpoint, see
+    "Residuals deferred" under "Code review").
+  - Provider sign-in with the six-digit code, then Fleet Map: tiles, buses
+    and routes drew on the new browser key and Map ID; no
+    `RefererNotAllowedMapError`. Address search on a student's address
+    showed suggestions (the API's `google-maps-api-key`).
+  - Driver PIN sign-in at Voluntari Academy, Start Run, location allowed,
+    run ended. Run `22536ba9…`: 9 action rows, 12 ping rows, fix coverage
+    9/9 (geolocation works under `Permissions-Policy: geolocation=(self)`).
+    It left two test exceptions on the test school, `custody-away` 1 and
+    `stop-bypassed` 2, unreviewed (the phone was not on the route).
+  - Parent: 1a has no parent reset (1b adds it), so the user signed up a
+    test parent on an alias of their own address, added to a Voluntari
+    Academy test student (auto-linked, R11). Parent Track drew the map (no
+    active run); Enable Push succeeded. Read 11:00:34Z:
+    `push-subscriptions-by-kind` web-push 1 subscription / 1 user (was 0);
+    `users-by-role` parent 6 (was 5); `consent-state` null for 6 parents.
+  - School admin password sign-in passed.
+  - Every CSP line over all of these, verbatim, both `connect-src`:
+    - `[Report Only] Refused to connect to https://www.gstatic.com/maps/res/CompactLegendSdk-Roadmap-EnhancedNavStyleHoldbackForGeoD-FetchableStyleSetSdk-b103b348710b1438b55d833825ed8263 because it does not appear in the connect-src directive of the Content Security Policy.` (twice)
+    - `[Report Only] Refused to connect to data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAADCAIAAADUVFKvAAAAO0lEQVQIHQEwAM//AP///wAAAAAAAAAP///wEAAD///8AAAAAAAABAQEB//AAAAQEB////AAAAeUMO+mDB0BwAAAAASUVORK5CYII= because it does not appear in the connect-src directive of the Content Security Policy.` (four times or more)
+
+    No `script-src`, `style-src`, `img-src`, `worker-src` or `frame-src`
+    line. For Release 2: `connect-src` needs `https://www.gstatic.com` and
+    `data:` before the policy is enforced (Google's Maps CSP guidance lists
+    both).
+  - One non-CSP warning, Radix's "Missing `Description` or
+    `aria-describedby={undefined}` for {DialogContent}": 22 admin and
+    provider dialogs and the confirm dialog, pre-existing. Fixed in PR #18
+    (merge `f7b1a51`); it ships with the next frontend deploy.
+  - Not yet: Android Chrome and Samsung Internet (no Android phone to hand),
+    and a Maps load on the apex origin.
+- **Still open:** the Android Chrome and Samsung Internet phone checks and
+  a Maps load on the apex origin (the user; before Release 2 enforces the
+  CSP); the first-48-hours checks —
   subscriptions +47 h (2026-11-21 08:25Z), ERROR
   searches +4/+24/+48 h, the first automated backup in tonight's
   23:00–23:30 UTC window with the instance's events, SES at +24 h and
