@@ -73,7 +73,7 @@
 | SSM copy helper never writes in report mode, never overwrites, never exposes a value | `test_copy_ssm_script.py` 25 passed against a fake `aws` at `0d953eb`, again at `639954e` under `nohup` | **met locally** |
 | Templates lint clean | `sam validate --lint` (backend) at `a12bc01`: only the pre-existing W1011; frontend `validate-template` and SAM lint clean at `a12bc01` | **met locally** |
 | `scripts/certify.sh` green at the release commit | Green at `156ace9` on 2026-11-18: backend unit 756 passed, 561 skipped; API integration 561 passed, 2 skipped; typecheck clean; vitest 346 passed in 23 files; build passes; Playwright 102 passed. The one later code commit, `c7b0271`, changes only two test stubs; `tests/core` 514 passed there. **Final run at `a66d53b`** (the branch tip then, the commit to tag `release/1a`), 2026-11-18 17:39:32Z → 17:50:42Z, exit 0: backend unit 756 passed, 561 skipped; API integration 561 passed, 2 skipped; typecheck clean; vitest 346 passed in 23 files; build passes; Playwright 102 passed; demo seed restored | **met** at `a66d53b` |
-| U1.1 SES production access requested (case id); both operator addresses verified | Requested 2026-11-18 14:31 UTC (`put-account-details`, af-south-1, mail type TRANSACTIONAL, one additional contact): `ReviewDetails.Status` `PENDING`, case id not yet assigned. Later that day AWS's automated first review asked for more detail (URL, mail type, volume, recipient source, bounce and complaint handling, a sample); the account then read `DENIED`, case `179501229800147`; the answer goes in that case. Account-level suppression list on for `BOUNCE` and `COMPLAINT`. One operator address verified (`SUCCESS`); no second operator chosen yet (`ALERT_EMAIL_SECONDARY` is optional). Record the case id and the outcome | **open** |
+| U1.1 SES production access requested (case id); both operator addresses verified | Requested 2026-11-18 14:31 UTC (`put-account-details`, af-south-1, mail type TRANSACTIONAL, one additional contact): `ReviewDetails.Status` `PENDING`, case id not yet assigned. Later that day AWS's automated first review asked for more detail (URL, mail type, volume, recipient source, bounce and complaint handling, a sample); the account then read `DENIED`, case `179501229800147`; the answer goes in that case. Account-level suppression list on for `BOUNCE` and `COMPLAINT`. One operator address verified (`SUCCESS`); no second operator chosen yet (`ALERT_EMAIL_SECONDARY` is optional). Record the case id and the outcome. 2026-11-20 09:25Z: still `DENIED`, sandbox quota 200 a day | **open** |
 | U1.2 Lambda concurrency quota (L-B99A9384) at least 100, or the request id | Requested 2026-11-18 13:42 UTC for 1000: request `b7c5f73ce466470791de552c6e2831ffTzsJCgjU`, support case `179500939000289`. **Granted 1000** (the user, 2026-11-18; read back the same day in af-south-1: `get-service-quota` `Value` 1000.0, `get-account-settings` `ConcurrentExecutions` 1000 and `UnreservedConcurrentExecutions` 1000, request status `CASE_CLOSED`, last updated 15:59:54 UTC). So every backend deploy exports `CONCURRENCY_ALARM_THRESHOLD=800` (80%) until a release raises the `ConcurrencyAlarmThreshold` Default (8); after the deploy the `AccountConcurrency` alarm reads threshold 800 | **met** |
 | U1.3 `release/0` on `a59756d`, pushed | 2026-11-18 on the user's go: annotated tag `f337b64` pushed; `git ls-remote --tags origin 'refs/tags/release/*'` shows `release/0` peeled to `a59756d7ac9379e068b4801968646dce515c6629` (Merge pull request #16, the head of `origin/main`) | **met** |
 | U1.4 five `values MATCH` lines from `copy-ssm-to-backend-region.sh` | 2026-11-18 on the user's go. The five secrets were only in **eu-west-2** (this machine's CLI default is `eu-central-1`, which holds none), so the helper ran with `SOURCE_REGION=eu-west-2`. Report: all five `missing in af-south-1`, exit 1. `--apply`: five `Copied … (SecureString)`, exit 0. Proof run: header `source eu-west-2 -> target af-south-1 (report only, read-only)`, five `present in both, values MATCH`, `All 5 parameters MATCH.`, exit 0; no temporary directory left. Cross-check by fingerprint against the live stack: the af-south-1 `pin-pepper`, `totp-pepper` and `google-maps-api-key` equal the API function's environment (eu-west-2's `pin-pepper` is at version 2, and its current value is the live one), `db-app-password` equals the API function's `DATABASE_URL` password and the migrate function's `DB_APP_PASSWORD`, `db-password` equals the migrate function's `DATABASE_URL` password. The eu-west-2 copies stay until one week after Release 2 is stable | **met** |
@@ -99,7 +99,7 @@
 | RDS properties as set (maintenance `sun:00:00-sun:01:00`, no log export), `PendingModifiedValues` empty | 2026-11-19 09:21Z: deletion protection `true`, retention 35, `maxStorage` 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, `logExports` `null`, `pending` `{}`; the diff against the baseline is exactly those five properties | **met** |
 | Alarms `OK`/`INSUFFICIENT_DATA` in both regions (the probe alarms re-read after 10 minutes); `AccountConcurrency` threshold 800 or 8; four subscriptions confirmed | 2026-11-19 09:21Z, af-south-1: all 12 `OK`, `AccountConcurrency` threshold **800**. 09:25Z, us-east-1: `ApiProbeFailing`, `SiteProbeFailing`, `SiteCertificateExpiry` `OK`, `SiteServerErrors` `INSUFFICIENT_DATA` (no traffic errors yet). Re-read 09:35:05Z (10 minutes after the frontend deploy): all four us-east-1 alarms `OK`, every af-south-1 alarm `OK`, API `{"status":"ok"}`, site 200. Subscriptions: two of two confirmed (one address, see U1.7) | **met** |
 | Alarm drill: one alarm per topic reaches both inboxes within five minutes, OK follows | 2026-11-19, `set-alarm-state … "Release 1a alarm drill"` at 09:25:49Z on `saferide-backend-ApiServerErrors-alHRYjAu0mun` and `saferide-frontend-SiteServerErrors-pH54EODEjYMp`. History: backend OK→ALARM 09:25:48.86Z, `Successfully executed action …:saferide-ops` 09:25:48.89Z; ALARM→OK 09:26:40.04Z, action executed 09:26:40.07Z. Frontend INSUFFICIENT_DATA→ALARM 09:25:49.51Z, action `…:saferide-ops-us-east-1` 09:25:49.54Z; ALARM→OK 09:26:50.49Z, action 09:26:50.54Z. SNS delivery proved on both topics; the user confirmed on 2026-11-19 that all four mails (two ALARM, two OK) reached the one inbox | **met** |
-| SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. The +24 h and +72 h reads stay in the first-48-hours list. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h) |
+| SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. +24 h (2026-11-20 09:25Z): the same three. The +72 h read stays in the first-48-hours list. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h, +24 h) |
 | CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | 2026-11-19, the user on the iPhone: driver PIN sign-in at Voluntari Academy (driver's last session 10:44:19Z, read 10:45:45Z; no PIN failures) proves `pin-pepper`; provider password plus six-digit code proves `totp-pepper`; school admin password sign-in about 11:10Z proves the API's database path | **met** |
 | Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android Chrome and Samsung Internet postponed: no Android phone to hand on 2026-11-19. They and a Maps load on the apex origin (only `www` was exercised, so the key's apex referrer is unproved) are due before Release 2 enforces the CSP, which the plan conditions on the Android Chrome check | **iOS met; Android open** |
@@ -578,10 +578,10 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
 - **Still open:** the Android Chrome and Samsung Internet phone checks and
   a Maps load on the apex origin (the user; before Release 2 enforces the
   CSP); the first-48-hours checks —
-  subscriptions +47 h (2026-11-21 08:25Z), ERROR
-  searches +24/+48 h, the first automated backup in tonight's
-  23:00–23:30 UTC window with the instance's events, SES at +24 h and
-  +72 h, `DatabaseConnections` against 79, trail delivery, spend; and the
+  subscriptions +47 h (2026-11-21 08:25Z); at +48 h the ERROR search,
+  `DatabaseConnections` against 79, trail delivery and spend; SES at
+  +72 h; the three decisions from +24 h (pending maintenance, SES
+  production access, the budget below the account's run rate); and the
   post-1a restore rehearsal with `restore-compare` before 1b (R21). The
   first school morning is 2027-01-04 (the 4xx, driver sign-in and trail
   checks wait for it).
@@ -596,3 +596,38 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
     phone checks: the sign-ins, the driver run, the parent sign-up and
     push); trail logging, latest delivery 14:28:50Z, no delivery error;
     API `{"status":"ok"}`, site 200.
+  - +24 h, 2026-11-20 09:25Z:
+    - First automated backup in the new window: `Backing up DB instance`
+      23:11:02Z, `Finished DB Instance backup` 23:15:34Z on 2026-11-19;
+      snapshot `…-2026-11-19-23-11` `available` (the earlier daily
+      backups ran at 06:10Z, the old window). No other instance event in
+      24 hours.
+    - **Pending maintenance is not empty** (it was at 2026-11-19 09:17Z):
+      `system-update` (new operating system update) and `db-upgrade`
+      (engine patch 16.14.R3), both without an apply date, so neither is
+      scheduled. `AutoMinorVersionUpgrade` true, window
+      `sun:00:00-sun:01:00`. A decision for the user: apply both in the
+      holiday (single-AZ, a few minutes' outage) rather than in a route
+      week.
+    - Every alarm in both regions `OK`. ERROR search over the three groups
+      from 2026-11-19 14:29:17Z to 09:25:09Z: 0 matches in 38,940 records.
+    - SES domain verified, DKIM and MAIL FROM `SUCCESS`; production access
+      still `DENIED` (case `179501229800147`), quota 200 a day; DMARC
+      `p=none`, SPF on the MAIL FROM domain, account suppression on
+      `BOUNCE` and `COMPLAINT`, bounce and complaint events to the ops
+      topic.
+    - `DatabaseConnections` peak 24 at 2026-11-19 11:10Z (the phone
+      checks) against `max_connections` 79.
+    - Trail logging, latest delivery 09:23:18Z, no delivery error. API
+      `{"status":"ok"}`, site 200.
+    - Spend (unblended, whole account): 5.19–5.25 USD a day from
+      2026-11-12 to 2026-11-18, 5.45 on 2026-11-19 (the day may still
+      fill in; 1a's trail, probes and alarms are of that size). By region
+      on 2026-11-19: another project in the same account, in sa-east-1,
+      2.84 (not SafeRide); SafeRide af-south-1 1.98 (NAT gateway 1.31, RDS
+      0.56, VPC 0.12) and Route 53 0.50. **The 60 USD budget is below the
+      run rate:** month-to-date 120.43, forecast 178.31, so both of its
+      notifications (80 percent actual, 100 percent forecast) are past
+      their thresholds. SafeRide alone runs about 75 USD a month. A
+      decision for the user: the budget's amount (`MonthlyBudgetUsd`,
+      applied by a frontend deploy) or a SafeRide-only filter.
