@@ -61,9 +61,9 @@ Parameters:
     Description: Second operator address subscribed to the us-east-1 alarm topic and the budget (empty = none).
   MonthlyBudgetUsd:
     Type: Number
-    Default: 60
+    Default: 100
     MinValue: 1
-    Description: Monthly cost budget for the whole account, in USD; mail at 80% actual and 100% forecast.
+    Description: Monthly cost budget for SafeRide's regions (af-south-1, us-east-1, global), in USD before tax; mail at 80% actual and 100% forecast.
 
 Conditions:
   HasCert: !Not [!Equals [!Ref CertificateArn, ""]]
@@ -496,7 +496,12 @@ Resources:
       OKActions:
         - !Ref OpsTopicUsEast1
 
-  # The budget covers the whole account (every service, both regions). Budgets
+  # The budget covers SafeRide's regions only: the backend's af-south-1, this
+  # stack's us-east-1 and global (Route 53). The account also runs other
+  # projects in other regions, which a whole-account budget would count;
+  # region-less charges (tax) fall outside the filter, so the amount is before
+  # tax. SafeRide ran about 67 USD a month in October and November 2026, so
+  # 100 puts the 80% actual mail at about a fifth over a normal month. Budgets
   # mails its subscribers directly; it needs at least one, hence HasAnyAlert.
   # No BudgetName (D23): a subscriber change replaces the budget, and
   # CloudFormation creates the new one before deleting the old, so a fixed
@@ -511,6 +516,11 @@ Resources:
         BudgetLimit:
           Amount: !Ref MonthlyBudgetUsd
           Unit: USD
+        CostFilters:
+          Region:
+            - af-south-1
+            - us-east-1
+            - global
       NotificationsWithSubscribers:
         - Notification:
             NotificationType: ACTUAL
