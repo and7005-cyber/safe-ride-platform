@@ -640,6 +640,5 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
       account's two other hosted zones). Applied to the live budget through
       `update-budget`: `CostFilters` `Region` those three, limit 100 USD;
       read back with both notifications unchanged (80 actual, 100
-      forecast). The template carries the same on branch
-      `fix/saferide-only-budget` (`614893f`, not pushed), so the next
-      frontend deploy matches the live budget.
+      forecast). The template carries the same: PR #19 (`614893f`, merge
+      `d8e7b61`), so the next frontend deploy matches the live budget.
