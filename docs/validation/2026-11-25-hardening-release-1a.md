@@ -580,8 +580,9 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
   CSP); the first-48-hours checks —
   subscriptions +47 h (2026-11-21 08:25Z); at +48 h the ERROR search,
   `DatabaseConnections` against 79, trail delivery and spend; SES at
-  +72 h; the three decisions from +24 h (pending maintenance, SES
-  production access, the budget below the account's run rate); and the
+  +72 h; after the 2026-11-22 maintenance window, the instance's events,
+  engine version and pending list; SES production access (reply sent
+  2026-11-20); and the
   post-1a restore rehearsal with `restore-compare` before 1b (R21). The
   first school morning is 2027-01-04 (the 4xx, driver sign-in and trail
   checks wait for it).
@@ -606,9 +607,13 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
       `system-update` (new operating system update) and `db-upgrade`
       (engine patch 16.14.R3), both without an apply date, so neither is
       scheduled. `AutoMinorVersionUpgrade` true, window
-      `sun:00:00-sun:01:00`. A decision for the user: apply both in the
-      holiday (single-AZ, a few minutes' outage) rather than in a route
-      week.
+      `sun:00:00-sun:01:00`. Decided by the user 2026-11-20: apply both
+      in the holiday rather than in a route week. Opted in that afternoon with
+      `apply-pending-maintenance-action --opt-in-type next-maintenance`;
+      read back: both `next-maintenance`, `CurrentApplyDate`
+      2026-11-22T00:00:00Z (Sunday 03:00 EAT; single-AZ, a few minutes'
+      outage, no runs in the holiday). Read the instance's events, engine
+      version and pending list after the window.
     - Every alarm in both regions `OK`. ERROR search over the three groups
       from 2026-11-19 14:29:17Z to 09:25:09Z: 0 matches in 38,940 records.
     - SES domain verified, DKIM and MAIL FROM `SUCCESS`; production access
@@ -628,6 +633,13 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
       0.56, VPC 0.12) and Route 53 0.50. **The 60 USD budget is below the
       run rate:** month-to-date 120.43, forecast 178.31, so both of its
       notifications (80 percent actual, 100 percent forecast) are past
-      their thresholds. SafeRide alone runs about 75 USD a month. A
-      decision for the user: the budget's amount (`MonthlyBudgetUsd`,
-      applied by a frontend deploy) or a SafeRide-only filter.
+      their thresholds. Decided by the user 2026-11-20: a SafeRide-only
+      budget. Cost Explorer filtered on `af-south-1`, `us-east-1` and
+      `global`: 66.96 USD in October, 41.84 for 2026-11-01 to 11-19, before
+      tax (tax has no region; `global` also holds about 1 USD a month of the
+      account's two other hosted zones). Applied to the live budget through
+      `update-budget`: `CostFilters` `Region` those three, limit 100 USD;
+      read back with both notifications unchanged (80 actual, 100
+      forecast). The template carries the same on branch
+      `fix/saferide-only-budget` (`614893f`, not pushed), so the next
+      frontend deploy matches the live budget.
