@@ -290,7 +290,7 @@ def test_with_nothing_exported_every_frontend_parameter_is_passed_at_its_templat
     }
     assert params == {
         "DomainName": "saferidelive.co.ke", "HostedZoneId": "Z0459820URO1AH08IO8T",
-        "ApiOrigin": "https://api.saferidelive.co.ke", "CspMode": "report-only", "MonthlyBudgetUsd": "60",
+        "ApiOrigin": "https://api.saferidelive.co.ke", "CspMode": "report-only", "MonthlyBudgetUsd": "100",
     }
     assert "Parameter override" not in log
 
@@ -321,7 +321,7 @@ def test_deploy_frontend_passes_every_parameter_on_every_deploy(tmp_path):
     assert result.returncode == 0, result.stderr
     assert params == {
         "DomainName": "saferidelive.co.ke", "HostedZoneId": "Z0459820URO1AH08IO8T",
-        "ApiOrigin": "https://api.saferidelive.co.ke", "CspMode": "report-only", "MonthlyBudgetUsd": "60",
+        "ApiOrigin": "https://api.saferidelive.co.ke", "CspMode": "report-only", "MonthlyBudgetUsd": "100",
         "AlertEmailPrimary": HELD_ALERT,  # held by the stack, passed explicitly (E1)
     }
     # Assembled before the build, like the backend's: the only aws calls before

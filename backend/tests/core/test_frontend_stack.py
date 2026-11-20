@@ -209,12 +209,18 @@ def test_the_us_east_1_topic_and_its_conditional_subscriptions():
     assert "Value: !Ref OpsTopicUsEast1" in OUTPUTS
 
 
-def test_the_budget_mails_the_alert_addresses_at_80_actual_and_100_forecast():
+def test_the_budget_covers_saferide_and_mails_the_alert_addresses_at_80_actual_and_100_forecast():
     block = T.block("MonthlyCostBudget")
     assert T.type_of("MonthlyCostBudget") == "AWS::Budgets::Budget"
     assert re.search(r"^    Condition: HasAnyAlert$", block, re.M)
     assert re.search(r"^  HasAnyAlert: !Or \[!Condition HasAlertPrimary, !Condition HasAlertSecondary\]$", T.text, re.M)
-    assert T.parameter("MonthlyBudgetUsd")["Default"] == "60"
+    assert T.parameter("MonthlyBudgetUsd")["Default"] == "100"
+    # SafeRide's regions only: the account runs other projects elsewhere, and
+    # a whole-account budget was past its limit on SafeRide's first day.
+    assert re.search(
+        r"^        CostFilters:\n          Region:\n            - af-south-1\n            - us-east-1\n            - global\n",
+        block, re.M,
+    )
     # A subscriber change replaces the budget, new before old: a fixed name
     # would clash, so CloudFormation generates it (D23).
     assert "BudgetName" not in block

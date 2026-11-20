@@ -397,9 +397,12 @@ can report a dead stack: their alarms treat missing data as breaching.
 | `SiteServerErrors` | over 5% of CloudFront responses were 5xx for 10 minutes | read the distribution's error graphs and the AWS Health Dashboard for CloudFront and S3 |
 | `SiteCertificateExpiry` | the CloudFront certificate expires in under 20 days (custom domain only) | check the apex and www validation CNAMEs in Route 53 and the renewal status in ACM (us-east-1) |
 
-The monthly cost budget (`MonthlyBudgetUsd`, Default 60 USD, the whole
-account) mails the same addresses directly when actual spend passes 80% and
-when the month's forecast passes 100%; no confirmation is needed, and it
+The monthly cost budget (`MonthlyBudgetUsd`, Default 100 USD before tax)
+counts SafeRide's regions only: `af-south-1`, `us-east-1` and `global`
+(Route 53). The account runs other projects in other regions, and tax has no
+region, so neither is counted. SafeRide ran about 67 USD a month in October
+and November 2026. The budget mails the same addresses directly when actual
+spend passes 80% and when the month's forecast passes 100%; no confirmation is needed, and it
 exists only when at least one address is set. `MONTHLY_BUDGET_USD` overrides
 the amount for one frontend deploy (live parity: repeat it, or change the
 Default in a release). CloudFormation generates the budget's name (D23): a
