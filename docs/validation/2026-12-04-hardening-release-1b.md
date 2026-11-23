@@ -8,7 +8,7 @@
   of Release 1a, live since 2026-11-19) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U7–U12 and
   U13 (U16 shipped in Release 1a, D8), as amended by the execution decisions
-  D1–D27 (the Release 1a record) and D28–D54 below.
+  D1–D27 (the Release 1a record) and D28–D59 below.
 - **Surface:** parent password recovery by email (SES v2, inline, one
   attempt, purpose-scoped single-use tokens, a per-account cap) and by the
   office (**Reset password**, **Confirm and reset**); sign-up that links
@@ -36,11 +36,15 @@
 | SHA | Unit | Summary |
 |---|---|---|
 | `48778e4` | U11 | A raw ASGI middleware puts the Lambda request id (never an inbound header) on every response as `X-Request-Id`, with HSTS, `nosniff`, `Cache-Control: no-store` and `default-src 'none'; frame-ancestors 'none'`; an unexpected error leaves one `unexpected-error` record (method, path, request id, class, traceback frames, and for database errors the SQL state, constraint and table only — no `exc_info`), redacted again by a root filter; the 500 body carries the request id and the client appends "(Reference: id)" to 5xx messages; `GET /api/health` runs a bounded, cached `select 1` and reports the version (503 with `db: error`); interactive docs only locally |
-| `17dd95a` | U7, U8 | `MailService` with an SES v2 transport (one attempt, ten-second timeouts) and a simulated one (local dev routes for the last links); a failed send logs `mail-send-failed kind=…` without the recipient and never fails the request; reset (30 minutes) and verification (24 hours) tokens scoped by `purpose`, at most three mails per account per hour; forgot-password's neutral answer; sign-up issues no session — a new address gets an unverified account (D1) that links nothing and raises no incident until its signed-in owner verifies, an existing address gets the "you already have an account" mail; the emailed reset ends every session, drops push registrations, verifies the address and signs in (not providers, who still pass the second factor); the office's email change requires verification again and notifies the old address; `GET /api/push/config` carries `mailEnabled`, and the screens send people to the office while it is false |
+| `17dd95a` | U7, U8 | `MailService` with an SES v2 transport (one attempt; ten-second timeouts at first, a 5 s connect and 8 s read after the code review, D59) and a simulated one (local dev routes for the last links); a failed send logs `mail-send-failed kind=…` without the recipient and never fails the request; reset (30 minutes) and verification (24 hours) tokens scoped by `purpose`, at most three mails per account per hour; forgot-password's neutral answer; sign-up issues no session — a new address gets an unverified account (D1) that links nothing and raises no incident until its signed-in owner verifies, an existing address gets the "you already have an account" mail; the emailed reset ends every session, drops push registrations, verifies the address and signs in (not providers, who still pass the second factor); the office's email change requires verification again and notifies the old address; `GET /api/push/config` carries `mailEnabled`, and the screens send people to the office while it is false |
 | `de59f8d` | U9 | Either staff role issues a parent a 16-character temporary password (Crockford alphabet, read out in groups of four, typed any way) through a helper shared with the staff reset: forced change within 72 hours, sessions revoked, tokens voided, push registrations removed, a neutral notice mail and a `parent-password-reset` audit row with counts only; a neutral 409 for anyone with a membership at any school or a provider account; **Confirm and reset** verifies an unverified sign-up matching a slot email, links it and issues the same temporary password (`parent-email-confirmed` and `parent-password-reset` rows); **Change password** for every role except PIN sessions, marked in the session token, keeping the current session. Also fixes the pre-existing shared-parent detection under row security (below) |
 | `85030e3` | U10 | The phone is set up once with the school's driver code (`GET /api/auth/schools/{code}`, typed, link or QR); a PIN without a school is refused with `school-required`; new PINs are six digits, refused when trivial, stored as `v2:k1:` + HMAC(pepper, school id + ":" + PIN), so the same PIN may exist at two schools and the in-school check no longer confirms another school's PINs; a legacy PIN signs in once and is rewritten to the salted form; more than twenty failures from one source at one school in fifteen minutes answer 429 `school-pin-locked` with `Retry-After`; every failure writes a row and a `pin-failure school=<code>` line; a director regenerates the code; one active driver membership per PIN holder; fixed driver codes in the seeds and e2e fixtures; `qrcode.react` 4.2.0 |
 | `c2bd543` | U12 | EventBridge Scheduler invokes the migrate function at 01:30 Africa/Nairobi with `{"action": "retention"}` (no async retries, 600-second timeout); the run deletes in bounded skip-locked batches — feed rows past 90 days, used or expired tokens, expired sessions and pre-auth tokens, PIN-failure rows, idempotency keys, unverified parents older than 30 days with no link, membership, provider account or audit and incident reference — then purges the trail per school under a time budget; never incidents or the audit log; an `ops_job_runs` row and an EMF `RetentionRunSucceeded` point per run (a budget stop is success); the heartbeat, Scheduler target-error, mail, PIN, PIN-lock and `school-required` alarms on metric filters; `ApiClientErrorsBurst` moved in place to the app's non-404 4xx (D47) |
-| uncommitted | U13 | The guides' final pass (parent, driver, staff, provider, index) in the app's words and five new `manualVocabulary` tests; the stale texts (index date, `agent-implementation-instructions.md`'s PIN lines, the seed-002 header); the `MailEnabled` parameter description; the Release 1b deploy checklist; the 1b paragraph of `infra/RESTORE.md`, "Code rollback"; this record |
+| `a500cdb` | U13 | The guides' final pass (parent, driver, staff, provider, index) in the app's words and five new `manualVocabulary` tests; the stale texts (index date, `agent-implementation-instructions.md`'s PIN lines, the seed-002 header); the `MailEnabled` parameter description; the Release 1b deploy checklist; the 1b paragraph of `infra/RESTORE.md`, "Code rollback"; this record |
+| `a9655e0` | D52 | The migrate function's `{"action": "purge-verify-tokens"}`, invoked on 1b immediately before a rollback's 1a backend deploy |
+| `fe0a5da` | review | Code review #1–#4, #6–#11 (below): Confirm and reset refuses cross-school addresses and accounts linked elsewhere; the Parents page refuses an email change for an identity with other access; the driver binding survives refused storage; the rollback notes on 1a's student saves; one-time passwords shown before the refetch (Parents and Staff pages); push re-attaches after the forced change; a failed config fetch is retried; one login-response type; two test fixes |
+| `965d8ec` | review | The same reveal-first ordering on the provider's account and school creation |
+| `00ea5d0` | review | Code review #5, #12–#14: retention never deletes an account the office changed the email of; the driver code is kept out of the API log; SES bounded at a 5 s connect and 8 s read; a dead helper removed |
 
 ## Go/No-Go gates (plan §Operational Notes, Release 1b checklist)
 
@@ -203,6 +207,38 @@ commit messages):
   reset for providers" are replaced; while mail is off both still go to a
   director or the deploy bootstrap.
 
+From the code review (2026-11-23):
+
+- **D55** **Confirm and reset is single-school.** It refuses, with the
+  neutral `nothing-to-confirm`, an address that also matches another
+  school's students and an account already linked at another school (#1):
+  otherwise one school's office could verify the account, hold its
+  temporary password and accept the other school's pending child — a trust
+  the plan grants the office reset only for a parent with an ACCEPTED link
+  at that school. A family listed at two schools verifies through its own
+  email link; while mail is off it stays "Awaiting signup" until mail is
+  on. (Open for the user: relax this if a cross-school family needs the
+  office path before mail is on.)
+- **D56** **The Parents page refuses an email change** (`not-editable-here`,
+  "This account's email cannot be changed from the Parents page") for an
+  identity holding any non-removed membership at any school or a provider
+  account — the office reset's own rule (#2): with mail on, a redirected
+  email plus Forgot password would otherwise take over a director, driver
+  or provider. Name and phone edits still save.
+- **D57** **Retention never deletes an account the office changed the email
+  of** (#5): the 30-day grace counts from creation, so only accounts that
+  were never verified qualify; the `parent-email-changed` audit row, now
+  recording the stored id, names the exceptions.
+- **D58** **The driver code is kept out of the API log** (#13): the public
+  lookup's path is logged as `/api/auth/schools/{code}` in the access line
+  and the unexpected-error line (`%2F`-decoded paths included); the status
+  stays last for the 4xx metric filter. The local stack's uvicorn access
+  log still prints it (local only).
+- **D59** **SES sends are bounded at a 5 s connect and 8 s read**, one
+  attempt (#14): the office's email change sends two mails after its
+  commit, and two hung sends must stay inside the API function's 30 s
+  timeout.
+
 **Pre-existing bug fixed in U9 (`de59f8d`).** Shared-parent detection was
 blind under row security, in production since the tenancy release: the
 runtime role cannot see another school's students, so a parent with
@@ -215,11 +251,11 @@ row's own school, and a link whose school cannot be seen counts as shared.
 | Residual | Where it stands |
 |---|---|
 | The database pool has no `connect_timeout` or `tcp_user_timeout` (U11): a hung socket holds the health check until the 30-second Lambda timeout | the probe still reports it, late |
-| `push_service.py` logs a web-push exception's text (U11), which may carry the subscription endpoint URL | for the code review |
+| `push_service.py` logs a web-push exception's text (U11), which may carry the subscription endpoint URL | not raised by the code review; still open |
 | The temporary-password check's second step on a failure is a small timing tell (U9) | accepted for now |
 | No per-staff rate limit on the office reset (U9) | the audit row names each issuer |
 | "This account cannot be reset from the Parents page. Ask the parent to use Forgot password." points to a dead end while mail is off (U9) | UI copy unchanged in U13 (no behaviour change); the staff guide now says what to do (a director for staff at the school, else SafeRide support). A parent who is a driver elsewhere has no reset path while mail is off |
-| DL12: the reset confirmation says "Their other devices are signed out", while every session of the parent ends | wording, for the code review |
+| DL12: the reset confirmation says "Their other devices are signed out", while every session of the parent ends | wording; not raised by the code review |
 | `infra/scripts/parity-params.sh` still comments "MAIL_ENABLED stays false until then" | comment only; U13 changed only the template's parameter description |
 | `test_parent_feeds::test_display_status_matches_raw_at_school` fails on a second back-to-back run without a reseed (pre-existing, U12) | reseed between runs |
 | The Scheduler's `TargetErrorCount` dimension (`ScheduleGroup`) is confirmed only after the first night | the checklist's next-morning step |
@@ -227,15 +263,75 @@ row's own school, and a link whose school cannot be seen counts as shared.
 
 ## Code review
 
-Pending: `ce-code-review` over the branch, then fixes and a full certify
-(the task list's last step). Findings, fix batches and residuals go here.
+`ce-code-review` over `main..a9655e0` (141 files; the code part about
+5,800 added lines), 2026-11-23, with the plan and the execution decisions as
+intent. Twelve reviewers: correctness, testing, maintainability and
+project standards (always on), security, performance, API contract,
+reliability, adversarial and frontend async races (conditional), plus the
+agent-native and learnings agents. No migration in 1b, so no data-migration
+or deployment-verification reviewer; no PR yet, so no previous-comments
+reviewer. Every finding at the confidence bar was re-checked by an
+independent validator (one per finding; the storage-fallback finding, at
+full confidence after two reviewers agreed, was verified directly).
+
+| # | Sev | Finding | Reviewers | Validated | Fix |
+|---|---|---|---|---|---|
+| 1 | P1 | Confirm and reset let one school's office take over a cross-school family's unverified account | security, adversarial, correctness | yes | `fe0a5da` (D55) |
+| 2 | P1 | The Parents page email change bypassed the not-resettable-here guard | correctness, adversarial | yes | `fe0a5da` (D56) |
+| 3 | P2 | The driver binding was lost when the browser refuses storage | frontend races, correctness | yes (direct) | `fe0a5da` |
+| 4 | P2 | The rollback notes said only email edits link unverified sign-ups under 1a; every student save does | adversarial | yes | `fe0a5da` |
+| 5 | P2 | Retention would delete a long-standing parent the office made unverified, the night their last link went | adversarial | yes | `00ea5d0` (D57) |
+| 6 | P2 | An existing test left a `parent-email-changed` audit row behind | testing | yes | `fe0a5da` |
+| 7 | P2 | The login-response user shape was declared three times | maintainability | yes | `fe0a5da` |
+| 8 | P2 | One-time passwords were revealed only after a list refetch | frontend races | yes | `fe0a5da`, `965d8ec` (Staff and provider screens too) |
+| 9 | P2 | Push never re-attached after an office reset's forced change | correctness | yes | `fe0a5da` |
+| 10 | P2 | A failed config fetch was cached as "mail off" for the session | frontend races | yes | `fe0a5da` |
+| 11 | P3 | No test for the concurrent sign-up branch | testing | yes | `fe0a5da` |
+| 12 | P3 | An unused `format_driver_code` | maintainability | yes | `00ea5d0` |
+| — | P3 | No test that a disabled account's live reset token is refused | testing | **no** — `test_staff_accounts.py` covers it | — |
+| — | P2 | PIN rules mirrored between backend and frontend | maintainability | **no** — the denylist is cross-checked; the rest is intentional | — |
+
+Below the confidence bar but applied as hardening: the driver code in the
+access log (#13, security, also noted by correctness; D58) and the two
+inline mails of the office's email change against the 30 s timeout (#14,
+reliability and adversarial; D59). Performance, API contract and project
+standards had no findings; the agent-native and learnings agents found no
+gap (the one learnings check — new template parameters outside the parity
+maps — holds: 1b adds no parameter).
+
+**Residual risks the review recorded, not fixed in 1b:**
+
+- The PIN lock reads the window and writes the failure row in separate
+  transactions, so a concurrent burst from one source can make up to about
+  the route burst (40) attempts before the count crosses 20 (security,
+  reliability, adversarial). Bounded by the route throttle and alarmed
+  (D33); an insert-first count is the fix if it matters.
+- A retention step that fails stops the later steps and the trail purge for
+  that night (reliability); the run raises and the errors alarm fires.
+- Verification is stamped before linking runs: if linking fails, the
+  account is verified but unlinked and a retry answers "already verified";
+  the office's next student save links it (correctness, adversarial).
+- Forgot-password answers an existing address after a token write and an
+  SES call, an unknown one at once — a timing tell once mail is on; login
+  already has the same tell (pre-existing).
+- With mail off, Confirm and reset trusts the office's identity check of
+  whoever phones in (adversarial); the staff guide now says to ring the
+  parent back on the number on the student's record before confirming.
+- The health check opens the database pool in every warm Lambda (four
+  connections by default; performance). Fine at the pilot's scale; a
+  smaller pool is the fix if connections grow.
+- A driver app left open on the 1a bundle through the deploy gets "Invalid
+  PIN" for `school-required`; the drivers' message says to close and
+  reopen the app (API contract).
+
+Fixes verified by the suites each batch ran and by a full certify (below).
 
 ## Test evidence
 
 | Command | Result |
 |---|---|
 | `scripts/certify.sh` at the branch start (`main` `42a20b7`) | backend unit 756 passed, 561 skipped; integration 561 passed, 2 skipped; vitest 349; Playwright 102 |
-| U11 (`48778e4`) | no certify counts recorded in the task list (U7+U8's run below covers the tree with U11 in it) |
+| U11 (`48778e4`) | backend unit 791 passed, 578 skipped; tsc clean; vitest 355 (U7+U8's full run below covers the tree with U11 in it) |
 | `scripts/certify.sh` after U7+U8 (`17dd95a`) | unit 837, integration 592, vitest 366, Playwright 103 — green |
 | `scripts/certify.sh` after U9 (`de59f8d`) | unit 863, integration 606, vitest 381, Playwright 106 — green |
 | `scripts/certify.sh` after U10 (`85030e3`) | unit 952, integration 625, vitest 452, Playwright 111 — green |
@@ -245,6 +341,7 @@ Pending: `ce-code-review` over the branch, then fixes and a full certify
 | U13: `npx tsc --noEmit` | clean |
 | U13: `../.venv/bin/python -m pytest -q tests/core` (backend, after the `MailEnabled` description change) | 636 passed |
 | U13: `git diff --check` | clean |
+| `scripts/certify.sh` after the code-review fixes (`00ea5d0`, after a reseed) | unit 1015 passed, 642 skipped; integration 642 passed, 2 skipped; vitest 470; Playwright 111 — green |
 | `scripts/certify.sh` at the release commit | **open** |
 
 ## Rollback position

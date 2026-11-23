@@ -407,7 +407,7 @@ Some accounts cannot be reset from here: anyone who is also staff or a driver at
 
 ### Confirm and reset (parents without a working inbox)
 
-A parent who signed up but never confirmed their email (no access to that inbox, or email isn't switched on yet) stays on **Awaiting signup**, and their children stay unlinked. Each Awaiting signup row has a **Confirm and reset** button. **Only confirm after speaking to this parent** — anyone can sign up with an address they don't own, and confirming attaches the children to that account.
+A parent who signed up but never confirmed their email (no access to that inbox, or email isn't switched on yet) stays on **Awaiting signup**, and their children stay unlinked. Each Awaiting signup row has a **Confirm and reset** button. **Only confirm after speaking to this parent** — anyone can sign up with an address they don't own, and confirming attaches the children to that account. If the parent phoned you, ring them back on the parent phone number on the student's record before you confirm — a caller can claim to be anyone, and the temporary password goes to whoever you are speaking to.
 
 If an account is waiting behind that email, Confirm and reset confirms it, links the children (with the usual "Parent signup auto-linked" alert), and issues a temporary password exactly like **Reset password** — shown once, the same 72 hours, the same notice email. The password chosen at sign-up stops working, and anyone signed in to that account is signed out: if the account was not really the parent's, whoever made it is locked out. Tell the parent the same things as for a reset.
 
