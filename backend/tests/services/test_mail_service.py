@@ -7,6 +7,8 @@ filter reads that line and the never-log list applies to all of it.
 """
 
 import logging
+import sys
+import types
 
 import pytest
 
@@ -196,9 +198,41 @@ def test_ses_send_sets_reply_to_when_configured(settings):
     assert stub.calls[0]["ReplyToAddresses"] == ["office@saferide.test"]
 
 
-def test_ses_client_is_bounded_ten_seconds_and_a_single_attempt():
-    assert ms.SES_TIMEOUT_SECONDS == 10
-    assert ms.SES_TOTAL_MAX_ATTEMPTS == 1
+def test_ses_client_is_bounded_so_two_hung_sends_stay_inside_the_api_timeout(monkeypatch):
+    """The office's email change sends two mails in a row after its commit:
+    two sends at the worst bound (connect + read, one attempt) must stay
+    under the API function's 30 s timeout. boto3 is not installed off
+    Lambda, so stand-ins record what the transport builds its client with."""
+    built: dict = {}
+
+    class Config:
+        def __init__(self, **kwargs):
+            built["config"] = kwargs
+
+    def client(service, **kwargs):
+        built["client"] = (service, kwargs)
+        return object()
+
+    boto3 = types.ModuleType("boto3")
+    boto3.client = client
+    botocore = types.ModuleType("botocore")
+    botocore_config = types.ModuleType("botocore.config")
+    botocore_config.Config = Config
+    botocore.config = botocore_config
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+
+    ms.SesTransport()._get_client()
+
+    assert built["config"] == {
+        "connect_timeout": 5,
+        "read_timeout": 8,
+        "retries": {"mode": "standard", "total_max_attempts": 1},
+    }
+    assert built["client"][0] == "sesv2"
+    worst_send = ms.SES_CONNECT_TIMEOUT_SECONDS + ms.SES_READ_TIMEOUT_SECONDS
+    assert ms.SES_TOTAL_MAX_ATTEMPTS * worst_send * 2 <= 26 < 30
 
 
 def test_message_rejected_logs_one_failure_line_without_the_address(json_log):

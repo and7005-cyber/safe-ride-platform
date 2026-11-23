@@ -267,9 +267,5 @@ def is_driver_code(value: str) -> bool:
     )
 
 
-def format_driver_code(code: str) -> str:
-    return f"{code[:4]}-{code[4:]}"
-
-
 def hash_session_token(session_token: str) -> str:
     return hashlib.sha256(session_token.encode("utf-8")).hexdigest()

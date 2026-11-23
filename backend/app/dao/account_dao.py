@@ -581,9 +581,12 @@ class AccountDao:
                 counts = _restart_verification(
                     conn, parent_id, verify_token_hash, verify_ttl_minutes
                 )
+                # The stored id, not the path's spelling of it: the nightly
+                # retention matches this row on the canonical text
+                # (retention_dao.delete_unverified_parents) to keep the account.
                 record_audit(
                     conn, action="parent-email-changed", actor=actor, scope=scope,
-                    resource_type="parent", resource_id=parent_id, detail=counts,
+                    resource_type="parent", resource_id=row["id"], detail=counts,
                 )
         return {
             **dict(row),

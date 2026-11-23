@@ -20,7 +20,8 @@ the job-runs row and the embedded-metric line; ``last-retention-run`` in the
 verify set reads that row. Unverified parents: 31 days with nothing holding
 them is deleted with its own private rows; a pending link, a membership, a
 provider account, an audit or incident reference, 29 days, a grandfathered or
-a verified account, or a non-parent role is kept. A held purge lock skips the
+a verified account, or a non-parent role is kept; so is an old account the
+office made unverified by changing its email. A held purge lock skips the
 school and the run still succeeds. Out of budget, the run stops after the
 current batch, records ``stopped`` and still emits success. A delete that hits
 the two-second statement timeout writes a ``failed`` row and raises. Every
@@ -408,6 +409,41 @@ def test_only_an_unverified_parent_nothing_holds_is_deleted_after_30_days(world,
             "select count(*) as n from live_incidents where acknowledged_by = %s",
             (accounts["incident-ack"],),
         ).fetchone()["n"] == 1
+
+
+def test_an_account_the_office_made_unverified_is_kept_once_its_links_are_gone(
+    world, run_retention,
+):
+    """D35: the office's email change leaves a long-standing parent
+    unverified while its created_at stays old. With its last link gone it
+    must survive the run — only accounts that never verified qualify. Its
+    twin, the same in every way but the audit row, shows the run would
+    otherwise delete it."""
+    from app.dao.audit_dao import record_audit
+
+    with db() as conn:
+        changed = _account(conn, "email-changed", days_old=400)
+        twin = _account(conn, "never-verified", days_old=400)
+        world["accounts"].extend((changed, twin))
+        # The row account_dao.update_parent writes after _restart_verification
+        # (017's action: deleted below, for the 013/016 double-apply checks).
+        audit = record_audit(
+            conn, action="parent-email-changed",
+            actor={"full_name": "IT Retention",
+                   "email": f"it-retention-{MARKER}-office@saferide.test"},
+            school_id=world["school"], resource_type="parent", resource_id=uuid.UUID(changed),
+            detail={"tokens_voided": 0, "sessions_revoked": 0, "push_registrations_removed": 0},
+        )
+    try:
+        report, _ = run_retention()
+
+        assert report["job_status"] == "ok", report
+        with db() as conn:
+            assert _exists(conn, "app_users", "id", changed)
+            assert not _exists(conn, "app_users", "id", twin)
+    finally:
+        with db() as conn:
+            conn.execute("delete from live_admin_audit where id = %s", (audit,))
 
 
 # --- the lock, the budget, a failure ---------------------------------------------

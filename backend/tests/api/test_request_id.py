@@ -4,11 +4,14 @@ Covers AE11 and the request-id half of the plan's U11 scenarios. Records are
 checked as the Lambda runtime would emit them (tests/lambda_json_log.py), not
 only as caplog text: Lambda's JSON formatter copies ``exc_info`` into
 ``errorMessage`` and every extra attribute into the line, so a value anywhere
-in the record counts. The last tests drive the real Lambda entry path —
+in the record counts. The driver code lookup's path reaches no record with
+its code (Mangum's access line, in process, and the unexpected-error line).
+The last tests drive the real Lambda entry path —
 Mangum, a fake API Gateway event and context, the runtime's handler on the
 root logger before the app is imported — in a fresh interpreter.
 """
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -21,6 +24,7 @@ import psycopg
 import pytest
 from fastapi import Body
 from fastapi.testclient import TestClient
+from mangum import Mangum
 
 from app.api import _helpers
 from app.api import auth as auth_api
@@ -29,6 +33,7 @@ from app.core.config import get_settings
 from app.core.request_context import (
     RequestLogFilter,
     configure_logging,
+    loggable_path,
     request_id_for,
 )
 from app.main import create_app
@@ -493,6 +498,120 @@ def test_log_level_defaults_to_info():
 
     assert Settings.model_fields["log_level"].default == "INFO"
     assert Settings.model_fields["app_version"].default == "dev"
+
+
+# --- the driver code lookup's path ---------------------------------------------
+# GET /api/auth/schools/{code} carries the school's driver code, which resolves
+# to the school id for PIN sign-in: no record names it, in any typed form.
+
+KNOWN_CODE, UNKNOWN_CODE, FAILING_CODE = "GFA07K1Q", "WXYZ8M3N", "HJKM5P6R"
+# Each code's halves, compared case-insensitively: a typed code may be split
+# by a hyphen, a space or a slash (Mangum unquotes the path). Every half holds
+# a letter outside hex, so no timestamp or request id can match one.
+CODE_NEEDLES = tuple(
+    code[start:start + 4].lower()
+    for code in (KNOWN_CODE, UNKNOWN_CODE, FAILING_CODE)
+    for start in (0, 4)
+)
+LOOKUP_SCHOOL_ID = "5cae0000-0000-0000-0000-000000000001"
+
+
+class _LookupDao:
+    def school_by_driver_code(self, code):
+        if code == FAILING_CODE:
+            raise RuntimeError("lookup failed")
+        if code == KNOWN_CODE:
+            return {"id": LOOKUP_SCHOOL_ID, "name": "Probe School"}
+        return None
+
+
+class _LambdaContext:
+    aws_request_id = "5e2d7c3b-9a4f-4b1e-8d0c-6f5e4d3c2b1a"
+    function_name = "saferide-api"
+    memory_limit_in_mb = 512
+    invoked_function_arn = "arn:aws:lambda:af-south-1:000000000000:function:saferide-api"
+
+    def get_remaining_time_in_millis(self):
+        return 30_000
+
+
+def _through_mangum(app, requests: list[tuple[str, str]]) -> list[dict]:
+    """Each (method, raw path) through the real Mangum adapter as an HTTP API
+    (payload v2) event, in process; returns Mangum's responses."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        handler = Mangum(app, lifespan="off")
+        return [
+            handler(
+                {
+                    "version": "2.0", "routeKey": "$default", "rawPath": path,
+                    "rawQueryString": "", "headers": {"host": "api.example.test"},
+                    "requestContext": {
+                        "http": {"method": method, "path": path, "protocol": "HTTP/1.1",
+                                 "sourceIp": "203.0.113.9", "userAgent": "probe"},
+                        "requestId": "apigw-1", "stage": "$default", "routeKey": "$default",
+                    },
+                    "isBase64Encoded": False,
+                },
+                _LambdaContext(),
+            )
+            for method, path in requests
+        ]
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    "path,logged",
+    [
+        ("/api/auth/schools/GFA07K1Q", "/api/auth/schools/{code}"),
+        ("/api/auth/schools/gfa0 7k1q", "/api/auth/schools/{code}"),
+        ("/api/auth/schools/GFA0/7K1Q", "/api/auth/schools/{code}"),
+        ("/api/auth/schools/", "/api/auth/schools/"),
+        ("/api/auth/schoolsGFA07K1Q", "/api/auth/schoolsGFA07K1Q"),
+        ("/api/health", "/api/health"),
+        (None, None),
+    ],
+)
+def test_only_the_lookup_path_is_logged_as_its_route_template(path, logged):
+    assert loggable_path(path) == logged
+
+
+def test_the_driver_code_lookup_logs_no_code_and_its_access_line_keeps_the_status(
+    json_log, monkeypatch
+):
+    monkeypatch.setattr(auth_api.service, "dao", _LookupDao())
+    # The hazard, so the test cannot pass vacuously: a handler on Mangum's
+    # own logger formats each record before the root handler's filter runs.
+    bare = JsonLines()
+    access_logger = logging.getLogger("mangum.http")
+    access_logger.addHandler(bare)
+    try:
+        responses = _through_mangum(_app(), [
+            ("GET", "/api/auth/schools/gfa0-7k1q"),
+            ("GET", "/api/auth/schools/WXYZ-8M3N"),
+            ("GET", f"/api/auth/schools/{FAILING_CODE}"),
+            ("GET", "/api/auth/schools/GFA0%2F7K1Q"),
+        ])
+    finally:
+        access_logger.removeHandler(bare)
+
+    statuses = [200, 404, 500, 404]
+    assert [response["statusCode"] for response in responses] == statuses
+    assert json.loads(responses[0]["body"]) == {"schoolId": LOOKUP_SCHOOL_ID, "name": "Probe School"}
+    access = [r["message"] for r in json_log.records() if r["logger"] == "mangum.http"]
+    # The route template in place of the path; the status stays the last word
+    # (the ApiClientErrorsFilter metric filter reads it there).
+    assert access == [f"GET /api/auth/schools/{{code}} {status}" for status in statuses]
+    (record,) = _unexpected(json_log)
+    assert "method=GET path=/api/auth/schools/{code} " in record["message"]
+    text = json_log.text().lower()
+    for needle in CODE_NEEDLES:
+        assert needle not in text, f"{needle!r} leaked into a record: {text}"
+    raw = bare.text().lower()
+    assert "gfa0-7k1q" in raw and "wxyz-8m3n" in raw and "gfa0/7k1q" in raw
 
 
 # --- the real Lambda entry path ----------------------------------------------

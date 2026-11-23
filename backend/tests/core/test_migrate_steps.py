@@ -731,5 +731,14 @@ def test_the_unverified_parent_delete_keeps_every_referenced_or_grandfathered_ac
             ("live_incidents", "acknowledged_by"), ("live_admin_audit", "actor_id")} <= set(
         retention_dao.USER_REFERENCES
     )
+    # Never an account the office made unverified by changing its email: the
+    # grace counts from creation, so only never-verified accounts qualify.
+    # The match is the row account_dao.update_parent writes.
+    assert (
+        "and not exists (select 1 from live_admin_audit e"
+        " where e.action = 'parent-email-changed'"
+        " and e.resource_type = 'parent'"
+        " and e.resource_id = u.id::text)"
+    ) in " ".join(statement.split())
     assert "for update of u skip locked" in statement
     assert params == (30, 50)

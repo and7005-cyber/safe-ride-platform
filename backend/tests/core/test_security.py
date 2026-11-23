@@ -12,7 +12,6 @@ from app.core.security import (
     PinRefused,
     create_pin_session_token,
     create_session_token,
-    format_driver_code,
     generate_relayed_temporary_password,
     hash_pin,
     hash_pin_hmac,
@@ -223,7 +222,3 @@ def test_a_typed_driver_code_normalises_to_its_stored_form(typed: str) -> None:
 @pytest.mark.parametrize("value", ["", "GFA-001", "GFA07K1", "GFA07K1QX", "GFA07K1U", "GFA07K1*"])
 def test_only_eight_symbols_of_the_alphabet_make_a_driver_code(value: str) -> None:
     assert not is_driver_code(normalise_driver_code(value))
-
-
-def test_a_driver_code_is_displayed_in_two_groups_of_four() -> None:
-    assert format_driver_code("GFA07K1Q") == "GFA0-7K1Q"

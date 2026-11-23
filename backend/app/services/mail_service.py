@@ -2,9 +2,11 @@
 
 Sent INLINE from the request, after the token row is committed: Lambda freezes
 the environment when the handler returns, so nothing detached would ever run.
-Each send is bounded (SES client: ten-second connect and read timeouts, a
-single attempt) and best-effort — a failure logs ONE error line and never
-fails the request, because every mail-sending route answers a neutral message
+Each send is bounded (SES client: a five-second connect and an eight-second
+read timeout, a single attempt) — the office's email change sends two mails
+in a row, so two hung sends stay under about 26 s, inside the API function's
+30 s timeout — and best-effort: a failure logs ONE error line and never fails
+the request, because every mail-sending route answers a neutral message
 whether or not the address exists.
 
 The failure line is the alarm's input (U12 builds a metric filter on the
@@ -52,10 +54,16 @@ VERIFY_TTL_MINUTES = 24 * 60
 # and nothing is sent; the route answers the same neutral message.
 MAIL_CAP_PER_HOUR = 3
 
-SES_TIMEOUT_SECONDS = 10
-# botocore's total attempts, the first included: one attempt, no retry. Two
-# attempts could hold a request for about 40 s on a hung read, past the API
-# function's 30 s timeout; a failed send is logged and alarmed instead.
+# The SES client's bounds on one send: connect 5 s, read 8 s, one attempt —
+# at most about 13 s. The office's email change (account_service.update_parent)
+# sends two mails in sequence after its commit, so two hung sends hold the
+# request about 26 s, inside the API function's 30 s timeout with room for
+# the database work before them.
+SES_CONNECT_TIMEOUT_SECONDS = 5
+SES_READ_TIMEOUT_SECONDS = 8
+# botocore's total attempts, the first included: one attempt, no retry. A
+# retry would double a hung send's hold and take two of them past the 30 s
+# timeout; a failed send is logged and alarmed instead.
 SES_TOTAL_MAX_ATTEMPTS = 1
 
 MAIL_FAILED_TOKEN = "mail-send-failed"
@@ -250,8 +258,8 @@ class SesTransport:
                 "sesv2",
                 region_name=get_settings().backend_region,
                 config=Config(
-                    connect_timeout=SES_TIMEOUT_SECONDS,
-                    read_timeout=SES_TIMEOUT_SECONDS,
+                    connect_timeout=SES_CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=SES_READ_TIMEOUT_SECONDS,
                     retries={"mode": "standard", "total_max_attempts": SES_TOTAL_MAX_ATTEMPTS},
                 ),
             )

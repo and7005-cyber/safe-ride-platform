@@ -19,6 +19,14 @@ message) and, for database errors, the SQL state, constraint and table names
 only. ``RequestLogFilter`` applies the same rule to every other record that
 reaches the root handlers (the existing ``logger.exception`` calls in the
 DAOs, the connection pool, Mangum).
+
+One path is itself a secret: the public driver code lookup
+(``GET /api/auth/schools/{code}``, hardening U10) carries the school's driver
+code, which resolves to the school id for PIN sign-in. Mangum's access line
+(``mangum.http``: ``"<METHOD> <path> <status>"``) and the unexpected-error
+line name that route as ``/api/auth/schools/{code}``, never the code
+(:func:`loggable_path`); the status stays the access line's last word, which
+the ``ApiClientErrorsFilter`` metric filter reads.
 """
 
 from __future__ import annotations
@@ -90,6 +98,25 @@ def current_request_id() -> str | None:
 
 # --- redaction ---------------------------------------------------------------
 
+# Everything below the lookup's prefix, not only one segment: Mangum unquotes
+# the path, so a typed "/" (%2F) would otherwise split the code across two.
+DRIVER_CODE_PATH_PREFIX = "/api/auth/schools/"
+DRIVER_CODE_PATH_LOGGED = "/api/auth/schools/{code}"
+
+
+def _is_driver_code_path(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(DRIVER_CODE_PATH_PREFIX)
+        and len(value) > len(DRIVER_CODE_PATH_PREFIX)
+    )
+
+
+def loggable_path(path: str | None) -> str | None:
+    """A request path as a log line may carry it: the driver code lookup's
+    path becomes its route template; every other path is unchanged."""
+    return DRIVER_CODE_PATH_LOGGED if _is_driver_code_path(path) else path
+
 
 def database_error(error: BaseException | None) -> PsycopgError | None:
     """The psycopg error behind ``error``: itself, or the first one in its
@@ -132,13 +159,14 @@ def log_unexpected_error(
     request_id: str | None = None,
 ) -> None:
     """The one record an unexpected error leaves: method, path (never the
-    query string), request id, class, the database names, and the traceback
-    frames as a structured field. ``unexpected-error`` is the stable token for
-    searches and metric filters. Anything not passed comes from the bound
-    request (map_error's callers pass nothing)."""
+    query string, and never a driver code: :func:`loggable_path`), request
+    id, class, the database names, and the traceback frames as a structured
+    field. ``unexpected-error`` is the stable token for searches and metric
+    filters. Anything not passed comes from the bound request (map_error's
+    callers pass nothing)."""
     info = _current.get()
     method = method or (info.method if info else None)
-    path = path or (info.path if info else None)
+    path = loggable_path(path or (info.path if info else None))
     request_id = request_id or (info.request_id if info else None) or "-"
     fields = database_fields(error)
     error_logger.error(
@@ -157,14 +185,19 @@ def log_unexpected_error(
 
 class RequestLogFilter(logging.Filter):
     """Installed on the root handlers (Lambda's own JSON handler, or the local
-    stream handler): stamps ``request_id`` on every record and strips
+    stream handler): stamps ``request_id`` on every record, strips
     ``exc_info`` from any record that carries one, keeping the class, the
-    frames and the database names. Always returns True — it redacts, it never
-    drops."""
+    frames and the database names, and puts the lookup's route template in
+    place of any driver code lookup path among a record's arguments (Mangum's
+    access line passes the path as its second; the method and the status are
+    left as they are). Always returns True — it redacts, it never drops."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "request_id"):
             record.request_id = current_request_id() or "-"
+        args = record.args
+        if isinstance(args, tuple) and any(_is_driver_code_path(arg) for arg in args):
+            record.args = tuple(loggable_path(arg) if isinstance(arg, str) else arg for arg in args)
         if record.exc_info:
             error = record.exc_info[1]
             if error is not None:

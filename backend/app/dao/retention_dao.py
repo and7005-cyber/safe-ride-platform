@@ -27,7 +27,9 @@ What goes, and after how long:
   ``email_verified_at`` — grandfathered accounts, flag false, never qualify)
   30 days after creation, holding no student link of any status, no school
   membership and no provider account, and referenced by nothing else (see
-  ``USER_REFERENCES``).
+  ``USER_REFERENCES``). Only accounts that were never verified: one the
+  office made unverified again by changing its email (a
+  ``parent-email-changed`` audit row names it) is never deleted here.
 
 Kept for the life of the school and never touched here: ``live_incidents``
 and ``live_admin_audit``. The position trail is ``position_dao.purge_batch``'s
@@ -213,6 +215,14 @@ def delete_expired_action_keys(conn, limit: int) -> int:
 def delete_unverified_parents(conn, limit: int) -> int:
     """Parent accounts that never verified, 30 days on, that nothing points at.
 
+    Never verified: the grace counts from ``created_at``, which says nothing
+    about an account the office made unverified again by changing its email
+    (D35) — a long-standing parent would go the night their last link did.
+    So an account named by a ``parent-email-changed`` audit row (the row
+    ``account_dao.update_parent`` writes: resource ``parent``, the account's
+    id as text; the audit is kept for the life of the school) is never a
+    victim.
+
     The row lock is what keeps a concurrent rescue safe: verification (the
     owner's click, an emailed reset, the office's Confirm and reset) updates
     the account row itself, so a rescue that commits first changes the row
@@ -226,7 +236,11 @@ def delete_unverified_parents(conn, limit: int) -> int:
             where {unverified_sql('u')}
               and u.created_at < {RETENTION_CUTOFF_SQL}
               and exists (select 1 from app_user_roles r
-                          where r.user_id = u.id and r.role = 'parent'){_unreferenced('u')}
+                          where r.user_id = u.id and r.role = 'parent')
+              and not exists (select 1 from live_admin_audit e
+                              where e.action = 'parent-email-changed'
+                                and e.resource_type = 'parent'
+                                and e.resource_id = u.id::text){_unreferenced('u')}
             order by u.created_at
             limit %s
             for update of u skip locked

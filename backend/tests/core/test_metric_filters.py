@@ -48,6 +48,7 @@ README = (REPO / "infra" / "README.md").read_text(encoding="utf-8")
 
 SCHOOL = "5cae0000-0000-0000-0000-000000000001"
 SCHOOL_CODE = "GFA-001"
+DRIVER_CODE = "GFA07K1Q"
 
 
 # --- the matcher ------------------------------------------------------------------
@@ -239,6 +240,10 @@ ACCESS_CASES = [
     # not decide it either way.
     ("GET", "/files/report-401", 404),
     ("GET", "/files/page-404", 403),
+    # The driver code lookup: the filter logs its route template in place of
+    # the path, and the status still decides.
+    ("GET", f"/api/auth/schools/{DRIVER_CODE}", 429),
+    ("GET", f"/api/auth/schools/{DRIVER_CODE}", 404),
 ]
 
 
@@ -329,13 +334,14 @@ def test_the_real_lines_have_the_shape_the_filters_read(sample_lines):
         record = json.loads(line)
         assert {"timestamp", "level", "message", "logger", "request_id"} <= set(record), line
         assert "saferide.test" not in line and "482915" not in line and "000001" not in line
-        assert "not verified" not in line
+        assert "not verified" not in line and DRIVER_CODE not in line
     access = [json.loads(line) for line in lines if json.loads(line)["logger"] == "mangum.http"]
     # The shape of the production line the brief quotes (the runtime adds
     # requestId from the invocation; the stand-in has no invocation).
     assert {"message": "GET /api/health 200", "level": "INFO", "logger": "mangum.http"}.items() <= (
         access[0].items()
     )
+    assert "GET /api/auth/schools/{code} 429" in {record["message"] for record in access}
     by_logger = {json.loads(line)["logger"] for line in lines}
     assert {"mangum.http", "saferide.mail", "saferide.auth"} <= by_logger
 
