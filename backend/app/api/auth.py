@@ -5,7 +5,7 @@ from typing import TypeVar
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from psycopg import Error as PsycopgError
 
-from app.core.auth import get_current_user
+from app.core.auth import get_current_user, get_optional_session_user
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, SafeRideError, to_http_exception
 from app.core.rate_limit import SlidingWindowLimiter, client_ip
@@ -24,8 +24,9 @@ from app.schemas.auth import (
     SignupRequest,
     SupportSessionOut,
     TotpRequest,
+    VerifyEmailRequest,
 )
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, VerificationError
 from app.services.provider_service import AuthCodeError, ProviderService
 
 _scope_logger = logging.getLogger("saferide.scope")
@@ -35,9 +36,6 @@ service = AuthService()
 provider_service = ProviderService()
 memberships_dao = MembershipDao()
 T = TypeVar("T")
-
-# Last reset link, exposed only in local dev for the email-less flow.
-_last_reset_link: dict[str, str | None] = {"link": None}
 
 # Brute-force protection. Per-account budgets are the tight ones; per-IP
 # budgets are coarse safety nets sized for shared NATs (school office, test
@@ -60,8 +58,23 @@ signup_ip_limiter = SlidingWindowLimiter(
     max_attempts=50 * _IP_BUDGET_MULTIPLIER, window_seconds=3600
 )
 forgot_ip_limiter = SlidingWindowLimiter(max_attempts=5, window_seconds=60)
+# Keyed on "ip|email" (plan U7), like the login account budget: a remote
+# caller cannot use up a victim's budget from elsewhere. The per-recipient
+# mail cap (three token mails an hour, counted from the token rows) is the
+# account-wide bound behind it.
 forgot_account_limiter = SlidingWindowLimiter(max_attempts=3, window_seconds=900)
 reset_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
+# verify-email (plan U8) is session-bound, so the tight budget keys on the
+# signed-in account and never scales; the per-IP net mirrors reset-password's
+# ten a minute and scales with the other coarse IP nets, because one local
+# certification run verifies dozens of fresh accounts from one address.
+verify_ip_limiter = SlidingWindowLimiter(
+    max_attempts=10 * _IP_BUDGET_MULTIPLIER, window_seconds=60
+)
+verify_account_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=900)
+# Resend (DL9): one new link a minute per account ("Try again in a minute"),
+# on top of the per-recipient mail cap.
+resend_account_limiter = SlidingWindowLimiter(max_attempts=1, window_seconds=60)
 # Change-password is authenticated, so the budget keys on the account itself
 # (U8): 5 attempts / 15 min stops an attacker holding a stolen session from
 # brute-forcing the current password, while never troubling a real user.
@@ -69,12 +82,16 @@ change_password_account_limiter = SlidingWindowLimiter(max_attempts=5, window_se
 
 _LOGIN_LIMIT_MESSAGE = "Too many login attempts. Try again shortly."
 _RESET_LIMIT_MESSAGE = "Too many password reset attempts. Try again shortly."
+_VERIFY_LIMIT_MESSAGE = "Too many verification attempts. Try again shortly."
+_RESEND_LIMIT_MESSAGE = "Try again in a minute"
 
 
 def map_error(error: Exception) -> HTTPException:
-    if isinstance(error, AuthCodeError):
-        # Second-factor refusals the client must branch on (U10): the detail
-        # carries a machine code (`preauth-voided`, `totp-step-up-required`).
+    if isinstance(error, (AuthCodeError, VerificationError)):
+        # Refusals the client must branch on: the detail carries a machine
+        # code — second-factor (U10: `preauth-voided`,
+        # `totp-step-up-required`) and verify-email (hardening U8, DL10:
+        # `sign-in-required`, `wrong-account`, `link-invalid`).
         return HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
@@ -235,6 +252,7 @@ def me(user: dict = Depends(get_current_user)):
             else None
         ),
         mustChangePassword=user.get("must_change_password", False),
+        emailVerified=user.get("email_verified", True),
     )
 
 
@@ -271,24 +289,60 @@ def decline_offer(offer_id: str, user: dict = Depends(get_current_user)):
 
 @router.post("/forgot-password")
 def forgot_password(request: ForgotPasswordRequest, http_request: Request):
-    account_key = request.email.strip().lower()
-    forgot_ip_limiter.check(client_ip(http_request), _RESET_LIMIT_MESSAGE)
-    forgot_account_limiter.check(account_key, _RESET_LIMIT_MESSAGE)
-    link = safe_call(lambda: service.forgot_password(request.email))
-    if get_settings().is_local:
-        _last_reset_link["link"] = link
-    return {"ok": True}
+    """The neutral answer for every address (plan U7): "If an account exists
+    for this address, a reset link has been sent"."""
+    ip = client_ip(http_request)
+    forgot_ip_limiter.check(ip, _RESET_LIMIT_MESSAGE)
+    forgot_account_limiter.check(f"{ip}|{request.email.strip().lower()}", _RESET_LIMIT_MESSAGE)
+    return safe_call(lambda: service.forgot_password(request.email))
 
 
 @router.post("/reset-password")
 def reset_password(request: ResetPasswordRequest, http_request: Request):
+    """Consumes a reset link. Answers a fresh session ({token, user}) so the
+    reset page lands signed in — except for a provider account, which must
+    still pass its second factor and is sent to sign-in."""
     reset_ip_limiter.check(client_ip(http_request), _RESET_LIMIT_MESSAGE)
-    safe_call(lambda: service.reset_password(request.token, request.password))
-    return {"ok": True}
+    return safe_call(lambda: service.reset_password(request.token, request.password))
 
+
+@router.post("/verify-email")
+def verify_email(
+    request: VerifyEmailRequest,
+    http_request: Request,
+    user: dict | None = Depends(get_optional_session_user),
+):
+    """Session-bound (plan U8): 400 {code: sign-in-required | wrong-account |
+    link-invalid} unless the signed-in caller owns the live token. Never a
+    401 — a signed-out reader gets the page's sign-in state, not the client's
+    session-expired sign-out."""
+    verify_ip_limiter.check(client_ip(http_request), _VERIFY_LIMIT_MESSAGE)
+    if user is not None:
+        verify_account_limiter.check(user["id"], _VERIFY_LIMIT_MESSAGE)
+    return safe_call(lambda: service.verify_email(user, request.token))
+
+
+@router.post("/resend-verification")
+def resend_verification(user: dict = Depends(get_current_user)):
+    """A new verification link for the signed-in, unverified caller; earlier
+    links stop working. Same answer under the per-recipient cap or over it."""
+    resend_account_limiter.check(user["id"], _RESEND_LIMIT_MESSAGE)
+    return safe_call(lambda: service.resend_verification(user))
+
+
+# Local dev only (404 elsewhere): the simulated transport's last link per
+# purpose, for the email-less local flows and the e2e suite. The existing-
+# account mail carries a reset link, so it lands under last-reset-link.
 
 @router.get("/dev/last-reset-link")
 def dev_last_reset_link():
     if not get_settings().is_local:
         raise to_http_exception(NotFoundError("Not found"))
-    return {"link": _last_reset_link["link"]}
+    return {"link": service.mail.last_link("reset")}
+
+
+@router.get("/dev/last-verification-link")
+def dev_last_verification_link():
+    if not get_settings().is_local:
+        raise to_http_exception(NotFoundError("Not found"))
+    return {"link": service.mail.last_link("verify")}

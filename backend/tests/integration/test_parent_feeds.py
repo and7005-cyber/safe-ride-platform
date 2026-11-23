@@ -36,7 +36,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run
+from conftest import purge_run, signup_verified_parent
 
 # Since U4 a run cannot close with unaccounted children.
 from test_students_parents import complete_run
@@ -223,17 +223,11 @@ def throwaway_parent(client):
     lifecycles, which would truncate the 200-row responses these partition
     assertions compare (signup precedent: test_route_broadcast.py)."""
     email = f"it-u9-{uuid.uuid4().hex[:6]}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!",
-              "full_name": "IT U9 Feed Parent", "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    yield {"id": body["user"]["id"], "headers": {"Authorization": f"Bearer {body['token']}"}}
+    parent = signup_verified_parent(client, email, "ParentPass1!", "IT U9 Feed Parent")
+    yield {"id": parent["id"], "headers": parent["headers"]}
     with psycopg.connect(DB_URL, autocommit=True) as conn:
         # Notifications, roles and sessions cascade with the user row.
-        conn.execute("delete from app_users where id = %s", (body["user"]["id"],))
+        conn.execute("delete from app_users where id = %s", (parent["id"],))
 
 
 @pytest.fixture(scope="module")

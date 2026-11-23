@@ -10,6 +10,24 @@ import {
   type RunException,
 } from "@/features/admin/components/RunExceptionsPanel";
 import { TRACKING_FIELDS } from "@/features/admin/trackingFields";
+import {
+  EMAIL_VERIFIED_TOAST,
+  MAIL_OFF_FORGOT,
+  MAIL_OFF_VERIFY,
+  RESEND_COOLDOWN,
+  RESEND_LABEL,
+  RESEND_SENT,
+  RESET_LINK_INVALID_TITLE,
+  SEND_NEW_LINK,
+  SIGNUP_DONE_TITLE,
+  VERIFY_CARD_TITLE,
+  VERIFY_CARD_WRONG_ADDRESS,
+  VERIFY_LINK_INVALID_TITLE,
+  VERIFY_SIGN_IN_PROMPT,
+  WRONG_ACCOUNT_TITLE,
+  forgotSentText,
+  verifyCardText,
+} from "@/features/auth/authCopy";
 import { arrivalOfferCopy } from "@/features/driver/components/NudgeQueue";
 import { arrivalOfferPrompt } from "@/features/driver/components/nudgeStore";
 import { LOCATION_EXPLAINER, PING_PAUSED_HINT } from "@/features/driver/DriverRunPage";
@@ -336,5 +354,46 @@ describe("the guides describe live pings in the shipped words", () => {
     for (const line of ["Delivered by Kuumbai", "Confirmed by Kuumbai", "School informed"]) {
       expect(briefing).toContain(line);
     }
+  });
+});
+
+/**
+ * Hardening Release 1b (U7, U8; DL1, DL2, DL9, DL10, DL11). Sign-up no longer
+ * signs the parent in, the address is confirmed from the signed-in app, and
+ * recovery goes by email — or by the school office while email is off. The
+ * parent guide quotes the screens' own words for every one of those states.
+ */
+describe("the parent guide describes sign-up, verification and recovery in the app's words", () => {
+  it("walks through sign-up and verification from the signed-in app", () => {
+    const parent = read("parent-guide.md");
+    for (const line of [
+      SIGNUP_DONE_TITLE,
+      VERIFY_CARD_TITLE,
+      VERIFY_SIGN_IN_PROMPT,
+      EMAIL_VERIFIED_TOAST,
+      WRONG_ACCOUNT_TITLE,
+      VERIFY_LINK_INVALID_TITLE,
+      SEND_NEW_LINK,
+      RESEND_LABEL,
+      RESEND_SENT,
+      RESEND_COOLDOWN,
+      VERIFY_CARD_WRONG_ADDRESS,
+    ]) {
+      expect(parent, `parent guide never quotes "${line}"`).toContain(line);
+    }
+    // The card's sentence up to the address the app fills in.
+    expect(parent).toContain(verifyCardText("").replace(/ \.$/, ""));
+    // Sign-up used to sign the parent in on the spot; it no longer does.
+    expect(parent).not.toMatch(/signed in immediately/i);
+  });
+
+  it("states the reset link's single use and 30 minutes, and the office route when mail is off", () => {
+    const parent = read("parent-guide.md");
+    expect(forgotSentText("x")).toContain("It works once and lasts 30 minutes.");
+    expect(parent).toContain("It works once and lasts 30 minutes.");
+    expect(parent).toContain(RESET_LINK_INVALID_TITLE);
+    expect(parent).toContain(MAIL_OFF_FORGOT);
+    expect(parent).toContain(MAIL_OFF_VERIFY);
+    expect(parent).toMatch(/24 hours/);
   });
 });

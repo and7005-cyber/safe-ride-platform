@@ -19,7 +19,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_accounts, purge_run
+from conftest import purge_accounts, purge_run, signup_verified_parent
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -242,16 +242,9 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
     driver_id = driver.json()["id"]
 
     parent_email = f"it-parent-{marker}@test.local"
-    signup = client.post(
-        "/api/auth/signup",
-        json={"email": parent_email, "password": "ParentPass1!",
-              "full_name": f"IT Parent {marker}", "role": "parent"},
-    )
-    assert signup.status_code == 200, signup.text
-    parent_id = signup.json()["user"]["id"] if "user" in signup.json() else None
-    if parent_id is None:
-        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
-        parent_id = next(p["id"] for p in parents if p.get("email") == parent_email)
+    parent_id = signup_verified_parent(
+        client, parent_email, "ParentPass1!", f"IT Parent {marker}"
+    )["id"]
 
     # Linking is email-driven (R11/R12): creating a student that carries the
     # registered parent's email auto-links it — no manual link endpoint.
@@ -625,7 +618,9 @@ def test_notifications_mark_read(client, parent_headers):
 
 def test_push_config_is_public_and_secretless(client):
     config = client.get("/api/push/config").json()
-    assert set(config.keys()) == {"firebase", "firebaseVapidKey", "vapidPublicKey"}
+    # mailEnabled (hardening DL1): the global mail-availability flag, a boolean.
+    assert set(config.keys()) == {"firebase", "firebaseVapidKey", "vapidPublicKey", "mailEnabled"}
+    assert isinstance(config["mailEnabled"], bool)
 
 
 def test_fcm_token_register_and_unregister(client, parent_headers):

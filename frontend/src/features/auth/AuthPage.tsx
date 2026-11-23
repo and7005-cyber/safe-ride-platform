@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Bus, KeyRound } from "lucide-react";
+import { Bus, KeyRound, MailCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -15,7 +15,19 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
 import { useAuth, type Role } from "@/lib/auth";
+import { useMailEnabled } from "@/lib/publicConfig";
 import { TotpChallengePage } from "@/features/auth/TotpChallengePage";
+import {
+  FORGOT_SENT_TITLE,
+  MAIL_OFF_FORGOT,
+  MAIL_OFF_FORGOT_TITLE,
+  MAIL_OFF_SIGNUP,
+  SIGNUP_DONE_MAIL_OFF_TITLE,
+  SIGNUP_DONE_NOTE,
+  SIGNUP_DONE_TITLE,
+  forgotSentText,
+  signupDoneText,
+} from "@/features/auth/authCopy";
 
 function homeFor(role: Role | null): string {
   // Staff access now comes from memberships, which the login response does
@@ -26,11 +38,54 @@ function homeFor(role: Role | null): string {
   return "/";
 }
 
+/** The persistent in-card end state of sign-up (DL2) and forgot password
+ * (DL11): the words stay on screen while the parent goes to their inbox.
+ * `role="status"` announces it once it replaces the form. */
+export function AuthNotice({
+  title,
+  text,
+  note,
+  actionLabel,
+  onAction,
+  testId,
+}: {
+  title: string;
+  text: string;
+  note?: string;
+  actionLabel: string;
+  onAction: () => void;
+  testId: string;
+}) {
+  return (
+    <div className="space-y-4" role="status" data-testid={testId}>
+      <div className="flex items-start gap-3">
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+          <MailCheck className="h-5 w-5" aria-hidden="true" />
+        </span>
+        <div className="space-y-1">
+          <p className="font-heading text-base font-semibold">{title}</p>
+          <p className="text-sm text-muted-foreground">{text}</p>
+          {note && <p className="text-xs text-muted-foreground">{note}</p>}
+        </div>
+      </div>
+      <Button type="button" className="w-full" onClick={onAction}>
+        {actionLabel}
+      </Button>
+    </div>
+  );
+}
+
 export function AuthPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const { signIn } = useAuth();
   const { toast } = useToast();
+  // DL1: whether a mail really goes out. null while the config loads.
+  const mailEnabled = useMailEnabled();
+  // DL2 / DL11: the address the sign-up or the reset request was made for,
+  // once it was answered — the card then shows its end state, not the form.
+  const [signupDoneFor, setSignupDoneFor] = useState<string | null>(null);
+  const [forgotSentFor, setForgotSentFor] = useState<string | null>(null);
 
   const [isLogin, setIsLogin] = useState(true);
   const [showForgot, setShowForgot] = useState(params.get("forgot") === "1");
@@ -55,6 +110,7 @@ export function AuthPage() {
       fullName?: string | null;
       role?: Role | null;
       mustChangePassword?: boolean;
+      emailVerified?: boolean;
     },
   ) => {
     const resolved: Role | null = user.role ?? null;
@@ -66,6 +122,7 @@ export function AuthPage() {
       // Respected immediately (R30): the change screen renders off the login
       // response, before /me — nothing else would answer anyway.
       mustChangePassword: Boolean(user.mustChangePassword),
+      emailVerified: user.emailVerified,
     });
     navigate(homeFor(resolved));
   };
@@ -105,13 +162,12 @@ export function AuthPage() {
     try {
       // Parent is the ONLY self-service role (U13): staff join through their
       // school's offers and drivers are set up by the school office.
+      // Release 1b: no session either way (a new address and an existing one
+      // get the same answer); the card ends on "check your email" and the
+      // parent signs in with the password just chosen (DL2).
       await api.post("/api/auth/signup", { email, password, fullName, role: "parent" });
-      toast({
-        title: "Account created!",
-        description: "Please check your email to verify your account.",
-      });
-      const res = await api.post("/api/auth/login", { email, password });
-      finishAuth(res.token, res.user);
+      setSignupDoneFor(email.trim());
+      setPassword("");
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
@@ -141,8 +197,8 @@ export function AuthPage() {
     setLoading(true);
     try {
       await api.post("/api/auth/forgot-password", { email });
-      toast({ title: "Reset link sent", description: "Check your email for a password reset link." });
-      setShowForgot(false);
+      // DL11: a persistent in-card state, never a vanishing toast.
+      setForgotSentFor(email.trim());
     } catch (err) {
       toast({
         title: "Error",
@@ -189,14 +245,49 @@ export function AuthPage() {
             </CardTitle>
             <CardDescription>
               {showForgot
-                ? "Enter your email to receive a reset link"
+                ? mailEnabled === false
+                  ? "Your school office can help"
+                  : "Enter your email to receive a reset link"
                 : isLogin
                   ? "Sign in to your account"
                   : "Parent sign-up for SafeRide"}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {showForgot ? (
+            {showForgot && forgotSentFor ? (
+              <AuthNotice
+                testId="forgot-sent"
+                title={mailEnabled ? FORGOT_SENT_TITLE : MAIL_OFF_FORGOT_TITLE}
+                text={mailEnabled ? forgotSentText(forgotSentFor) : MAIL_OFF_FORGOT}
+                actionLabel="Back to sign in"
+                onAction={() => {
+                  setForgotSentFor(null);
+                  setShowForgot(false);
+                }}
+              />
+            ) : showForgot && mailEnabled === false ? (
+              <AuthNotice
+                testId="forgot-mail-off"
+                title={MAIL_OFF_FORGOT_TITLE}
+                text={MAIL_OFF_FORGOT}
+                actionLabel="Back to sign in"
+                onAction={() => setShowForgot(false)}
+              />
+            ) : !showForgot && !isLogin && signupDoneFor ? (
+              <AuthNotice
+                testId="signup-done"
+                title={mailEnabled ? SIGNUP_DONE_TITLE : SIGNUP_DONE_MAIL_OFF_TITLE}
+                text={mailEnabled ? signupDoneText(signupDoneFor) : MAIL_OFF_SIGNUP}
+                note={mailEnabled ? SIGNUP_DONE_NOTE : undefined}
+                actionLabel="Sign in"
+                onAction={() => {
+                  // The email stays prefilled; the password is typed again.
+                  setEmail(signupDoneFor);
+                  setSignupDoneFor(null);
+                  setIsLogin(true);
+                }}
+              />
+            ) : showForgot ? (
               <form onSubmit={handleForgot} className="space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="email">Email</Label>
@@ -297,7 +388,7 @@ export function AuthPage() {
         </Card>
         )}
 
-        {!showForgot && !preauth && (
+        {!showForgot && !preauth && !signupDoneFor && (
           <p className="text-center text-sm text-muted-foreground">
             {isLogin ? "New parent here? " : "Already have an account? "}
             <button type="button" className="text-primary font-medium hover:underline" onClick={() => setIsLogin(!isLogin)}>

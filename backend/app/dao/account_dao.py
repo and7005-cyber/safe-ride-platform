@@ -5,6 +5,7 @@ from app.core.errors import ConflictError, NotFoundError
 from app.core.scope import ParentScope, SchoolScope
 from app.dao.audit_dao import record_audit
 from app.dao.student_live_dao import _ConnParentLinks, link_account_to_matching_students
+from app.dao.verification_sql import verified_sql
 
 # Neutral wording for a shared parent (R33): names no other school, discloses
 # nothing beyond "shared" — which the school already knows from its own card.
@@ -35,6 +36,51 @@ def _assert_parent_editable_here(conn, parent_id: str, school_id: str) -> None:
     ).fetchone()
     if elsewhere:
         raise ConflictError(PARENT_SHARED_MESSAGE)
+
+
+def _restart_verification(
+    conn, user_id, verify_token_hash: str | None, verify_ttl_minutes: int
+) -> dict[str, int]:
+    """An office email change (execution decisions, Release 1b): the new
+    address is unproven, so the account is unverified again (D1: required
+    true, verified_at null) and everything bound to the old address ends —
+    every emailed token (both purposes), pre-auth tokens, every session and
+    every push registration. One fresh verification token is written for the
+    new address. Links are left in place. Returns counts for the audit row
+    (never addresses)."""
+    conn.execute(
+        "update app_users set email_verification_required = true, "
+        "email_verified_at = null where id = %s",
+        (user_id,),
+    )
+    tokens = conn.execute(
+        "update password_reset_tokens set used_at = now() "
+        "where user_id = %s and used_at is null",
+        (user_id,),
+    ).rowcount
+    conn.execute("delete from auth_preauth_tokens where user_id = %s", (user_id,))
+    sessions = conn.execute(
+        "update auth_sessions set revoked_at = now() "
+        "where user_id = %s and revoked_at is null",
+        (user_id,),
+    ).rowcount
+    push = conn.execute(
+        "delete from live_push_subscriptions where user_id = %s", (user_id,)
+    ).rowcount
+    push += conn.execute("delete from live_fcm_tokens where user_id = %s", (user_id,)).rowcount
+    if verify_token_hash:
+        conn.execute(
+            """
+            insert into password_reset_tokens (user_id, token_hash, purpose, expires_at)
+            values (%s, %s, 'verify', now() + make_interval(mins => %s))
+            """,
+            (user_id, verify_token_hash, verify_ttl_minutes),
+        )
+    return {
+        "tokens_voided": tokens or 0,
+        "sessions_revoked": sessions or 0,
+        "push_registrations_removed": push or 0,
+    }
 
 
 class AccountDao:
@@ -209,8 +255,11 @@ class AccountDao:
             # Pending parents: an email in either parent slot of THIS school's
             # students with no matching account (R11 — Parent 2 shows up as
             # pending too). Slot email only, no account name/phone to leak.
+            # An account still waiting for its verification click does not
+            # count as a match (hardening U8): its slot keeps reading
+            # "Awaiting signup" until the owner verifies.
             pending = conn.execute(
-                """
+                f"""
                 with slots as (
                     select parent_email as email, parent_name as pname, name
                     from live_students
@@ -221,11 +270,12 @@ class AccountDao:
                     where parent2_email is not null and school_id = %s
                 )
                 select email as parent_email, pname as parent_name,
-                       coalesce(array_agg(name) filter (where name is not null), '{}') as students
+                       coalesce(array_agg(name) filter (where name is not null), '{{}}') as students
                 from slots
                 where lower(email) not in (
-                        select lower(email) from app_users u
+                        select lower(u.email) from app_users u
                         join app_user_roles r on r.user_id = u.id and r.role = 'parent'
+                        where {verified_sql("u")}
                     )
                 group by email, pname
                 order by pname asc
@@ -246,10 +296,21 @@ class AccountDao:
         return result
 
     def update_parent(
-        self, scope: SchoolScope, parent_id, full_name, email, phone, *, actor: dict
+        self, scope: SchoolScope, parent_id, full_name, email, phone, *, actor: dict,
+        verify_token_hash: str | None = None, verify_ttl_minutes: int = 24 * 60,
     ) -> dict[str, Any]:
+        """The office's edit of a parent account. A changed email address
+        (case-insensitively) restarts verification in the same transaction
+        (hardening Release 1b): see ``_restart_verification``. Returns the
+        row plus ``email_changed`` and ``previous_email`` — internal fields
+        the service strips after sending the two mails."""
         with get_connection(scope) as conn:
             _assert_parent_editable_here(conn, parent_id, scope.school_id)
+            before = conn.execute(
+                "select email from app_users where id = %s for update", (parent_id,)
+            ).fetchone()
+            if not before:
+                raise NotFoundError("Parent not found")
             row = conn.execute(
                 "update app_users set full_name=%s, email=%s, phone=%s where id=%s "
                 "returning id, full_name, email, phone",
@@ -261,7 +322,22 @@ class AccountDao:
                 conn, action="parent-updated", actor=actor, scope=scope,
                 resource_type="parent", resource_id=parent_id, detail={},
             )
-        return dict(row)
+            email_changed = (
+                str(before["email"]).strip().lower() != str(row["email"]).strip().lower()
+            )
+            if email_changed:
+                counts = _restart_verification(
+                    conn, parent_id, verify_token_hash, verify_ttl_minutes
+                )
+                record_audit(
+                    conn, action="parent-email-changed", actor=actor, scope=scope,
+                    resource_type="parent", resource_id=parent_id, detail=counts,
+                )
+        return {
+            **dict(row),
+            "email_changed": email_changed,
+            "previous_email": before["email"] if email_changed else None,
+        }
 
     def delete_parent(self, scope: SchoolScope, parent_id: str, *, actor: dict) -> None:
         with get_connection(scope) as conn:
@@ -287,7 +363,9 @@ class AccountDao:
     def link_parent_to_matching_students(self, parent_id, email: str) -> int:
         """Link a (new) parent account to every student carrying its email in
         either parent slot (R11/R31), honouring the per-student link cap.
-        Returns the number of links created.
+        Returns the number of links created. Since Release 1b this runs when
+        a new account VERIFIES its address (verify-email, or an emailed reset
+        that verifies it), never at sign-up, and refuses an unverified one.
 
         Matching reads through migration 013's SECURITY DEFINER
         ``parent_signup_matches`` — the platform-wide scan has no scope of its
@@ -298,17 +376,18 @@ class AccountDao:
         ``ParentScope`` of the matched schools, passed explicitly to
         ``get_connection`` so the writes pass the database backstop.
 
-        Signup emails are self-asserted and unverified, so every school with
-        created links also gets an admin-visible incident (school-stamped, no
-        bus/student stamp, so it never reaches a parent feed): the office
-        knows its families and can catch an email claimed by the wrong person
-        before it matters.
+        A verified address proves the inbox, not the parenthood, so every
+        school with created links also gets an admin-visible incident
+        (school-stamped, no bus/student stamp, so it never reaches a parent
+        feed): the office knows its families and can catch an email claimed
+        by the wrong person before it matters.
         """
         with get_global_connection() as conn:
             eligible = conn.execute(
-                """
+                f"""
                 select 1 from app_users u
                 where u.id = %s and u.disabled_at is null
+                  and {verified_sql("u")}
                   and not exists (select 1 from provider_accounts p
                                   where p.user_id = u.id and p.removed_at is null)
                 """,
@@ -316,7 +395,8 @@ class AccountDao:
             ).fetchone()
             if not eligible:
                 # U8 hygiene: a provider or disabled identity is never linked
-                # as a parent, even if its email lands in a student slot.
+                # as a parent, even if its email lands in a student slot — nor
+                # (hardening U8) an account whose address is not verified yet.
                 return 0
             matches = _ConnParentLinks(conn).signup_matches(email)
         if not matches:

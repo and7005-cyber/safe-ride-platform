@@ -28,6 +28,11 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/auth/offers/{offer_id}/accept"): "auth",
     ("POST", "/api/auth/offers/{offer_id}/decline"): "auth",
     ("GET", "/api/auth/dev/last-reset-link"): "auth",
+    # Release 1b (hardening U7/U8): session-bound verification, the signed-in
+    # resend, and the local-only last verification link (404 outside local).
+    ("POST", "/api/auth/verify-email"): "auth",
+    ("POST", "/api/auth/resend-verification"): "auth",
+    ("GET", "/api/auth/dev/last-verification-link"): "auth",
     ("GET", "/api/fleet/buses"): "school-scoped",
     ("POST", "/api/fleet/buses"): "school-scoped",
     ("PUT", "/api/fleet/buses/{bus_id}"): "school-scoped",

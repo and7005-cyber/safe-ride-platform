@@ -122,14 +122,20 @@ class Settings(BaseSettings):
     # Transactional email through SES (hardening plan U4 wires them; the
     # Release 1b sender reads them). Mirrored as parameters + API env in
     # infra/backend/template.yaml under the live-parity rule
-    # (tests/core/test_mail_settings.py keeps them in step). mail_enabled stays
-    # False until the sender ships.
+    # (tests/core/test_mail_settings.py keeps them in step). MAIL_ENABLED is
+    # the operator's switch (false until SES production access is granted);
+    # app.services.mail_service sends through SES only when it is true AND the
+    # app is not local — the local stack always uses the simulated transport.
     mail_from_address: str = Field(default="no-reply@saferidelive.co.ke", alias="MAIL_FROM_ADDRESS")
     mail_reply_to: str = Field(default="", alias="MAIL_REPLY_TO")
     mail_configuration_set: str = Field(
         default="saferide-transactional", alias="MAIL_CONFIGURATION_SET"
     )
     mail_enabled: bool = Field(default=False, alias="MAIL_ENABLED")
+    # The region the API runs in, for the SES v2 client (the identity and the
+    # configuration set live beside the function). Lambda sets AWS_REGION on
+    # every function; the default is the production backend region.
+    backend_region: str = Field(default="af-south-1", alias="AWS_REGION")
     # Maps provider for geocoding + route optimisation (#4, #9). When neither
     # key is set the app falls back to free OSM Nominatim geocoding and an
     # offline nearest-neighbour optimiser.
@@ -197,6 +203,20 @@ class Settings(BaseSettings):
     @property
     def is_local(self) -> bool:
         return self.app_env.lower() == "local"
+
+    @property
+    def mail_via_ses(self) -> bool:
+        """Real sends: the operator switched mail on, and this is not the
+        local stack (which never mails a real inbox)."""
+        return self.mail_enabled and not self.is_local
+
+    @property
+    def mail_available(self) -> bool:
+        """The public ``mailEnabled`` flag (DL1): true when a mail really goes
+        out (SES), and on the local stack, where the simulated transport
+        records every link for the dev routes so the mail-on screens and the
+        e2e flows can be exercised. Global, never per account."""
+        return self.mail_via_ses or self.is_local
 
 
 @lru_cache

@@ -175,6 +175,84 @@ def purge_accounts(*user_ids: str | None) -> None:
         pg.execute("delete from app_users where id = any(%s::uuid[])", (ids,))
 
 
+# --- Parent sign-up after Release 1b (hardening U7/U8) ------------------------
+# Sign-up answers no session and links nothing until the new account verifies
+# its address from a signed-in session. Suites that need a parent who can see
+# their children go through the whole product path: sign up, sign in, read the
+# link the local simulated transport recorded (the dev route), verify.
+
+
+def verification_token_from(client) -> str:
+    """The token in the last verification link the simulated transport
+    recorded (GET /api/auth/dev/last-verification-link, local only)."""
+    from urllib.parse import parse_qs, urlparse
+
+    response = client.get("/api/auth/dev/last-verification-link")
+    assert response.status_code == 200, response.text
+    link = response.json()["link"]
+    assert link, "no verification link recorded"
+    return parse_qs(urlparse(link).query)["token"][0]
+
+
+def reset_token_from(client) -> str:
+    """The token in the last reset link recorded (forgot-password and the
+    existing-account mail both carry one)."""
+    from urllib.parse import parse_qs, urlparse
+
+    response = client.get("/api/auth/dev/last-reset-link")
+    assert response.status_code == 200, response.text
+    link = response.json()["link"]
+    assert link, "no reset link recorded"
+    return parse_qs(urlparse(link).query)["token"][0]
+
+
+def signup_unverified_parent(client, email: str, password: str, full_name: str) -> dict:
+    """A fresh parent account exactly as sign-up leaves it: unverified, no
+    links. Signs in (sign-up itself issues no session) and returns
+    ``{id, email, token, headers, verify_token}``."""
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": email, "password": password, "full_name": full_name, "role": "parent"},
+    )
+    assert response.status_code == 200, response.text
+    assert "token" not in response.json()
+    verify_token = verification_token_from(client)
+    login_resp = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert login_resp.status_code == 200, login_resp.text
+    body = login_resp.json()
+    return {
+        "id": str(body["user"]["id"]),
+        "email": email,
+        "token": body["token"],
+        "headers": {"Authorization": f"Bearer {body['token']}"},
+        "verify_token": verify_token,
+    }
+
+
+def verify_parent(client, parent: dict) -> None:
+    """Verify from the owner's own session — the session-bound rule."""
+    if hasattr(client, "app"):
+        # In-process TestClient: the auth limiters are module-global and the
+        # suite verifies many accounts from one address within a minute.
+        from app.api import auth as auth_api
+
+        auth_api.verify_ip_limiter.reset()
+    response = client.post(
+        "/api/auth/verify-email", json={"token": parent["verify_token"]},
+        headers=parent["headers"],
+    )
+    assert response.status_code == 200, response.text
+
+
+def signup_verified_parent(client, email: str, password: str, full_name: str) -> dict:
+    """Sign up, sign in and verify: the parent the pre-1b suites relied on
+    (sign-up used to link at once). Linking and the office incident run at
+    verification. Returns ``{id, email, token, headers}``."""
+    parent = signup_unverified_parent(client, email, password, full_name)
+    verify_parent(client, parent)
+    return parent
+
+
 SANDBOX_PASSWORD = "SandboxPass1!"
 
 

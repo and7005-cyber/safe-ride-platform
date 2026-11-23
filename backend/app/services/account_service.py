@@ -1,9 +1,21 @@
 from app.core.config import get_settings
 from app.core.errors import BadRequestError, ConflictError
 from app.core.scope import SchoolScope
-from app.core.security import hash_password, hash_pin_hmac
+from app.core.security import (
+    create_session_token,
+    hash_password,
+    hash_pin_hmac,
+    hash_session_token,
+)
 from app.core.validation import clean_email, clean_phone
 from app.dao.account_dao import AccountDao
+from app.services.mail_service import (
+    VERIFY_TTL_MINUTES,
+    MailService,
+    email_changed_notice,
+    get_mail_service,
+    verification_mail,
+)
 
 # One neutral wording for every email collision (R34's sibling rule): the
 # address may exist at another school, as a parent, or as a provider — the
@@ -23,9 +35,16 @@ def _map_unique_violation(exc: Exception) -> Exception:
 
 
 class AccountService:
-    def __init__(self, dao: AccountDao | None = None) -> None:
+    def __init__(self, dao: AccountDao | None = None, mail: MailService | None = None) -> None:
         self.dao = dao or AccountDao()
+        self._mail = mail
         self.pepper = get_settings().pin_pepper
+
+    @property
+    def mail(self) -> MailService:
+        if self._mail is None:
+            self._mail = get_mail_service()
+        return self._mail
 
     def list_drivers(self, scope: SchoolScope):
         return self.dao.list_drivers(scope)
@@ -68,14 +87,29 @@ class AccountService:
         return self.dao.list_parents(scope)
 
     def update_parent(self, scope: SchoolScope, parent_id, full_name, email, phone, *, actor: dict):
+        """A changed email restarts verification (hardening Release 1b): the
+        DAO voids the old address's tokens, sessions and push registrations
+        and writes a verification token in the same transaction; after the
+        commit the verification mail goes to the NEW address and a neutral
+        notice to the OLD one. Staff-initiated and audited, so the public
+        endpoints' per-recipient cap does not apply."""
         email = clean_email(email, required=True)
         phone = clean_phone(phone, field="parent phone")
+        raw = create_session_token()
         try:
-            return self.dao.update_parent(
-                scope, parent_id, full_name, email, phone, actor=actor
+            row = self.dao.update_parent(
+                scope, parent_id, full_name, email, phone, actor=actor,
+                verify_token_hash=hash_session_token(raw),
+                verify_ttl_minutes=VERIFY_TTL_MINUTES,
             )
         except Exception as exc:
             raise _map_unique_violation(exc) from exc
+        previous = row.pop("previous_email", None)
+        if row.pop("email_changed", False):
+            self.mail.send(verification_mail(row["email"], raw))
+            if previous:
+                self.mail.send(email_changed_notice(previous))
+        return row
 
     def delete_parent(self, scope: SchoolScope, parent_id, *, actor: dict):
         self.dao.delete_parent(scope, parent_id, actor=actor)

@@ -38,6 +38,13 @@ class ResetPasswordRequest(_CamelModel):
     password: str = Field(min_length=6, max_length=72)
 
 
+class VerifyEmailRequest(_CamelModel):
+    """The token from the verification link (plan U8). Session-bound: the
+    route also requires the signed-in owner of the token."""
+
+    token: str = Field(min_length=1, max_length=256)
+
+
 class ChangePasswordRequest(_CamelModel):
     current_password: str = Field(alias="currentPassword")
     # Same 6–72 rule as every other password field (signup/reset).
@@ -50,6 +57,7 @@ class AuthUser(_CamelModel):
     full_name: str | None = Field(default=None, alias="fullName")
     role: str | None = None
     must_change_password: bool = Field(default=False, alias="mustChangePassword")
+    email_verified: bool = Field(default=True, alias="emailVerified")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -117,3 +125,7 @@ class MeResponse(_CamelModel):
         default=None, alias="supportSession"
     )
     must_change_password: bool = Field(default=False, alias="mustChangePassword")
+    # Release 1b (D1): false while a new sign-up (or an account whose email
+    # the office changed) waits for its verification click. Grandfathered
+    # accounts, made before 1b, always read true.
+    email_verified: bool = Field(default=True, alias="emailVerified")

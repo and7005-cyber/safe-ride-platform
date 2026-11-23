@@ -17,6 +17,7 @@ import {
   pickSelectOption,
   purgeRun,
   schoolHeaders,
+  signUpVerifiedParent,
   uniqueName,
 } from "./helpers";
 
@@ -453,10 +454,9 @@ test("admin can edit and delete a registered parent account", async ({ page, req
   const email = `e2e-parent-acct-${Date.now()}@test.local`;
   const fullName = uniqueName("E2E ParentAcct");
   const renamed = `${fullName} Edited`;
-  const signup = await request.post(`${API_URL}/api/auth/signup`, {
-    data: { email, password: "ParentPass1!", full_name: fullName, role: "parent" },
-  });
-  expect(signup.ok()).toBeTruthy();
+  // Verified (Release 1b): an unverified sign-up is never linked to a
+  // student, so the Parents page would keep showing it as Awaiting signup.
+  await signUpVerifiedParent(request, { email, password: "ParentPass1!", fullName });
 
   // U6/R33: the Parents page lists only parents linked to THIS school's
   // students — an unlinked signup is invisible here. Stage a student carrying
@@ -501,10 +501,11 @@ test("creating a student with a registered parent's email links it to that paren
 
   const parentEmail = `e2e-assign-${Date.now()}@test.local`;
   const parentName = uniqueName("E2E AssignParent");
-  const signup = await request.post(`${API_URL}/api/auth/signup`, {
-    data: { email: parentEmail, password: "ParentPass1!", full_name: parentName, role: "parent" },
+  await signUpVerifiedParent(request, {
+    email: parentEmail,
+    password: "ParentPass1!",
+    fullName: parentName,
   });
-  expect(signup.ok()).toBeTruthy();
 
   const studentName = uniqueName("E2E AssignKid");
   try {

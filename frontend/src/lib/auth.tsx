@@ -81,6 +81,10 @@ export interface AuthUser {
   /** The session's live step-in (providers only, U13); null otherwise. */
   supportSession: SupportSession | null;
   mustChangePassword: boolean;
+  /** False only while the account waits for its verification click
+   * (hardening Release 1b): a new sign-up, or an account whose email the
+   * office changed. Accounts made before 1b always read true. */
+  emailVerified: boolean;
   /** False until the first /me answered — a fresh login knows only the login
    * response's fields, and ProtectedRoute must not judge memberships yet. */
   hydrated: boolean;
@@ -165,6 +169,8 @@ function mapMe(me: any): AuthUser {
         }
       : null,
     mustChangePassword: Boolean(me.mustChangePassword),
+    // An older API without the field: treat as verified (no verify card).
+    emailVerified: me.emailVerified !== false,
     hydrated: true,
   };
 }
@@ -211,6 +217,7 @@ interface AuthContextValue {
       fullName?: string | null;
       role?: Role | null;
       mustChangePassword?: boolean;
+      emailVerified?: boolean;
     },
   ) => void;
   signOut: () => Promise<void>;
@@ -260,10 +267,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         provider: null,
         supportSession: null,
         mustChangePassword: Boolean(nextUser.mustChangePassword),
+        // The login response carries it (Release 1b), so Home shows the
+        // verify card from the first frame instead of the empty state.
+        emailVerified: nextUser.emailVerified !== false,
         hydrated: false,
       });
       setLoading(false);
       void refresh();
+      // A reset deleted this account's push registrations; a browser that
+      // still holds its subscription re-attaches it now (hardening U7).
+      void import("@/lib/push")
+        .then(({ reattachPushSubscription }) => reattachPushSubscription())
+        .catch(() => {});
     },
     [refresh],
   );

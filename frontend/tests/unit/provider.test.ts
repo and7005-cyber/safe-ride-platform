@@ -114,6 +114,7 @@ function makeUser(overrides: Partial<AuthUser> = {}): AuthUser {
     provider: null,
     supportSession: null,
     mustChangePassword: false,
+    emailVerified: true,
     hydrated: true,
     ...overrides,
   };

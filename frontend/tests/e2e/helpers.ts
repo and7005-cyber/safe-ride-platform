@@ -174,6 +174,61 @@ export function authHeaders(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
+/** The last link the local simulated mail transport recorded for a purpose
+ * (hardening U7): `/api/auth/dev/last-verification-link` or
+ * `/api/auth/dev/last-reset-link`, both 404 outside the local stack. */
+export async function lastMailLink(
+  request: APIRequestContext,
+  purpose: "verification" | "reset",
+): Promise<string> {
+  const response = await request.get(`${API_URL}/api/auth/dev/last-${purpose}-link`);
+  expect(response.ok()).toBeTruthy();
+  const { link } = await response.json();
+  expect(link).toBeTruthy();
+  return link as string;
+}
+
+/** The app-relative path of an emailed link (the mail is built from
+ * APP_BASE_URL; the spec navigates within its own base URL). */
+export function linkPath(link: string): string {
+  return link.replace(/^https?:\/\/[^/]+/, "");
+}
+
+/**
+ * A fresh parent who can see their children (Release 1b): sign up, sign in,
+ * and verify from that session with the link the simulated transport
+ * recorded. Sign-up alone answers no session and links nothing — the linking
+ * rule and the office incident run at verification. Returns the session.
+ */
+export async function signUpVerifiedParent(
+  request: APIRequestContext,
+  account: { email: string; password: string; fullName: string },
+): Promise<{ token: string; id: string }> {
+  const signup = await request.post(`${API_URL}/api/auth/signup`, {
+    data: {
+      email: account.email,
+      password: account.password,
+      full_name: account.fullName,
+      role: "parent",
+    },
+  });
+  expect(signup.ok()).toBeTruthy();
+  expect((await signup.json()).token).toBeUndefined();
+  const link = await lastMailLink(request, "verification");
+  const verifyToken = new URL(link).searchParams.get("token");
+  const login = await request.post(`${API_URL}/api/auth/login`, {
+    data: { email: account.email, password: account.password },
+  });
+  expect(login.ok()).toBeTruthy();
+  const body = await login.json();
+  const verified = await request.post(`${API_URL}/api/auth/verify-email`, {
+    headers: authHeaders(body.token),
+    data: { token: verifyToken },
+  });
+  expect(verified.ok()).toBeTruthy();
+  return { token: body.token as string, id: String(body.user.id) };
+}
+
 /** Staff-surface API calls carry the school scope explicitly (U12): with more
  * than one membership the server refuses to guess, so fixture/setup requests
  * name their school the same way the app does. */

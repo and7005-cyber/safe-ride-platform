@@ -37,7 +37,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox
+from conftest import purge_accounts, purge_run, school_sandbox, signup_verified_parent
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -105,20 +105,15 @@ def absence_dao():
 
 
 def signup_parent(client, marker: str, tag: str) -> dict:
-    """A fresh parent account; fresh email per run = fresh limiter budget."""
+    """A fresh, verified parent account (Release 1b: sign-up, sign-in and the
+    session-bound verification); fresh email per run = fresh limiter budget."""
     email = f"it-cr-{tag}-{marker}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!",
-              "full_name": f"IT CR {tag} {marker}", "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
+    parent = signup_verified_parent(client, email, "ParentPass1!", f"IT CR {tag} {marker}")
     return {
-        "id": body["user"]["id"],
+        "id": parent["id"],
         "email": email,
         "name": f"IT CR {tag} {marker}",
-        "headers": {"Authorization": f"Bearer {body['token']}"},
+        "headers": parent["headers"],
     }
 
 

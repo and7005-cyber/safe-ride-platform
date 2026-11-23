@@ -179,7 +179,9 @@ def test_scoped_responses_are_uncacheable_and_header_variant(client):
     login = client.post(
         "/api/auth/login", json={"email": COORDINATOR_A, "password": TEST_PASSWORD}
     )
-    assert login.headers.get("Cache-Control") != "no-store"  # unscoped route
+    # Hardening U11 made no-store universal (every API response); what stays
+    # scoped-only is the Vary on the school header.
+    assert "X-School-Id" not in login.headers.get("Vary", "")  # unscoped route
 
 
 # --- role limits (AE2) -------------------------------------------------------

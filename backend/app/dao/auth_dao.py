@@ -2,16 +2,24 @@ from typing import Any
 
 from app.core.db import get_connection, get_global_connection
 from app.dao.audit_dao import masked_display_sql
+from app.dao.verification_sql import verified_sql
+
+# Token purposes on password_reset_tokens (migration 017): consumption is
+# purpose-scoped, so a verification token can never reset a password and a
+# reset token never verifies an address.
+TOKEN_PURPOSES = ("reset", "verify")
 
 
 class AuthDao:
     def get_user_by_email(self, email: str) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 select u.id, u.email, u.password_hash, u.full_name, u.phone,
                        u.pin_hash, u.must_change_password,
-                       u.temporary_password_expires_at, u.disabled_at, r.role
+                       u.temporary_password_expires_at, u.disabled_at, r.role,
+                       u.email_verification_required, u.email_verified_at,
+                       {verified_sql("u")} as email_verified
                 from app_users u
                 left join app_user_roles r on r.user_id = u.id
                 where lower(u.email) = lower(%s)
@@ -23,8 +31,13 @@ class AuthDao:
     def get_user_by_id(self, user_id: str) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(
-                """
-                select u.id, u.email, u.full_name, u.phone, r.role
+                f"""
+                select u.id, u.email, u.full_name, u.phone, r.role,
+                       u.must_change_password,
+                       {verified_sql("u")} as email_verified,
+                       exists (select 1 from provider_accounts p
+                               where p.user_id = u.id and p.removed_at is null
+                       ) as is_provider
                 from app_users u
                 left join app_user_roles r on r.user_id = u.id
                 where u.id = %s
@@ -46,21 +59,39 @@ class AuthDao:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def create_user(
-        self, email: str, password_hash: str, full_name: str, role: str, phone: str | None = None
+    def create_unverified_parent(
+        self,
+        email: str,
+        password_hash: str,
+        full_name: str,
+        verify_token_hash: str,
+        verify_ttl_minutes: int,
     ) -> dict[str, Any]:
-        with get_connection() as conn:
+        """Release 1b sign-up (U8): the account, its parent role and its
+        verification token in ONE transaction. The account starts unverified
+        (``email_verification_required`` true, ``email_verified_at`` null —
+        D1): it links nothing, raises no office incident and stays off the
+        Parents page until its owner verifies from a signed-in session."""
+        with get_global_connection() as conn:
             row = conn.execute(
                 """
-                insert into app_users (email, password_hash, full_name, phone)
-                values (%s, %s, %s, %s)
+                insert into app_users
+                    (email, password_hash, full_name, email_verification_required)
+                values (%s, %s, %s, true)
                 returning id, email, full_name
                 """,
-                (email, password_hash, full_name, phone),
+                (email, password_hash, full_name),
             ).fetchone()
             conn.execute(
-                "insert into app_user_roles (user_id, role) values (%s, %s)",
-                (row["id"], role),
+                "insert into app_user_roles (user_id, role) values (%s, 'parent')",
+                (row["id"],),
+            )
+            conn.execute(
+                """
+                insert into password_reset_tokens (user_id, token_hash, purpose, expires_at)
+                values (%s, %s, 'verify', now() + make_interval(mins => %s))
+                """,
+                (row["id"], verify_token_hash, verify_ttl_minutes),
             )
         return dict(row)
 
@@ -88,6 +119,7 @@ class AuthDao:
                 f"""
                 select s.id as session_id, s.last_school_id, s.totp_verified_at,
                        u.id, u.email, u.full_name, u.phone, u.must_change_password,
+                       {verified_sql("u")} as email_verified,
                        r.role,
                        (select coalesce(jsonb_agg(jsonb_build_object(
                                 'id', m.id::text,
@@ -265,21 +297,66 @@ class AuthDao:
                 (session_id,),
             )
 
-    def create_reset_token(self, user_id: str, token_hash: str, ttl_minutes: int = 60) -> None:
-        with get_connection() as conn:
+    # --- emailed tokens: reset (30 min) and verify (24 h) — U7 ---------------
+
+    def create_reset_token(
+        self,
+        user_id: str,
+        token_hash: str,
+        purpose: str = "reset",
+        ttl_minutes: int = 30,
+        *,
+        cap_per_hour: int | None = None,
+        void_earlier: bool = False,
+    ) -> bool:
+        """Write one token row; returns whether it was written.
+
+        ``cap_per_hour`` is the per-recipient mail cap: the account's row is
+        locked first (concurrent requests for one account queue here), then
+        the rows of BOTH purposes created in the last hour are counted, and
+        at or over the cap nothing is written. ``void_earlier`` (the
+        verification resend) marks every earlier unused token of the same
+        purpose used, in the same transaction, so only the newest link works.
+        """
+        if purpose not in TOKEN_PURPOSES:
+            raise ValueError(f"unknown token purpose {purpose!r}")
+        with get_global_connection() as conn:
+            if cap_per_hour is not None:
+                conn.execute(
+                    "select 1 from app_users where id = %s for update", (user_id,)
+                ).fetchone()
+                recent = conn.execute(
+                    "select count(*) as n from password_reset_tokens "
+                    "where user_id = %s and created_at > now() - interval '1 hour'",
+                    (user_id,),
+                ).fetchone()["n"]
+                if recent >= cap_per_hour:
+                    return False
+            if void_earlier:
+                conn.execute(
+                    "update password_reset_tokens set used_at = now() "
+                    "where user_id = %s and purpose = %s and used_at is null",
+                    (user_id, purpose),
+                )
             conn.execute(
                 """
-                insert into password_reset_tokens (user_id, token_hash, expires_at)
-                values (%s, %s, now() + make_interval(mins => %s))
+                insert into password_reset_tokens (user_id, token_hash, purpose, expires_at)
+                values (%s, %s, %s, now() + make_interval(mins => %s))
                 """,
-                (user_id, token_hash, ttl_minutes),
+                (user_id, token_hash, purpose, ttl_minutes),
             )
+        return True
 
-    def consume_reset_token(self, token_hash: str) -> dict[str, Any] | None:
-        """Single-use: mark used and return the user_id if valid and unused.
-        A disabled account's tokens are dead on arrival (R13: `disable_user`
-        voids them, and this join refuses any that slip through a race)."""
-        with get_connection() as conn:
+    def consume_reset_token(
+        self, token_hash: str, purpose: str = "reset"
+    ) -> dict[str, Any] | None:
+        """Single-use: mark used and return the user_id if valid, unused AND
+        of ``purpose``. A token of the other purpose matches nothing and is
+        left untouched — a verification link never resets a password, and a
+        reset link never verifies an address. A disabled account's tokens are
+        dead on arrival (R13: `disable_user` voids them, and this join refuses
+        any that slip through a race)."""
+        with get_global_connection() as conn:
             row = conn.execute(
                 """
                 update password_reset_tokens t
@@ -287,14 +364,77 @@ class AuthDao:
                 from app_users u
                 where u.id = t.user_id
                     and t.token_hash = %s
+                    and t.purpose = %s
                     and t.used_at is null
                     and t.expires_at > now()
                     and u.disabled_at is null
                 returning t.user_id
                 """,
-                (token_hash,),
+                (token_hash, purpose),
             ).fetchone()
         return dict(row) if row else None
+
+    def live_verify_token_owner(self, token_hash: str) -> str | None:
+        """The owner of a LIVE (unused, unexpired) verification token, without
+        consuming it — the verify endpoint refuses another account's token
+        and must leave it working for its owner."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                select t.user_id from password_reset_tokens t
+                join app_users u on u.id = t.user_id and u.disabled_at is null
+                where t.token_hash = %s and t.purpose = 'verify'
+                  and t.used_at is null and t.expires_at > now()
+                """,
+                (token_hash,),
+            ).fetchone()
+        return str(row["user_id"]) if row else None
+
+    def consume_verify_token(self, token_hash: str, user_id: str) -> bool:
+        """Single-use, owner-bound: consumes only the caller's own live
+        verification token."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                update password_reset_tokens set used_at = now()
+                where token_hash = %s and purpose = 'verify' and user_id = %s
+                  and used_at is null and expires_at > now()
+                returning id
+                """,
+                (token_hash, user_id),
+            ).fetchone()
+        return row is not None
+
+    def mark_email_verified(self, user_id: str) -> dict[str, Any] | None:
+        """Stamp ``email_verified_at`` when it is still null. Returns
+        ``{"email", "was_unverified"}`` when a stamp was written —
+        ``was_unverified`` is true only for an account that was waiting for
+        verification (the transition that runs the parent-link rule) — or
+        None when the address was already verified."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                update app_users set email_verified_at = now()
+                where id = %s and email_verified_at is null
+                returning email, email_verification_required as was_unverified
+                """,
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_push_registrations(self, user_id: str) -> int:
+        """Every push registration of the account (web push subscriptions and
+        FCM tokens): an emailed or office reset usually follows a lost phone,
+        which must stop receiving child notices. The parent's own browser
+        re-posts its subscription at the next sign-in (lib/push.ts)."""
+        with get_global_connection() as conn:
+            web = conn.execute(
+                "delete from live_push_subscriptions where user_id = %s", (user_id,)
+            ).rowcount
+            fcm = conn.execute(
+                "delete from live_fcm_tokens where user_id = %s", (user_id,)
+            ).rowcount
+        return (web or 0) + (fcm or 0)
 
     def get_user_credentials(self, user_id: str) -> dict[str, Any] | None:
         """id + password hash for the change-password current-password check.
@@ -309,9 +449,10 @@ class AuthDao:
     def set_user_password(self, user_id: str, password_hash: str) -> None:
         """THE user-set-a-password write (U8): new hash, ``password_changed_at``
         stamped, the temporary-password flag and expiry cleared, and every
-        outstanding reset and pre-auth token voided — one transaction. Used by
-        both change-password and the forgot-password reset; session handling
-        stays with the caller (change keeps its own session, reset keeps none).
+        outstanding emailed token (both purposes, reset and verify) and
+        pre-auth token voided — one transaction. Used by both change-password
+        and the emailed reset; session handling stays with the caller (change
+        keeps its own session, the emailed reset issues a fresh one).
         """
         with get_global_connection() as conn:
             conn.execute(

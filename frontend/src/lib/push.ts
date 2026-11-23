@@ -8,6 +8,10 @@ export interface PushConfig {
   firebase: Record<string, string> | null;
   firebaseVapidKey: string | null;
   vapidPublicKey: string | null;
+  /** Whether the platform really sends email (hardening DL1): global, never
+   * per account. Rides on this unauthenticated config response; false when
+   * the config could not be read, so no screen claims a mail on a guess. */
+  mailEnabled: boolean;
 }
 
 export type PushMode = "fcm" | "webpush";
@@ -18,10 +22,18 @@ let configPromise: Promise<PushConfig> | null = null;
 
 export function fetchPushConfig(): Promise<PushConfig> {
   if (!configPromise) {
-    configPromise = api.get("/api/push/config").catch(() => {
-      configPromise = null;
-      return { firebase: null, firebaseVapidKey: null, vapidPublicKey: null };
-    });
+    configPromise = api
+      .get("/api/push/config")
+      .then((config: Partial<PushConfig>) => ({
+        firebase: config.firebase ?? null,
+        firebaseVapidKey: config.firebaseVapidKey ?? null,
+        vapidPublicKey: config.vapidPublicKey ?? null,
+        mailEnabled: config.mailEnabled === true,
+      }))
+      .catch(() => {
+        configPromise = null;
+        return { firebase: null, firebaseVapidKey: null, vapidPublicKey: null, mailEnabled: false };
+      });
   }
   return configPromise;
 }
@@ -125,6 +137,40 @@ export async function disablePush(): Promise<void> {
     // Best effort.
   }
   storePushMode(null);
+}
+
+/**
+ * Re-post this browser's existing web push subscription for the account that
+ * just signed in (hardening U7). An emailed or office reset deletes every
+ * push registration of the account — the lost phone must stop receiving
+ * child notices — so the parent's own phone, still holding its subscription,
+ * re-attaches it at the next sign-in (the server upserts on the endpoint).
+ * Never prompts, never creates a subscription: only an existing one, with
+ * notification permission already granted. The FCM path (removed in Release
+ * 2) is not re-attached. Resolves whether a subscription was re-posted.
+ */
+export async function reattachPushSubscription(): Promise<boolean> {
+  if (!("serviceWorker" in navigator)) return false;
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return false;
+  if (getStoredPushMode() === "fcm") return false;
+  try {
+    // getRegistration, not .ready: .ready never settles without a worker.
+    const registration = await navigator.serviceWorker.getRegistration();
+    const subscription = await registration?.pushManager.getSubscription();
+    if (!subscription) return false;
+    const json = subscription.toJSON();
+    await api.post("/api/push/subscribe", {
+      endpoint: subscription.endpoint,
+      p256dh: json.keys?.p256dh ?? null,
+      auth: json.keys?.auth ?? null,
+      user_agent: navigator.userAgent,
+    });
+    storePushMode("webpush");
+    return true;
+  } catch {
+    // Best effort: Profile's push switch remains the manual path.
+    return false;
+  }
 }
 
 /** True when this device currently has an active push setup. */

@@ -17,6 +17,9 @@ def reset_limiters():
         auth_api.forgot_account_limiter,
         auth_api.reset_ip_limiter,
         auth_api.change_password_account_limiter,
+        auth_api.verify_ip_limiter,
+        auth_api.verify_account_limiter,
+        auth_api.resend_account_limiter,
     ]
     for limiter in limiters:
         limiter.reset()
@@ -116,7 +119,7 @@ def test_successful_login_clears_account_budget(
 def test_forgot_password_is_rate_limited_per_account(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(auth_api.service, "forgot_password", lambda email: None)
+    monkeypatch.setattr(auth_api.service, "forgot_password", lambda email: {"ok": True})
 
     payload = {"email": "victim@test.com"}
     for _ in range(auth_api.forgot_account_limiter.max_attempts):
@@ -130,7 +133,7 @@ def test_forgot_password_is_rate_limited_per_account(
 def test_reset_password_is_rate_limited_per_ip(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(auth_api.service, "reset_password", lambda token, password: None)
+    monkeypatch.setattr(auth_api.service, "reset_password", lambda token, password: {"ok": True})
 
     payload = {"token": "token", "password": "NewPassword1"}
     for _ in range(auth_api.reset_ip_limiter.max_attempts):
@@ -183,3 +186,124 @@ def test_change_password_is_rate_limited_per_account(
     current["id"] = "cp-user-2"
     response = client.post("/api/auth/change-password", json=payload, headers=headers)
     assert response.status_code == 200
+
+
+def test_forgot_password_account_budget_is_keyed_per_ip_and_email(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan U7: the per-account budget keys on ``ip|email``, so a caller
+    elsewhere cannot spend a victim's budget."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "trust_proxy_headers", True)
+    monkeypatch.setattr(auth_api.service, "forgot_password", lambda email: {"ok": True})
+    payload = {"email": "victim@test.com"}
+    attacker = {"X-Forwarded-For": "203.0.113.7"}
+    for _ in range(auth_api.forgot_account_limiter.max_attempts):
+        assert client.post("/api/auth/forgot-password", json=payload, headers=attacker).status_code == 200
+    assert client.post("/api/auth/forgot-password", json=payload, headers=attacker).status_code == 429
+    victim = {"X-Forwarded-For": "198.51.100.9"}
+    assert client.post("/api/auth/forgot-password", json=payload, headers=victim).status_code == 200
+
+
+def test_verify_email_is_rate_limited_per_ip(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan U8: verify-email has a per-IP net like reset-password's (signed
+    out here, so only the IP budget applies)."""
+    monkeypatch.setattr(auth_api.service, "verify_email", lambda user, token: {"ok": True})
+    for _ in range(auth_api.verify_ip_limiter.max_attempts):
+        assert client.post("/api/auth/verify-email", json={"token": "t"}).status_code == 200
+    response = client.post("/api/auth/verify-email", json={"token": "t"})
+    assert response.status_code == 429
+    assert "Too many verification attempts" in response.json()["detail"]
+
+
+def test_verify_email_is_rate_limited_per_account(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.core.auth as core_auth
+
+    monkeypatch.setattr(
+        core_auth._service, "resolve_session", lambda token: _fake_session_user("vf-user-1")
+    )
+    seen: list = []
+    monkeypatch.setattr(
+        auth_api.service, "verify_email", lambda user, token: seen.append(user) or {"ok": True}
+    )
+    headers = {"Authorization": "Bearer test-token"}
+    for _ in range(auth_api.verify_account_limiter.max_attempts):
+        assert client.post("/api/auth/verify-email", json={"token": "t"}, headers=headers).status_code == 200
+    assert client.post("/api/auth/verify-email", json={"token": "t"}, headers=headers).status_code == 429
+    # The route hands the service the signed-in caller.
+    assert seen[0]["id"] == "vf-user-1"
+
+
+def test_verify_email_never_answers_401_to_a_dead_session(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DL10: a signed-out (or expired) reader gets the 400 sign-in state, not
+    the client's session-expired sign-out."""
+    import app.core.auth as core_auth
+
+    monkeypatch.setattr(core_auth._service, "resolve_session", lambda token: None)
+    response = client.post(
+        "/api/auth/verify-email", json={"token": "t"},
+        headers={"Authorization": "Bearer stale"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "code": "sign-in-required",
+        "message": "Sign in to the account you are verifying",
+    }
+
+
+def test_resend_verification_is_limited_to_one_a_minute_per_account(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.core.auth as core_auth
+
+    current = {"id": "rs-user-1"}
+    monkeypatch.setattr(
+        core_auth._service, "resolve_session", lambda token: _fake_session_user(current["id"])
+    )
+    monkeypatch.setattr(auth_api.service, "resend_verification", lambda user: {"ok": True})
+    headers = {"Authorization": "Bearer test-token"}
+    assert client.post("/api/auth/resend-verification", headers=headers).status_code == 200
+    response = client.post("/api/auth/resend-verification", headers=headers)
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Try again in a minute"
+    current["id"] = "rs-user-2"
+    assert client.post("/api/auth/resend-verification", headers=headers).status_code == 200
+
+
+def test_resend_verification_requires_a_session(client: TestClient) -> None:
+    assert client.post("/api/auth/resend-verification").status_code == 401
+
+
+def test_dev_link_routes_are_404_outside_local(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "app_env", "production")
+    for path in ("/api/auth/dev/last-reset-link", "/api/auth/dev/last-verification-link"):
+        assert client.get(path).status_code == 404
+
+
+def test_public_config_carries_the_global_mail_flag(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DL1: the flag is global (no session involved) and true only when a
+    mail really goes out — or on the local stack's simulated transport."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    for env, enabled, expected in (
+        ("production", False, False),
+        ("production", True, True),
+        ("local", False, True),
+    ):
+        monkeypatch.setattr(settings, "app_env", env)
+        monkeypatch.setattr(settings, "mail_enabled", enabled)
+        assert client.get("/api/push/config").json()["mailEnabled"] is expected

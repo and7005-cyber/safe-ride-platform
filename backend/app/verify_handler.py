@@ -41,6 +41,7 @@ from app.core.tenancy import (
     SCHOOL_OWNED_TABLES,
     SEED_DEMO_EMAILS,
 )
+from app.dao.verification_sql import unverified_sql
 
 # The system retention default the `gps` set reports against (GPS plan U11):
 # the same Settings field the API and the migrate Lambda's purge resolve, so
@@ -543,7 +544,7 @@ _CHECK_SETS["hardening"] = [
         " select u.created_at, exists (select 1 from live_parent_students ps"
         "  where ps.parent_id = u.id) as has_link"
         " from app_users u"
-        f" where u.email_verification_required and u.email_verified_at is null and {_PARENT_ROLE})"
+        f" where {unverified_sql('u')} and {_PARENT_ROLE})"
         " select l.has_link,"
         " count(v.created_at) filter (where v.created_at > now() - interval '7 days') as under_7d,"
         " count(v.created_at) filter (where v.created_at <= now() - interval '7 days'"

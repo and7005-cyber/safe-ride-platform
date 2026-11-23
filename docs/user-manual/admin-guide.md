@@ -167,7 +167,7 @@ Click **Add Student** and fill in:
 - **Pickup time** (e.g. `06:45`).
 - **Morning route** and **Afternoon route**. Students are assigned to routes; the bus is whatever bus runs the route. (The student belongs to your active school automatically — there is no school field.)
 
-**Parent emails matter:** the email you record here is what links the parent's app account. When a parent signs up with that exact email, their account attaches to the child automatically (up to two parent accounts per child). If a parent says the app shows no children, the email on the student record is almost always the mismatch.
+**Parent emails matter:** the email you record here is what links the parent's app account. When a parent signs up with that exact email **and confirms it** from the link SafeRide emails them, their account attaches to the child automatically (up to two parent accounts per child). Until the parent confirms, nothing attaches — even if you type their address on a student record — and the Parents page keeps showing the email as **Awaiting signup**. If a parent says the app shows no children, the email on the student record is almost always the mismatch.
 
 **If the email belongs to a parent whose children are at another school**, nothing attaches automatically: the parent sees a **pending card** naming your school (never the child) and the link takes effect only when they **accept** it. If they tap **"Not my child"**, the link is cleared, that email is removed from the student record, and your Alerts page gets a **mismatched-email alert** — re-check the address with the family.
 
@@ -355,9 +355,9 @@ Two other admin powers live here:
 This page lists every parent contact in the system. **Status** tells you where each stands:
 
 - **Registered** — the parent has created their app account.
-- **Awaiting signup** — the email exists on a student record but the parent hasn't signed up yet. Chase these before launch day so parents get notifications from day one.
+- **Awaiting signup** — the email exists on a student record but no parent has signed up with it and confirmed the address yet. Chase these before launch day so parents get notifications from day one.
 
-You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
+You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). **Changing a parent's email** signs the parent out on every device, stops their push notifications and asks them to confirm the new address from the email SafeRide sends to it; their children stay linked, and the old address receives a short notice of the change. Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
 
 A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting.
 

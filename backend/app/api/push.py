@@ -32,7 +32,11 @@ class FcmTokenPayload(BaseModel):
 
 @router.get("/config")
 def push_config():
-    """Public client push configuration (no secrets)."""
+    """Public client configuration (no secrets): the push channels, and the
+    global ``mailEnabled`` flag (hardening DL1) — whether the platform really
+    sends email (SES on outside the local stack, or the local simulated
+    transport). The sign-in, sign-up and Home screens read it so no screen
+    claims a mail that is not sent. Never per account."""
     settings = get_settings()
     firebase = None
     raw = settings.firebase_web_config_json.strip()
@@ -45,6 +49,7 @@ def push_config():
         "firebase": firebase,
         "firebaseVapidKey": settings.firebase_vapid_key or None,
         "vapidPublicKey": settings.vapid_public_key or None,
+        "mailEnabled": settings.mail_available,
     }
 
 

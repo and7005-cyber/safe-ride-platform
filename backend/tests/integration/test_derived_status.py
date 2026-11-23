@@ -20,7 +20,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox
+from conftest import purge_accounts, purge_run, school_sandbox, signup_verified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -138,11 +138,11 @@ def fleet(client, admin_headers, sandbox):
             headers=admin_headers,
         ).json()
 
-    signup = client.post("/api/auth/signup", json={
-        "email": f"it-ds-parent-{marker}@test.local", "password": "ParentPass1!",
-        "full_name": f"IT DS Parent {marker}", "role": "parent"}).json()
-    created["parent_id"] = signup["user"]["id"]
-    created["parent_headers"] = {"Authorization": f"Bearer {signup['token']}"}
+    parent = signup_verified_parent(
+        client, f"it-ds-parent-{marker}@test.local", "ParentPass1!", f"IT DS Parent {marker}"
+    )
+    created["parent_id"] = parent["id"]
+    created["parent_headers"] = parent["headers"]
 
     created["student"] = client.post(
         "/api/students",

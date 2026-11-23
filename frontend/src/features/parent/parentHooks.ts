@@ -1,8 +1,12 @@
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Home, MapPin, Bell, User, type LucideIcon } from "lucide-react";
+import { toast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
+import { useAuth } from "@/lib/auth";
 import type { ParentBusPosition } from "@/lib/positionFreshness";
 import { POLL_LIVE } from "@/lib/queries";
+import { EMAIL_VERIFIED_TOAST } from "@/features/auth/authCopy";
 
 export const PARENT_NAV: { to: string; label: string; icon: LucideIcon; end?: boolean }[] = [
   { to: "/parent", label: "Home", icon: Home, end: true },
@@ -16,6 +20,40 @@ export function useChildren() {
     queryKey: ["parent-children"],
     queryFn: () => api.get("/api/parent-portal/children"),
     refetchInterval: POLL_LIVE,
+  });
+}
+
+// Email verification (hardening U8, DL9): while the signed-in account is
+// unverified, /me is polled at the live cadence so a verification finished in
+// another browser (the mail opened in Safari, a laptop) flips this tab without
+// a reload — the card goes, "Email verified" is toasted and announced, and the
+// children and pending cards load at once.
+export function useVerificationWatch(): { unverified: boolean; justVerified: boolean } {
+  const { user, refresh } = useAuth();
+  const queryClient = useQueryClient();
+  const unverified = user?.emailVerified === false;
+  const [justVerified, setJustVerified] = useState(false);
+  const { data } = useQuery<{ emailVerified?: boolean }>({
+    queryKey: ["auth-me-verification", user?.id],
+    queryFn: () => api.get("/api/auth/me"),
+    enabled: unverified,
+    refetchInterval: POLL_LIVE,
+  });
+  const flipped = unverified && data?.emailVerified === true;
+  useEffect(() => {
+    if (!flipped) return;
+    setJustVerified(true);
+    void refresh();
+    void queryClient.invalidateQueries({ queryKey: ["parent-children"] });
+    void queryClient.invalidateQueries({ queryKey: ["parent-pending"] });
+    toast({ title: EMAIL_VERIFIED_TOAST });
+  }, [flipped, refresh, queryClient]);
+  return { unverified: unverified && !flipped, justVerified };
+}
+
+export function useResendVerification() {
+  return useMutation({
+    mutationFn: () => api.post("/api/auth/resend-verification"),
   });
 }
 

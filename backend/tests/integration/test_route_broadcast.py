@@ -38,7 +38,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, school_sandbox
+from conftest import purge_accounts, school_sandbox, signup_verified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -133,18 +133,8 @@ def delete_throwaway_admin(admin_id: str) -> None:
 def signup_parent(client, marker: str, tag: str) -> dict:
     """A fresh parent account; fresh email per run keeps links deterministic."""
     email = f"it-rb-{tag}-{marker}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!",
-              "full_name": f"IT RB {tag} {marker}", "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    return {
-        "id": body["user"]["id"],
-        "email": email,
-        "headers": {"Authorization": f"Bearer {body['token']}"},
-    }
+    parent = signup_verified_parent(client, email, "ParentPass1!", f"IT RB {tag} {marker}")
+    return {"id": parent["id"], "email": email, "headers": parent["headers"]}
 
 
 def accept_pending(client, parent_headers):

@@ -67,6 +67,29 @@ def get_current_user(
             str(user["last_school_id"]) if user.get("last_school_id") else None
         ),
         "totp_verified_at": user.get("totp_verified_at"),
+        # Release 1b (D1): false only while the account waits for its
+        # verification click; grandfathered accounts read true.
+        "email_verified": bool(user.get("email_verified", True)),
+    }
+
+
+def get_optional_session_user(authorization: str | None = Header(default=None)) -> dict | None:
+    """The caller's session if a live one is presented, else None — never a
+    401. For POST /api/auth/verify-email, whose signed-out answer is the
+    400 "Sign in to the account you are verifying" the page turns into its
+    sign-in state (DL10), not the client's session-expired sign-out."""
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    user = _service.resolve_session(token.strip())
+    if not user:
+        return None
+    return {
+        "id": str(user["id"]),
+        "email": user["email"],
+        "email_verified": bool(user.get("email_verified", True)),
     }
 
 
