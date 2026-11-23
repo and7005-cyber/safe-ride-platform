@@ -104,9 +104,11 @@ export function ProviderAccountsPage() {
         fullName: form.fullName.trim() || null,
         code: askCreateCode && createCode ? createCode : undefined,
       });
-      await refetchAccounts();
+      // Reveal first (code review #8): the server keeps only a hash, so a
+      // refetch that stalls or a navigation away must not lose the password.
       setOpen(false);
       setReveal({ who: res.fullName ?? res.email, password: res.temporaryPassword });
+      void refetchAccounts();
       void refresh(); // pick up the session's refreshed totpVerifiedAt
     } catch (err) {
       if (err instanceof ApiError && err.code === "totp-step-up-required") {
