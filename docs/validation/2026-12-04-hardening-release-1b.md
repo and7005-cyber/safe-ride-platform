@@ -70,7 +70,7 @@ Each gate is a step of the
 | Parent drill: a sign-up stays unlisted; it verifies from its own session and links (mail window); an office reset and a Confirm and reset leave their audit rows | — | **open** |
 | `hardening` final, diffed against the baselines, every difference explained | — | **open** |
 | Alarms after the smoke: `OK`/`INSUFFICIENT_DATA` apart from the drills' recorded ALARM/OK pairs | — | **open** |
-| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted while on 1a (D52); no student-email edits on 1a; back to `release/1b`; both durations | — | **open** |
+| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student-email edits on 1a; back to `release/1b`; both durations | — | **open** |
 | Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | — | **open** |
 | Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | — | **open** |
 | The old unrestricted Maps browser key restricted to localhost or deleted (D45) | — | **open** |
@@ -174,17 +174,19 @@ commit messages):
   lock window simply ages out); the lock's e2e test stubs the 429 rather
   than making twenty-one real failures.
 - **D51** (U10) `qrcode.react` 4.2.0, the one new dependency, draws the QR.
-- **D52** (U13) **The `verify`-token delete on a rollback has no method
-  yet.** Production has no ad-hoc SQL path: the verify function is
-  read-only, 1a's migrate function runs only migrations and `gps-purge`, and
-  there is no bastion. Open for the user before the rehearsal; the options
-  are a small migrate action added to 1b and invoked just before the 1a
-  backend deploy (leaving at most the tokens of sign-ups in those minutes,
-  which `token-rows-by-purpose` then shows), or a throwaway function in the
-  D27 manner. Until one is chosen, the bound is the tokens' 24-hour expiry.
-  The exposure is narrow: a `verify` token reaches only its address's own
-  inbox, so under 1a it lets that inbox's owner set the account's password —
-  what an emailed reset allows anyway.
+- **D52** (U13, resolved by the orchestrator) **The `verify`-token delete
+  on a rollback is a migrate action on 1b.** Production has no ad-hoc SQL
+  path (the verify function is read-only, 1a's migrate function runs only
+  migrations and `gps-purge`, there is no bastion), so 1b's migrate function
+  gains `{"action": "purge-verify-tokens"}` — one statement,
+  `delete from password_reset_tokens where purpose = 'verify'`, reporting the
+  count — invoked on 1b immediately before the 1a backend deploy (checklist,
+  "Rollback rehearsal", step 1). The 1b frontend on a 1a backend creates no
+  verification tokens, so only a sign-up in the minutes of that deploy can
+  leave one, bounded by its 24-hour expiry. The exposure is narrow anyway: a
+  `verify` token reaches only its address's own inbox, so under 1a it lets
+  that inbox's owner set the account's password — what an emailed reset
+  allows.
 - **D53** (U13) Checklist choices the plan left open: a manual snapshot
   before the deploy (a fixed point before the first retention deletes,
   which a code rollback does not undo); a gate dry run as for 1a; the first
@@ -262,8 +264,10 @@ Pending: `ce-code-review` over the branch, then fixes and a full certify
 - **Decision window for a real rollback: 48 hours** from the deploy, with
   `driver-pin-hash-versions-per-school` as the count of drivers who would
   need a new PIN under 1a. After that, fix forward.
-- **Verification tokens:** deleted while on 1a (1a's reset ignores
-  `purpose`); the method is open (D52), the 24-hour expiry the bound.
+- **Verification tokens:** deleted on 1b just before the 1a backend deploy
+  with the migrate function's `purge-verify-tokens` action (D52), since 1a's
+  reset ignores `purpose`; a sign-up in the deploy's minutes is bounded by the
+  24-hour expiry.
 - **Unverified sign-ups:** under 1a an office edit of a student's parent
   email links an unverified account; no such edits while on 1a, and
   `unverified-parent-accounts-by-age` read after returning.

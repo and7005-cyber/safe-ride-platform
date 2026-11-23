@@ -101,14 +101,12 @@ expected change sets, are rehearsed in the
   real rollback, which is decided within 48 hours of the deploy.
 - **Verification tokens.** 1a's reset consumes a token by its hash alone,
   ignoring `purpose`, so a live verification link (24 hours) would work as a
-  password-reset link. While on 1a, delete them —
-  `delete from password_reset_tokens where purpose = 'verify';` — and read
-  `token-rows-by-purpose`: the `verify` row's `live` is 0. Nothing in 1a
-  creates new ones. Production has no ad-hoc SQL path (the verify function is
-  read-only, 1a's migrate function runs only migrations and `gps-purge`), so
-  how the statement runs is an open decision recorded in the Release 1b
-  validation record; until it is taken, the bound is the tokens' 24-hour
-  expiry, which the same row shows passing.
+  password-reset link. Delete them on 1b immediately before the 1a backend
+  deploy with the migrate function's `{"action": "purge-verify-tokens"}`
+  (1a's migrate function has no such action, and production has no other
+  SQL path); then read `token-rows-by-purpose` on 1a: the `verify` row's
+  `live` is 0. Nothing in 1a creates new ones; a sign-up in the minutes of
+  the deploy can leave one, bounded by its 24-hour expiry.
 - **Unverified sign-ups can be linked under 1a.** 1a's student sync links
   any parent account whose email matches, verified or not: avoid editing
   students' parent emails while on 1a, and after returning to 1b read

@@ -44,6 +44,16 @@ Lambda is server-enforced read-only):
   ``RetentionRunSucceeded`` = 1 (the heartbeat alarm's metric). Any error
   closes the row ``failed`` and RAISES — the migrate function's errors alarm
   sees a raise, never a returned error status — and prints no metric.
+- ``{"action": "purge-verify-tokens"}`` — before a rollback to Release 1a
+  (hardening D52): deletes every email-verification token. 1a's reset
+  consumes a token by its hash alone, so a live ``verify`` token would work
+  as a reset link once the backend is back on ``release/1a``. Invoked on 1b
+  immediately before the 1a backend deploy (Release 1b checklist, "Rollback
+  rehearsal"); the 1b frontend on a 1a backend creates no verification
+  tokens, so only a sign-up in the minutes of that deploy can add one, which
+  the ``hardening`` set's ``token-rows-by-purpose`` shows. A parent whose
+  link was deleted asks for a new one (Resend) once 1b is back, or the office
+  confirms the sign-up. Reports the count only.
 """
 
 from __future__ import annotations
@@ -155,6 +165,8 @@ def handler(event=None, context=None) -> dict:
         return _gps_purge(event or {})
     if action == "retention":
         return _retention(context)
+    if action == "purge-verify-tokens":
+        return _purge_verify_tokens()
     if action is not None:
         return {"status": "error", "reason": f"unknown action {action!r}"}
     with psycopg.connect(_database_url(), autocommit=True) as conn:
@@ -384,6 +396,19 @@ def _gps_purge(event: dict) -> dict:
         "stopped": stopped,
         **totals,
     }
+
+
+# --- Before a rollback to Release 1a (hardening D52) ------------------------------
+
+# Verification tokens only: reset tokens are what 1a itself writes and reads.
+PURGE_VERIFY_TOKENS_SQL = "delete from password_reset_tokens where purpose = 'verify'"
+
+
+def _purge_verify_tokens() -> dict:
+    """Delete every email-verification token (see the module docstring)."""
+    with psycopg.connect(_database_url(), autocommit=True) as conn:
+        deleted = conn.execute(PURGE_VERIFY_TOKENS_SQL).rowcount
+    return {"status": "ok", "action": "purge-verify-tokens", "deleted": deleted}
 
 
 # --- The nightly retention job (hardening U12) -----------------------------------

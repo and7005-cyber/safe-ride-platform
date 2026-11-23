@@ -1171,7 +1171,21 @@ when it ends.
 
 1. **Before:** `open-runs-and-today` 0/0; note the test-school driver whose
    PIN smoke step 5 salted, and `token-rows-by-purpose` (the drill's live `verify`
-   tokens).
+   tokens). **Then, still on 1b and immediately before step 2, delete the
+   verification tokens** (D52): 1a's reset consumes a token by its hash
+   alone, so a live `verify` token would work as a reset link on 1a, and 1a's
+   migrate function cannot delete them —
+
+   ```bash
+   MIGRATE_FN="$(aws cloudformation describe-stacks --region af-south-1 --stack-name saferide-backend \
+     --query "Stacks[0].Outputs[?OutputKey=='MigrateFunctionName'].OutputValue" --output text)"
+   aws lambda invoke --region af-south-1 --function-name "$MIGRATE_FN" --cli-read-timeout 0 \
+     --cli-binary-format raw-in-base64-out --payload '{"action": "purge-verify-tokens"}' \
+     /dev/stdout --query FunctionError --output text
+   ```
+
+   **Go:** `{"status": "ok", "action": "purge-verify-tokens", "deleted": N}`
+   with N the drill's live `verify` count, then `None` (no function error).
 2. **Backend to `release/1a`** — `git checkout release/1a`, then
    `CONFIRM_CHANGESET=1 ./scripts/deploy-backend.sh`
    (`CONCURRENCY_ALARM_THRESHOLD=800` still exported; `MAIL_ENABLED`
@@ -1193,14 +1207,12 @@ when it ends.
    hash). On 1a's Drivers page, edit that driver → a new PIN (1a issues four
    digits) → sign in with it: **a legacy PIN sign-in on 1a**.
    `driver-pin-hash-versions-per-school` shows it as `legacy_hmac` again.
-6. **Delete the verification tokens while on 1a.** 1a's reset ignores
-   `purpose`, so each live `verify` token would work as a reset link. The
-   statement is `delete from password_reset_tokens where purpose =
-   'verify';` — run by the method the user chose (D52: production has no
-   ad-hoc SQL path; the method is open). **Go:** `token-rows-by-purpose` →
-   the `verify` row's `live` 0. Without an agreed method, record the count
-   and when the newest expires (24 hours after it was sent): that is the
-   exposure bound.
+6. **No verification token is live on 1a.** `token-rows-by-purpose` → the
+   `verify` row's `live` 0: step 1 deleted them, and the 1b frontend on the
+   1a backend creates none (1a's sign-up writes no token). A sign-up made in
+   the minutes between step 1 and step 2 can have left one: record it, with
+   when it expires (24 hours after it was sent) — that is the exposure
+   bound, and only that address's own inbox holds the link.
 7. **Under 1a, office edits of students' parent emails would link unverified
    sign-ups** (1a's student sync does not ask for verification): make none
    during the rehearsal.

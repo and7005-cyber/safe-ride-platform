@@ -165,6 +165,35 @@ class TestGpsPurgeEvent:
         }
 
 
+# --- before a rollback to 1a: the verification tokens go (hardening D52) ------
+
+
+def test_purge_verify_tokens_deletes_only_verification_tokens_and_reports_the_count(monkeypatch):
+    statements: list[str] = []
+
+    class Result:
+        rowcount = 3
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=()):
+            statements.append(sql)
+            return Result()
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://fake")
+    monkeypatch.setattr(mh.psycopg, "connect", lambda *args, **kwargs: Conn())
+    assert mh.handler({"action": "purge-verify-tokens"}) == {
+        "status": "ok", "action": "purge-verify-tokens", "deleted": 3,
+    }
+    # One statement, scoped to the verify purpose: 1a's own reset tokens stay.
+    assert statements == ["delete from password_reset_tokens where purpose = 'verify'"]
+
+
 # --- seeds are local-only (hardening U3) -------------------------------------
 
 

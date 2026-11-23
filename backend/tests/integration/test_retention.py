@@ -528,3 +528,36 @@ def test_every_foreign_key_to_app_users_is_classified():
     assert set(foreign.values()) <= {"c", "n"}
     # Every listed column exists (a typo would silently weaken the guard).
     assert (own | kept) <= columns, sorted((own | kept) - columns)
+
+
+# --- before a rollback to 1a: the verification tokens go (hardening D52) ---------
+
+
+def test_purge_verify_tokens_deletes_live_verification_tokens_and_keeps_reset_tokens(monkeypatch):
+    """1a's reset consumes a token by hash alone, so every live verify token
+    must be gone before the backend goes back to release/1a; reset tokens are
+    1a's own and stay."""
+    monkeypatch.setenv("DATABASE_URL", DSN)
+    from app import migrate_handler
+
+    with db() as conn:
+        user_id = _account(conn, "purge-verify", days_old=0)
+        tokens = {}
+        for purpose in ("verify", "reset"):
+            tokens[purpose] = conn.execute(
+                "insert into password_reset_tokens (user_id, token_hash, purpose, expires_at)"
+                " values (%s, %s, %s, now() + interval '1 hour') returning id",
+                (user_id, f"it-purge-{MARKER}-{purpose}", purpose),
+            ).fetchone()["id"]
+    try:
+        report = migrate_handler.handler({"action": "purge-verify-tokens"})
+        assert report["status"] == "ok" and report["action"] == "purge-verify-tokens"
+        assert report["deleted"] >= 1
+        with db() as conn:
+            assert not _exists(conn, "password_reset_tokens", "id", tokens["verify"])
+            assert _exists(conn, "password_reset_tokens", "id", tokens["reset"])
+            assert conn.execute(
+                "select count(*) as n from password_reset_tokens where purpose = 'verify'"
+            ).fetchone()["n"] == 0
+    finally:
+        purge_accounts(user_id)
