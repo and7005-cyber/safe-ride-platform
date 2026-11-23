@@ -5,23 +5,41 @@ This guide is for bus drivers. It explains how to sign in, run your morning and 
 ## Before you start
 
 - **Your account is created by your school's office** — there is no driver sign-up in the app. The office sets up your account and assigns your PIN; everything you see in the app (your bus, your routes, your students) belongs to your school and nothing else ever appears.
-- You need a **smartphone with an internet connection** (mobile data or Wi-Fi). SafeRide runs in your phone's web browser — there is no app to install.
+- You need a **smartphone with an internet connection** (mobile data or Wi-Fi). SafeRide runs in your phone's web browser — there is nothing to download from an app store. Add it to your home screen once and use that **installed app** every day (see the tip below).
 - Have the phone's **location turned on** for your browser. The app uses it **only while a run is in progress** — see [Your phone's location during a run](#your-phones-location-during-a-run).
-- You need your **driver PIN**. The school office assigns it when they create your account. If you don't have a PIN, or you forget it, ask the office — you cannot set or reset it yourself.
+- You need your **driver PIN** and your school's **driver code**. The school office gives you both: the PIN is yours (six digits; drivers who had a shorter PIN keep it until the office gives them a new one), the driver code is the school's and looks like `GFA0-7K1Q`. If you don't have them, or you forget your PIN, ask the office — you cannot set or reset your PIN yourself.
 - The office must have **assigned you a bus** and given that bus at least one **route** with students. If the app says "No bus is assigned to you yet. Contact your administrator." or "No routes assigned to this bus yet.", the office needs to finish your setup.
 
-> **Tip:** Open `https://saferidelive.co.ke` in your browser and add it to your home screen so it is one tap away every morning.
+> **Tip:** Open `https://saferidelive.co.ke` in your browser and add it to your home screen so it is one tap away every morning. From then on, always open SafeRide from that home-screen icon: that is the installed app this guide refers to.
 
 ## Signing in
 
-Your PIN identifies you, and your school follows from your account.
+Your PIN works only at your own school, so each phone is set up for your school once, with the school's **driver code**. After that you only type your PIN.
 
-1. Open `https://saferidelive.co.ke/auth`.
-2. Tap the **Driver PIN** tab.
-3. Type your PIN in the **Driver PIN** field. The PIN is **4 to 6 digits**, numbers only.
-4. Tap **Sign In with PIN**.
+### First sign-in on a new phone (or after a long gap)
+
+**Open the installed app** — the SafeRide icon on your home screen — not a link in a chat or a browser tab. On iPhones the installed app and Safari keep separate settings, and the phone forgets them after about a week without use, so always use the same installed app.
+
+1. Open the installed app and tap the **Driver PIN** tab.
+2. When it asks for the driver code — **"Enter the driver code from your school office"** — type the **Driver code** the office gave you and tap **Continue**. Capitals or small letters both work, with or without the hyphen, and the letters O, I and L are read as the digits 0, 1 and 1.
+3. The app shows a school's name and asks **"Is this your school?"**. Tap **Yes, that's my school** if it is yours, or **No, enter a different code** to type the code again.
+4. Type your PIN and tap **Sign In with PIN**.
+
+If it shows another school's name, tap **Change school**. The office may also send you a link or a QR code instead of the code; opening it does the same as typing the code, and the app still asks "Is this your school?". If the link opens in a browser instead of the installed app, open the installed app and type the code instead.
+
+If the app says **"That code didn't match a school. Ask your school office for the current code or link."**, the code was mistyped or the office has replaced it — ask the office for the current one. **"That isn't a driver code. The school code in Settings is a different code."** means you typed the school code (it looks like `MSB-001`); ask the office for the driver code instead.
+
+### Every other day
+
+1. Open the app. It opens on the **Driver PIN** tab with your school's name above the PIN field.
+2. Type your PIN in the **Driver PIN** field (numbers only).
+3. Tap **Sign In with PIN**.
+
+Signing out keeps the phone set up for your school. **Change school** (the small link under the Sign In button) clears it; the app first asks you to confirm — **"You'll need the code again."** — so only tap it when you have the driver code at hand.
 
 If you see **"Invalid PIN"**, check the digits and try again. After about **10 wrong attempts in a minute** the app temporarily blocks sign-in ("Too many PIN attempts. Try again shortly.") — wait a minute and retry.
+
+If the app says **"Sign-in for your school is paused for a few minutes. Try again in N minutes."**, too many wrong PINs were tried from your network at your school in a short time. Wait the minutes it shows — the countdown updates by itself — then sign in again. If you are already signed in, nothing changes: you can carry on with your run. If you are not sure of your PIN, call the office to confirm it before trying again.
 
 You stay signed in for the whole working day: the session lasts **16 hours** and renews itself every time you use the app. If the app ever says **"Your session has expired. Please sign in again."**, just sign in again with your PIN.
 
@@ -202,6 +220,11 @@ The school office sees the report immediately on their Alerts page, and for dela
 | --- | --- |
 | "Invalid PIN" | Re-check the digits. Still failing? Ask the office to confirm or change your PIN. |
 | "Too many PIN attempts. Try again shortly." | Wait about a minute, then try again. |
+| "Sign-in for your school is paused for a few minutes. Try again in N minutes." | Wait the minutes shown, then sign in again. A run you are already signed in to is not affected. |
+| The app asks for the driver code | This phone is not set up for your school yet (a new phone, or the phone forgot after a week unused). Open the installed app and type the driver code from your school office. |
+| "That code didn't match a school. …" | Ask the office for the current driver code or link — it may have been replaced. |
+| "That isn't a driver code. …" | You typed the school code. Ask the office for the driver code. |
+| The PIN form shows another school's name | Tap **Change school**, confirm, and type your school's driver code. |
 | "No bus is assigned to you yet." | The office must assign you a bus. |
 | Route shows "· Completed today" | That route already ran today. If it was started by mistake, the office can delete the run. |
 | "No students are assigned to this route yet." | The office must assign students to the route before you can start. |

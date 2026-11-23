@@ -44,6 +44,34 @@ import {
   temporaryPasswordChip,
   verifyCardText,
 } from "@/features/auth/authCopy";
+import {
+  CHANGE_SCHOOL_LABEL,
+  CONFIRM_SCHOOL_NO,
+  CONFIRM_SCHOOL_QUESTION,
+  CONFIRM_SCHOOL_YES,
+  DRIVER_CODE_IS_SCHOOL_CODE,
+  DRIVER_CODE_LABEL,
+  DRIVER_CODE_NOT_FOUND,
+  DRIVER_CODE_PROMPT,
+  INVALID_PIN_TITLE,
+  PIN_LOCKED_LEAD,
+  PIN_SIGN_IN_LABEL,
+} from "@/features/auth/authCopy";
+import {
+  COPY_DRIVER_CODE_LABEL,
+  COPY_DRIVER_MESSAGE_LABEL,
+  COPY_LINK_LABEL,
+  DRIVER_CODE_CARD_TITLE,
+  REGENERATE_CONFIRM_TEXT,
+  REGENERATE_CONFIRM_TITLE,
+  REGENERATE_LABEL,
+  SHARE_BY_LINK_TITLE,
+} from "@/features/admin/driverCodeCopy";
+import {
+  PIN_IN_USE_MESSAGE,
+  PIN_LENGTH_MESSAGE,
+  PIN_TOO_EASY_MESSAGE,
+} from "@/lib/driverPin";
 import { arrivalOfferCopy } from "@/features/driver/components/NudgeQueue";
 import { arrivalOfferPrompt } from "@/features/driver/components/nudgeStore";
 import { LOCATION_EXPLAINER, PING_PAUSED_HINT } from "@/features/driver/DriverRunPage";
@@ -464,5 +492,71 @@ describe("the guides describe the office reset and the self-service change in th
     }
     expect(parent).toMatch(/with or without them, in capitals or not/);
     expect(parent).not.toMatch(/The only controls here are the push notifications switch and \*\*Sign Out\*\*/);
+  });
+});
+
+/**
+ * Hardening Release 1b (U10; DL3, DL4, DL5, DL7, DL8). A driver's PIN works
+ * only at the school the phone is set up for, with the school's driver code.
+ * The driver guide quotes the PIN tab's words and leads with the installed
+ * app; the office guide quotes the Drivers page's card, its Regenerate
+ * confirmation and the PIN rules' refusals. No guide may say an operator or
+ * the office can lift the school lock (D3), and the driver code is never
+ * called the school code.
+ */
+describe("the guides describe the driver code and the school-bound PIN in the app's words", () => {
+  it("walks a driver through the first sign-in on a phone, every other day and the lock", () => {
+    const driver = read("driver-guide.md");
+    for (const line of [
+      DRIVER_CODE_LABEL,
+      DRIVER_CODE_PROMPT,
+      CONFIRM_SCHOOL_QUESTION,
+      CONFIRM_SCHOOL_YES,
+      CONFIRM_SCHOOL_NO,
+      CHANGE_SCHOOL_LABEL,
+      DRIVER_CODE_NOT_FOUND,
+      DRIVER_CODE_IS_SCHOOL_CODE,
+      PIN_SIGN_IN_LABEL,
+      INVALID_PIN_TITLE,
+      "You'll need the code again.",
+      `${PIN_LOCKED_LEAD} Try again in N minutes.`,
+    ]) {
+      expect(driver, `driver guide never quotes "${line}"`).toContain(line);
+    }
+    // The installed app first (iOS keeps Safari and the installed app apart).
+    expect(driver).toMatch(/\*\*Open the installed app\*\*/);
+    expect(driver).not.toMatch(/PIN is \*\*4 to 6 digits\*\*/);
+  });
+
+  it("gives the office the Drivers page's card, Regenerate and the PIN refusals", () => {
+    const admin = read("admin-guide.md");
+    for (const line of [
+      DRIVER_CODE_CARD_TITLE,
+      COPY_DRIVER_CODE_LABEL,
+      COPY_DRIVER_MESSAGE_LABEL,
+      SHARE_BY_LINK_TITLE,
+      COPY_LINK_LABEL,
+      REGENERATE_LABEL,
+      `${REGENERATE_CONFIRM_TITLE} ${REGENERATE_CONFIRM_TEXT}`,
+      PIN_LENGTH_MESSAGE,
+      PIN_TOO_EASY_MESSAGE,
+      PIN_IN_USE_MESSAGE,
+      DRIVER_CODE_IS_SCHOOL_CODE,
+      "A driver can sign in by PIN at one school only.",
+      `${PIN_LOCKED_LEAD.replace(/\.$/, "")}`,
+    ]) {
+      expect(admin, `admin guide never quotes "${line}"`).toContain(line);
+    }
+    expect(admin).toMatch(/## Share the driver code|### Share the driver code/);
+    expect(admin).not.toMatch(/4-digit PIN|unique across drivers|already in use by another driver/);
+  });
+
+  it("never promises that anyone can clear the school lock", () => {
+    for (const guide of ["driver-guide.md", "admin-guide.md", "provider-guide.md", "README.md"]) {
+      const text = read(guide);
+      expect(text, `${guide} promises a lock can be cleared`).not.toMatch(
+        /(clear|lift|reset|unlock)s? the (school )?(PIN )?lock/i,
+      );
+    }
   });
 });

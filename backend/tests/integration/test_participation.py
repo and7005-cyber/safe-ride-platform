@@ -23,7 +23,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_run, school_sandbox
+from conftest import driver_pin, pin_login_body, purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -80,7 +80,7 @@ def fleet(client, admin_headers, sandbox):
     """Bus + driver + school + morning and afternoon routes with two children."""
     marker = uuid.uuid4().hex[:6]
     created: dict = {"marker": marker}
-    pin = str(random.randint(100000, 999999))
+    pin = driver_pin()
 
     created["driver"] = client.post(
         "/api/accounts/drivers",
@@ -138,7 +138,7 @@ def fleet(client, admin_headers, sandbox):
 
 @pytest.fixture
 def driver_headers(client, fleet):
-    token = client.post("/api/auth/pin-login", json={"pin": fleet["pin"]}).json()["token"]
+    token = client.post("/api/auth/pin-login", json=pin_login_body(fleet["pin"], fleet["school"]["id"])).json()["token"]
     return {"Authorization": f"Bearer {token}"}
 
 

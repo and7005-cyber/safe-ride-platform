@@ -34,6 +34,7 @@ from conftest import (
     SCHOOL_B_ID,
     TEST_PASSWORD,
     _password_hash,
+    pin_login_body,
     purge_accounts,
     school_headers,
     signup_unverified_parent,
@@ -650,7 +651,8 @@ def test_self_service_change_needs_the_current_password_and_keeps_this_session(c
 def test_a_pin_session_cannot_change_the_password(client):
     from app.core.security import hash_session_token
 
-    by_pin = client.post("/api/auth/pin-login", json={"pin": DRIVER_B_PIN})
+    # Hardening U10: the PIN signs in with the school the phone is bound to.
+    by_pin = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_B_PIN, SCHOOL_B_ID))
     assert by_pin.status_code == 200, by_pin.text
     token = by_pin.json()["token"]
     try:

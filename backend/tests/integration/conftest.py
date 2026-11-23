@@ -57,6 +57,13 @@ DIRECTOR_B = "director.b@saferide.test"
 PROVIDER = "provider@kuumbai.test"
 DRIVER_B_PIN = "7391"
 TEST_PASSWORD = "Test1234"
+# The seeded drivers' PINs (seed 003): Daniel Kamau at school A, Dan Wekesa
+# at school B. Both are legacy four-digit PINs; since hardening U10 a PIN
+# signs in only with the school the phone is bound to (pin_login_body).
+DRIVER_A_PIN = "0322"
+# The seeded schools' driver codes (seed 003, hardening U10), stored form.
+SCHOOL_A_DRIVER_CODE = "GFA07K1Q"
+SCHOOL_B_DRIVER_CODE = "SEC2ND8B"
 
 _token_cache: dict[str, str] = {}
 
@@ -71,6 +78,26 @@ def login(email: str, password: str = TEST_PASSWORD) -> dict[str, str]:
         response.raise_for_status()
         _token_cache[email] = response.json()["token"]
     return {"Authorization": f"Bearer {_token_cache[email]}"}
+
+
+def driver_pin() -> str:
+    """A random PIN the office may set (hardening U10): six digits, never one
+    the creation rules refuse (repeated, a run, a repeated pattern, the
+    denylist), so a suite's throwaway driver is never refused by chance."""
+    import secrets
+
+    from app.core.security import pin_is_too_easy
+
+    while True:
+        pin = f"{secrets.randbelow(1_000_000):06d}"
+        if not pin_is_too_easy(pin):
+            return pin
+
+
+def pin_login_body(pin: str, school_id: str) -> dict[str, str]:
+    """The PIN sign-in payload since hardening U10: the PIN plus the school
+    the phone is bound to (the id the driver code lookup answered)."""
+    return {"pin": pin, "schoolId": str(school_id)}
 
 
 def school_headers(headers: dict[str, str], school_id: str) -> dict[str, str]:

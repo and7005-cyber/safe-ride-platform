@@ -53,6 +53,9 @@ from conftest import (
     purge_run,
     school_headers,
     school_sandbox,
+    SCHOOL_B_ID,
+    driver_pin,
+    pin_login_body,
 )
 from test_students_parents import signup_parent
 
@@ -81,8 +84,9 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def pin_login(client: httpx.Client, pin: str) -> dict:
-    response = client.post("/api/auth/pin-login", json={"pin": pin})
+def pin_login(client: httpx.Client, pin: str, school_id: str) -> dict:
+    # Hardening U10: a PIN signs in only with the school the phone is bound to.
+    response = client.post("/api/auth/pin-login", json=pin_login_body(pin, school_id))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -101,7 +105,7 @@ def admin_headers(client, sandbox):
 def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
     """A throwaway driver with a known PIN (retry rare PIN collisions)."""
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT RX Driver{n} {marker}",
@@ -194,8 +198,8 @@ def fleet(client, admin_headers, sandbox):
             "marker": marker,
             "school_id": school_id,
             "driver1": driver1, "driver2": driver2,
-            "driver_headers": pin_login(client, driver1["pin"]),
-            "driver2_headers": pin_login(client, driver2["pin"]),
+            "driver_headers": pin_login(client, driver1["pin"], school_id),
+            "driver2_headers": pin_login(client, driver2["pin"], school_id),
             "bus1": bus1, "bus2": bus2,
             "morning": morning, "afternoon": afternoon, "morning2": morning2,
             "a": a, "b": b, "c": c, "d": d, "e": e,
@@ -1297,7 +1301,7 @@ def test_no_bus_context_carries_an_empty_prompts_block(client, admin_headers, fl
     the client never branches on its absence."""
     driver = _create_driver(client, admin_headers, fleet["marker"], 3)
     try:
-        context = _context(client, pin_login(client, driver["pin"]))
+        context = _context(client, pin_login(client, driver["pin"], fleet["school_id"]))
         assert context["bus"] is None
         assert context["pending_prompts"] == []
         assert context["blocking"] == [] and context["run_stops"] == []
@@ -1695,7 +1699,7 @@ def test_prompt_routes_follow_ownership_roles_and_school_scoping(client, admin_h
         assert _respond(client, other_driver, event_id, "dismissed").status_code == 403
         assert _shown(client, other_driver, event_id).status_code == 403
 
-        driver_b = pin_login(client, DRIVER_B_PIN)
+        driver_b = pin_login(client, DRIVER_B_PIN, SCHOOL_B_ID)
         assert _respond(client, driver_b, event_id, "dismissed").status_code == 404
         assert _shown(client, driver_b, event_id).status_code == 404
 

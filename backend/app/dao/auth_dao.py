@@ -1,5 +1,7 @@
 from typing import Any
 
+from psycopg import errors as pg_errors
+
 from app.core.db import get_connection, get_global_connection
 from app.dao.audit_dao import masked_display_sql
 from app.dao.verification_sql import verified_sql
@@ -8,6 +10,24 @@ from app.dao.verification_sql import verified_sql
 # purpose-scoped, so a verification token can never reset a password and a
 # reset token never verifies an address.
 TOKEN_PURPOSES = ("reset", "verify")
+
+
+def upgrade_pin_hash(conn, user_id: str, legacy_hash: str, salted_hash: str) -> bool:
+    """Rewrite one driver's legacy global PIN hash to the school-salted form
+    (hardening U10, upgrade on sign-in), on the caller's transaction. Only
+    the row still holding the hash that matched is touched. Under a
+    savepoint: if the salted value is somehow already taken (the global
+    unique index), the sign-in still succeeds and the row stays legacy until
+    the office re-issues the PIN. Returns whether the row was rewritten."""
+    try:
+        with conn.transaction():
+            rewritten = conn.execute(
+                "update app_users set pin_hash = %s where id = %s and pin_hash = %s",
+                (salted_hash, user_id, legacy_hash),
+            ).rowcount
+    except pg_errors.UniqueViolation:
+        return False
+    return bool(rewritten)
 
 
 class AuthDao:
@@ -46,16 +66,85 @@ class AuthDao:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_driver_pin_users(self) -> list[dict[str, Any]]:
-        with get_connection() as conn:
+    # --- driver sign-in bound to the school (hardening U10) --------------------
+    # Every read and write here runs on the global connection: the sign-in
+    # path has no school scope yet, and none of these tables is school-owned
+    # (live_schools, school_memberships, app_users and pin_login_failures
+    # carry no row security).
+
+    def school_by_driver_code(self, driver_code: str) -> dict[str, Any] | None:
+        """The school a NORMALISED driver code names — id and name only,
+        all the public lookup ever answers."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                "select id, name from live_schools where driver_code = %s",
+                (driver_code,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def school_for_pin_login(self, school_id: str) -> dict[str, Any] | None:
+        """The bound school's id and public code (the only school detail a
+        log line may carry); None when no such school exists."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                "select id, code from live_schools where id = %s", (school_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pin_failures_since(
+        self, school_id: str, source: str, window_minutes: int, limit: int
+    ) -> dict[str, Any]:
+        """Failed PIN sign-ins from one source at one school inside the
+        window (D3). ``retry_after_s`` is how long until the count falls back
+        to ``limit`` — when the failure that tipped it over the limit leaves
+        the window — or None while the count is within it."""
+        with get_global_connection() as conn:
+            row = conn.execute(
+                """
+                with w as (
+                    select attempted_at from pin_login_failures
+                    where school_id = %(school)s and source = %(source)s
+                      and attempted_at > now() - make_interval(mins => %(mins)s)
+                ), n as (select count(*) as failures from w)
+                select n.failures,
+                       case when n.failures > %(limit)s then (
+                           select extract(epoch from
+                                      w.attempted_at + make_interval(mins => %(mins)s) - now())
+                           from w order by w.attempted_at
+                           offset n.failures - %(limit)s - 1 limit 1
+                       ) end as retry_after_s
+                from n
+                """,
+                {"school": school_id, "source": source, "mins": window_minutes, "limit": limit},
+            ).fetchone()
+        retry = row["retry_after_s"]
+        return {
+            "failures": int(row["failures"]),
+            "retry_after_s": float(retry) if retry is not None else None,
+        }
+
+    def record_pin_failure(self, school_id: str, source: str) -> None:
+        with get_global_connection() as conn:
+            conn.execute(
+                "insert into pin_login_failures (school_id, source) values (%s, %s)",
+                (school_id, source),
+            )
+
+    def driver_members_for_school(self, school_id: str) -> list[dict[str, Any]]:
+        """The PIN holders a sign-in at this school may match: an ACTIVE
+        driver membership here (removed and offered rows never), an enabled
+        account and a PIN. Nothing at any other school is ever read."""
+        with get_global_connection() as conn:
             rows = conn.execute(
                 """
-                select u.id, u.email, u.full_name, u.pin_hash
-                from app_users u
-                join app_user_roles r on r.user_id = u.id
-                where r.role = 'driver' and u.pin_hash is not null
-                    and u.disabled_at is null
-                """
+                select u.id, u.pin_hash
+                from school_memberships m
+                join app_users u on u.id = m.user_id
+                where m.school_id = %s and m.role = 'driver'
+                  and m.state = 'active' and m.removed_at is null
+                  and u.disabled_at is null and u.pin_hash is not null
+                """,
+                (school_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -95,14 +184,29 @@ class AuthDao:
             )
         return dict(row)
 
-    def create_session(self, user_id: str, token_hash: str, ttl_hours: int = 16) -> None:
+    def create_session(
+        self,
+        user_id: str,
+        token_hash: str,
+        ttl_hours: int = 16,
+        *,
+        last_school_id: str | None = None,
+        pin_upgrade: tuple[str, str] | None = None,
+    ) -> None:
+        """One session row. A PIN sign-in (hardening U10) stamps the bound
+        school as the session's ``last_school_id`` and, after a match on the
+        legacy global hash, rewrites that row to the school-salted form in
+        the SAME transaction (``pin_upgrade`` = (legacy hash, salted hash)) —
+        see upgrade_pin_hash."""
         with get_connection() as conn:
+            if pin_upgrade is not None:
+                upgrade_pin_hash(conn, user_id, *pin_upgrade)
             conn.execute(
                 """
-                insert into auth_sessions (user_id, token_hash, expires_at)
-                values (%s, %s, now() + make_interval(hours => %s))
+                insert into auth_sessions (user_id, token_hash, expires_at, last_school_id)
+                values (%s, %s, now() + make_interval(hours => %s), %s)
                 """,
-                (user_id, token_hash, ttl_hours),
+                (user_id, token_hash, ttl_hours, last_school_id),
             )
 
     def get_session_user(self, token_hash: str) -> dict[str, Any] | None:

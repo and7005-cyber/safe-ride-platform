@@ -7,7 +7,7 @@ This manual is split by role. Each guide is self-contained — share only the re
 | Guide | Audience | What it covers |
 | --- | --- | --- |
 | [School Staff Guide](admin-guide.md) | School directors and transport coordinators | Staff accounts and roles, buses, drivers, students and routes; daily attendance; monitoring live runs; alerts and parent broadcasts |
-| [Driver Guide](driver-guide.md) | Bus drivers | Signing in with a PIN, starting a run, recording boarding and drop-offs, the phone's location during a run, the prompts, reporting incidents |
+| [Driver Guide](driver-guide.md) | Bus drivers | Setting up a phone with the school's driver code, signing in with a PIN, starting a run, recording boarding and drop-offs, the phone's location during a run, the prompts, reporting incidents |
 | [Driver GPS Briefing](driver-gps-briefing.md) | Bus drivers, delivered by Kuumbai before each driver's first run with location on | One page: what location data is collected, when, who sees it, how long it is kept, whom to ask; allowing location; the screen during a run; the four prompts; sign-off |
 | [Parent Guide](parent-guide.md) | Parents and guardians | Creating your account, connecting schools, following the bus live, notifications, cancelling a ride |
 | [Provider Guide](provider-guide.md) | Kuumbai Kenya staff (internal — do not share with schools) | Two-step sign-in, provisioning schools, stepping in to support a school, provider accounts, the audit reader |
@@ -20,7 +20,7 @@ SafeRide runs in a web browser — there is nothing to install from an app store
 
 - **Web address:** `https://saferidelive.co.ke`
 - **School staff** (directors and transport coordinators) sign in with an email address and password at `/auth`. Staff accounts are created by the school's director — the first director is set up by SafeRide (Kuumbai Kenya) when the school joins. There is no self-service staff sign-up.
-- **Drivers** sign in with their personal PIN on the **Driver PIN** tab at `/auth`. The school office creates the driver's account and assigns the PIN.
+- **Drivers** sign in with their personal PIN on the **Driver PIN** tab at `/auth`. The school office creates the driver's account, assigns the PIN and gives the school's **driver code**, which each phone needs once: a PIN works only at the school the phone is set up for.
 - **Parents** create their own account (email + password) at `/auth` — **using the same email address the school has on the child's record**. The in-app sign-up form is for parents only.
 
 SafeRide works on any modern browser (Chrome, Safari, Edge, Firefox) on phones, tablets and computers. Drivers and parents will normally use it on a phone; administrators on a computer.

@@ -29,6 +29,7 @@ from conftest import (
     SCHOOL_A_ID,
     SCHOOL_B_ID,
     TEST_PASSWORD,
+    pin_login_body,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -68,10 +69,14 @@ def tok(client, email: str) -> str:
     return _tokens[email]
 
 
+# Hardening U10: each seeded PIN signs in with its own school only.
+_PIN_SCHOOL = {DRIVER_A_PIN: SCHOOL_A_ID, DRIVER_B_PIN: SCHOOL_B_ID}
+
+
 def pin_tok(client, pin: str) -> str:
     key = f"pin:{pin}"
     if key not in _tokens:
-        resp = client.post("/api/auth/pin-login", json={"pin": pin})
+        resp = client.post("/api/auth/pin-login", json=pin_login_body(pin, _PIN_SCHOOL[pin]))
         assert resp.status_code == 200, resp.text
         _tokens[key] = resp.json()["token"]
     return _tokens[key]

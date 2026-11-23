@@ -93,7 +93,16 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, Phone, haversine_m, purge_accounts, purge_run, school_sandbox
+from conftest import (
+    driver_pin,
+    DSN,
+    haversine_m,
+    Phone,
+    pin_login_body,
+    purge_accounts,
+    purge_run,
+    school_sandbox,
+)
 from test_students_parents import signup_parent
 
 pytestmark = pytest.mark.skipif(
@@ -129,8 +138,9 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def pin_login(client: httpx.Client, pin: str) -> dict:
-    response = client.post("/api/auth/pin-login", json={"pin": pin})
+def pin_login(client: httpx.Client, pin: str, school_id: str) -> dict:
+    # Hardening U10: a PIN signs in only with the school the phone is bound to.
+    response = client.post("/api/auth/pin-login", json=pin_login_body(pin, school_id))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -148,7 +158,7 @@ def admin_headers(client, sandbox):
 
 def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT GPS Driver{n} {marker}",
@@ -240,8 +250,8 @@ def fleet(client, admin_headers, sandbox):
         yield {
             "marker": marker, "school_id": sandbox["id"],
             "driver1": driver1, "driver2": driver2,
-            "driver_headers": pin_login(client, driver1["pin"]),
-            "driver2_headers": pin_login(client, driver2["pin"]),
+            "driver_headers": pin_login(client, driver1["pin"], sandbox["id"]),
+            "driver2_headers": pin_login(client, driver2["pin"], sandbox["id"]),
             "bus1": bus1, "bus2": bus2,
             "morning": morning, "afternoon": afternoon, "morning2": morning2,
             "a": a, "b": b, "c": c, "z": z, "five": five,

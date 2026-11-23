@@ -31,7 +31,6 @@ for today would block that route for the rest of the day (R24).
 """
 
 import os
-import random
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -41,7 +40,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox
+from conftest import driver_pin, pin_login_body, purge_accounts, purge_run, school_sandbox
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -75,8 +74,9 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def pin_login(client: httpx.Client, pin: str) -> dict:
-    response = client.post("/api/auth/pin-login", json={"pin": pin})
+def pin_login(client: httpx.Client, pin: str, school_id: str) -> dict:
+    # Hardening U10: a PIN signs in only with the school the phone is bound to.
+    response = client.post("/api/auth/pin-login", json=pin_login_body(pin, school_id))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -114,7 +114,7 @@ def absences():
 def _create_driver(client, admin_headers, marker: str) -> dict:
     """Create a throwaway driver with a known PIN (retry rare PIN collisions)."""
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT DL Driver {marker}", "email": f"it-dl-driver-{marker}@test.local",
@@ -172,7 +172,7 @@ def fleet(client, admin_headers, sandbox):
         yield {
             "marker": marker,
             "driver": driver,
-            "driver_headers": pin_login(client, driver["pin"]),
+            "driver_headers": pin_login(client, driver["pin"], sandbox["id"]),
             "bus": bus, "school": school,
             "morning": morning, "afternoon": afternoon,
             "s1": s1, "s2": s2,
@@ -331,7 +331,7 @@ def test_custom_stops_route_cannot_start(client, admin_headers, fleet):
 
         blocked = client.post(
             "/api/runs/driver/start", json={"route_id": route["id"]},
-            headers=pin_login(client, driver2["pin"]),
+            headers=pin_login(client, driver2["pin"], fleet["school"]["id"]),
         )
         assert blocked.status_code == 409, blocked.text
         assert "No students are assigned" in blocked.json()["detail"]

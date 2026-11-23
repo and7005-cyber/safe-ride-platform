@@ -240,9 +240,12 @@ def test_the_runtime_role_writes_counts_and_clears_pin_failures_without_a_scope(
                     "insert into pin_login_failures (school_id, source) values (%s, %s)",
                     (SCHOOL_A_ID, source),
                 )
+            # Only this test's sources: since Release 1b the sign-in path
+            # writes rows of its own during a suite run.
             failures, sources = app.execute(
                 "select count(*), count(distinct source) from pin_login_failures "
-                "where school_id = %s and attempted_at > now() - interval '15 minutes'",
+                "where school_id = %s and attempted_at > now() - interval '15 minutes' "
+                "and source in ('198.51.100.7', '203.0.113.9')",
                 (SCHOOL_A_ID,),
             ).fetchone()
             assert (failures, sources) == (3, 2)

@@ -12,13 +12,12 @@ Run with the stack up: RUN_INTEGRATION=1 pytest tests/integration/test_cross_bus
 """
 
 import os
-import random
 import uuid
 
 import httpx
 import pytest
 
-from conftest import purge_run, school_sandbox
+from conftest import driver_pin, pin_login_body, purge_run, school_sandbox
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -41,8 +40,9 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def pin_login(client: httpx.Client, pin: str) -> dict:
-    response = client.post("/api/auth/pin-login", json={"pin": pin})
+def pin_login(client: httpx.Client, pin: str, school_id: str) -> dict:
+    # Hardening U10: a PIN signs in only with the school the phone is bound to.
+    response = client.post("/api/auth/pin-login", json=pin_login_body(pin, school_id))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -63,7 +63,7 @@ def admin_headers(client, sandbox):
 
 def _create_driver(client, admin_headers, marker: str, n: int) -> dict:
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT XB Driver{n} {marker}",
@@ -128,7 +128,7 @@ def test_cross_bus_afternoon_roster_is_run_scoped(client, admin_headers, sandbox
         assert row["bus_id"] == bus_a["id"]
 
         # Bus B's driver starts the afternoon run.
-        driver_b_headers = pin_login(client, driver_b["pin"])
+        driver_b_headers = pin_login(client, driver_b["pin"], sandbox["id"])
         started = client.post(
             "/api/runs/driver/start", json={"route_id": afternoon["id"]},
             headers=driver_b_headers,

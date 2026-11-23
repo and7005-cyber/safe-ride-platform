@@ -39,7 +39,6 @@ test has no subject — stated here rather than tested.
 """
 
 import os
-import random
 import time
 import uuid
 
@@ -48,7 +47,15 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import purge_accounts, DSN, purge_run, school_sandbox, signup_verified_parent
+from conftest import (
+    driver_pin,
+    DSN,
+    pin_login_body,
+    purge_accounts,
+    purge_run,
+    school_sandbox,
+    signup_verified_parent,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -82,8 +89,9 @@ def login(client: httpx.Client, email: str, password: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def pin_login(client: httpx.Client, pin: str) -> dict:
-    response = client.post("/api/auth/pin-login", json={"pin": pin})
+def pin_login(client: httpx.Client, pin: str, school_id: str) -> dict:
+    # Hardening U10: a PIN signs in only with the school the phone is bound to.
+    response = client.post("/api/auth/pin-login", json=pin_login_body(pin, school_id))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -199,7 +207,7 @@ def signup_parent(client, marker: str, tag: str) -> dict:
 
 def _create_driver(client, admin_headers, marker: str) -> dict:
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT FPA Driver {marker}",
@@ -822,7 +830,7 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
         rides = _ride_map(review)
 
         # Start a run on the seeded surplus route, then apply mid-run.
-        driver_headers = pin_login(client, driver["pin"])
+        driver_headers = pin_login(client, driver["pin"], school["id"])
         started = client.post("/api/runs/driver/start", json={"route_id": route_c["id"]},
                               headers=driver_headers)
         assert started.status_code == 200, started.text
@@ -944,7 +952,7 @@ def test_ae5_mid_run_apply_reconcile_and_post_apply_invariants(client, admin_hea
                              if r["bus_id"] == bus_a["id"] and r["type"] == MORNING)
         started2 = client.post("/api/runs/driver/start",
                                json={"route_id": bus_a_morning["id"]},
-                               headers=pin_login(client, driver["pin"]))
+                               headers=pin_login(client, driver["pin"], school["id"]))
         assert started2.status_code == 200, started2.text
         run2_id = started2.json()["id"]
     finally:

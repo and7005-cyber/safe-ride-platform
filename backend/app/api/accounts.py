@@ -72,6 +72,18 @@ def update_driver(
     )
 
 
+@router.post("/school/driver-code/regenerate")
+def regenerate_driver_code(
+    scope: SchoolScope = Depends(require_director),
+    user: dict = Depends(get_current_user),
+):
+    """A new driver code for the active school (hardening U10; DL7:
+    director-only, like Delete). Links and QR codes already sent stop
+    resolving; phones already set up keep working. The current code is read
+    from GET /api/fleet/school (``driver_code``)."""
+    return safe_call(lambda: service.regenerate_driver_code(scope, actor=user))
+
+
 @router.delete("/drivers/{driver_id}")
 def delete_driver(
     driver_id: str,

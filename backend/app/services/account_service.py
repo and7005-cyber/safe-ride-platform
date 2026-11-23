@@ -3,14 +3,17 @@ from app.core.errors import BadRequestError, ConflictError
 from app.core.request_context import log_unexpected_error
 from app.core.scope import SchoolScope
 from app.core.security import (
+    PinRefused,
     create_session_token,
     generate_relayed_temporary_password,
     hash_password,
     hash_pin_hmac,
+    hash_pin_v2,
     hash_session_token,
+    validate_pin,
 )
 from app.core.validation import clean_email, clean_phone
-from app.dao.account_dao import AccountDao
+from app.dao.account_dao import PIN_IN_USE_MESSAGE, AccountDao
 from app.services.mail_service import (
     VERIFY_TTL_MINUTES,
     MailService,
@@ -28,10 +31,11 @@ EMAIL_IN_USE_MESSAGE = "That email is already in use"
 
 def _map_unique_violation(exc: Exception) -> Exception:
     """Translate the two relevant unique-index races into their contract
-    errors; anything else propagates unchanged."""
+    errors; anything else propagates unchanged. The PIN index is global, but
+    a school-salted hash can only collide inside its own school."""
     text = str(exc)
     if "app_users_pin_hash_key" in text:
-        return ConflictError("That PIN is already in use by another driver")
+        return ConflictError(PIN_IN_USE_MESSAGE)
     if "app_users_email_key" in text:
         return BadRequestError(EMAIL_IN_USE_MESSAGE)
     return exc
@@ -62,10 +66,10 @@ class AccountService:
             raise BadRequestError(EMAIL_IN_USE_MESSAGE)
         if not password or len(password) < 6:
             raise BadRequestError("Password must be at least 6 characters")
-        pin_hash = hash_pin_hmac(pin, self.pepper) if pin else None
+        pin_hashes = self._new_pin_hashes(scope, pin)
         try:
             return self.dao.create_driver(
-                scope, email, hash_password(password), full_name, phone, pin_hash,
+                scope, email, hash_password(password), full_name, phone, pin_hashes,
                 actor=actor,
             )
         except Exception as exc:  # unique pin/email index → collision
@@ -74,14 +78,37 @@ class AccountService:
     def update_driver(self, scope: SchoolScope, driver_id, full_name, email, phone, pin, *, actor: dict):
         email = clean_email(email, required=True)
         phone = clean_phone(phone, field="driver phone")
-        # Blank PIN keeps the existing PIN; a 4-digit value replaces it.
-        pin_hash = hash_pin_hmac(pin, self.pepper) if pin else None
+        # Blank PIN keeps the existing PIN; a value replaces it (six digits).
+        pin_hashes = self._new_pin_hashes(scope, pin)
         try:
             return self.dao.update_driver(
-                scope, driver_id, full_name, email, phone, pin_hash, actor=actor
+                scope, driver_id, full_name, email, phone, pin_hashes, actor=actor
             )
         except Exception as exc:
             raise _map_unique_violation(exc) from exc
+
+    def _new_pin_hashes(self, scope: SchoolScope, pin) -> tuple[str, str] | None:
+        """A new or re-issued PIN (hardening U10): exactly six digits and not
+        an easy guess, stored school-salted. Returns (salted, legacy) — the
+        legacy global form is computed only for the in-school pre-check, so a
+        salted and a legacy hash of one PIN never coexist at a school. None
+        for a blank PIN (create: no PIN; update: keep the current one)."""
+        if pin is None or str(pin) == "":
+            return None
+        try:
+            validate_pin(str(pin), for_creation=True)
+        except PinRefused as refused:
+            raise BadRequestError(str(refused)) from refused
+        return (
+            hash_pin_v2(scope.school_id, str(pin), self.pepper),
+            hash_pin_hmac(str(pin), self.pepper),
+        )
+
+    def regenerate_driver_code(self, scope: SchoolScope, *, actor: dict):
+        """A new driver code for the scope school (hardening U10): links and
+        QR codes already sent stop resolving; phones already set up keep
+        working, because they store the school id, never the code."""
+        return {"driverCode": self.dao.regenerate_driver_code(scope, actor=actor)}
 
     def delete_driver(self, scope: SchoolScope, driver_id, *, actor: dict):
         self.dao.delete_driver(scope, driver_id, actor=actor)

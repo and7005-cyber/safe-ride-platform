@@ -26,7 +26,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_run, school_sandbox
+from conftest import purge_run, school_sandbox, driver_pin, pin_login_body
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -81,7 +81,7 @@ def fleet(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
     created: dict = {"marker": marker}
 
-    pin = str(random.randint(100000, 999999))
+    pin = driver_pin()
     response = client.post(
         "/api/accounts/drivers",
         json={"full_name": f"IT Fleet Driver {marker}",
@@ -173,7 +173,7 @@ def test_bus_derives_active_while_its_run_is_open(client, admin_headers, fleet):
     No admin action in either direction — this is the defect the derivation
     exists to fix.
     """
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
 
     response = client.post("/api/runs/driver/start",
                            json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
@@ -248,7 +248,7 @@ def test_arrival_records_when_not_just_how_many(client, admin_headers, fleet):
     The counter alone cannot answer "how long since the bus last moved", and the
     force-close needs evidence the gate was actually reached.
     """
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
     assert started.status_code == 200, started.text
@@ -276,7 +276,7 @@ def test_arrival_records_when_not_just_how_many(client, admin_headers, fleet):
 def test_fresh_run_is_not_flagged_and_completed_runs_never_are(client, admin_headers, fleet):
     """R25: the flag measures a stall, so a run that just started is clean, and
     a completed run is never flagged however long ago it ended."""
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
     assert started.status_code == 200, started.text
@@ -293,7 +293,7 @@ def test_flag_is_suppressed_once_every_stop_is_recorded(client, admin_headers, f
     """R25: the closure gate lengthens the window after the last arrival while
     the driver resolves blocking children. A flag that fires on that normal path
     is one the office learns to ignore, so it is suppressed there."""
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
     assert started.status_code == 200, started.text
@@ -326,7 +326,7 @@ def test_stall_before_the_first_stop_is_flagged(client, admin_headers, fleet):
     A driver whose phone dies before stop one is the case the office force-close
     exists for; measuring only between arrivals would never fire on it.
     """
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
     assert started.status_code == 200, started.text
@@ -356,7 +356,7 @@ def test_repeat_arrive_taps_still_advance_progress(client, admin_headers, fleet)
     confirming their drop-off. Suppressing repeats for the flag's benefit would
     strand a driver who missed a tap.
     """
-    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json={'pin': fleet['pin']}).json()['token']}"}
+    driver_headers = {"Authorization": f"Bearer {client.post('/api/auth/pin-login', json=pin_login_body(fleet['pin'], fleet['school']['id'])).json()['token']}"}
     started = client.post("/api/runs/driver/start",
                           json={"route_id": fleet["route"]["id"]}, headers=driver_headers)
     assert started.status_code == 200, started.text

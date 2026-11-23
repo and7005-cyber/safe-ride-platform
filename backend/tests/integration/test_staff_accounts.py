@@ -33,6 +33,7 @@ from conftest import (
     purge_accounts,
     signup_verified_parent,
     temp_school,
+    pin_login_body,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -927,7 +928,7 @@ def test_disable_user_kills_pin_sessions_and_reset_tokens(client):
         driver_id = str(created.json()["id"])
 
         # Working before the disable: PIN and password both sign in.
-        assert client.post("/api/auth/pin-login", json={"pin": pin}).status_code == 200
+        assert client.post("/api/auth/pin-login", json=pin_login_body(pin, SCHOOL_A_ID)).status_code == 200
         session_token = login(client, email, "DriverPass1").json()["token"]
         assert client.get("/api/auth/me", headers=hdr(session_token)).status_code == 200
         raw_reset = create_session_token()
@@ -941,7 +942,7 @@ def test_disable_user_kills_pin_sessions_and_reset_tokens(client):
             ).fetchone()["disabled_at"] is not None
         # The PIN no longer resolves, the live session is dead, the password
         # is refused with the generic message, and the reset link is void.
-        assert client.post("/api/auth/pin-login", json={"pin": pin}).status_code == 401
+        assert client.post("/api/auth/pin-login", json=pin_login_body(pin, SCHOOL_A_ID)).status_code == 401
         assert client.get("/api/auth/me", headers=hdr(session_token)).status_code == 401
         assert login(client, email, "DriverPass1").status_code == 401
         assert client.post(

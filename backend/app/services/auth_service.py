@@ -1,17 +1,31 @@
 import datetime as dt
+import hmac
 import logging
+import uuid
 
 from psycopg import errors as pg_errors
 
 from app.core.config import get_settings
-from app.core.errors import BadRequestError, ForbiddenError, UnauthorizedError
+from app.core.errors import (
+    BadRequestError,
+    ForbiddenError,
+    NotFoundError,
+    TooManyRequestsError,
+    UnauthorizedError,
+)
 from app.core.request_context import current_request_id
 from app.core.security import (
+    PinRefused,
     create_pin_session_token,
     create_session_token,
     hash_password,
+    hash_pin_v2,
     hash_session_token,
+    is_driver_code,
+    is_v2_pin_hash,
+    normalise_driver_code,
     normalise_relayed_code,
+    validate_pin,
     verify_password,
     verify_pin_hmac,
 )
@@ -51,6 +65,51 @@ VERIFY_LINK_INVALID_MESSAGE = "This verification link has expired or was already
 PIN_SESSION_CHANGE_MESSAGE = (
     "You signed in with a PIN. Sign in with your email and password to change your password."
 )
+
+
+# Driver sign-in bound to the school (hardening U10). The phone stores the
+# school it was set up for (the driver code lookup) and sends its id with the
+# PIN; there is no PIN-only fallback. More than PIN_LOCK_MAX_FAILURES failed
+# attempts from one source at one school inside PIN_LOCK_WINDOW_MINUTES pause
+# PIN sign-in for that source at that school until the window passes (D3).
+PIN_LOCK_WINDOW_MINUTES = 15
+PIN_LOCK_MAX_FAILURES = 20
+INVALID_PIN_MESSAGE = "Invalid PIN"
+SCHOOL_REQUIRED_MESSAGE = (
+    "This phone is not set up for a school yet. Enter the driver code from your school office."
+)
+SCHOOL_PIN_LOCKED_MESSAGE = (
+    "Sign-in for your school is paused for a few minutes. Try again shortly."
+)
+DRIVER_CODE_UNKNOWN_MESSAGE = "No school has that driver code"
+
+
+class PinLoginError(UnauthorizedError):
+    """A refused PIN sign-in the client branches on: ``school-required`` (no
+    school was sent — the phone is not bound) or ``invalid-pin`` (a wrong PIN,
+    or a school that does not exist)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class SchoolPinLockedError(TooManyRequestsError):
+    """PIN sign-in paused for this source at this school (D3). The answer
+    carries ``Retry-After``: seconds until the window lets the source in."""
+
+    code = "school-pin-locked"
+
+    def __init__(self, message: str, *, retry_after_s: float) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+def _canonical_school_id(value) -> str | None:
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 class VerificationError(BadRequestError):
@@ -111,12 +170,26 @@ class AuthService:
 
     # --- session helpers ---------------------------------------------------
 
-    def _issue_session(self, user: dict, *, pin: bool = False) -> dict:
+    def _issue_session(
+        self,
+        user: dict,
+        *,
+        pin: bool = False,
+        school_id: str | None = None,
+        pin_upgrade: tuple[str, str] | None = None,
+    ) -> dict:
         # A PIN session's token carries the marker (security.PIN_SESSION_TOKEN_PREFIX):
         # the account menus hide Change password for it and the server
-        # refuses the change (hardening U9).
+        # refuses the change (hardening U9). A PIN session also remembers the
+        # school it signed in at, and carries the legacy-hash upgrade into
+        # the same transaction (hardening U10).
         token = create_pin_session_token() if pin else create_session_token()
-        self.dao.create_session(user["id"], hash_session_token(token))
+        extra: dict = {}
+        if school_id is not None:
+            extra["last_school_id"] = school_id
+        if pin_upgrade is not None:
+            extra["pin_upgrade"] = pin_upgrade
+        self.dao.create_session(user["id"], hash_session_token(token), **extra)
         return {
             "token": token,
             "user": {
@@ -237,16 +310,91 @@ class AuthService:
             return False
         return expires_at <= dt.datetime.now(dt.timezone.utc)
 
-    def pin_login(self, pin: str) -> dict:
-        matches = [
-            u
-            for u in self.dao.list_driver_pin_users()
-            if verify_pin_hmac(pin, u["pin_hash"], self.pepper)
+    # --- driver sign-in bound to the school (hardening U10) --------------------
+
+    def school_for_driver_code(self, code: str) -> dict:
+        """The public lookup behind the driver's first sign-in on a phone:
+        a typed driver code (any case, with or without the hyphen or spaces,
+        O for 0, I or L for 1) answers the school's id and name — nothing
+        else — or 404. The public AAA-NNN school code never matches."""
+        normalised = normalise_driver_code(code)
+        school = self.dao.school_by_driver_code(normalised) if is_driver_code(normalised) else None
+        if not school:
+            raise NotFoundError(DRIVER_CODE_UNKNOWN_MESSAGE)
+        return {"schoolId": str(school["id"]), "name": school["name"]}
+
+    def pin_login(self, pin: str, school_id: str | None, source: str = "unknown") -> dict:
+        """A PIN resolves only among the bound school's active drivers.
+
+        No school: 401 ``school-required`` (the phone must be set up with the
+        driver code first). An unknown school: 401 ``invalid-pin``. More than
+        PIN_LOCK_MAX_FAILURES failures from ``source`` at the school in the
+        window: 429 ``school-pin-locked`` with the seconds to wait — the
+        correct PIN included, other sources and schools unaffected. Then the
+        school-salted hash is matched directly; failing that, the legacy
+        global hashes OF THIS SCHOOL'S DRIVERS ONLY are verified and a match
+        is rewritten to the salted form in the session's transaction. Every
+        failure at a known school writes a failure row.
+
+        Log lines (U12's metric filters match their first word:
+        ``school-required``, ``pin-failure``, ``pin-locked``) carry the public
+        school code only — never the PIN, a hash, the driver code, an address
+        or the source; the request id is stamped by the log filter."""
+        if school_id is None or not str(school_id).strip():
+            logger.warning("school-required")
+            raise PinLoginError("school-required", SCHOOL_REQUIRED_MESSAGE)
+        canonical = _canonical_school_id(school_id)
+        school = self.dao.school_for_pin_login(canonical) if canonical else None
+        if not school:
+            logger.warning("pin-failure school=unknown")
+            raise PinLoginError("invalid-pin", INVALID_PIN_MESSAGE)
+        school_id = str(school["id"])
+        school_code = school.get("code") or "-"
+
+        window = self.dao.pin_failures_since(
+            school_id, source, PIN_LOCK_WINDOW_MINUTES, PIN_LOCK_MAX_FAILURES
+        )
+        if window["failures"] > PIN_LOCK_MAX_FAILURES:
+            logger.warning("pin-locked school=%s", school_code)
+            raise SchoolPinLockedError(
+                SCHOOL_PIN_LOCKED_MESSAGE,
+                retry_after_s=max(1.0, window["retry_after_s"] or 1.0),
+            )
+
+        match = self._match_school_pin(school_id, pin)
+        if match is None:
+            self.dao.record_pin_failure(school_id, source)
+            logger.warning("pin-failure school=%s", school_code)
+            raise PinLoginError("invalid-pin", INVALID_PIN_MESSAGE)
+        user_id, upgrade = match
+        user = self.dao.get_user_by_id(user_id)
+        if user is None:
+            raise PinLoginError("invalid-pin", INVALID_PIN_MESSAGE)
+        return self._issue_session(user, pin=True, school_id=school_id, pin_upgrade=upgrade)
+
+    def _match_school_pin(
+        self, school_id: str, pin: str
+    ) -> tuple[str, tuple[str, str] | None] | None:
+        """(user id, legacy-to-salted upgrade or None) for the one driver at
+        ``school_id`` the PIN belongs to, or None. The salted match wins."""
+        try:
+            validate_pin(pin, for_creation=False)
+        except PinRefused:
+            return None
+        salted = hash_pin_v2(school_id, pin, self.pepper)
+        members = self.dao.driver_members_for_school(school_id)
+        for member in members:
+            if hmac.compare_digest(str(member["pin_hash"]), salted):
+                return str(member["id"]), None
+        legacy = [
+            member
+            for member in members
+            if not is_v2_pin_hash(member["pin_hash"])
+            and verify_pin_hmac(pin, member["pin_hash"], self.pepper)
         ]
-        if len(matches) != 1:
-            raise UnauthorizedError("Invalid PIN")
-        user = self.dao.get_user_by_id(matches[0]["id"])
-        return self._issue_session(user, pin=True)
+        if len(legacy) != 1:
+            return None
+        return str(legacy[0]["id"]), (legacy[0]["pin_hash"], salted)
 
     def logout(self, token: str) -> None:
         if token:

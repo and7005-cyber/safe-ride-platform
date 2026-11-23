@@ -42,11 +42,14 @@ on conflict (user_id) do update set role = excluded.role;
 
 -- School -------------------------------------------------------------------
 
-insert into live_schools (id, name, address, phone, lat, lng) values
-  ('5cae0000-0000-0000-0000-000000000001', 'Greenfield Academy', 'Ngong Road, Nairobi', '+254709000000', -1.300100, 36.760800)
+-- A fixed driver code (hardening U10, D2: Crockford base32, stored without
+-- the hyphen, shown GFA0-7K1Q) so the local sign-in link and the e2e
+-- fixtures are stable. Seed 003 sets the same code after its reload.
+insert into live_schools (id, name, address, phone, lat, lng, driver_code) values
+  ('5cae0000-0000-0000-0000-000000000001', 'Greenfield Academy', 'Ngong Road, Nairobi', '+254709000000', -1.300100, 36.760800, 'GFA07K1Q')
 on conflict (id) do update set
   name = excluded.name, address = excluded.address, phone = excluded.phone,
-  lat = excluded.lat, lng = excluded.lng;
+  lat = excluded.lat, lng = excluded.lng, driver_code = excluded.driver_code;
 
 -- Buses (bus 6 is the dedicated always-parked fleet-map bus with GPS) -------
 

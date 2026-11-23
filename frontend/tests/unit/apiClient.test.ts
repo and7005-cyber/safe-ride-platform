@@ -301,6 +301,37 @@ describe("apiClient structured error details", () => {
   });
 });
 
+describe("apiClient Retry-After (hardening U10, DL4)", () => {
+  it("exposes the seconds a 429 asks for, from the header or the body", async () => {
+    const { api } = await import("@/lib/apiClient");
+    const locked = {
+      detail: { code: "school-pin-locked", message: "paused", retry_after_s: 240 },
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(locked), { status: 429, headers: { "Retry-After": "300" } }),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify(locked), { status: 429 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Invalid PIN" }), {
+          status: 401,
+          headers: { "Retry-After": "30" },
+        }),
+      );
+    const body = { pin: "482915", schoolId: "s" };
+    const fromHeader = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(fromHeader).toBeInstanceOf(ApiError);
+    expect(fromHeader.code).toBe("school-pin-locked");
+    expect(fromHeader.retryAfter).toBe(300);
+    const fromBody = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(fromBody.retryAfter).toBe(240);
+    const notA429 = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(notA429.retryAfter).toBeNull();
+    fetchMock.mockRestore();
+  });
+});
+
 // U13 — the provider second factor's client seams.
 
 describe("apiClient provider auth seams", () => {

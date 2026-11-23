@@ -569,6 +569,14 @@ UPDATE public.live_schools SET code = 'GFA-001'
 UPDATE public.live_schools SET code = 'ITS-002'
   WHERE id = '5cae0000-0000-0000-0000-000000000002' AND code IS DISTINCT FROM 'ITS-002';
 
+-- Fixed driver codes (hardening U10, D2): eight Crockford base32 symbols,
+-- stored without the hyphen and shown GFA0-7K1Q / SEC2-ND8B. The e2e
+-- fixtures (frontend/tests/e2e/helpers.ts DRIVER / DRIVER_B) carry them.
+UPDATE public.live_schools SET driver_code = 'GFA07K1Q'
+  WHERE id = '5cae0000-0000-0000-0000-000000000001' AND driver_code IS DISTINCT FROM 'GFA07K1Q';
+UPDATE public.live_schools SET driver_code = 'SEC2ND8B'
+  WHERE id = '5cae0000-0000-0000-0000-000000000002' AND driver_code IS DISTINCT FROM 'SEC2ND8B';
+
 -- Staff memberships (school A = Greenfield locally, school B = IT Second).
 -- admin@test.com keeps an interim director membership, mirroring production's
 -- rollout state, so the legacy e2e identity still works on the scoped code.

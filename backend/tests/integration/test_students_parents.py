@@ -23,7 +23,14 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox, signup_verified_parent
+from conftest import (
+    purge_accounts,
+    purge_run,
+    school_sandbox,
+    signup_verified_parent,
+    SCHOOL_A_ID,
+    pin_login_body,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -398,7 +405,7 @@ U3_HOME = {
 
 @pytest.fixture(scope="module")
 def driver_headers(client):
-    response = client.post("/api/auth/pin-login", json={"pin": DRIVER_PIN})
+    response = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_PIN, SCHOOL_A_ID))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 

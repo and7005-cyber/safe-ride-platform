@@ -18,6 +18,9 @@ import {
   purgeRun,
   schoolHeaders,
   signUpVerifiedParent,
+  sqlCreateSchool,
+  sqlDeleteAuditFor,
+  sqlDropSchool,
   uniqueName,
 } from "./helpers";
 
@@ -435,12 +438,25 @@ test("admin can create and delete a driver account with a PIN", async ({ page })
   await fieldInput(dialog(page), "Full name").fill(name);
   await fieldInput(dialog(page), "Email").fill(email);
   await fieldInput(dialog(page), "Password").fill("DriverPass1!");
+  // Hardening U10 (DL8): six digits; a short or easy PIN holds Save with
+  // the rule's words, and Generate makes one the server accepts.
+  const pinField = dialog(page).getByPlaceholder("6 digits");
+  await pinField.fill("12345");
+  await expect(dialog(page).getByTestId("pin-error")).toHaveText("PIN must be 6 digits");
+  await expect(dialog(page).getByRole("button", { name: "Save" })).toBeDisabled();
+  await pinField.fill("123456");
+  await expect(dialog(page).getByTestId("pin-error")).toHaveText("That PIN is too easy to guess");
+  await expect(dialog(page).getByRole("button", { name: "Save" })).toBeDisabled();
   await dialog(page).getByRole("button", { name: "Generate" }).click();
+  await expect(pinField).toHaveValue(/^[0-9]{6}$/);
+  await expect(dialog(page).getByTestId("pin-error")).toHaveCount(0);
   await dialog(page).getByRole("button", { name: "Save" }).click();
 
-  // The PIN is revealed once after saving so the admin can share it.
+  // The PIN is revealed once after saving so the admin can share it, with
+  // the driver code a new phone needs (DL7).
   const reveal = page.getByRole("dialog");
   await expect(reveal.getByText("Driver PIN set")).toBeVisible();
+  await expect(reveal.getByTestId("pin-reveal-code")).toContainText(DRIVER.driverCode);
   await reveal.getByRole("button", { name: "Done" }).click();
 
   await expect(page.getByRole("row", { name: new RegExp(name) })).toBeVisible();
@@ -448,6 +464,55 @@ test("admin can create and delete a driver account with a PIN", async ({ page })
   await page.getByRole("row", { name: new RegExp(name) }).getByRole("button").last().click();
   await confirmDelete(page);
   await expect(page.getByRole("row", { name: new RegExp(name) })).toHaveCount(0);
+});
+
+test("the Drivers page shows the driver code, its link and QR, and Regenerate (U10)", async ({
+  page,
+  request,
+}) => {
+  // A fixture school: regenerating the seeded school's code would strand
+  // every later spec that signs in through DRIVER.driverCode.
+  const school = sqlCreateSchool(uniqueName("E2E Driver Code School"), ADMIN.email);
+  try {
+    await signInAs(page, ADMIN, school.id);
+    await page.goto("/drivers");
+    const card = page.getByTestId("driver-code-card");
+    const shown = `${school.driverCode.slice(0, 4)}-${school.driverCode.slice(4)}`;
+    await expect(card.getByTestId("driver-code-value")).toHaveText(shown);
+    await expect(card.getByText("Driver code", { exact: true })).toBeVisible();
+    await expect(card.getByRole("button", { name: "Copy code" })).toBeVisible();
+    await expect(card.getByRole("button", { name: "Copy message for drivers" })).toBeVisible();
+    await expect(card.getByText("Share by link or QR")).toBeVisible();
+    await expect(card.getByTestId("driver-code-link")).toHaveText(
+      new RegExp(`/auth\\?school=${school.driverCode}$`),
+    );
+    await expect(card.getByRole("img", { name: "QR code for the driver sign-in link" })).toBeVisible();
+
+    // Regenerate asks first; cancelling changes nothing.
+    await card.getByRole("button", { name: "Regenerate" }).click();
+    const confirmBox = page.getByRole("dialog");
+    await expect(confirmBox).toContainText("Replace the driver code?");
+    await expect(confirmBox).toContainText(
+      "Links and QR codes already sent stop working. Phones already set up keep working.",
+    );
+    await confirmBox.getByRole("button", { name: "Keep the current code" }).click();
+    await expect(card.getByTestId("driver-code-value")).toHaveText(shown);
+
+    await card.getByRole("button", { name: "Regenerate" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Replace code" }).click();
+    await expect(card.getByTestId("driver-code-value")).not.toHaveText(shown);
+    // The old link stops resolving; the new one names the school.
+    const old = await request.get(`${API_URL}/api/auth/schools/${school.driverCode}`);
+    expect(old.status()).toBe(404);
+    const fresh = (await card.getByTestId("driver-code-value").textContent())!.trim();
+    const resolved = await request.get(`${API_URL}/api/auth/schools/${fresh}`);
+    expect(resolved.ok()).toBeTruthy();
+    expect((await resolved.json()).schoolId).toBe(school.id);
+  } finally {
+    // 017's driver-code-regenerated row must not outlive the spec.
+    sqlDeleteAuditFor(school.id);
+    sqlDropSchool(school.id);
+  }
 });
 
 test("admin can edit and delete a registered parent account", async ({ page, request }) => {
@@ -581,7 +646,7 @@ test("admin can add and delete a manual run record", async ({ page }) => {
 test("admin can acknowledge and delete a driver incident", async ({ page, request }) => {
   // A driver files an incident through the API...
   const pinLoginResponse = await request.post(`${API_URL}/api/auth/pin-login`, {
-    data: { pin: DRIVER.pin },
+    data: { pin: DRIVER.pin, schoolId: DRIVER.schoolId },
   });
   const driverToken = (await pinLoginResponse.json()).token;
   const marker = uniqueName("E2E incident");

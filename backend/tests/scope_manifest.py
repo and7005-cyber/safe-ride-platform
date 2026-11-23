@@ -33,6 +33,9 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/auth/verify-email"): "auth",
     ("POST", "/api/auth/resend-verification"): "auth",
     ("GET", "/api/auth/dev/last-verification-link"): "auth",
+    # Hardening U10: the public driver code lookup ({schoolId, name} or 404),
+    # throttled at the gateway (D6) and in process.
+    ("GET", "/api/auth/schools/{code}"): "public",
     ("GET", "/api/fleet/buses"): "school-scoped",
     ("POST", "/api/fleet/buses"): "school-scoped",
     ("PUT", "/api/fleet/buses/{bus_id}"): "school-scoped",
@@ -111,6 +114,8 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/accounts/drivers"): "school-scoped",
     ("PUT", "/api/accounts/drivers/{driver_id}"): "school-scoped",
     ("DELETE", "/api/accounts/drivers/{driver_id}"): "school-scoped",
+    # Hardening U10: replace the active school's driver code (director only).
+    ("POST", "/api/accounts/school/driver-code/regenerate"): "school-scoped",
     ("GET", "/api/accounts/parents"): "school-scoped",
     ("PUT", "/api/accounts/parents/{parent_id}"): "school-scoped",
     ("DELETE", "/api/accounts/parents/{parent_id}"): "school-scoped",

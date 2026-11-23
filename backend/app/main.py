@@ -220,8 +220,9 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        # The browser may read the id, so a 5xx message can quote it (U11).
-        expose_headers=[REQUEST_ID_HEADER],
+        # The browser may read the id, so a 5xx message can quote it (U11),
+        # and Retry-After, so the PIN lock screen can count down (U10, DL4).
+        expose_headers=[REQUEST_ID_HEADER, "Retry-After"],
     )
     app.add_middleware(ScopeResponseMiddleware)
     app.add_middleware(

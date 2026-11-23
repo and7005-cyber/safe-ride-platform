@@ -6,20 +6,25 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from app.core.config import get_settings
-from app.core.errors import BadRequestError, UnauthorizedError
+from app.core.errors import BadRequestError, NotFoundError, UnauthorizedError
 from app.core.security import (
     PIN_SESSION_TOKEN_PREFIX,
     hash_password,
     hash_pin_hmac,
+    hash_pin_v2,
     hash_session_token,
     verify_password,
 )
 from app.services import auth_service as auth_module
 from app.services.auth_service import (
     FORGOT_MESSAGE,
+    PIN_LOCK_MAX_FAILURES,
+    PIN_LOCK_WINDOW_MINUTES,
     VERIFY_SIGN_IN_MESSAGE,
     AuthService,
+    PinLoginError,
     PinSessionError,
+    SchoolPinLockedError,
     VerificationError,
 )
 from app.services.mail_service import (
@@ -31,6 +36,8 @@ from app.services.mail_service import (
 )
 
 PEPPER = get_settings().pin_pepper
+SCHOOL_A = "5cae0000-0000-0000-0000-000000000001"
+SCHOOL_B = "5cae0000-0000-0000-0000-000000000002"
 
 
 _ids = itertools.count(1)
@@ -58,6 +65,18 @@ class FakeAuthDao:
                 "pin_hash": hash_pin_hmac("1234", PEPPER), "role": "driver",
             },
         }
+        # Hardening U10: schools (id → public code, driver code), driver
+        # memberships, the failure window and the session's school.
+        self.schools = {
+            SCHOOL_A: {"id": SCHOOL_A, "code": "GFA-001", "name": "Greenfield", "driver_code": "GFA07K1Q"},
+            SCHOOL_B: {"id": SCHOOL_B, "code": "ITS-002", "name": "IT Second", "driver_code": "SEC2ND8B"},
+        }
+        self.memberships = [
+            {"user_id": "u-driver", "school_id": SCHOOL_A, "role": "driver", "removed": False},
+        ]
+        self.failures: list[dict] = []
+        self.session_schools: dict[str, str | None] = {}
+        self.upgrades: list[tuple] = []
         self.sessions: dict[str, str] = {}
         self.revoked_all_for: list[str] = []
         self.kept_sessions: list[tuple[str, str]] = []
@@ -86,12 +105,43 @@ class FakeAuthDao:
             return None
         return {**self._view(user), "is_provider": bool(user.get("provider"))}
 
-    def list_driver_pin_users(self):
-        return [
-            {"id": u["id"], "email": u["email"], "full_name": u["full_name"], "pin_hash": u["pin_hash"]}
-            for u in self.users.values()
-            if u["role"] == "driver" and u["pin_hash"]
-        ]
+    # driver sign-in bound to the school (hardening U10) ------------------------
+
+    def school_by_driver_code(self, driver_code):
+        for school in self.schools.values():
+            if school["driver_code"] == driver_code:
+                return {"id": school["id"], "name": school["name"]}
+        return None
+
+    def school_for_pin_login(self, school_id):
+        school = self.schools.get(school_id)
+        return {"id": school["id"], "code": school["code"]} if school else None
+
+    def pin_failures_since(self, school_id, source, window_minutes, limit):
+        cutoff = _now() - dt.timedelta(minutes=window_minutes)
+        times = sorted(
+            f["at"] for f in self.failures
+            if f["school_id"] == school_id and f["source"] == source and f["at"] > cutoff
+        )
+        retry = None
+        if len(times) > limit:
+            leaves = times[len(times) - limit - 1] + dt.timedelta(minutes=window_minutes)
+            retry = (leaves - _now()).total_seconds()
+        return {"failures": len(times), "retry_after_s": retry}
+
+    def record_pin_failure(self, school_id, source, at=None):
+        self.failures.append({"school_id": school_id, "source": source, "at": at or _now()})
+
+    def driver_members_for_school(self, school_id):
+        out = []
+        for m in self.memberships:
+            user = self.users.get(m["user_id"])
+            if (
+                m["school_id"] == school_id and m["role"] == "driver" and not m["removed"]
+                and user and user.get("disabled_at") is None and user.get("pin_hash")
+            ):
+                out.append({"id": user["id"], "pin_hash": user["pin_hash"]})
+        return out
 
     def create_unverified_parent(self, email, password_hash, full_name, token_hash, ttl):
         uid = f"u-{email}"
@@ -105,8 +155,14 @@ class FakeAuthDao:
 
     # sessions ----------------------------------------------------------------
 
-    def create_session(self, user_id, token_hash, ttl_hours=16):
+    def create_session(self, user_id, token_hash, ttl_hours=16, *, last_school_id=None, pin_upgrade=None):
+        if pin_upgrade is not None:
+            legacy, salted = pin_upgrade
+            if self.users[user_id]["pin_hash"] == legacy:
+                self.users[user_id]["pin_hash"] = salted
+                self.upgrades.append((user_id, legacy, salted))
         self.sessions[token_hash] = user_id
+        self.session_schools[token_hash] = last_school_id
 
     def get_session_user(self, token_hash):
         uid = self.sessions.get(token_hash)
@@ -277,13 +333,163 @@ def test_signup_issues_no_session_and_links_nothing(service, accounts, transport
 
 
 def test_pin_login_single_match(service):
-    result = service.pin_login("1234")
+    result = service.pin_login("1234", SCHOOL_A)
     assert result["user"]["role"] == "driver"
 
 
 def test_pin_login_unknown_pin_rejected(service):
     with pytest.raises(UnauthorizedError):
-        service.pin_login("9999")
+        service.pin_login("9999", SCHOOL_A)
+
+
+# --- driver sign-in bound to the school (hardening U10) ----------------------------
+
+SOURCE = "198.51.100.7"
+
+
+def _add_driver(dao, uid, school_id, pin_hash, *, removed=False, disabled=False):
+    dao.users[uid] = {
+        "id": uid, "email": f"{uid}@saferide.test", "password_hash": hash_password("Test1234"),
+        "full_name": uid, "phone": None, "pin_hash": pin_hash, "role": "driver",
+        "disabled_at": _now() if disabled else None,
+    }
+    dao.memberships.append(
+        {"user_id": uid, "school_id": school_id, "role": "driver", "removed": removed}
+    )
+
+
+def _session_school(service, result):
+    return service.dao.session_schools[hash_session_token(result["token"])]
+
+
+def test_a_pin_without_a_school_is_refused_with_school_required_and_logged(service, caplog):
+    # AE8: no PIN-only fallback, whatever the PIN.
+    caplog.set_level(logging.INFO, logger="saferide.auth")
+    for school in (None, "", "   "):
+        with pytest.raises(PinLoginError) as caught:
+            service.pin_login("1234", school, source=SOURCE)
+        assert caught.value.code == "school-required" and caught.value.status_code == 401
+    lines = [r.getMessage() for r in caplog.records]
+    assert len([line for line in lines if line.startswith("school-required")]) == 3
+    assert service.dao.failures == [] and service.dao.sessions == {}
+
+
+def test_with_the_school_the_pin_signs_in_and_the_session_remembers_it(service):
+    result = service.pin_login("1234", SCHOOL_A, source=SOURCE)
+    assert result["user"]["id"] == "u-driver"
+    assert result["token"].startswith(PIN_SESSION_TOKEN_PREFIX)
+    assert _session_school(service, result) == SCHOOL_A
+    # Any spelling of the school's uuid is the same school.
+    assert service.pin_login("1234", SCHOOL_A.upper(), source=SOURCE)["user"]["id"] == "u-driver"
+
+
+def test_an_unknown_or_malformed_school_is_an_invalid_pin(service, caplog):
+    caplog.set_level(logging.INFO, logger="saferide.auth")
+    for school in ("5cae0000-0000-0000-0000-0000000000ff", "GFA-001", "not-a-uuid"):
+        with pytest.raises(PinLoginError) as caught:
+            service.pin_login("1234", school, source=SOURCE)
+        assert caught.value.code == "invalid-pin"
+    assert service.dao.failures == []  # no school to count against
+    assert all(r.getMessage().startswith("pin-failure school=unknown") for r in caplog.records)
+
+
+def test_a_legacy_pin_resolves_only_among_the_bound_schools_drivers(service):
+    # u-driver (school A) holds the legacy global hash of 1234.
+    with pytest.raises(PinLoginError) as caught:
+        service.pin_login("1234", SCHOOL_B, source=SOURCE)
+    assert caught.value.code == "invalid-pin"
+    assert service.dao.users["u-driver"]["pin_hash"] == hash_pin_hmac("1234", PEPPER)
+
+
+def test_a_legacy_sign_in_rewrites_the_row_to_the_salted_form(service):
+    legacy = hash_pin_hmac("1234", PEPPER)
+    salted = hash_pin_v2(SCHOOL_A, "1234", PEPPER)
+    first = service.pin_login("1234", SCHOOL_A, source=SOURCE)
+    assert first["user"]["id"] == "u-driver"
+    assert service.dao.upgrades == [("u-driver", legacy, salted)]
+    assert service.dao.users["u-driver"]["pin_hash"].startswith("v2:k1:")
+    # The next sign-in matches the salted hash directly: no second upgrade.
+    assert service.pin_login("1234", SCHOOL_A, source=SOURCE)["user"]["id"] == "u-driver"
+    assert len(service.dao.upgrades) == 1
+
+
+def test_two_schools_one_pin_each_driver_signs_in_only_at_their_own_school(service):
+    # AE9: school A's driver holds the legacy hash, school B's the salted one.
+    _add_driver(service.dao, "u-b", SCHOOL_B, hash_pin_v2(SCHOOL_B, "1234", PEPPER))
+    assert service.pin_login("1234", SCHOOL_B, source=SOURCE)["user"]["id"] == "u-b"
+    assert service.pin_login("1234", SCHOOL_A, source=SOURCE)["user"]["id"] == "u-driver"
+    # After the upgrade both hold salted hashes of the same PIN, still apart.
+    assert service.pin_login("1234", SCHOOL_B, source=SOURCE)["user"]["id"] == "u-b"
+    assert service.pin_login("1234", SCHOOL_A, source=SOURCE)["user"]["id"] == "u-driver"
+
+
+def test_a_salted_match_wins_over_a_legacy_one(service):
+    _add_driver(service.dao, "u-salted", SCHOOL_A, hash_pin_v2(SCHOOL_A, "1234", PEPPER))
+    assert service.pin_login("1234", SCHOOL_A, source=SOURCE)["user"]["id"] == "u-salted"
+    assert service.dao.upgrades == []
+
+
+@pytest.mark.parametrize("state", ["removed", "disabled"])
+def test_a_removed_membership_or_a_disabled_driver_never_matches(service, state):
+    _add_driver(
+        service.dao, "u-gone", SCHOOL_B, hash_pin_v2(SCHOOL_B, "482915", PEPPER),
+        removed=state == "removed", disabled=state == "disabled",
+    )
+    with pytest.raises(PinLoginError):
+        service.pin_login("482915", SCHOOL_B, source=SOURCE)
+
+
+def test_every_failure_writes_a_row_and_a_line_with_the_public_school_code_only(service, caplog):
+    caplog.set_level(logging.INFO, logger="saferide.auth")
+    for wrong in ("9999", "12ab", "482915"):
+        with pytest.raises(PinLoginError):
+            service.pin_login(wrong, SCHOOL_A, source=SOURCE)
+    assert [(f["school_id"], f["source"]) for f in service.dao.failures] == [(SCHOOL_A, SOURCE)] * 3
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == ["pin-failure school=GFA-001"] * 3
+    blob = " ".join(messages)
+    for secret in ("9999", "482915", "GFA07K1Q", SOURCE, SCHOOL_A, "v2:", "hmac_sha256"):
+        assert secret not in blob
+
+
+def _fail(dao, school_id, source, n, minutes_ago):
+    at = _now() - dt.timedelta(minutes=minutes_ago)
+    for _ in range(n):
+        dao.record_pin_failure(school_id, source, at=at)
+
+
+def test_more_than_twenty_failures_lock_that_source_at_that_school(service, caplog):
+    caplog.set_level(logging.INFO, logger="saferide.auth")
+    _fail(service.dao, SCHOOL_A, SOURCE, PIN_LOCK_MAX_FAILURES, minutes_ago=10)
+    # The twenty-first failure is still an ordinary wrong PIN...
+    with pytest.raises(PinLoginError):
+        service.pin_login("9999", SCHOOL_A, source=SOURCE)
+    # ...and the twenty-second attempt is refused, the right PIN included.
+    with pytest.raises(SchoolPinLockedError) as caught:
+        service.pin_login("1234", SCHOOL_A, source=SOURCE)
+    assert caught.value.status_code == 429 and caught.value.code == "school-pin-locked"
+    # The oldest counted failure leaves the window in about five minutes.
+    assert 280 < caught.value.retry_after_s <= 300
+    assert any(r.getMessage().startswith("pin-locked school=GFA-001") for r in caplog.records)
+    # A refused attempt writes no failure row (the lock cannot extend itself).
+    assert len(service.dao.failures) == PIN_LOCK_MAX_FAILURES + 1
+    # Another source at the same school and another school are unaffected.
+    assert service.pin_login("1234", SCHOOL_A, source="203.0.113.9")["user"]["id"] == "u-driver"
+    _add_driver(service.dao, "u-b", SCHOOL_B, hash_pin_v2(SCHOOL_B, "482915", PEPPER))
+    assert service.pin_login("482915", SCHOOL_B, source=SOURCE)["user"]["id"] == "u-b"
+
+
+def test_the_lock_lifts_once_the_window_has_passed(service):
+    _fail(service.dao, SCHOOL_A, SOURCE, PIN_LOCK_MAX_FAILURES + 1, minutes_ago=PIN_LOCK_WINDOW_MINUTES + 1)
+    assert service.pin_login("1234", SCHOOL_A, source=SOURCE)["user"]["id"] == "u-driver"
+
+
+def test_the_driver_code_lookup_answers_id_and_name_only(service):
+    for typed in ("GFA07K1Q", "gfa0-7k1q", " gfaO 7kIq ", "GFAO-7KLQ"):
+        assert service.school_for_driver_code(typed) == {"schoolId": SCHOOL_A, "name": "Greenfield"}
+    for unknown in ("GFA-001", "ZZZZ-ZZZZ", "", "GFA07K1QX", "GFA07K1U"):
+        with pytest.raises(NotFoundError):
+            service.school_for_driver_code(unknown)
 
 
 def test_resolve_session_round_trip(service):
@@ -367,7 +573,7 @@ def test_reset_password_clears_the_temporary_flag_and_revokes_all(service):
 
 
 def test_a_pin_sign_in_marks_its_session_and_a_password_sign_in_does_not(service):
-    by_pin = service.pin_login("1234")
+    by_pin = service.pin_login("1234", SCHOOL_A)
     assert by_pin["token"].startswith(PIN_SESSION_TOKEN_PREFIX)
     assert by_pin["user"]["signedInWithPin"] is True
     assert service.resolve_session(by_pin["token"])["id"] == "u-driver"

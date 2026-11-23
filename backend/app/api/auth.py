@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -26,7 +27,13 @@ from app.schemas.auth import (
     TotpRequest,
     VerifyEmailRequest,
 )
-from app.services.auth_service import AuthService, PinSessionError, VerificationError
+from app.services.auth_service import (
+    AuthService,
+    PinLoginError,
+    PinSessionError,
+    SchoolPinLockedError,
+    VerificationError,
+)
 from app.services.provider_service import AuthCodeError, ProviderService
 
 _scope_logger = logging.getLogger("saferide.scope")
@@ -53,7 +60,16 @@ login_account_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=300
 # budget caps token-farming request rates. Never scaled.
 totp_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
 # The 4-digit PIN space is tiny, so PIN logins get the strictest IP budget.
+# Hardening U10 adds the database-backed lock per (school, source) behind it
+# (auth_service.pin_login): this in-process net resets on a cold start.
 pin_ip_limiter = SlidingWindowLimiter(max_attempts=10, window_seconds=60)
+# The driver code lookup (hardening U10): public, and throttled at the API
+# Gateway (D6). Forty bits cannot be walked at any of these rates; the
+# in-process net just keeps one source from hammering it. Scales with the
+# other coarse IP nets for the local certification run.
+school_lookup_ip_limiter = SlidingWindowLimiter(
+    max_attempts=30 * _IP_BUDGET_MULTIPLIER, window_seconds=60
+)
 signup_ip_limiter = SlidingWindowLimiter(
     max_attempts=50 * _IP_BUDGET_MULTIPLIER, window_seconds=3600
 )
@@ -87,12 +103,22 @@ _RESEND_LIMIT_MESSAGE = "Try again in a minute"
 
 
 def map_error(error: Exception) -> HTTPException:
-    if isinstance(error, (AuthCodeError, VerificationError, PinSessionError)):
+    if isinstance(error, SchoolPinLockedError):
+        # Hardening U10 (D3, DL4): the screen counts down from Retry-After.
+        wait = max(1, math.ceil(error.retry_after_s))
+        return HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error), "retry_after_s": wait},
+            headers={"Retry-After": str(wait)},
+        )
+    if isinstance(error, (AuthCodeError, VerificationError, PinSessionError, PinLoginError)):
         # Refusals the client must branch on: the detail carries a machine
         # code — second-factor (U10: `preauth-voided`,
         # `totp-step-up-required`), verify-email (hardening U8, DL10:
-        # `sign-in-required`, `wrong-account`, `link-invalid`) and the
-        # self-service change from a PIN session (hardening U9: `pin-session`).
+        # `sign-in-required`, `wrong-account`, `link-invalid`), the
+        # self-service change from a PIN session (hardening U9: `pin-session`)
+        # and the school-bound PIN sign-in (hardening U10: `school-required`,
+        # `invalid-pin`).
         return HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
@@ -172,13 +198,30 @@ def totp(request: TotpRequest, http_request: Request):
 
 @router.post("/pin-login")
 def pin_login(request: PinLoginRequest, http_request: Request):
+    """{pin, schoolId} → a PIN session at that school (hardening U10).
+    401 {code: school-required | invalid-pin}; 429 {code: school-pin-locked}
+    with Retry-After once the source has failed too often at the school; a
+    plain 429 from the per-IP net before that."""
     ip = client_ip(http_request)
     pin_ip_limiter.check(ip, "Too many PIN attempts. Try again shortly.")
-    result = safe_call(lambda: service.pin_login(request.pin))
+    result = safe_call(lambda: service.pin_login(request.pin, request.school_id, source=ip))
     # A correct PIN clears the IP's attempt budget so legitimate repeated
     # logins (shared driver kiosk / office NAT) don't lock themselves out.
     pin_ip_limiter.clear(ip)
     return result
+
+
+@router.get("/schools/{code}")
+def school_by_driver_code(code: str, http_request: Request):
+    """The driver code lookup (hardening U10): public, throttled. The typed
+    code is normalised (case, hyphens and spaces, O/I/L look-alikes) and
+    answers {schoolId, name} — nothing else — or 404. Phones store the
+    answer, so a regenerated code leaves them signed in while the old link
+    stops resolving."""
+    school_lookup_ip_limiter.check(
+        client_ip(http_request), "Too many tries. Wait a minute and try again."
+    )
+    return safe_call(lambda: service.school_for_driver_code(code))
 
 
 @router.post("/logout")

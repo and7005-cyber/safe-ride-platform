@@ -1,6 +1,8 @@
 import uuid
 from typing import Any
 
+from psycopg import errors as pg_errors
+
 from app.core.db import get_connection, get_global_connection
 from app.core.errors import AccountRefusedError, ConflictError, NotFoundError
 from app.core.scope import ParentScope, SchoolScope
@@ -44,6 +46,59 @@ _HOLDS_OTHER_ACCESS_SQL = (
     " or exists (select 1 from provider_accounts p"
     " where p.user_id = {u}.id and p.removed_at is null))"
 )
+
+
+# Driver PINs (hardening U10). A PIN is unique within its school only: the
+# office's refusal names no other school and never says whether the PIN
+# exists anywhere else. A PIN holder drives at ONE school (execution
+# decisions, Release 1b): giving a PIN to an identity with an active driver
+# membership elsewhere is refused, because one PIN binds one school.
+PIN_IN_USE_MESSAGE = "That PIN is already in use at this school"
+DRIVER_ELSEWHERE_MESSAGE = (
+    "This driver already drives for another school. "
+    "A driver can sign in by PIN at one school only."
+)
+
+_ACTIVE_DRIVER_SQL = (
+    "m.role = 'driver' and m.state = 'active' and m.removed_at is null"
+)
+
+
+def _assert_pin_assignable(
+    conn, school_id: str, user_id: str | None, pin_hashes: tuple[str, str]
+) -> None:
+    """Before a PIN is written for ``user_id`` (None: a driver being created)
+    at ``school_id``: refuse an identity that drives elsewhere, then refuse
+    the PIN when any OTHER active driver at this school holds it in either
+    form — the school-salted hash or the legacy global one — so a salted and
+    a legacy hash of one PIN never coexist at a school. The global unique
+    index on app_users.pin_hash stays the race-proof backstop (same
+    message, see account_service._map_unique_violation)."""
+    salted, legacy = pin_hashes
+    if user_id is not None:
+        elsewhere = conn.execute(
+            "select 1 from school_memberships m "
+            f"where m.user_id = %s and m.school_id <> %s and {_ACTIVE_DRIVER_SQL} limit 1",
+            (user_id, school_id),
+        ).fetchone()
+        if elsewhere:
+            raise ConflictError(DRIVER_ELSEWHERE_MESSAGE)
+    taken = conn.execute(
+        "select 1 from school_memberships m join app_users u on u.id = m.user_id "
+        f"where m.school_id = %s and {_ACTIVE_DRIVER_SQL} "
+        "and u.pin_hash in (%s, %s) and u.id is distinct from %s limit 1",
+        (school_id, salted, legacy, user_id),
+    ).fetchone()
+    if taken:
+        raise ConflictError(PIN_IN_USE_MESSAGE)
+
+
+def _is_uuid(value) -> bool:
+    try:
+        uuid.UUID(str(value).strip())
+    except (ValueError, AttributeError):
+        return False
+    return True
 
 
 def _parent_uuid_or_404(parent_id: str) -> str:
@@ -213,10 +268,17 @@ class AccountDao:
         return [dict(r) for r in rows]
 
     def create_driver(
-        self, scope: SchoolScope, email, password_hash, full_name, phone, pin_hash,
+        self, scope: SchoolScope, email, password_hash, full_name, phone,
+        pin_hashes: tuple[str, str] | None,
         *, actor: dict,
     ) -> dict[str, Any]:
+        """``pin_hashes`` is (school-salted, legacy) for a new PIN, or None:
+        the salted form is stored, both are checked against this school's
+        drivers first (hardening U10)."""
+        pin_hash = pin_hashes[0] if pin_hashes else None
         with get_connection(scope) as conn:
+            if pin_hashes:
+                _assert_pin_assignable(conn, scope.school_id, None, pin_hashes)
             row = conn.execute(
                 "insert into app_users (email, password_hash, full_name, phone, pin_hash) "
                 "values (%s, %s, %s, %s, %s) returning id, full_name, email, phone",
@@ -242,7 +304,8 @@ class AccountDao:
         return dict(row)
 
     def update_driver(
-        self, scope: SchoolScope, driver_id, full_name, email, phone, pin_hash,
+        self, scope: SchoolScope, driver_id, full_name, email, phone,
+        pin_hashes: tuple[str, str] | None,
         *, actor: dict,
     ) -> dict[str, Any]:
         membership_predicate = (
@@ -250,7 +313,17 @@ class AccountDao:
             "where m.user_id = app_users.id and m.school_id = %s "
             "and m.role = 'driver' and m.state = 'active' and m.removed_at is null)"
         )
+        pin_hash = pin_hashes[0] if pin_hashes else None
         with get_connection(scope) as conn:
+            if pin_hashes:
+                is_driver_here = conn.execute(
+                    "select 1 from school_memberships m "
+                    f"where m.user_id = %s and m.school_id = %s and {_ACTIVE_DRIVER_SQL}",
+                    (str(driver_id), scope.school_id),
+                ).fetchone() if _is_uuid(driver_id) else None
+                if not is_driver_here:
+                    raise NotFoundError("Driver not found")
+                _assert_pin_assignable(conn, scope.school_id, str(driver_id), pin_hashes)
             if pin_hash is not None:
                 row = conn.execute(
                     "update app_users set full_name=%s, email=%s, phone=%s, pin_hash=%s "
@@ -323,6 +396,35 @@ class AccountDao:
                 resource_type="driver", resource_id=driver_id,
                 detail={"identity_deleted": identity_deleted},
             )
+
+    # --- the driver code (hardening U10) --------------------------------------
+
+    def regenerate_driver_code(self, scope: SchoolScope, *, actor: dict) -> str:
+        """Replace the scope school's driver code with a fresh one from the
+        database generator (017's ``saferide_new_driver_code()``), audited as
+        ``driver-code-regenerated`` with ids only — never the code. A
+        (40-bit, practically impossible) collision on the unique index draws
+        again."""
+        with get_connection(scope) as conn:
+            row = None
+            for _ in range(3):
+                try:
+                    with conn.transaction():
+                        row = conn.execute(
+                            "update live_schools set driver_code = saferide_new_driver_code() "
+                            "where id = %s returning driver_code",
+                            (scope.school_id,),
+                        ).fetchone()
+                    break
+                except pg_errors.UniqueViolation:
+                    continue
+            if not row:
+                raise NotFoundError("School not found")
+            record_audit(
+                conn, action="driver-code-regenerated", actor=actor, scope=scope,
+                resource_type="school", resource_id=scope.school_id, detail={},
+            )
+        return row["driver_code"]
 
     # --- parents -----------------------------------------------------------
 

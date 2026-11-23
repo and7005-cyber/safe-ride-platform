@@ -39,7 +39,7 @@ The rule of thumb: removals that are part of the daily job (an absence, a studen
 
 ## Your school, and switching schools
 
-The bottom of the sidebar shows the **active school** — its name and its **school code** (e.g. `MSB-001`, assigned by SafeRide and never editable). Quote the code when you contact support.
+The bottom of the sidebar shows the **active school** — its name and its **school code** (e.g. `MSB-001`, assigned by SafeRide and never editable). Quote the code when you contact support. It is not the **driver code** your drivers type on their phones — see [Share the driver code](#share-the-driver-code).
 
 Most people belong to one school and never think about this. If you hold a role at **more than one school** (for example an owner who is director at both), the school card becomes a **switcher**: click it and pick a school from **"Your schools"**. Switching replaces everything on screen with the other school's data — nothing from the first school remains — and lands you on its Dashboard. On sign-in with several schools, the app asks you to **choose a school to work in** first.
 
@@ -65,7 +65,7 @@ The left sidebar lists the sections of the console (everything scoped to your ac
 | **Students** | Student records, parent contacts, route assignment, daily absences |
 | **Run History** | Every run, with a detailed report per run |
 | **Parents** | Registered parent accounts |
-| **Drivers** | Driver accounts and PINs |
+| **Drivers** | Driver accounts and PINs, and the school's driver code |
 | **Alerts** | Incident feed from drivers and parent cancellations |
 | **Staff** | Staff accounts and role offers — **directors only** |
 | **Settings** | The school's own record: name, contact, bell times, gate location; the **Tracking** card for the GPS thresholds |
@@ -80,11 +80,11 @@ Set things up in this order — each step depends on the previous one:
 
 1. **Check School Settings** — your school is created by SafeRide, but routes and runs need the **gate location** and bell times to be right. Confirm them (Settings) before anything else.
 2. **Add staff** (Staff, director only) — give the coordinator their own account.
-3. **Add drivers** (Drivers) — each gets a 4-digit PIN to sign in with, and is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run.
+3. **Add drivers** (Drivers) — each gets a six-digit PIN to sign in with and your school's driver code to set up their phone, and is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run.
 4. **Add buses** (Buses) — and assign a driver to each.
 5. **Add students** (Students) — with parent contacts and home locations.
 6. **Create routes** (Routes, the Fleet Plan page, or the Fleet Map route planner) — assign a bus, and put students on the route.
-7. **Dry-run**: have a driver sign in with their PIN and confirm they see the bus and route on their Home screen.
+7. **Dry-run**: have a driver set up their phone with the driver code, sign in with their PIN and confirm they see the bus and route on their Home screen.
 
 The sections below cover each screen in detail.
 
@@ -135,11 +135,26 @@ Staff creation is rate-limited (about 20 per hour) — enough for onboarding, an
 
 ## Drivers
 
-Click **Add Driver** and fill in **Full name**, **Email**, **Password** (min 6 characters — drivers can use this on the Email & Password tab, though most will only ever use the PIN), **Phone**, and the **Driver PIN**. Use **Generate** for a random 4-digit PIN.
+### Share the driver code
 
-**The PIN is shown exactly once.** After saving, a **"Driver PIN set"** dialog reveals the PIN with a **Copy** button — share it with the driver right there and then. It is stored encrypted and cannot be viewed again. If a driver forgets their PIN, edit their record and use **Reset PIN** (leaving it blank keeps the current one).
+A driver's PIN works only at your school, so each driver's phone is set up for your school once, with your school's **driver code**. The **Driver code** card at the top of the Drivers page shows it, large, in two groups of four (for example `GFA0-7K1Q`). It is **not** the school code (`MSB-001`) shown in the sidebar and in Settings — that is a different code, and a driver who types it is told "That isn't a driver code. The school code in Settings is a different code."
 
-PINs are **unique across drivers** — if you pick one that's taken you'll see "That PIN is already in use by another driver".
+- **Copy code** copies the driver code. Reading it out or sending it is the surest way: it works on every phone, including an iPhone's installed app. Drivers can type it in capitals or small letters, with or without the hyphen; the code never contains the letters I, L, O or U, so nothing can be misread.
+- **Copy message for drivers** copies a ready-to-send message with the code, the link and the instruction to open the installed app and type the code.
+- **Share by link or QR** shows the sign-in link (`…/auth?school=` followed by the code) and a QR code of it, with **Copy link**. Opening the link sets the phone up the same way as typing the code; the driver still confirms "Is this your school?". On iPhones a link from a chat often opens in Safari rather than the installed app, which keeps its own settings — so lead with the code.
+- **Regenerate** (director only) replaces the code. It asks first: **"Replace the driver code? Links and QR codes already sent stop working. Phones already set up keep working."** Use it at the start of a term, or when the code reached someone it should not have. Drivers whose phones are already set up are not affected; only new phones need the new code.
+
+### Adding a driver and the PIN
+
+Click **Add Driver** and fill in **Full name**, **Email**, **Password** (min 6 characters — drivers can use this on the Email & Password tab, though most will only ever use the PIN), **Phone**, and the **Driver PIN**. A new PIN is **six digits**. Use **Generate** for a random six-digit PIN; it never makes one the app would refuse.
+
+**Save** stays unavailable until the PIN is right, with the reason under the field: **"PIN must be 6 digits"**, or **"That PIN is too easy to guess"** for repeated digits (`111111`), runs (`123456`, `654321`), a repeated pattern (`121212`, `123123`) and a few other common choices. Drivers who had a shorter PIN before December 2026 keep signing in with it until you give them a new one.
+
+**The PIN is shown exactly once.** After saving, a **"Driver PIN set"** dialog reveals the PIN with a **Copy** button — share it with the driver right there and then, together with the driver code the dialog repeats ("On a new phone they first enter the driver code …"). It is stored encrypted and cannot be viewed again. If a driver forgets their PIN, edit their record and use **Reset PIN** (leaving it blank keeps the current one).
+
+PINs are **unique within your school** — if you pick one another of your drivers already has, you'll see **"That PIN is already in use at this school"**; pick another (or use Generate). The same PIN at another school is not a clash, and nothing here tells you about other schools' PINs.
+
+**A driver signs in by PIN at one school only.** If someone already drives for another school on SafeRide, setting a PIN for them here is refused with "This driver already drives for another school. A driver can sign in by PIN at one school only." — contact SafeRide support to sort it out.
 
 A driver **belongs to your school**: they are created here, sign in by PIN, and only ever see your school's buses, routes and runs. There is no driver self-signup. **Before a driver's first run, Kuumbai takes them through the [Driver GPS Briefing](driver-gps-briefing.md)** — the notice of what the app records about their phone's location during a run, who sees it and for how long — and signs it off with the school informed. A driver who has not been briefed should be, before their next run; the office's part is to make sure it happened. If you see "That email is already in use", the address already has a SafeRide account — use a different email for the driver.
 
@@ -432,7 +447,8 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 **Validation rules**
 
 - Phone numbers: Kenyan mobile formats (`07…`, `01…`, `+2547…`, `+2541…`), normalized to `+254…`. Schools may also use landlines.
-- Passwords: 6–72 characters. Driver PINs: 4 digits, unique per driver, viewable only once at creation/reset.
+- Passwords: 6–72 characters. Driver PINs: six digits for a new or reset PIN (older four- or five-digit PINs keep working until replaced), not an easy guess, unique within your school, viewable only once at creation/reset.
+- Driver code: eight letters and numbers without I, L, O or U, shown in two groups of four; typed in any case, with or without the hyphen; replaced only by **Regenerate**.
 - Students: Parent 1 name required; at least one phone and one email across the two parent contacts.
 - Bus capacity: 1–100. Route planner: max 24 stops. Broadcasts: 500 characters, 12 per hour.
 - School Settings: address **and** map location both required; bell times `HH:MM`.
@@ -451,6 +467,9 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: yellow **Location off** or **Turn on precise location** banner | Their phone refused location, or is sharing a rough one. Taps still work; the map shows planned stops instead of the bus. The banner's **How to turn it on** lists the steps per phone (also in the Driver Guide). |
 | Driver: "the app keeps asking me to confirm" | Taps made further than the **Custody distance** from the child's stop, after accuracy. Check the stop pins on the route and the phone's accuracy on the run report before loosening the threshold in Settings → Tracking. |
 | Driver forgot their PIN | Drivers → edit → Reset PIN; the new PIN shows once. |
+| Driver: the app asks for a driver code | Their phone is not set up for your school (a new phone, or an iPhone that forgot after a week unused). Give them the code from the **Driver code** card; they open the installed app and type it. |
+| Driver: "That code didn't match a school" | They mistyped it, or the code was regenerated. Read them the current code from the Drivers page. |
+| Driver: "Sign-in for your school is paused for a few minutes" | Too many wrong PINs were tried from their network at your school. It lifts by itself after the minutes shown; drivers already signed in are not affected. Confirm the driver's PIN with them (or reset it) before they try again. |
 | Staff member locked out of their account | A director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
 | A director is locked out and there is no other director | Contact SafeRide support — they can step in and issue the reset. |
 | New staff member's temporary password "doesn't work" | Temporary passwords expire after **72 hours** unused. Reset it and hand over the new one. |

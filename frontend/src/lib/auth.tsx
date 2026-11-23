@@ -27,6 +27,7 @@ import {
   setActiveSchoolId,
   useActiveSchoolId,
 } from "@/lib/school";
+import { adoptSessionSchool } from "@/lib/driverSchool";
 
 export type Role = "admin" | "driver" | "parent";
 export type MembershipRole = "director" | "coordinator" | "driver";
@@ -253,6 +254,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const me = await api.get("/api/auth/me");
       const mapped = mapMe(me);
       reconcileSchoolStore(mapped);
+      // Hardening U10 (AE10): a signed-in driver on a phone that is not set
+      // up for a school adopts the session's school, so the next PIN
+      // sign-in asks for nothing. The binding survives sign-out.
+      adoptSessionSchool(mapped);
       setUser(mapped);
     } catch {
       setUser(null);

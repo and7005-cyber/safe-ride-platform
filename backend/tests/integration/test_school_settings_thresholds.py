@@ -138,7 +138,7 @@ def fleet(client, admin_headers, sandbox):
         created["parent_id"] = parent_id
         yield {
             "school_id": sandbox["id"], "driver": driver,
-            "driver_headers": pin_login(client, driver["pin"]),
+            "driver_headers": pin_login(client, driver["pin"], sandbox["id"]),
             "parent_headers": parent_headers,
             "bus": bus, "route": route.json(), "students": students,
         }

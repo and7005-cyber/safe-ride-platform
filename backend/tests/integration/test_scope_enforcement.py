@@ -23,6 +23,7 @@ from conftest import (
     SCHOOL_A_ID,
     SCHOOL_B_ID,
     TEST_PASSWORD,
+    pin_login_body,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -269,7 +270,7 @@ def test_staff_switch_persists_last_school_on_the_session(client):
 
 
 def test_driver_scope_is_derived_and_a_header_is_refused(client):
-    resp = client.post("/api/auth/pin-login", json={"pin": DRIVER_A_PIN})
+    resp = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_A_PIN, SCHOOL_A_ID))
     assert resp.status_code == 200, resp.text
     token = resp.json()["token"]
     body = client.get("/t/driver", headers=hdr(token)).json()

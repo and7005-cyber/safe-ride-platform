@@ -7,6 +7,7 @@ import {
   SEED,
   apiDriverToken,
   authHeaders,
+  pinLogin,
   signInAs,
   endActiveRun,
 } from "./helpers";
@@ -40,10 +41,8 @@ test("admin is the only role allowed on admin routes", async ({ page }) => {
 
 test("driver can log in by PIN and start a run", async ({ page, request }) => {
   try {
-    await page.goto("/auth");
-    await page.getByRole("tab", { name: /Driver PIN/ }).click();
-    await page.locator("#pin").fill(DRIVER.pin);
-    await page.getByRole("button", { name: /Sign In with PIN/ }).click();
+    // Hardening U10: the office's link sets the phone up for the school.
+    await pinLogin(page, DRIVER.pin, DRIVER.driverCode);
     await expect(page).toHaveURL("/driver");
     await expect(page.getByText(SEED.driverBus)).toBeVisible();
 

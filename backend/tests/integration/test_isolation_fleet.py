@@ -27,6 +27,8 @@ from conftest import (
     SCHOOL_A_ID,
     SCHOOL_B_ID,
     TEST_PASSWORD,
+    driver_pin,
+    purge_accounts,
     temp_school,
 )
 
@@ -414,23 +416,36 @@ def test_create_driver_conflicts_disclose_no_school(client):
     assert clashed.status_code == 400, clashed.text
     assert clashed.json()["detail"] == "That email is already in use"
 
-    # PIN uniqueness is global (PIN login has no school context): the message
-    # is unchanged (R34).
-    fresh_email = f"it-u6-pin-{marker}@test.local"
-    pinned = client.post(
+    # Hardening U10: a PIN is unique within its school only. A PIN in use at
+    # this school is refused with a message that names no other school; the
+    # same PIN at another school is simply accepted, so nothing confirms
+    # another school's PIN.
+    pin = driver_pin()
+    first_email = f"it-u6-pin-{marker}@test.local"
+    first = client.post(
         "/api/accounts/drivers",
-        json={
-            "full_name": "IT U6 Y", "email": fresh_email,
-            "password": "Test1234", "pin": "0322",
-        },
+        json={"full_name": "IT U6 Y", "email": first_email, "password": "Test1234", "pin": pin},
         headers=headers,
     )
-    assert pinned.status_code == 409, pinned.text
-    assert pinned.json()["detail"] == "That PIN is already in use by another driver"
-    with db() as conn:
-        assert conn.execute(
-            "select 1 from app_users where email = %s", (fresh_email,)
-        ).fetchone() is None  # the refused create left nothing behind
+    assert first.status_code == 200, first.text
+    fresh_email = f"it-u6-pin2-{marker}@test.local"
+    try:
+        pinned = client.post(
+            "/api/accounts/drivers",
+            json={
+                "full_name": "IT U6 Z", "email": fresh_email,
+                "password": "Test1234", "pin": pin,
+            },
+            headers=headers,
+        )
+        assert pinned.status_code == 409, pinned.text
+        assert pinned.json()["detail"] == "That PIN is already in use at this school"
+        with db() as conn:
+            assert conn.execute(
+                "select 1 from app_users where email = %s", (fresh_email,)
+            ).fetchone() is None  # the refused create left nothing behind
+    finally:
+        purge_accounts(str(first.json()["id"]))
 
 
 def test_foreign_driver_is_404_and_unchanged(client):

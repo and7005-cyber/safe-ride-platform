@@ -115,3 +115,35 @@ export const TEMPORARY_PASSWORD_TYPING_HINT =
 export function groupInFours(code: string): string {
   return code.replace(/(.{4})(?=.)/g, "$1 ");
 }
+
+// Hardening U10 (DL3, DL4, DL5) — the driver's PIN tab. A phone is set up
+// for one school with the school's DRIVER code (from the office: typed, a
+// link or a QR); the public AAA-NNN value is the "school code" and is a
+// different code. The driver guide quotes these words.
+export const DRIVER_CODE_LABEL = "Driver code";
+export const DRIVER_CODE_PROMPT = "Enter the driver code from your school office";
+export const DRIVER_CODE_CHECKING = "Checking…";
+export const DRIVER_CODE_CONTINUE = "Continue";
+export const DRIVER_CODE_NOT_FOUND =
+  "That code didn't match a school. Ask your school office for the current code or link.";
+export const DRIVER_CODE_IS_SCHOOL_CODE =
+  "That isn't a driver code. The school code in Settings is a different code.";
+export const DRIVER_CODE_THROTTLED = "Too many tries. Wait a minute and try again.";
+export const DRIVER_CODE_OFFLINE =
+  "Couldn't reach SafeRide. Check your connection and try again.";
+export const CONFIRM_SCHOOL_QUESTION = "Is this your school?";
+export const CONFIRM_SCHOOL_YES = "Yes, that's my school";
+export const CONFIRM_SCHOOL_NO = "No, enter a different code";
+export const CHANGE_SCHOOL_LABEL = "Change school";
+export const CHANGE_SCHOOL_CONFIRM_TITLE = "Change school?";
+export const CHANGE_SCHOOL_CONFIRM_TEXT =
+  "You'll need the code again. Ask your school office for the driver code before you continue.";
+export const PIN_SIGN_IN_LABEL = "Sign In with PIN";
+export const INVALID_PIN_TITLE = "Invalid PIN";
+export const INVALID_PIN_TEXT = "Please check your PIN and try again.";
+export const PIN_LOCKED_LEAD = "Sign-in for your school is paused for a few minutes.";
+/** The lock line, counted down from Retry-After (DL4). */
+export function pinLockedText(minutes: number): string {
+  const n = Math.max(1, Math.ceil(minutes));
+  return `${PIN_LOCKED_LEAD} Try again in ${n} minute${n === 1 ? "" : "s"}.`;
+}

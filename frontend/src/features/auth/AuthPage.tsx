@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Bus, KeyRound, MailCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,8 @@ import { api } from "@/lib/apiClient";
 import { useAuth, type Role } from "@/lib/auth";
 import { useMailEnabled } from "@/lib/publicConfig";
 import { TotpChallengePage } from "@/features/auth/TotpChallengePage";
+import { DriverPinSignIn } from "@/features/auth/DriverPinSignIn";
+import { readDriverSchool } from "@/lib/driverSchool";
 import {
   FORGOT_SENT_TITLE,
   MAIL_OFF_FORGOT,
@@ -77,7 +79,7 @@ export function AuthNotice({
 
 export function AuthPage() {
   const navigate = useNavigate();
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const { signIn } = useAuth();
   const { toast } = useToast();
   // DL1: whether a mail really goes out. null while the config loads.
@@ -92,8 +94,23 @@ export function AuthPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
-  const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
+  // Hardening U10 (DL3): a sign-in link (`?school=<driver code>`) or a phone
+  // already set up for a school opens on the Driver PIN tab.
+  const linkCode = params.get("school");
+  const [tab, setTab] = useState<string>(() =>
+    linkCode || readDriverSchool() ? "pin" : "email",
+  );
+  const consumeLink = useCallback(() => {
+    setParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("school");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setParams]);
   // Provider two-step login (U13/AE19): the pre-auth token from the password
   // step, held in COMPONENT STATE ONLY — a reload forgets it and returns to
   // the password step. While set, the code screen replaces the card below.
@@ -173,23 +190,6 @@ export function AuthPage() {
       setPassword("");
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handlePinLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const res = await api.post("/api/auth/pin-login", { pin });
-      finishAuth(res.token, res.user);
-    } catch {
-      toast({
-        title: "Invalid PIN",
-        description: "Please check your PIN and try again.",
-        variant: "destructive",
-      });
     } finally {
       setLoading(false);
     }
@@ -306,7 +306,7 @@ export function AuthPage() {
                 </div>
               </form>
             ) : isLogin ? (
-              <Tabs defaultValue="email">
+              <Tabs value={tab} onValueChange={setTab}>
                 <TabsList className="grid w-full grid-cols-2 mb-4">
                   <TabsTrigger value="email">Email &amp; Password</TabsTrigger>
                   <TabsTrigger value="pin" className="gap-1.5">
@@ -342,23 +342,11 @@ export function AuthPage() {
                   </form>
                 </TabsContent>
                 <TabsContent value="pin">
-                  <form onSubmit={handlePinLogin} className="space-y-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="pin">Driver PIN</Label>
-                      <Input
-                        id="pin"
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        placeholder="••••"
-                        maxLength={6}
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
-                      />
-                    </div>
-                    <Button type="submit" className="w-full" disabled={loading || pin.length < 4}>
-                      {loading ? "Please wait..." : "Sign In with PIN"}
-                    </Button>
-                  </form>
+                  <DriverPinSignIn
+                    linkCode={linkCode}
+                    onLinkConsumed={consumeLink}
+                    onSignedIn={(token, user) => finishAuth(token, user)}
+                  />
                 </TabsContent>
               </Tabs>
             ) : (

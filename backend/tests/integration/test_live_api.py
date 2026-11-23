@@ -19,7 +19,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_accounts, purge_run, signup_verified_parent
+from conftest import purge_accounts, purge_run, signup_verified_parent, SCHOOL_A_ID, pin_login_body
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -69,7 +69,7 @@ def parent_headers(client):
 
 @pytest.fixture(scope="module")
 def driver_headers(client):
-    response = client.post("/api/auth/pin-login", json={"pin": DRIVER_PIN})
+    response = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_PIN, SCHOOL_A_ID))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 

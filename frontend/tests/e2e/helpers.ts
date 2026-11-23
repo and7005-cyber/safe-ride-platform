@@ -11,7 +11,17 @@ const COMPOSE_FILE = "docker-compose.local.yml";
 // On seed drift, update these constants instead of individual specs.
 export const ADMIN = { email: "admin@test.com", password: "test1234." };
 export const PARENT = { email: "and7005@gmail.com", password: "Test1234" };
-export const DRIVER = { email: "and7005@yahoo.it", password: "Test1234", pin: "0322" };
+export const SCHOOL_A_ID = "5cae0000-0000-0000-0000-000000000001";
+export const SCHOOL_B_ID = "5cae0000-0000-0000-0000-000000000002";
+// Hardening U10: a PIN signs in only with the school the phone is bound to.
+// Each seeded school has a fixed driver code (seed 003), shown XXXX-XXXX.
+export const DRIVER = {
+  email: "and7005@yahoo.it",
+  password: "Test1234",
+  pin: "0322",
+  schoolId: SCHOOL_A_ID,
+  driverCode: "GFA0-7K1Q",
+};
 
 // Tenancy identities (U1): seeded staff/provider accounts for the
 // multi-tenant suites (backend/db/seeds/003_local_snapshot.sql tail).
@@ -19,9 +29,13 @@ export const DIRECTOR_A = { email: "director.a@saferide.test", password: "Test12
 export const COORDINATOR_A = { email: "coordinator.a@saferide.test", password: "Test1234" };
 export const DIRECTOR_B = { email: "director.b@saferide.test", password: "Test1234" };
 export const PROVIDER = { email: "provider@kuumbai.test", password: "Test1234" };
-export const DRIVER_B = { email: "driver.b@saferide.test", password: "Test1234", pin: "7391" };
-export const SCHOOL_A_ID = "5cae0000-0000-0000-0000-000000000001";
-export const SCHOOL_B_ID = "5cae0000-0000-0000-0000-000000000002";
+export const DRIVER_B = {
+  email: "driver.b@saferide.test",
+  password: "Test1234",
+  pin: "7391",
+  schoolId: SCHOOL_B_ID,
+  driverCode: "SEC2-ND8B",
+};
 export const SEED_B = {
   school: "IT Second School",
   bus: "IT Bus B",
@@ -108,7 +122,9 @@ export async function signInAs(
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }
 
-/** The driver equivalent: PIN login is limited to 10 per IP per minute. */
+/** The driver equivalent: PIN login is limited to 10 per IP per minute.
+ * The phone is not set up for a school beforehand: a signed-in driver adopts
+ * the session's school (hardening U10, AE10). */
 export async function signInAsDriver(page: Page): Promise<void> {
   const token = await cachedDriverToken(page.request);
   await page.goto("/auth");
@@ -122,6 +138,8 @@ export async function signInAsDriver(page: Page): Promise<void> {
 
 export async function emailLogin(page: Page, email: string, password: string) {
   await page.goto("/auth");
+  // A phone set up for a school opens on the Driver PIN tab (hardening U10).
+  await page.getByRole("tab", { name: /Email/ }).click();
   await page.locator("#email").fill(email);
   await page.locator("#password").fill(password);
   await page.getByRole("button", { name: "Sign In", exact: true }).click();
@@ -130,10 +148,18 @@ export async function emailLogin(page: Page, email: string, password: string) {
   await page.waitForURL((url) => !url.pathname.startsWith("/auth"));
 }
 
-export async function pinLogin(page: Page, pin: string) {
-  await page.goto("/auth");
-  await page.getByRole("tab", { name: /Driver PIN/ }).click();
-  await page.locator("#pin").fill(pin);
+/**
+ * The driver's own sign-in (hardening U10): open the office's link for the
+ * school (`/auth?school=<driver code>`), confirm "Is this your school?" when
+ * asked (a phone already set up for that school is not asked), then the PIN.
+ */
+export async function pinLogin(page: Page, pin: string, driverCode: string) {
+  await page.goto(`/auth?school=${encodeURIComponent(driverCode)}`);
+  const confirmSchool = page.getByRole("button", { name: "Yes, that's my school" });
+  const pinField = page.locator("#pin");
+  await expect(confirmSchool.or(pinField)).toBeVisible();
+  if (await confirmSchool.isVisible()) await confirmSchool.click();
+  await pinField.fill(pin);
   await page.getByRole("button", { name: /Sign In with PIN/ }).click();
   await page.waitForURL("/driver");
 }
@@ -162,7 +188,7 @@ async function cachedDriverToken(request: APIRequestContext): Promise<string> {
   const hit = tokenCache.get(DRIVER_TOKEN_KEY);
   if (hit) return hit;
   const response = await request.post(`${API_URL}/api/auth/pin-login`, {
-    data: { pin: DRIVER.pin },
+    data: { pin: DRIVER.pin, schoolId: DRIVER.schoolId },
   });
   expect(response.ok()).toBeTruthy();
   const token = (await response.json()).token;
@@ -320,21 +346,34 @@ export function sqlDeleteAuditFor(resourceId: string): void {
 // account, and drop it the same way. This mirrors purgeRun/backdateRun: the
 // tests must not get a product-level backdoor around a real product rule.
 
-/** Create a school row plus an active director membership for `email`. */
-export function sqlCreateSchool(name: string, email: string): { id: string; code: string } {
+/** A random driver code (hardening U10, D2): eight Crockford base32 symbols. */
+export function randomDriverCode(): string {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => alphabet[b % 32]).join("");
+}
+
+/** Create a school row plus an active director membership for `email`. The
+ * school gets a known driver code (hardening U10), returned stored-form. */
+export function sqlCreateSchool(
+  name: string,
+  email: string,
+): { id: string; code: string; driverCode: string } {
   const id = crypto.randomUUID();
   const code = `E2P-${id.slice(0, 8)}`;
+  const driverCode = randomDriverCode();
   psql(
-    `insert into live_schools (id, name, address, phone, lat, lng, morning_bell, afternoon_bell, code) ` +
+    `insert into live_schools (id, name, address, phone, lat, lng, morning_bell, afternoon_bell, code, driver_code) ` +
       `values ('${id}', '${name.replace(/'/g, "''")}', '1 Plan Lane, Nairobi', '+254700000001', ` +
-      `-1.3005, 36.8102, '07:30', '15:30', '${code}')`,
+      `-1.3005, 36.8102, '07:30', '15:30', '${code}', '${driverCode}')`,
   );
   psql(
     `insert into school_memberships (user_id, school_id, role, state, accepted_at) ` +
       `select id, '${id}', 'director', 'active', now() from app_users ` +
       `where lower(email) = lower('${email.replace(/'/g, "''")}')`,
   );
-  return { id, code };
+  return { id, code, driverCode };
 }
 
 /** Drop a fixture school and every school-stamped row it still owns. */

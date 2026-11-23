@@ -2,8 +2,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import auth as auth_api
-from app.core.errors import UnauthorizedError
+from app.core.errors import NotFoundError, UnauthorizedError
 from app.main import create_app
+from app.services.auth_service import (
+    SCHOOL_PIN_LOCKED_MESSAGE,
+    PinLoginError,
+    SchoolPinLockedError,
+)
+
+SCHOOL_ID = "5cae0000-0000-0000-0000-000000000001"
 
 
 @pytest.fixture(autouse=True)
@@ -12,6 +19,7 @@ def reset_limiters():
         auth_api.login_ip_limiter,
         auth_api.login_account_limiter,
         auth_api.pin_ip_limiter,
+        auth_api.school_lookup_ip_limiter,
         auth_api.signup_ip_limiter,
         auth_api.forgot_ip_limiter,
         auth_api.forgot_account_limiter,
@@ -36,28 +44,108 @@ def client() -> TestClient:
 def test_pin_login_is_rate_limited_per_ip(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Hardening U10: the service takes the bound school and the source too.
     monkeypatch.setattr(
         auth_api.service,
         "pin_login",
-        lambda pin: (_ for _ in ()).throw(UnauthorizedError("Invalid PIN")),
+        lambda pin, school_id, source=None: (_ for _ in ()).throw(
+            UnauthorizedError("Invalid PIN")
+        ),
     )
 
+    body = {"pin": "0000", "schoolId": SCHOOL_ID}
     for _ in range(auth_api.pin_ip_limiter.max_attempts):
-        response = client.post("/api/auth/pin-login", json={"pin": "0000"})
+        response = client.post("/api/auth/pin-login", json=body)
         assert response.status_code == 401
 
-    response = client.post("/api/auth/pin-login", json={"pin": "0000"})
+    response = client.post("/api/auth/pin-login", json=body)
     assert response.status_code == 429
 
 
 def test_successful_pin_login_clears_ip_budget(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(auth_api.service, "pin_login", lambda pin: {"token": "t"})
+    monkeypatch.setattr(
+        auth_api.service, "pin_login", lambda pin, school_id, source=None: {"token": "t"}
+    )
 
     for _ in range(auth_api.pin_ip_limiter.max_attempts + 5):
-        response = client.post("/api/auth/pin-login", json={"pin": "1234"})
+        response = client.post(
+            "/api/auth/pin-login", json={"pin": "1234", "schoolId": SCHOOL_ID}
+        )
         assert response.status_code == 200
+
+
+def test_pin_login_passes_the_bound_school_and_the_source(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = {}
+
+    def stub(pin, school_id, source=None):
+        seen.update(pin=pin, school_id=school_id, source=source)
+        return {"token": "t"}
+
+    monkeypatch.setattr(auth_api.service, "pin_login", stub)
+    response = client.post(
+        "/api/auth/pin-login", json={"pin": "482915", "schoolId": SCHOOL_ID}
+    )
+    assert response.status_code == 200
+    assert seen == {"pin": "482915", "school_id": SCHOOL_ID, "source": "testclient"}
+    # No school: the service decides (school-required); the field is optional.
+    client.post("/api/auth/pin-login", json={"pin": "482915"})
+    assert seen["school_id"] is None
+
+
+def test_the_school_lock_answers_429_with_retry_after_the_browser_can_read(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        auth_api.service,
+        "pin_login",
+        lambda pin, school_id, source=None: (_ for _ in ()).throw(
+            SchoolPinLockedError(SCHOOL_PIN_LOCKED_MESSAGE, retry_after_s=299.2)
+        ),
+    )
+    response = client.post(
+        "/api/auth/pin-login",
+        json={"pin": "482915", "schoolId": SCHOOL_ID},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "300"
+    assert response.json()["detail"] == {
+        "code": "school-pin-locked",
+        "message": SCHOOL_PIN_LOCKED_MESSAGE,
+        "retry_after_s": 300,
+    }
+    assert "Retry-After" in response.headers["access-control-expose-headers"]
+
+
+@pytest.mark.parametrize("code", ["school-required", "invalid-pin"])
+def test_pin_refusals_carry_their_code(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    monkeypatch.setattr(
+        auth_api.service,
+        "pin_login",
+        lambda pin, school_id, source=None: (_ for _ in ()).throw(PinLoginError(code, "x")),
+    )
+    response = client.post("/api/auth/pin-login", json={"pin": "482915"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == {"code": code, "message": "x"}
+
+
+def test_the_driver_code_lookup_is_rate_limited_per_ip(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        auth_api.service,
+        "school_for_driver_code",
+        lambda code: (_ for _ in ()).throw(NotFoundError("No school has that driver code")),
+    )
+    for _ in range(auth_api.school_lookup_ip_limiter.max_attempts):
+        assert client.get("/api/auth/schools/ABCD-EFGH").status_code == 404
+    assert client.get("/api/auth/schools/ABCD-EFGH").status_code == 429
 
 
 def test_login_is_rate_limited_per_account(

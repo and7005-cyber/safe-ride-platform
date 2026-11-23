@@ -4,10 +4,12 @@ import {
   API_URL,
   DRIVER,
   PARENT,
+  SEED,
   emailLogin,
   lastMailLink,
   linkPath,
   pinLogin,
+  signInAsDriver,
   uniqueName,
 } from "./helpers";
 
@@ -24,13 +26,144 @@ test("wrong password shows the server message without a session-expired sign-out
 });
 
 test("wrong PIN shows an error and stays on the auth page", async ({ page }) => {
-  await page.goto("/auth");
-  await page.getByRole("tab", { name: /Driver PIN/ }).click();
+  // Hardening U10: the phone is set up for the school first (the link).
+  await page.goto(`/auth?school=${DRIVER.driverCode}`);
+  await page.getByRole("button", { name: "Yes, that's my school" }).click();
   await page.locator("#pin").fill("9999");
   await page.getByRole("button", { name: /Sign In with PIN/ }).click();
 
-  await expect(page.getByText(/Invalid PIN|Invalid email or password|Invalid/i).first()).toBeVisible();
+  await expect(page.getByText("Invalid PIN").first()).toBeVisible();
   await expect(page).toHaveURL(/\/auth/);
+});
+
+// --- Driver sign-in bound to the school (hardening U10; AE8, AE10; DL3–DL5) --
+
+test("a driver sets the phone up with the office's link, signs in by PIN, and the school stays after sign-out", async ({
+  page,
+}) => {
+  await page.goto(`/auth?school=${DRIVER.driverCode.toLowerCase()}`);
+  // The link opens the Driver PIN tab and asks before storing anything.
+  await expect(page.getByRole("tab", { name: /Driver PIN/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByText("Is this your school?")).toBeVisible();
+  await expect(page.getByTestId("confirm-school-name")).toHaveText(SEED.school);
+  await page.getByRole("button", { name: "Yes, that's my school" }).click();
+  // Stored, and the code is stripped from the address.
+  await expect(page).toHaveURL(/\/auth$/);
+  await expect(page.getByTestId("driver-school-name")).toHaveText(SEED.school);
+
+  await page.locator("#pin").fill(DRIVER.pin);
+  await page.getByRole("button", { name: /Sign In with PIN/ }).click();
+  await page.waitForURL("/driver");
+
+  // Sign out: the next visit opens on the PIN form under the school's name.
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForURL(/\/auth/);
+  await expect(page.getByRole("tab", { name: /Driver PIN/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("driver-school-name")).toHaveText(SEED.school);
+  await expect(page.getByLabel("Driver code")).toHaveCount(0);
+});
+
+test("a phone that is not set up asks for the driver code; Change school asks first; a wrong code says so", async ({
+  page,
+}) => {
+  await page.goto("/auth");
+  await page.getByRole("tab", { name: /Driver PIN/ }).click();
+  await expect(page.getByText("Enter the driver code from your school office")).toBeVisible();
+  await expect(page.locator("#pin")).toHaveCount(0);
+
+  const code = page.getByLabel("Driver code");
+  // The school code is a different code (DL5).
+  await code.fill("GFA-001");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "That isn't a driver code. The school code in Settings is a different code.",
+  );
+  // An unknown (or replaced) driver code.
+  await code.fill("ZZZZ-ZZZZ");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "That code didn't match a school. Ask your school office for the current code or link.",
+  );
+  // Typed however the driver reads it: lower case, O for 0, I for 1.
+  await code.fill(DRIVER.driverCode.toLowerCase().replace("0", "o").replace("1", "i"));
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByTestId("confirm-school-name")).toHaveText(SEED.school);
+  await page.getByRole("button", { name: "No, enter a different code" }).click();
+  await expect(code).toHaveValue("");
+
+  await code.fill(DRIVER.driverCode);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page.getByRole("button", { name: "Yes, that's my school" }).click();
+  await expect(page.getByTestId("driver-school-name")).toHaveText(SEED.school);
+
+  // Change school is one stray tap from losing the code: it asks first.
+  await page.getByRole("button", { name: "Change school" }).click();
+  const ask = page.getByRole("alertdialog");
+  await expect(ask).toContainText("You'll need the code again.");
+  await ask.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByTestId("driver-school-name")).toHaveText(SEED.school);
+  await page.getByRole("button", { name: "Change school" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Change school" }).click();
+  await expect(page.getByLabel("Driver code")).toBeVisible();
+  await expect(page.getByTestId("driver-school-name")).toHaveCount(0);
+});
+
+test("the school lock shows its message and counts down instead of 'Invalid PIN'", async ({
+  page,
+}) => {
+  // The lock itself (twenty-one failures from one source at one school) is
+  // proven against the database in test_driver_pin_scoping.py; here the
+  // screen's answer to it, with the API's 429 stood in.
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Expose-Headers": "Retry-After, X-Request-Id",
+  };
+  await page.route("**/api/auth/pin-login", async (route) => {
+    if (route.request().method() === "OPTIONS") {
+      await route.fulfill({ status: 204, headers: cors });
+      return;
+    }
+    await route.fulfill({
+      status: 429,
+      headers: { ...cors, "Content-Type": "application/json", "Retry-After": "120" },
+      body: JSON.stringify({
+        detail: {
+          code: "school-pin-locked",
+          message: "Sign-in for your school is paused for a few minutes. Try again shortly.",
+          retry_after_s: 120,
+        },
+      }),
+    });
+  });
+  await page.goto(`/auth?school=${DRIVER.driverCode}`);
+  await page.getByRole("button", { name: "Yes, that's my school" }).click();
+  await page.locator("#pin").fill(DRIVER.pin);
+  await page.getByRole("button", { name: /Sign In with PIN/ }).click();
+
+  await expect(page.getByTestId("pin-locked")).toHaveText(
+    "Sign-in for your school is paused for a few minutes. Try again in 2 minutes.",
+  );
+  await expect(page.getByRole("button", { name: /Sign In with PIN/ })).toBeDisabled();
+  await expect(page.getByText("Invalid PIN")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/auth/);
+});
+
+test("a driver signed in on a phone that is not set up adopts the session's school (AE10)", async ({
+  page,
+}) => {
+  await signInAsDriver(page);
+  await expect
+    .poll(() => page.evaluate(() => localStorage.getItem("saferide-driver-school")))
+    .toContain(DRIVER.schoolId);
+  // The next PIN sign-in asks for nothing: straight to the PIN form.
+  await page.evaluate(() => localStorage.removeItem("saferide-token"));
+  await page.goto("/auth");
+  await expect(page.getByTestId("driver-school-name")).toHaveText(SEED.school);
+  await page.locator("#pin").fill(DRIVER.pin);
+  await page.getByRole("button", { name: /Sign In with PIN/ }).click();
+  await page.waitForURL("/driver");
 });
 
 test("each role lands on its home after login", async ({ page }) => {
@@ -44,7 +177,7 @@ test("each role lands on its home after login", async ({ page }) => {
   await expect(page).toHaveURL("/parent");
 
   await emailLoginAfterSignOutViaStorage(page);
-  await pinLogin(page, DRIVER.pin);
+  await pinLogin(page, DRIVER.pin, DRIVER.driverCode);
   await expect(page).toHaveURL("/driver");
 });
 

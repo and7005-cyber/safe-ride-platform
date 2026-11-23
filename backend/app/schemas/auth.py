@@ -18,7 +18,12 @@ class LoginRequest(_CamelModel):
 
 
 class PinLoginRequest(_CamelModel):
-    pin: str
+    """A driver's PIN plus the school the phone is bound to (hardening U10):
+    the id the driver code lookup answered. Without it the sign-in is refused
+    with ``school-required`` — there is no PIN-only fallback."""
+
+    pin: str = Field(max_length=32)
+    school_id: str | None = Field(default=None, alias="schoolId", max_length=64)
 
 
 class TotpRequest(_CamelModel):

@@ -183,13 +183,13 @@ def fleet(client, admin_headers, sandbox):
         )
         assert updated.status_code == 200, updated.text
 
-        driver_headers = pin_login(client, driver1["pin"])
+        driver_headers = pin_login(client, driver1["pin"], sandbox["id"])
         yield {
             "marker": marker, "school_id": sandbox["id"],
             "driver1": driver1, "driver2": driver2,
             "driver_headers": driver_headers,
             "session1": latest_session_id(driver1["id"]),
-            "driver2_headers": pin_login(client, driver2["pin"]),
+            "driver2_headers": pin_login(client, driver2["pin"], sandbox["id"]),
             "bus1": bus1, "bus2": bus2, "morning": morning,
             "a": students[0], "b": students[1],
         }
@@ -451,7 +451,7 @@ def test_a_second_session_is_refused_and_flagged_once_and_a_tap_from_it_rebinds_
     h1 = fleet["driver_headers"]
     driver_id = fleet["driver1"]["id"]
     run_id = start_run(client, fleet)
-    h2 = pin_login(client, fleet["driver1"]["pin"])
+    h2 = pin_login(client, fleet["driver1"]["pin"], fleet["school_id"])
     session2 = latest_session_id(driver_id)
     assert session2 != fleet["session1"]
     try:
@@ -622,7 +622,7 @@ def test_the_endpoint_schedules_no_background_task(client, admin_headers, fleet)
     unsent across a ping and goes on the next context poll."""
     h1 = fleet["driver_headers"]
     run_id = start_run(client, fleet)
-    h2 = pin_login(client, fleet["driver1"]["pin"])
+    h2 = pin_login(client, fleet["driver1"]["pin"], fleet["school_id"])
     try:
         assert ping(client, h2, run_id, stream(1)).status_code == 409
         flag = exceptions(client, admin_headers, run_id, UNVERIFIED)[0]
