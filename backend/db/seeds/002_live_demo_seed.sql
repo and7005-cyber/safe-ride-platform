@@ -6,9 +6,12 @@
 -- Test credentials (LOCAL DEV ONLY — rotate before any repo visibility change):
 --   admin@test.com     / test1234.   (role admin)
 --   and7005@gmail.com  / Test1234    (role parent)
---   and7005@yahoo.it   / Test1234    (role driver, PIN 1234)
+--   and7005@yahoo.it   / Test1234    (role driver)
 -- Password/PIN hashes below were generated with app.core.security helpers and
--- the local PIN_PEPPER 'saferide-local-pin-pepper'.
+-- the local PIN_PEPPER 'saferide-local-pin-pepper'. The driver PIN hashed here
+-- is not the one that signs in locally: seed 003 reloads the users, and after
+-- scripts/reset-local-db.sh this driver's PIN is 0322 at Greenfield Academy,
+-- driver code GFA0-7K1Q (the e2e fixture DRIVER in frontend/tests/e2e/helpers.ts).
 
 -- DEMO SEED — LOCAL DEV ONLY. Guarded so it can never run against a database
 -- unless the session explicitly opts in (the local scripts do this for you):

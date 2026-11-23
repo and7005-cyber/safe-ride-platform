@@ -68,6 +68,23 @@ import {
   SHARE_BY_LINK_TITLE,
 } from "@/features/admin/driverCodeCopy";
 import {
+  MAIL_OFF_FORGOT_TITLE,
+  MAIL_OFF_SIGNUP,
+  RESET_LINK_INVALID_TEXT,
+  SIGNUP_DONE_MAIL_OFF_TITLE,
+  SIGNUP_DONE_NOTE,
+  VERIFIED_TEXT,
+  VERIFY_LINK_INVALID_TEXT,
+  WRONG_ACCOUNT_TEXT,
+  pinLockedText,
+} from "@/features/auth/authCopy";
+import {
+  DRIVER_CODE_CARD_LEAD,
+  driverMessage,
+  pinRevealCodeLine,
+} from "@/features/admin/driverCodeCopy";
+import { driverSignInLink } from "@/lib/driverSchool";
+import {
   PIN_IN_USE_MESSAGE,
   PIN_LENGTH_MESSAGE,
   PIN_TOO_EASY_MESSAGE,
@@ -557,6 +574,110 @@ describe("the guides describe the driver code and the school-bound PIN in the ap
       expect(text, `${guide} promises a lock can be cleared`).not.toMatch(
         /(clear|lift|reset|unlock)s? the (school )?(PIN )?lock/i,
       );
+    }
+  });
+});
+
+/**
+ * Hardening Release 1b, the final pass (U13; R8, R11, R35). The guides quote
+ * every state the 1b screens can be in, the mail-off ones included, so no
+ * guide promises an email the platform does not send (R8). Two screens keep
+ * inline words (the reset page's button and its provider landing) and one
+ * refusal is the API's own (school-required): those are read from the source
+ * files, so a rewording there fails here too.
+ */
+describe("the guides carry Release 1b's remaining states in the app's words", () => {
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const source = (path: string) => readFileSync(resolve(HERE, "../..", path), "utf8");
+  const resetPage = source("src/features/auth/ResetPasswordPage.tsx");
+
+  it("quotes the parent's mail-off cards, the sign-up note and the reset and verify outcomes", () => {
+    const parent = read("parent-guide.md");
+    for (const line of [
+      MAIL_OFF_FORGOT_TITLE,
+      SIGNUP_DONE_MAIL_OFF_TITLE,
+      MAIL_OFF_SIGNUP,
+      SIGNUP_DONE_NOTE,
+      RESET_LINK_INVALID_TEXT,
+      VERIFIED_TEXT,
+      VERIFY_LINK_INVALID_TEXT,
+      WRONG_ACCOUNT_TEXT,
+      // The forgot card, with the guide's placeholder where the app shows the address.
+      forgotSentText("{your email}"),
+    ]) {
+      expect(parent, `parent guide never quotes "${line}"`).toContain(line);
+    }
+    expect(resetPage).toContain("Request a new reset link");
+    expect(parent).toContain("**Request a new reset link**");
+    // Email is SafeRide's to switch on, not the school's.
+    expect(parent).not.toMatch(/the school's email sending/);
+  });
+
+  it("tells drivers where school-required leads, what a stale app looks like, and how to change a password", () => {
+    const driver = read("driver-guide.md");
+    // A PIN sent without a school is refused by the API (U10) and the app goes
+    // back to the code step; the API's own words end on that step's prompt.
+    const api = readFileSync(resolve(HERE, "../../../backend/app/services/auth_service.py"), "utf8");
+    const schoolRequired = api.match(/SCHOOL_REQUIRED_MESSAGE = \(\s*"([^"]+)"\s*\)/)?.[1];
+    expect(schoolRequired, "SCHOOL_REQUIRED_MESSAGE not found in auth_service.py").toBeDefined();
+    expect(schoolRequired!.endsWith(`${DRIVER_CODE_PROMPT}.`)).toBe(true);
+    expect(driver).toContain(`goes back to **"${DRIVER_CODE_PROMPT}"**`);
+    // The app cached from before the release sends no school and reads the
+    // refusal as a wrong PIN: the guide says to close and reopen it.
+    expect(driver).toMatch(/never asked you for the driver code/);
+    expect(driver).toMatch(/Close SafeRide completely/);
+    // The lead the release message and the guide share (DL5).
+    expect(driver).toMatch(/open the installed app, tap Change school .*type the code/i);
+    expect(driver).toMatch(/one school only/);
+    // The guide's "N minutes" is the countdown line's own shape.
+    expect(pinLockedText(5)).toBe(`${PIN_LOCKED_LEAD} Try again in 5 minutes.`);
+    for (const line of [CHANGE_PASSWORD_LABEL, CHANGE_PASSWORD_DIALOG_TEXT, "(Reference: …)"]) {
+      expect(driver, `driver guide never quotes "${line}"`).toContain(line);
+    }
+  });
+
+  it("gives the office the card's lead, the drivers' message, the PIN dialog's line and staff recovery", () => {
+    const admin = read("admin-guide.md");
+    expect(admin).toContain(DRIVER_CODE_CARD_LEAD);
+    // The guide's worked example is the seeded Greenfield code on the apex
+    // origin; every line of the copied message appears as the app writes it.
+    const message = driverMessage(
+      "Greenfield Academy",
+      "GFA0-7K1Q",
+      driverSignInLink("https://saferidelive.co.ke", "GFA0-7K1Q"),
+    );
+    for (const line of message.split("\n")) {
+      expect(admin, `admin guide's message example lacks "${line}"`).toContain(line);
+    }
+    expect(admin).toContain(pinRevealCodeLine("…").replace(/\.$/, ""));
+    // Staff can recover by email once it is on; the old "no e-mail reset" line is gone.
+    expect(admin).not.toMatch(/no self-service e-mail reset for staff/i);
+    expect(admin).toContain(MAIL_OFF_FORGOT_TITLE);
+    expect(admin).toContain(MAIL_OFF_FORGOT);
+  });
+
+  it("gives providers Change password, the emailed reset that keeps the second factor, and the driver code", () => {
+    const provider = read("provider-guide.md");
+    expect(resetPage).toContain("Sign in with your new password.");
+    for (const line of [
+      CHANGE_PASSWORD_LABEL,
+      CHANGE_PASSWORD_DIALOG_TEXT,
+      MAIL_OFF_FORGOT_TITLE,
+      "Sign in with your new password.",
+      DRIVER_CODE_CARD_TITLE,
+      COPY_DRIVER_MESSAGE_LABEL,
+      REGENERATE_LABEL,
+    ]) {
+      expect(provider, `provider guide never quotes "${line}"`).toContain(line);
+    }
+    expect(provider).not.toMatch(/there is no in-app reset for providers/i);
+  });
+
+  it("keeps the index current: no September date as the app's state, recovery, the driver code, the Reference", () => {
+    const index = read("README.md");
+    expect(index).not.toMatch(/as deployed on \*\*22 September 2026\*\*/);
+    for (const line of ["driver code", "Forgot password?", "Change password", "(Reference: …)", "six-digit"]) {
+      expect(index, `index never mentions "${line}"`).toContain(line);
     }
   });
 });

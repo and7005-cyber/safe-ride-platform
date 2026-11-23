@@ -19,6 +19,10 @@ Rules worth knowing:
 
 If codes stop working entirely, your second factor needs a reset by a **peer provider** — see [Provider accounts](#provider-accounts). This is why the platform always keeps at least two provider accounts.
 
+**Changing your password:** open the account menu (your initials, top right) and choose **Change password**. Your current password is required. The dialog says *"You'll stay signed in here. Other devices will be signed out."* — and that is what happens; your second factor is untouched.
+
+**Forgot your password?** Once SafeRide's email is switched on, **Forgot password?** on the sign-in page emails you a reset link (it works once and lasts 30 minutes). After you choose the new password, SafeRide sends you back to the sign-in page — **"Sign in with your new password."** — and you sign in with it **and** your authenticator code: an emailed reset never skips the second factor, and it signs out every other session. While email isn't switched on, the page shows **"Email recovery is off"** and sends nothing; then a forgotten provider password is recovered through the deploy bootstrap below. A provider account can never be reset from a school's Parents page (it is refused there with a neutral message).
+
 ## Your first sign-in
 
 A new provider account starts with a **temporary password** — handed over by the peer who created your account (valid unused for **72 hours**), or retrieved from SSM for a bootstrap account (no expiry — sign in and replace it immediately) — and no second factor yet. The app walks you through both, **in this order**:
@@ -47,6 +51,8 @@ The school list shows **counts only, never a roster**. To see or touch a school'
 - The school gets a **generated school code** (e.g. `MSB-001`, three letters from the name plus a number). The code is **not editable, ever** — it is the school's stable identity in support requests and role offers. Quote it when talking to the school.
 - If the director's email is **new**, an account is created and its **temporary password is shown to you exactly once** — pass it to the director by a channel you trust. It expires unused after **72 hours**, and the director must replace it at first sign-in.
 - If the email **already has a SafeRide account** (the owner of an existing school, typically), no account and no password are created: the director role is **offered**, and the person accepts it at their next sign-in. Tell them the school code so they can check the offer is genuine.
+
+The school is also created with its own **driver code** — eight letters and numbers, shown in two groups of four, and not the school code. Drivers type it once on each phone so their PIN works at this school only. It is shown, with the sign-in link and a QR code, on the **Driver code** card of the school's Drivers page (not in the provider console): point the director to it at handover, and to **Copy message for drivers**. Only a director (or you, stepped in) can **Regenerate** it.
 
 After that, the director does the rest in their own console (staff, drivers, buses, students, routes); the school's **Tracking** card starts on the platform defaults. Step in only if they ask for help. One thing stays with Kuumbai: every driver is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run, and the sign-off block is kept with the release's validation record.
 
@@ -77,7 +83,7 @@ The **Provider accounts** page lists every Kuumbai account with its second-facto
 - **Remove** — ends that person's access **immediately**, open sessions included. **The last provider account cannot be removed** — the platform always keeps at least one, and should always have at least two so a lockout can be recovered by a peer.
 - **Reset second factor** — for a peer whose authenticator is lost or broken: clears their enrolment so they enrol afresh at their next sign-in (password step, then straight into enrolment). Their password is untouched.
 
-If a provider forgets their **password** (rather than the code), there is no in-app reset for providers — re-key the account through the deploy bootstrap below.
+If a provider forgets their **password** (rather than the code), they use **Forgot password?** once email is switched on (see [Signing in](#signing-in--two-steps-always)); without email, re-key the account through the deploy bootstrap below.
 
 ## The audit reader
 

@@ -8,7 +8,7 @@ SafeRide is a school bus management platform (Nairobi private schools) with thre
 
 - **Frontend**: React 18 + Vite + TypeScript, Tailwind v3 + shadcn/ui, React Query, React Router (21 routes)
 - **Backend**: FastAPI + Postgres, DAO/service layers, Pydantic schemas
-- **Auth**: email+password and 4-digit driver PIN, sliding 16h bearer sessions, role-guarded endpoints (no Firebase, no Supabase)
+- **Auth**: email+password and a six-digit driver PIN that signs in only at the school the phone is set up for (the school's driver code; hardening Release 1b — older four- and five-digit PINs keep signing in until re-issued), sliding 16h bearer sessions, role-guarded endpoints (no Firebase, no Supabase)
 - **Local stack**: Docker Compose (Postgres + API on :9001) + Vite dev server (:5173). Start with `scripts/start-local.sh` (`--reset` for clean seeded DB).
 
 ### Repos and folders (important — there was churn)
@@ -26,8 +26,8 @@ SafeRide is a school bus management platform (Nairobi private schools) with thre
 
 - Admin: `admin@test.com` / `test1234.` (note the **trailing dot**)
 - Parent: `and7005@gmail.com` / `Test1234`
-- Driver: `and7005@yahoo.it` / `Test1234`, driver PIN `1234`
-- Seed file: `backend/db/seeds/002_live_demo_seed.sql` — **rotate before any public deployment**
+- Driver: `and7005@yahoo.it` / `Test1234`, driver PIN `0322` (seed 003 reloads the driver; seed 002's own hash is an older PIN) at Greenfield Academy, driver code `GFA0-7K1Q` — the e2e fixture `DRIVER` in `frontend/tests/e2e/helpers.ts`
+- Seed files: `backend/db/seeds/002_live_demo_seed.sql` and `003_local_snapshot.sql` (applied by `scripts/reset-local-db.sh`) — **rotate before any public deployment**
 
 ## What has been done
 

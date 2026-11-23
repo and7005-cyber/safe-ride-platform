@@ -17,7 +17,7 @@ Staff accounts are personal — **never share a login**. Every change made in th
 
 **Changing your password:** open the account menu (your initials, top right) and choose **Change password**. Your current password is required. The dialog says *"You'll stay signed in here. Other devices will be signed out."* — and that is what happens.
 
-**Locked out?** There is no self-service e-mail reset for staff. A **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
+**Locked out?** Tap **Forgot password?** on the sign-in page. Once SafeRide's email is switched on, it emails you a reset link that works once and lasts 30 minutes; choosing a new password there signs you in and signs out every other device. Until then the page shows **"Email recovery is off"** (*"Email recovery isn't switched on yet. Ask your school office to reset your password."*) and sends nothing: a **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
 
 ## Director and transport coordinator
 
@@ -137,10 +137,19 @@ Staff creation is rate-limited (about 20 per hour) — enough for onboarding, an
 
 ### Share the driver code
 
-A driver's PIN works only at your school, so each driver's phone is set up for your school once, with your school's **driver code**. The **Driver code** card at the top of the Drivers page shows it, large, in two groups of four (for example `GFA0-7K1Q`). It is **not** the school code (`MSB-001`) shown in the sidebar and in Settings — that is a different code, and a driver who types it is told "That isn't a driver code. The school code in Settings is a different code."
+A driver's PIN works only at your school, so each driver's phone is set up for your school once, with your school's **driver code**. The **Driver code** card at the top of the Drivers page shows it, large, in two groups of four (for example `GFA0-7K1Q`), under the line *"Drivers type this code once on each phone, then sign in with their PIN. It is not the school code."* It is **not** the school code (`MSB-001`) shown in the sidebar and in Settings — that is a different code, and a driver who types it is told "That isn't a driver code. The school code in Settings is a different code."
 
 - **Copy code** copies the driver code. Reading it out or sending it is the surest way: it works on every phone, including an iPhone's installed app. Drivers can type it in capitals or small letters, with or without the hyphen; the code never contains the letters I, L, O or U, so nothing can be misread.
-- **Copy message for drivers** copies a ready-to-send message with the code, the link and the instruction to open the installed app and type the code.
+- **Copy message for drivers** copies a ready-to-send message: the code first, then the link, then the PIN step. For Greenfield Academy it reads:
+
+  ```text
+  SafeRide driver sign-in for Greenfield Academy.
+  Open the SafeRide app. When it asks for the driver code, type GFA0-7K1Q. If it shows another school's name, tap Change school.
+  Or open this link on your phone: https://saferidelive.co.ke/auth?school=GFA07K1Q
+  Then sign in with your PIN.
+  ```
+
+  It never contains a PIN: give each driver their PIN yourself (the PIN dialog below).
 - **Share by link or QR** shows the sign-in link (`…/auth?school=` followed by the code) and a QR code of it, with **Copy link**. Opening the link sets the phone up the same way as typing the code; the driver still confirms "Is this your school?". On iPhones a link from a chat often opens in Safari rather than the installed app, which keeps its own settings — so lead with the code.
 - **Regenerate** (director only) replaces the code. It asks first: **"Replace the driver code? Links and QR codes already sent stop working. Phones already set up keep working."** Use it at the start of a term, or when the code reached someone it should not have. Drivers whose phones are already set up are not affected; only new phones need the new code.
 
@@ -394,7 +403,7 @@ The **Temporary password** dialog then shows 16 letters and numbers in groups of
 
 Until the parent changes it, the row shows the chip **"Temporary password · expires …"** (date and time). If 72 hours pass unused it reads **"Temporary password expired — reset again"**: issue a new one. A second reset always replaces the first — only the newest temporary password works.
 
-Some accounts cannot be reset from here: anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account. The page then says *"This account cannot be reset from the Parents page. Ask the parent to use Forgot password."* — it never says why, or which school.
+Some accounts cannot be reset from here: anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account. The page then says *"This account cannot be reset from the Parents page. Ask the parent to use Forgot password."* — it never says why, or which school. While email isn't switched on, Forgot password sends nothing either: if the person is staff at your own school, a director resets them from the Staff page (**Reset password**); otherwise ask SafeRide support.
 
 ### Confirm and reset (parents without a working inbox)
 
@@ -470,12 +479,15 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: the app asks for a driver code | Their phone is not set up for your school (a new phone, or an iPhone that forgot after a week unused). Give them the code from the **Driver code** card; they open the installed app and type it. |
 | Driver: "That code didn't match a school" | They mistyped it, or the code was regenerated. Read them the current code from the Drivers page. |
 | Driver: "Sign-in for your school is paused for a few minutes" | Too many wrong PINs were tried from their network at your school. It lifts by itself after the minutes shown; drivers already signed in are not affected. Confirm the driver's PIN with them (or reset it) before they try again. |
-| Staff member locked out of their account | A director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
+| Driver: "Invalid PIN" with the right PIN, and the app never asked for the driver code | The phone is still running the app from before an update (the December 2026 update added the driver code). Ask them to close SafeRide completely and open it again from the home-screen icon; it then asks for the driver code. |
+| Driver: "This driver already drives for another school" when you set a PIN | A driver can sign in by PIN at one school only. Contact SafeRide support. |
+| Staff member locked out of their account | Once email is switched on they can use **Forgot password?** themselves. Otherwise a director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
 | A director is locked out and there is no other director | Contact SafeRide support — they can step in and issue the reset. |
 | New staff member's temporary password "doesn't work" | Temporary passwords expire after **72 hours** unused. Reset it and hand over the new one. |
 | Parent: "No children are linked to your account yet" | The parent's sign-up email doesn't match the student record. Fix the email on the student (or have the parent re-register with the recorded email). If the parent's other children are at another school, the link shows on their phone as a **pending card** — ask them to accept it. |
 | Alerts: "mismatched email" from a parent decline | A parent answered your link with "Not my child". The email was removed from the student's record — verify the address with the family and re-enter it. |
-| Parent: locked out, or the reset email never arrives | Parents → the key button on their row (**Reset password**), and read them the temporary password. See [Resetting a parent's password](#resetting-a-parents-password). |
+| Parent: locked out, the reset email never arrives, or "Email recovery isn't switched on yet" | Parents → the key button on their row (**Reset password**), and read them the temporary password. See [Resetting a parent's password](#resetting-a-parents-password). |
+| Parent: "Sign-up received" — no link was sent | Email isn't switched on yet. Speak to them, then Parents → **Confirm and reset** on their Awaiting signup row. |
 | Parent: signed up but can't confirm their email | Speak to them, then Parents → **Confirm and reset** on their Awaiting signup row. See [Confirm and reset](#confirm-and-reset-parents-without-a-working-inbox). |
 | Parent: "the temporary password doesn't work" | Check the row's chip: after 72 hours it reads "Temporary password expired — reset again". Otherwise make sure they use the newest one — each reset replaces the last. |
 | Parent: wants name/phone/address changed | Edit it on the Students or Parents page — parents can't self-edit. |

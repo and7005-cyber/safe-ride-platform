@@ -14,9 +14,11 @@ This guide is for bus drivers. It explains how to sign in, run your morning and 
 
 ## Signing in
 
-Your PIN works only at your own school, so each phone is set up for your school once, with the school's **driver code**. After that you only type your PIN.
+Your PIN works only at your own school, so each phone is set up for your school once, with the school's **driver code**. After that you only type your PIN. A driver signs in by PIN at **one school only**: if you also drive for another school on SafeRide, ask your office — they will sort it out with SafeRide support.
 
 ### First sign-in on a new phone (or after a long gap)
+
+> **In short: open the installed app, tap Change school (only if it shows a school that isn't yours), type the code.** Then your PIN.
 
 **Open the installed app** — the SafeRide icon on your home screen — not a link in a chat or a browser tab. On iPhones the installed app and Safari keep separate settings, and the phone forgets them after about a week without use, so always use the same installed app.
 
@@ -37,6 +39,10 @@ If the app says **"That code didn't match a school. Ask your school office for t
 
 Signing out keeps the phone set up for your school. **Change school** (the small link under the Sign In button) clears it; the app first asks you to confirm — **"You'll need the code again."** — so only tap it when you have the driver code at hand.
 
+If, after you tap **Sign In with PIN**, the app goes back to **"Enter the driver code from your school office"**, the phone's setup for your school was lost: type the driver code again, confirm your school, then your PIN.
+
+**After a SafeRide update** (the one that brought the driver code, December 2026, in particular): if the app says **"Invalid PIN"** although your PIN is right, and it never asked you for the driver code, the phone is still running the app from before the update. Close SafeRide completely (swipe it away) and open it again from the home-screen icon; it then asks for the driver code.
+
 If you see **"Invalid PIN"**, check the digits and try again. After about **10 wrong attempts in a minute** the app temporarily blocks sign-in ("Too many PIN attempts. Try again shortly.") — wait a minute and retry.
 
 If the app says **"Sign-in for your school is paused for a few minutes. Try again in N minutes."**, too many wrong PINs were tried from your network at your school in a short time. Wait the minutes it shows — the countdown updates by itself — then sign in again. If you are already signed in, nothing changes: you can carry on with your run. If you are not sure of your PIN, call the office to confirm it before trying again.
@@ -44,6 +50,8 @@ If the app says **"Sign-in for your school is paused for a few minutes. Try agai
 You stay signed in for the whole working day: the session lasts **16 hours** and renews itself every time you use the app. If the app ever says **"Your session has expired. Please sign in again."**, just sign in again with your PIN.
 
 **Signing out:** tap the **sign-out icon in the top-right corner** of any screen. Always sign out if you share the phone with someone else.
+
+**Changing your password** (only if your office also gave you a password, and you signed in on the **Email & Password** tab): tap the key icon beside the sign-out icon — **Change password** — type your current password, then the new one twice. The dialog says *"You'll stay signed in here. Other devices will be signed out."* After a PIN sign-in the key icon is not shown: a PIN cannot change the account password. To change your PIN, ask the office.
 
 ## The app at a glance
 
@@ -219,6 +227,7 @@ The school office sees the report immediately on their Alerts page, and for dela
 | Problem | What to do |
 | --- | --- |
 | "Invalid PIN" | Re-check the digits. Still failing? Ask the office to confirm or change your PIN. |
+| "Invalid PIN" with the right PIN, and the app never asked for the driver code | The phone still runs the app from before an update. Close SafeRide completely and open it again from the home-screen icon; it then asks for the driver code. |
 | "Too many PIN attempts. Try again shortly." | Wait about a minute, then try again. |
 | "Sign-in for your school is paused for a few minutes. Try again in N minutes." | Wait the minutes shown, then sign in again. A run you are already signed in to is not affected. |
 | The app asks for the driver code | This phone is not set up for your school yet (a new phone, or the phone forgot after a week unused). Open the installed app and type the driver code from your school office. |
@@ -243,3 +252,4 @@ The school office sees the report immediately on their Alerts page, and for dela
 | The battery drains fast on a run | Expected: the screen stays on for the whole run and the phone sends the bus's position every few seconds. Keep the phone on its charger on the bus. |
 | The office says the bus "went quiet" between stops | The bus's position between stops is only sent while the app is on your screen. Unlock the phone and come back to the app; sending resumes on its own, and your next tap sends a position too. |
 | "Your session has expired." | Sign in again with your PIN. |
+| An error message ending "(Reference: …)" | Something went wrong on SafeRide's side, not yours. Tap once more; if it happens again, take a screenshot (the message disappears after a few seconds) and send it to the office with the time, quoting the Reference. |

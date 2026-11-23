@@ -541,15 +541,20 @@ Maps key and Map ID, the Route 53 preflight, the alert addresses, the deploy
 day and window) and the Release 1a deploy checklist (the gates before the
 deploy — the 017 rehearsal on a production copy, the gate dry run, the
 fixed-name pre-checks, the baselines — what to watch in both deploys, the
-verification after it and the first 48 hours) are in
+verification after it and the first 48 hours) and the Release 1b deploy
+checklist (the mail decision and baselines, the metric-filter tests, the
+expected change sets, the first retention run, the mail, PIN and parent
+drills, the rollback rehearsal to `release/1a`, the PIN re-issue, the alarm
+drill and the next morning) are in
 [docs/runbooks/hardening-release-checklists.md](../docs/runbooks/hardening-release-checklists.md).
 
 ## Restore and rollback
 
 The restore and rollback runbook is [RESTORE.md](RESTORE.md): the decision
 between a code rollback, a data restore and a pepper rotation; code rollback
-by release tag (and what rolling back to `release/0` takes away, the checks
-immediately before and after it); point-in-time restore into a scratch
+by release tag (what rolling back Release 1b to `release/1a` means for
+salted PINs, verification tokens and unverified sign-ups; what rolling back
+to `release/0` takes away, the checks immediately before and after it); point-in-time restore into a scratch
 instance checked through the verify function; the rename swap that replaces
 production; the rehearsal, with 017 applied to the production copy; retained
 resources after a failed or reverted Release 1a; pepper rotation; who may run

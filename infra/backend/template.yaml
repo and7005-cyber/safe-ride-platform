@@ -273,7 +273,12 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Whether the API sends mail through SES; false until Release 1b's sender ships.
+    Description: >
+      The operator's mail switch (MAIL_ENABLED). true: the API sends reset,
+      verification and notice mail through SES and the screens offer email
+      recovery. false: nothing is sent and the screens send people to their
+      school office. Keep false while SES is in the sandbox, except for a
+      drill to verified addresses.
 
 Conditions:
   HasApiCert: !Not [!Equals [!Ref ApiCertificateArn, ""]]
