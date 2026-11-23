@@ -381,7 +381,7 @@ This page lists every parent contact in the system. **Status** tells you where e
 - **Registered** — the parent has created their app account.
 - **Awaiting signup** — the email exists on a student record but no parent has signed up with it and confirmed the address yet. Chase these before launch day so parents get notifications from day one.
 
-You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). **Changing a parent's email** signs the parent out on every device, stops their push notifications and asks them to confirm the new address from the email SafeRide sends to it; their children stay linked, and the old address receives a short notice of the change. Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
+You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). **Changing a parent's email** signs the parent out on every device, stops their push notifications and asks them to confirm the new address from the email SafeRide sends to it; their children stay linked, and the old address receives a short notice of the change. The email of anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account, cannot be changed here: the page says *"This account's email cannot be changed from the Parents page. Keep the current email to save a name or phone change."* — it never says why, or which school. Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
 
 A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting. **Reset password** still works on a Shared row (either school can get the parent back in); the other school's records are not changed.
 
@@ -411,7 +411,7 @@ A parent who signed up but never confirmed their email (no access to that inbox,
 
 If an account is waiting behind that email, Confirm and reset confirms it, links the children (with the usual "Parent signup auto-linked" alert), and issues a temporary password exactly like **Reset password** — shown once, the same 72 hours, the same notice email. The password chosen at sign-up stops working, and anyone signed in to that account is signed out: if the account was not really the parent's, whoever made it is locked out. Tell the parent the same things as for a reset.
 
-If there is nothing to confirm — no sign-up with that email yet, or it is already confirmed — the page says *"Nothing to confirm yet"* / *"Ask the parent to sign up with this email."* Nothing changes.
+If there is nothing to confirm — no sign-up with that email yet, it is already confirmed, or the parent is also on another school's records (such a family confirms from the email SafeRide sends them; while email isn't switched on, ask SafeRide support) — the page says *"Nothing to confirm yet"* / *"Ask the parent to sign up with this email."* Nothing changes.
 
 ## Alerts
 

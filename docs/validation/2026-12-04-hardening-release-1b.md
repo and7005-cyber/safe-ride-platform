@@ -70,7 +70,7 @@ Each gate is a step of the
 | Parent drill: a sign-up stays unlisted; it verifies from its own session and links (mail window); an office reset and a Confirm and reset leave their audit rows | — | **open** |
 | `hardening` final, diffed against the baselines, every difference explained | — | **open** |
 | Alarms after the smoke: `OK`/`INSUFFICIENT_DATA` apart from the drills' recorded ALARM/OK pairs | — | **open** |
-| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student-email edits on 1a; back to `release/1b`; both durations | — | **open** |
+| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student saves or imports on 1a; back to `release/1b`; both durations | — | **open** |
 | Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | — | **open** |
 | Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | — | **open** |
 | The old unrestricted Maps browser key restricted to localhost or deleted (D45) | — | **open** |
@@ -268,9 +268,10 @@ Pending: `ce-code-review` over the branch, then fixes and a full certify
   with the migrate function's `purge-verify-tokens` action (D52), since 1a's
   reset ignores `purpose`; a sign-up in the deploy's minutes is bounded by the
   24-hour expiry.
-- **Unverified sign-ups:** under 1a an office edit of a student's parent
-  email links an unverified account; no such edits while on 1a, and
-  `unverified-parent-accounts-by-age` read after returning.
+- **Unverified sign-ups:** under 1a every student create, edit or import
+  re-runs the parent-link sync and links an unverified account whose email
+  matches; no student saves or imports of any kind while on 1a, and
+  `unverified-parent-accounts-by-age` read after returning (code review #4).
 - **What reverts with 1a's templates:** the schedule, the heartbeat, the
   target-error, mail and PIN alarms and the five metric filters;
   `ApiClientErrorsBurst` back on the gateway's 4xx; the migrate timeout back

@@ -10,7 +10,8 @@ transport, so the notice mail is checked without SES.
 Families are synthetic and throwaway (``@saferide.test`` addresses, students
 inserted at the seeded schools and deleted afterwards); seeded accounts are
 never reset. Every audit row written with 017's actions
-(``parent-password-reset``, ``parent-email-confirmed``) is deleted in the
+(``parent-password-reset``, ``parent-email-confirmed``,
+``parent-email-changed``) is deleted in the
 finally blocks: the 013/016 double-apply rehearsals validate existing rows
 against older CHECK lists.
 """
@@ -613,6 +614,258 @@ def test_confirm_and_reset_refusals(client, mail):
         purge_family(created[1] if len(created) > 1 else None, driver_email, [])
         grandfathered.teardown()
         purge_family(None, no_account, students)
+
+
+def confirm_both_ways(client, email: str) -> list:
+    """Confirm and reset from school A's coordinator, in-process (owner
+    connection) and through the API container (runtime role, row security
+    on: another school's students are invisible there, so the refusal must
+    come from the SECURITY DEFINER scan and the links' own school stamp)."""
+    import httpx
+
+    from conftest import login as container_login
+
+    answers = [
+        client.post(
+            "/api/accounts/parents/slots/confirm",
+            headers=staff(client, COORDINATOR_A, SCHOOL_A_ID),
+            json={"email": email},
+        )
+    ]
+    headers = school_headers(container_login(COORDINATOR_A), SCHOOL_A_ID)
+    with httpx.Client(base_url=API_URL, timeout=20) as api:
+        answers.append(
+            api.post("/api/accounts/parents/slots/confirm", headers=headers, json={"email": email})
+        )
+    return answers
+
+
+def assert_confirm_left_nothing(user_id: str, *, links: list[tuple[str, str]]) -> None:
+    """A refused Confirm: still unverified, the creator's password intact, the
+    links as they were, no office-issued credential recorded."""
+    from app.core.security import verify_password
+
+    with db() as conn:
+        account = conn.execute(
+            "select password_hash, email_verified_at, must_change_password "
+            "from app_users where id = %s",
+            (user_id,),
+        ).fetchone()
+        rows = conn.execute(
+            "select status, school_id from live_parent_students where parent_id = %s "
+            "order by school_id",
+            (user_id,),
+        ).fetchall()
+        audits = conn.execute(
+            "select count(*) as n from live_admin_audit where resource_id = %s "
+            "and action in ('parent-email-confirmed', 'parent-password-reset')",
+            (user_id,),
+        ).fetchone()["n"]
+    assert account["email_verified_at"] is None
+    assert account["must_change_password"] is False
+    assert verify_password(PARENT_PASSWORD, account["password_hash"])
+    assert [(r["status"], str(r["school_id"])) for r in rows] == links
+    assert audits == 0
+
+
+def test_confirm_and_reset_refuses_an_address_also_on_another_schools_slot(client, mail):
+    """School A writes its own slots: an address A put on one of its students
+    must not let A's office verify the account and reach school B's child
+    through the platform-wide linking. The family verifies through its own
+    email link instead, which links both schools as pending."""
+    email = fresh_email("slot-a-and-b")
+    students = [slot_student(SCHOOL_A_ID, email), slot_student(SCHOOL_B_ID, email)]
+    parent = None
+    try:
+        parent = signup_unverified_parent(client, email, PARENT_PASSWORD, "IT U9 Two Slots")
+        sent_before = len(mail.sent)
+
+        for resp in confirm_both_ways(client, email):
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"] == {
+                "code": "nothing-to-confirm", "message": NOTHING_TO_CONFIRM,
+            }
+            assert SCHOOL_B_NAME not in resp.text
+        assert list(mail.sent)[sent_before:] == []
+        assert_confirm_left_nothing(parent["id"], links=[])
+        # The creator's session was not touched.
+        assert client.get("/api/auth/me", headers=parent["headers"]).status_code == 200
+
+        # The owner's own verification still links both schools, pending.
+        verify_parent(client, parent)
+        with db() as conn:
+            links = conn.execute(
+                "select status from live_parent_students where parent_id = %s",
+                (parent["id"],),
+            ).fetchall()
+        assert sorted(link["status"] for link in links) == ["pending", "pending"]
+    finally:
+        purge_family(parent["id"] if parent else None, email, students)
+
+
+def test_confirm_and_reset_refuses_an_account_linked_at_another_school(client, mail):
+    """School B changed its parent's email (the account is unverified again,
+    B's accepted link stays); school A then carries the new address on a
+    slot. Confirm from A must not take over B's family."""
+    family = Family("linked-at-b")
+    try:
+        family.child_at(SCHOOL_B_ID)
+        new_email = fresh_email("b-renamed")
+        renamed = client.put(
+            f"/api/accounts/parents/{family.id}",
+            headers=staff(client, DIRECTOR_B, SCHOOL_B_ID),
+            json={"full_name": "IT U9 linked-at-b", "email": new_email, "phone": None},
+        )
+        assert renamed.status_code == 200, renamed.text
+        family.email = new_email
+        family.students.append(slot_student(SCHOOL_A_ID, new_email))
+        sent_before = len(mail.sent)
+
+        for resp in confirm_both_ways(client, new_email):
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"] == {
+                "code": "nothing-to-confirm", "message": NOTHING_TO_CONFIRM,
+            }
+        assert list(mail.sent)[sent_before:] == []
+        assert_confirm_left_nothing(family.id, links=[("accepted", SCHOOL_B_ID)])
+    finally:
+        family.teardown()
+
+
+def test_confirm_and_reset_still_adopts_an_account_linked_only_here(client, mail):
+    """The guard is "another school", not "any link": A changed its own
+    parent's email and carries the new address on a slot — Confirm from A
+    verifies and issues the password as before."""
+    family = Family("linked-at-a")
+    try:
+        family.child_at(SCHOOL_A_ID)
+        new_email = fresh_email("a-renamed")
+        renamed = client.put(
+            f"/api/accounts/parents/{family.id}",
+            headers=staff(client, COORDINATOR_A, SCHOOL_A_ID),
+            json={"full_name": "IT U9 linked-at-a", "email": new_email, "phone": None},
+        )
+        assert renamed.status_code == 200, renamed.text
+        family.email = new_email
+        family.students.append(slot_student(SCHOOL_A_ID, new_email))
+
+        resp = client.post(
+            "/api/accounts/parents/slots/confirm",
+            headers=staff(client, COORDINATOR_A, SCHOOL_A_ID),
+            json={"email": new_email},
+        )
+        assert resp.status_code == 200, resp.text
+        assert login(client, new_email, resp.json()["temporaryPassword"]).status_code == 200
+        assert len(audit_rows(family.id, "parent-email-confirmed")) == 1
+    finally:
+        family.teardown()
+
+
+# --- the office's email change on an identity holding other access ------------------
+
+
+def edit_parent(client, parent_id: str, *, email: str, full_name: str, phone: str | None = None):
+    return client.put(
+        f"/api/accounts/parents/{parent_id}",
+        headers=staff(client, COORDINATOR_A, SCHOOL_A_ID),
+        json={"full_name": full_name, "email": email, "phone": phone},
+    )
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        "driver-elsewhere",
+        "director-elsewhere",
+        "coordinator-here",
+        "offered-elsewhere",
+        "provider",
+    ],
+)
+def test_an_email_change_on_an_identity_with_any_other_access_is_refused(client, mail, access):
+    """A new address hands over the recovery channel: once mail is on, Forgot
+    password to it would let A's office sign in as B's driver or director, or
+    as a provider. The same predicate as the reset; name and phone still save."""
+    family = Family(f"no-email-edit-{access}")
+    try:
+        family.child_at(SCHOOL_A_ID)
+        with db() as conn:
+            if access == "provider":
+                conn.execute(
+                    "insert into provider_accounts (user_id, totp_salt) values (%s, %s)",
+                    (family.id, uuid.uuid4().hex),
+                )
+            else:
+                role, school, state = {
+                    "driver-elsewhere": ("driver", SCHOOL_B_ID, "active"),
+                    "director-elsewhere": ("director", SCHOOL_B_ID, "active"),
+                    "coordinator-here": ("coordinator", SCHOOL_A_ID, "active"),
+                    "offered-elsewhere": ("coordinator", SCHOOL_B_ID, "offered"),
+                }[access]
+                conn.execute(
+                    "insert into school_memberships (user_id, school_id, role, state, accepted_at) "
+                    "values (%s, %s, %s, %s, case when %s = 'active' then now() end)",
+                    (family.id, school, role, state, state),
+                )
+        sent_before = len(mail.sent)
+
+        resp = edit_parent(
+            client, family.id, email=fresh_email("taken-over"), full_name="IT U9 Hijack",
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == {
+            "code": "not-editable-here",
+            "message": "This account's email cannot be changed from the Parents page",
+        }
+        # Neutral: no school, no role named.
+        assert SCHOOL_B_NAME not in resp.text and "driver" not in resp.text.lower()
+        # Nothing changed, nothing mailed, nothing recorded; still signed in.
+        with db() as conn:
+            account = conn.execute(
+                "select email, full_name, email_verification_required from app_users "
+                "where id = %s",
+                (family.id,),
+            ).fetchone()
+        assert account["email"] == family.email
+        assert account["full_name"] == f"IT U9 no-email-edit-{access}"
+        assert account["email_verification_required"] is False
+        assert list(mail.sent)[sent_before:] == []
+        assert audit_rows(family.id, "parent-email-changed") == []
+        assert audit_rows(family.id, "parent-updated") == []
+        assert login(client, family.email, PARENT_PASSWORD).status_code == 200
+
+        # Name and phone still save; the same address in another case is no change.
+        kept = edit_parent(
+            client, family.id, email=family.email.upper(), full_name="IT U9 Renamed",
+            phone="+254712345678",
+        )
+        assert kept.status_code == 200, kept.text
+        assert kept.json()["full_name"] == "IT U9 Renamed"
+        assert audit_rows(family.id, "parent-email-changed") == []
+    finally:
+        family.teardown()
+
+
+def test_an_email_change_on_a_plain_parent_still_restarts_verification(client, mail):
+    family = Family("plain-email-edit")
+    try:
+        family.child_at(SCHOOL_A_ID)
+        new_email = fresh_email("plain-renamed")
+        resp = edit_parent(client, family.id, email=new_email, full_name="IT U9 Plain")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["email"] == new_email
+        family.email = new_email
+        assert len(audit_rows(family.id, "parent-email-changed")) == 1
+        with db() as conn:
+            account = conn.execute(
+                "select email_verification_required, email_verified_at from app_users "
+                "where id = %s",
+                (family.id,),
+            ).fetchone()
+        assert account["email_verification_required"] is True
+        assert account["email_verified_at"] is None
+    finally:
+        family.teardown()
 
 
 # --- self-service change -----------------------------------------------------------

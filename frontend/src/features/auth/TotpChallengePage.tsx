@@ -11,6 +11,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api, ApiError } from "@/lib/apiClient";
+import type { LoginResponseUser } from "@/lib/auth";
 
 // The provider login's second step (U13/AE19). Rendered by AuthPage after a
 // password submit answered {preauth, totpRequired}: the pre-auth token lives
@@ -30,7 +31,7 @@ export function TotpChallengePage({
   preauth: string;
   email: string;
   /** A session landed: same contract as the password login's response. */
-  onSuccess: (token: string, user: any) => void;
+  onSuccess: (token: string, user: LoginResponseUser) => void;
   /** The token died on its fifth wrong code — back to the password step. */
   onVoided: (message: string) => void;
   onBack: () => void;

@@ -16,6 +16,8 @@ from app.core.errors import AccountRefusedError, NotFoundError
 from app.core.scope import SchoolScope
 from app.core.security import RELAYED_CODE_ALPHABET, verify_password
 from app.dao.account_dao import (
+    NOT_EDITABLE_HERE_CODE,
+    NOT_EDITABLE_HERE_MESSAGE,
     NOT_RESETTABLE_HERE_CODE,
     NOT_RESETTABLE_HERE_MESSAGE,
     NOTHING_TO_CONFIRM_CODE,
@@ -107,12 +109,17 @@ def test_a_refused_reset_mails_nothing(refusal):
 def test_the_refusals_answer_a_structured_409_with_neutral_words():
     for code, message in (
         (NOT_RESETTABLE_HERE_CODE, NOT_RESETTABLE_HERE_MESSAGE),
+        (NOT_EDITABLE_HERE_CODE, NOT_EDITABLE_HERE_MESSAGE),
         (NOTHING_TO_CONFIRM_CODE, NOTHING_TO_CONFIRM_MESSAGE),
     ):
         http = map_error(AccountRefusedError(message, code=code))
         assert http.status_code == 409
         assert http.detail == {"code": code, "message": message}
     assert NOT_RESETTABLE_HERE_MESSAGE == "This account cannot be reset from the Parents page"
+    # The Parents page and the admin guide quote this sentence verbatim.
+    assert NOT_EDITABLE_HERE_MESSAGE == (
+        "This account's email cannot be changed from the Parents page"
+    )
 
 
 def test_confirm_and_reset_verifies_links_after_the_commit_and_mails_the_notice():

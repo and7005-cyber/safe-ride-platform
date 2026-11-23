@@ -1213,9 +1213,10 @@ when it ends.
    the minutes between step 1 and step 2 can have left one: record it, with
    when it expires (24 hours after it was sent) — that is the exposure
    bound, and only that address's own inbox holds the link.
-7. **Under 1a, office edits of students' parent emails would link unverified
-   sign-ups** (1a's student sync does not ask for verification): make none
-   during the rehearsal.
+7. **Under 1a, any student save or import links unverified sign-ups**
+   (1a re-runs the parent-link sync on every student create, edit and import,
+   whatever changed, and does not ask for verification): no student saves or
+   imports of any kind during the rehearsal.
 8. **Back to `release/1b`** — `git checkout release/1b`; backend (the
    expected backend change set again, migrate `[]`), then frontend (the
    budget row, no export needed). Record start and end.

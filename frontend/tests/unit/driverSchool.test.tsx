@@ -1,9 +1,10 @@
 // The phone's school binding (hardening U10; AE8, AE10; DL3, DL5). The store
 // reads the code from a sign-in link, keeps the confirmed school across
 // sign-out, and is cleared only by "Change school"; a signed-in driver with
-// no binding adopts the session's school.
+// no binding adopts the session's school. Where storage refuses (privacy
+// modes, quota), the binding lasts as long as the tab.
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +20,8 @@ vi.mock("@/lib/push", () => ({
 
 import { AuthProvider, useAuth } from "@/lib/auth";
 import { setToken } from "@/lib/apiClient";
+import { DriverPinSignIn } from "@/features/auth/DriverPinSignIn";
+import { CONFIRM_SCHOOL_YES, DRIVER_CODE_PROMPT } from "@/features/auth/authCopy";
 import {
   adoptSessionSchool,
   clearDriverSchool,
@@ -36,6 +39,8 @@ import {
 const SCHOOL = { schoolId: "5cae0000-0000-0000-0000-000000000001", name: "Greenfield Academy" };
 
 beforeEach(() => {
+  // Also drops a tab-only binding left by a test whose storage refused.
+  clearDriverSchool();
   localStorage.clear();
   sessionStorage.clear();
   mocks.get.mockReset();
@@ -188,5 +193,64 @@ describe("sign-out and a live session (AE10)", () => {
       }),
     ).toBeNull();
     expect(readDriverSchool()).toBeNull();
+  });
+});
+
+describe("storage that refuses (privacy modes, quota)", () => {
+  function refuseStorage(methods: ("getItem" | "setItem" | "removeItem")[]) {
+    const spies = methods.map((method) =>
+      vi.spyOn(Storage.prototype, method).mockImplementation(() => {
+        throw new DOMException("The operation is insecure.", "SecurityError");
+      }),
+    );
+    return () => spies.forEach((spy) => spy.mockRestore());
+  }
+
+  it("a confirmed school reaches the PIN form for this tab; Change school clears it", async () => {
+    const restore = refuseStorage(["getItem", "setItem", "removeItem"]);
+    try {
+      mocks.get.mockResolvedValue(SCHOOL);
+      render(<DriverPinSignIn linkCode={null} onLinkConsumed={() => {}} onSignedIn={vi.fn()} />);
+      fireEvent.change(screen.getByLabelText("Driver code"), { target: { value: "GFA0-7K1Q" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.click(await screen.findByRole("button", { name: CONFIRM_SCHOOL_YES }));
+
+      expect(screen.getByTestId("driver-school-name")).toHaveTextContent(SCHOOL.name);
+      expect(screen.getByLabelText("Driver PIN", { selector: "input" })).toBeInTheDocument();
+      expect(readDriverSchool()).toEqual(SCHOOL);
+      // The same object on every read: useSyncExternalStore needs a stable snapshot.
+      expect(readDriverSchool()).toBe(readDriverSchool());
+
+      fireEvent.click(screen.getByRole("button", { name: "Change school" }));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Change school" }));
+      expect(readDriverSchool()).toBeNull();
+      expect(screen.getByText(DRIVER_CODE_PROMPT)).toBeInTheDocument();
+    } finally {
+      restore();
+    }
+  });
+
+  it("the tab's choice wins over an older stored school it could not replace", () => {
+    const older = { schoolId: "5cae0000-0000-0000-0000-000000000002", name: "IT Second School" };
+    storeDriverSchool(older);
+    const restore = refuseStorage(["setItem", "removeItem"]);
+    try {
+      storeDriverSchool(SCHOOL);
+      expect(readDriverSchool()).toEqual(SCHOOL);
+    } finally {
+      restore();
+    }
+  });
+
+  it("a signed-in driver adopts the session's school for this tab", () => {
+    const restore = refuseStorage(["getItem", "setItem", "removeItem"]);
+    try {
+      expect(adoptSessionSchool(driverMe())).toEqual(SCHOOL);
+      expect(readDriverSchool()).toEqual(SCHOOL);
+      // Adopted once: the next /me finds the binding and writes nothing.
+      expect(adoptSessionSchool(driverMe())).toBeNull();
+    } finally {
+      restore();
+    }
   });
 });

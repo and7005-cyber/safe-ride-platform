@@ -1,7 +1,9 @@
 // Hardening U9 (DL6, DL12, DL13): the office reset and Confirm and reset on
 // the Parents page, the voluntary Change password dialog, and where each role
 // reaches it — never from a session created by PIN. The live flows run in
-// tests/e2e/parent-office-reset.spec.ts; here, the states and words.
+// tests/e2e/parent-office-reset.spec.ts; here, the states and words — and two
+// orderings: the one-time password shows before the list refetch, and the
+// forced change re-attaches this browser's push subscription.
 // The matchers are installed by the vitest setup file; this import brings
 // their types into the typecheck (tsc includes tests/).
 import "@testing-library/jest-dom/vitest";
@@ -19,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   signOut: vi.fn(),
   parents: [] as any[],
   mailEnabled: true as boolean | null,
+  reattach: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", async (importOriginal) => {
@@ -46,6 +49,10 @@ vi.mock("@/lib/apiClient", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/apiClient")>();
   return { ...actual, api: { ...actual.api, post: mocks.post } };
 });
+vi.mock("@/lib/push", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/push")>();
+  return { ...actual, reattachPushSubscription: mocks.reattach };
+});
 
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -56,6 +63,8 @@ import {
   CONFIRM_SLOT_WARNING,
   NOTHING_TO_CONFIRM_TEXT,
   NOTHING_TO_CONFIRM_TITLE,
+  NOT_EDITABLE_HINT,
+  NOT_EDITABLE_TITLE,
   NOT_RESETTABLE_HINT,
   PASSWORD_CHANGED_TOAST,
   TEMPORARY_PASSWORD_EXPIRED_CHIP,
@@ -64,7 +73,7 @@ import {
 } from "@/features/auth/authCopy";
 import { ChangePasswordDialog, ChangePasswordPage } from "@/features/auth/ChangePasswordPage";
 import { ProviderLayout } from "@/features/provider/ProviderLayout";
-import { ApiError } from "@/lib/apiClient";
+import { ApiError, api } from "@/lib/apiClient";
 import { canChangeOwnPassword } from "@/lib/auth";
 
 function user(overrides: Partial<AuthUser> = {}): AuthUser {
@@ -86,8 +95,7 @@ function user(overrides: Partial<AuthUser> = {}): AuthUser {
   };
 }
 
-function withProviders(node: React.ReactNode) {
-  const client = new QueryClient();
+function withProviders(node: React.ReactNode, client: QueryClient = new QueryClient()) {
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
@@ -104,6 +112,8 @@ beforeEach(() => {
   mocks.post.mockReset();
   mocks.toast.mockReset();
   mocks.refresh.mockReset();
+  mocks.reattach.mockReset();
+  mocks.reattach.mockResolvedValue(true);
   mocks.parents = [];
   mocks.mailEnabled = true;
 });
@@ -172,6 +182,37 @@ describe("Change password (DL13)", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
     expect(screen.queryByText(CHANGE_PASSWORD_DIALOG_TEXT)).toBeNull();
+  });
+
+  it("forced: once changed, re-attaches this browser's push subscription", async () => {
+    // An office reset deleted the account's push rows, and the re-attach at
+    // sign-in was refused while the temporary password was still in force.
+    mocks.user = user({ role: "parent", mustChangePassword: true });
+    mocks.post.mockResolvedValue({ ok: true });
+    mocks.refresh.mockResolvedValue(undefined);
+    withProviders(<ChangePasswordPage />);
+    expect(mocks.reattach).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "Temp1234" } });
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "New1234!" } });
+    fireEvent.change(screen.getByLabelText("Confirm new password"), { target: { value: "New1234!" } });
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await waitFor(() => expect(mocks.reattach).toHaveBeenCalledTimes(1));
+    // After /me no longer carries the flag: the subscribe call is accepted.
+    expect(mocks.refresh.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.reattach.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("voluntary: push is kept, so nothing is re-attached", async () => {
+    mocks.post.mockResolvedValue({ ok: true });
+    const onOpenChange = vi.fn();
+    withProviders(<ChangePasswordDialog open onOpenChange={onOpenChange} />);
+    fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "Old123!" } });
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "New1234!" } });
+    fireEvent.change(screen.getByLabelText("Confirm new password"), { target: { value: "New1234!" } });
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(mocks.reattach).not.toHaveBeenCalled();
   });
 });
 
@@ -244,6 +285,36 @@ describe("the Parents page (DL12)", () => {
     expect(mocks.post).toHaveBeenCalledWith("/api/accounts/parents/p-1/reset-password");
   });
 
+  it("shows the one-time password even when the list refetch never answers", async () => {
+    // The server already replaced the password; only the dialog can show it.
+    mocks.parents = [registered];
+    mocks.post.mockResolvedValue({ ok: true, temporaryPassword: "CMEJ4QPBJTNY10C5" });
+    const client = new QueryClient();
+    const refetch = vi.spyOn(client, "invalidateQueries").mockReturnValue(new Promise(() => {}));
+    withProviders(<ParentsPage />, client);
+    fireEvent.click(screen.getByRole("button", { name: "Reset password for amina@saferide.test" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Reset password" }));
+    expect(await screen.findByTestId("temp-password")).toHaveAttribute("data-value", "CMEJ4QPBJTNY10C5");
+    expect(refetch).toHaveBeenCalled();
+  });
+
+  it("Confirm and reset shows its password even when the list refetch never answers", async () => {
+    mocks.parents = [{
+      id: null, full_name: "Slot Parent", email: "slot@saferide.test", phone: null,
+      status: "pending", students: ["Kid"], shared: false, linkAccepted: false,
+      mustChangePassword: false, temporaryPasswordExpiresAt: null,
+    }];
+    mocks.post.mockResolvedValue({ ok: true, temporaryPassword: "ABCD2345EFGH6789" });
+    const client = new QueryClient();
+    vi.spyOn(client, "invalidateQueries").mockReturnValue(new Promise(() => {}));
+    withProviders(<ParentsPage />, client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and reset for slot@saferide.test" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Confirm and reset" }),
+    );
+    expect(await screen.findByTestId("temp-password")).toHaveAttribute("data-value", "ABCD2345EFGH6789");
+  });
+
   it("with mail off the confirmation promises no email", async () => {
     mocks.mailEnabled = false;
     mocks.parents = [registered];
@@ -290,5 +361,34 @@ describe("the Parents page (DL12)", () => {
       title: NOTHING_TO_CONFIRM_TITLE,
       description: NOTHING_TO_CONFIRM_TEXT,
     });
+  });
+
+  it("an email change the server refuses shows the neutral sentence and the keep-the-email hint", async () => {
+    mocks.parents = [registered];
+    const put = vi.spyOn(api, "put").mockRejectedValue(
+      new ApiError("This account's email cannot be changed from the Parents page", 409, "not-editable-here"),
+    );
+    try {
+      withProviders(<ParentsPage />);
+      fireEvent.click(screen.getByRole("button", { name: "Edit amina@saferide.test" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.change(within(dialog).getByDisplayValue("amina@saferide.test"), {
+        target: { value: "elsewhere@saferide.test" },
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(mocks.toast).toHaveBeenCalled());
+      expect(put).toHaveBeenCalledWith("/api/accounts/parents/p-1", {
+        full_name: "Amina A", email: "elsewhere@saferide.test", phone: "",
+      });
+      expect(mocks.toast.mock.calls[0][0]).toEqual({
+        title: NOT_EDITABLE_TITLE,
+        description: `This account's email cannot be changed from the Parents page. ${NOT_EDITABLE_HINT}`,
+        variant: "destructive",
+      });
+      // The dialog stays open so the office can put the email back.
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+    } finally {
+      put.mockRestore();
+    }
   });
 });

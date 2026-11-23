@@ -14,7 +14,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
-import { useAuth, type Role } from "@/lib/auth";
+import { useAuth, type LoginResponseUser, type Role } from "@/lib/auth";
 import { useMailEnabled } from "@/lib/publicConfig";
 import { TotpChallengePage } from "@/features/auth/TotpChallengePage";
 import { DriverPinSignIn } from "@/features/auth/DriverPinSignIn";
@@ -119,18 +119,7 @@ export function AuthPage() {
   // step after the pre-auth token was voided (AE19).
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
 
-  const finishAuth = (
-    token: string,
-    user: {
-      id: string;
-      email: string;
-      fullName?: string | null;
-      role?: Role | null;
-      mustChangePassword?: boolean;
-      emailVerified?: boolean;
-      signedInWithPin?: boolean;
-    },
-  ) => {
+  const finishAuth = (token: string, user: LoginResponseUser) => {
     const resolved: Role | null = user.role ?? null;
     signIn(token, {
       id: user.id,

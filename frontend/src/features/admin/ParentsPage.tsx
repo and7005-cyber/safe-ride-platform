@@ -35,6 +35,8 @@ import {
   LINK_NOT_ACCEPTED_TOOLTIP,
   NOTHING_TO_CONFIRM_TEXT,
   NOTHING_TO_CONFIRM_TITLE,
+  NOT_EDITABLE_HINT,
+  NOT_EDITABLE_TITLE,
   NOT_RESETTABLE_HINT,
   NOT_RESETTABLE_TITLE,
   RESET_CONFIRM_LEAD,
@@ -97,7 +99,16 @@ export function ParentsPage() {
       await refetchParents();
       setOpen(false);
     } catch (err) {
-      toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+      if (err instanceof ApiError && err.code === "not-editable-here") {
+        // The reset's sibling refusal: neutral, never the school or role.
+        toast({
+          title: NOT_EDITABLE_TITLE,
+          description: `${err.message}. ${NOT_EDITABLE_HINT}`,
+          variant: "destructive",
+        });
+      } else {
+        toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
+      }
     }
   };
 
@@ -126,8 +137,10 @@ export function ParentsPage() {
     setBusyId(p.id);
     try {
       const res = await api.post(`/api/accounts/parents/${p.id}/reset-password`);
-      await refetchParents();
+      // Reveal first: the server keeps only a hash, so a refetch that stalls
+      // or a page left mid-refetch must not lose the one-time password.
       setReveal({ who, password: res.temporaryPassword });
+      void refetchParents();
     } catch (err) {
       if (err instanceof ApiError && err.code === "not-resettable-here") {
         toast({
@@ -156,8 +169,8 @@ export function ParentsPage() {
     setBusyId(`slot:${p.email}`);
     try {
       const res = await api.post("/api/accounts/parents/slots/confirm", { email: p.email });
-      await refetchParents();
       setReveal({ who: p.full_name ?? p.email, password: res.temporaryPassword });
+      void refetchParents();
     } catch (err) {
       if (err instanceof ApiError && err.code === "nothing-to-confirm") {
         // The neutral no-op (DL12): never says whether an account exists.

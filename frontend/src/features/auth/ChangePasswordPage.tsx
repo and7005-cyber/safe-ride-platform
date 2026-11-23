@@ -90,6 +90,14 @@ function ForcedChange() {
                 // /me now answers without the flag; ProtectedRoute continues to
                 // the destination on its own once the state lands.
                 await refresh();
+                // An office reset or Confirm and reset deleted this account's
+                // push registrations, and the re-attach at sign-in was refused
+                // (409 password-change-required) while the temporary password
+                // was in force. Now that it is changed, this browser's existing
+                // subscription re-attaches (best effort, never prompts).
+                void import("@/lib/push")
+                  .then(({ reattachPushSubscription }) => reattachPushSubscription())
+                  .catch(() => {});
               }}
               actions={(saving, ready) => (
                 <Button type="submit" className="w-full" disabled={saving || !ready}>

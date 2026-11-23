@@ -35,6 +35,14 @@ NOT_RESETTABLE_HERE_MESSAGE = "This account cannot be reset from the Parents pag
 NOTHING_TO_CONFIRM_CODE = "nothing-to-confirm"
 NOTHING_TO_CONFIRM_MESSAGE = "Nothing to confirm yet. Ask the parent to sign up with this email."
 
+# The office's parent EMAIL change on an identity holding other access (the
+# same predicate as the reset's refusal): a new address hands over the
+# recovery channel, so once mail is on, Forgot password would let one
+# school's office sign in as a driver, staff member or provider. Name and
+# phone edits stay allowed. One neutral sentence, never the school or role.
+NOT_EDITABLE_HERE_CODE = "not-editable-here"
+NOT_EDITABLE_HERE_MESSAGE = "This account's email cannot be changed from the Parents page"
+
 # Holds access the Parents page must never reach: a membership row of ANY
 # role at ANY school that is not removed (offered rows included), or a live
 # provider account. Drivers are memberships and sign in by password, so "no
@@ -174,6 +182,18 @@ def _link_school_sql(link: str, student: str) -> str:
     return f"coalesce({link}.school_id, {student}.school_id)"
 
 
+def _linked_elsewhere(conn, parent_id: str, school_id: str) -> bool:
+    """Any link (any status) of the parent's whose school is not ``school_id``
+    — read from the link's own stamp, see ``_link_school_sql``."""
+    return conn.execute(
+        "select 1 from live_parent_students ps "
+        "left join live_students s on s.id = ps.student_id "
+        f"where ps.parent_id = %s and {_link_school_sql('ps', 's')} is distinct from %s "
+        "limit 1",
+        (parent_id, school_id),
+    ).fetchone() is not None
+
+
 def _assert_parent_editable_here(conn, parent_id: str, school_id: str) -> None:
     """The school-side powers over a parent account (U6/R33): the parent must
     be linked to one of THIS school's students (else they do not exist here —
@@ -187,14 +207,7 @@ def _assert_parent_editable_here(conn, parent_id: str, school_id: str) -> None:
     ).fetchone()
     if not linked_here:
         raise NotFoundError("Parent not found")
-    elsewhere = conn.execute(
-        "select 1 from live_parent_students ps "
-        "left join live_students s on s.id = ps.student_id "
-        f"where ps.parent_id = %s and {_link_school_sql('ps', 's')} is distinct from %s "
-        "limit 1",
-        (parent_id, school_id),
-    ).fetchone()
-    if elsewhere:
+    if _linked_elsewhere(conn, parent_id, school_id):
         raise ConflictError(PARENT_SHARED_MESSAGE)
 
 
@@ -529,16 +542,27 @@ class AccountDao:
     ) -> dict[str, Any]:
         """The office's edit of a parent account. A changed email address
         (case-insensitively) restarts verification in the same transaction
-        (hardening Release 1b): see ``_restart_verification``. Returns the
-        row plus ``email_changed`` and ``previous_email`` — internal fields
-        the service strips after sending the two mails."""
+        (hardening Release 1b): see ``_restart_verification``. An identity
+        holding other access (a membership anywhere, a provider account) keeps
+        its email: changing it answers the neutral ``not-editable-here`` 409,
+        while name and phone still save. Returns the row plus
+        ``email_changed`` and ``previous_email`` — internal fields the service
+        strips after sending the two mails."""
         with get_connection(scope) as conn:
             _assert_parent_editable_here(conn, parent_id, scope.school_id)
             before = conn.execute(
-                "select email from app_users where id = %s for update", (parent_id,)
+                f"select u.email, {_HOLDS_OTHER_ACCESS_SQL.format(u='u')} as holds_other "
+                "from app_users u where u.id = %s for update of u",
+                (parent_id,),
             ).fetchone()
             if not before:
                 raise NotFoundError("Parent not found")
+            if before["holds_other"] and (
+                str(before["email"]).strip().lower() != str(email).strip().lower()
+            ):
+                raise AccountRefusedError(
+                    NOT_EDITABLE_HERE_MESSAGE, code=NOT_EDITABLE_HERE_CODE
+                )
             row = conn.execute(
                 "update app_users set full_name=%s, email=%s, phone=%s where id=%s "
                 "returning id, full_name, email, phone",
@@ -631,9 +655,11 @@ class AccountDao:
         decisions, Release 1b), one transaction: the slot email must be on
         one of THIS school's students (else 404) and belong to an UNVERIFIED
         parent account (D1) that the Parents page may reset — no membership
-        anywhere, no provider account, not disabled; otherwise the neutral
-        ``nothing-to-confirm`` 409. The account is verified and given a
-        temporary password through the shared helper, because confirming an
+        anywhere, no provider account, not disabled — and that reaches no
+        other school: its address on no other school's slot, no link at
+        another school; otherwise the neutral ``nothing-to-confirm`` 409. The
+        account is verified and given a temporary password through the
+        shared helper, because confirming an
         account someone else may have created must not leave the creator's
         password working.
 
@@ -670,6 +696,21 @@ class AccountDao:
                     NOTHING_TO_CONFIRM_MESSAGE, code=NOTHING_TO_CONFIRM_CODE
                 )
             parent_id = str(target["id"])
+            # This office writes its own slots, so "the email is on one of
+            # our students" proves nothing about another school's child. An
+            # address also carried on another school's slot (the platform-
+            # wide linking would reach that child), or an account already
+            # linked at another school (that school changed its email, say),
+            # verifies through its own email link — never through one
+            # school's office. Same neutral answer; nothing written.
+            elsewhere_slot = any(
+                str(match["school_id"]) != str(scope.school_id)
+                for match in _ConnParentLinks(conn).signup_matches(target["email"])
+            )
+            if elsewhere_slot or _linked_elsewhere(conn, parent_id, scope.school_id):
+                raise AccountRefusedError(
+                    NOTHING_TO_CONFIRM_MESSAGE, code=NOTHING_TO_CONFIRM_CODE
+                )
             conn.execute(
                 "update app_users set email_verified_at = now() where id = %s",
                 (parent_id,),

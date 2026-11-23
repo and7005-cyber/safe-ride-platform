@@ -90,6 +90,11 @@ export const LINK_NOT_ACCEPTED_TOOLTIP =
   "Available once the parent accepts the link to your school in their app.";
 export const NOT_RESETTABLE_TITLE = "Can't reset here";
 export const NOT_RESETTABLE_HINT = "Ask the parent to use Forgot password.";
+// The edit's sibling refusal (code "not-editable-here"): the server's neutral
+// sentence, then this hint — the rest of the edit still saves without the
+// email change.
+export const NOT_EDITABLE_TITLE = "Can't change the email here";
+export const NOT_EDITABLE_HINT = "Keep the current email to save a name or phone change.";
 export function temporaryPasswordChip(expiresOn: string): string {
   return `Temporary password · expires ${expiresOn}`;
 }

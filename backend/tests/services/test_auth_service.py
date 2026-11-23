@@ -807,6 +807,32 @@ def test_signup_on_an_existing_address_creates_nothing_and_mails_the_account(ser
     assert verify_password("NewPass789", service.dao.users[uid]["password_hash"])
 
 
+def test_signup_losing_a_concurrent_insert_answers_like_a_fresh_address(service, accounts, transport, monkeypatch):
+    """Two sign-ups for one address at once: both read "no account", the
+    other insert wins, and this one's raises UniqueViolation. The answer must
+    still be the fresh address's — never the generic 409 or a 500, which
+    would tell the caller the address exists."""
+    from psycopg import errors as pg_errors
+
+    fresh = service.signup("fresh@test.com", "secret1", "Parent", "parent")
+    sent_before = len(transport.sent)
+    users_before = dict(service.dao.users)
+
+    def lose_the_race(*_args, **_kwargs):
+        raise pg_errors.UniqueViolation("duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(service.dao, "create_unverified_parent", lose_the_race)
+    raced = service.signup("race@test.com", "secret1", "Parent", "parent")
+
+    assert raced == fresh
+    assert "token" not in raced and "user" not in raced
+    # No mail, no session, no account, no link from the losing call.
+    assert list(transport.sent)[sent_before:] == []
+    assert service.dao.sessions == {}
+    assert service.dao.users == users_before
+    assert accounts.linked == []
+
+
 # --- verification (hardening U8) -----------------------------------------------------
 
 

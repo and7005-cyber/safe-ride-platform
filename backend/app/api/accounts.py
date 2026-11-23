@@ -109,6 +109,9 @@ def update_parent(
     scope: SchoolScope = Depends(require_staff),
     user: dict = Depends(get_current_user),
 ):
+    """409 ``{code: "not-editable-here"}`` (neutral) for an email change on
+    an identity holding a membership anywhere or a provider account; its
+    name and phone still save."""
     return safe_call(
         lambda: service.update_parent(
             scope, parent_id, payload.full_name, payload.email, payload.phone,
@@ -153,7 +156,9 @@ def confirm_parent_slot(
 ):
     """"Confirm and reset" on an Awaiting-signup row: 404 when the email is
     not on this school's students; 409 ``{code: "nothing-to-confirm"}`` when
-    no unverified parent account the page may reset stands behind it."""
+    no unverified parent account the page may reset stands behind it, or
+    when that account reaches another school (its address on another
+    school's slot, or a link there)."""
     return safe_call(
         lambda: service.confirm_parent_slot(scope, payload.email, actor=user)
     )

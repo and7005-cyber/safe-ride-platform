@@ -93,8 +93,10 @@ class ActionReplayed(Exception):
 class AccountRefusedError(ConflictError):
     """An office account action the target cannot take (hardening U9). The
     ``code`` is what the Parents page branches on — ``not-resettable-here``
-    (the account holds a membership somewhere or a provider account) and
-    ``nothing-to-confirm`` (no unverified parent account behind a slot email).
+    (the account holds a membership somewhere or a provider account),
+    ``not-editable-here`` (the same accounts' email change) and
+    ``nothing-to-confirm`` (no unverified parent account behind a slot email
+    that this school alone may confirm).
     The message is neutral: it never says which of the reasons applied, nor
     which other school or role the account holds."""
 

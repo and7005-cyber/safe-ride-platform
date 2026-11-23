@@ -21,6 +21,7 @@ import {
   MAIL_OFF_VERIFY,
   NOTHING_TO_CONFIRM_TEXT,
   NOTHING_TO_CONFIRM_TITLE,
+  NOT_EDITABLE_HINT,
   NOT_RESETTABLE_HINT,
   PASSWORD_CHANGED_TOAST,
   RESEND_COOLDOWN,
@@ -468,6 +469,7 @@ describe("the parent guide describes sign-up, verification and recovery in the a
 describe("the guides describe the office reset and the self-service change in the app's words", () => {
   // The server's neutral refusal; the page appends the hint after it.
   const NOT_RESETTABLE = "This account cannot be reset from the Parents page";
+  const NOT_EDITABLE = "This account's email cannot be changed from the Parents page";
 
   it("gives the office every Parents-page label, confirmation, chip and refusal", () => {
     const admin = read("admin-guide.md");
@@ -480,6 +482,7 @@ describe("the guides describe the office reset and the self-service change in th
       TEMPORARY_PASSWORD_EXPIRED_CHIP,
       LINK_NOT_ACCEPTED_TOOLTIP,
       `${NOT_RESETTABLE}. ${NOT_RESETTABLE_HINT}`,
+      `${NOT_EDITABLE}. ${NOT_EDITABLE_HINT}`,
       CONFIRM_AND_RESET_LABEL,
       CONFIRM_SLOT_WARNING.replace(/\.$/, ""),
       NOTHING_TO_CONFIRM_TITLE,

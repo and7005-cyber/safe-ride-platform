@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/components/ui/use-toast";
 import { ApiError, api } from "@/lib/apiClient";
+import type { LoginResponseUser } from "@/lib/auth";
 import {
   type DriverSchool,
   clearDriverSchool,
@@ -36,16 +37,6 @@ import {
   PIN_SIGN_IN_LABEL,
   pinLockedText,
 } from "@/features/auth/authCopy";
-
-export interface PinSessionUser {
-  id: string;
-  email: string;
-  fullName?: string | null;
-  role?: "admin" | "driver" | "parent" | null;
-  mustChangePassword?: boolean;
-  emailVerified?: boolean;
-  signedInWithPin?: boolean;
-}
 
 /** Why a driver code lookup failed, in the words the code step shows (DL3,
  * DL5). A 5xx keeps the server's sentence, which carries the Reference. */
@@ -82,7 +73,7 @@ export function DriverPinSignIn({
   linkCode: string | null;
   /** Strip `?school=` from the address once the link has been answered. */
   onLinkConsumed: () => void;
-  onSignedIn: (token: string, user: PinSessionUser) => void;
+  onSignedIn: (token: string, user: LoginResponseUser) => void;
 }) {
   const { toast } = useToast();
   const binding = useDriverSchool();

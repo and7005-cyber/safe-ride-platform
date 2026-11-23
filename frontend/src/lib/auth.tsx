@@ -216,22 +216,24 @@ export function reconcileSchoolStore(user: AuthUser): void {
   // renders the choose-school screen (the plan's first-landing answer).
 }
 
+/** The user object of every login response (password, provider code step,
+ * driver PIN, verify and reset links): the fields that apply before /me
+ * answers. One declaration for signIn and its callers. */
+export interface LoginResponseUser {
+  id: string;
+  email: string;
+  fullName?: string | null;
+  role?: Role | null;
+  mustChangePassword?: boolean;
+  emailVerified?: boolean;
+  signedInWithPin?: boolean;
+}
+
 interface AuthContextValue {
   user: AuthUser | null;
   role: Role | null;
   loading: boolean;
-  signIn: (
-    token: string,
-    user: {
-      id: string;
-      email: string;
-      fullName?: string | null;
-      role?: Role | null;
-      mustChangePassword?: boolean;
-      emailVerified?: boolean;
-      signedInWithPin?: boolean;
-    },
-  ) => void;
+  signIn: (token: string, user: LoginResponseUser) => void;
   signOut: () => Promise<void>;
   refresh: () => Promise<void>;
 }
@@ -267,7 +269,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signIn = useCallback(
-    (token: string, nextUser: Parameters<AuthContextValue["signIn"]>[1]) => {
+    (token: string, nextUser: LoginResponseUser) => {
       setToken(token);
       // The login response's own fields apply immediately — above all
       // mustChangePassword (R30): the change screen must not wait for /me,

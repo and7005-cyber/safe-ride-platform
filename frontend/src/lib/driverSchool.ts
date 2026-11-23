@@ -12,7 +12,9 @@ import { api } from "@/lib/apiClient";
 // tab; only "Change school" clears it. A regenerated driver code does not
 // unbind a phone (the id is unchanged). iOS keeps separate storage for
 // Safari and the installed app and clears both after a week unused, which is
-// why the driver guide leads with "open the installed app".
+// why the driver guide leads with "open the installed app". Where storage
+// refuses the write (privacy modes, blocked site data, quota), the binding
+// is kept in memory and lasts as long as the tab.
 
 export interface DriverSchool {
   schoolId: string;
@@ -29,9 +31,17 @@ function notify(): void {
 let cachedRaw: string | null = null;
 let cachedValue: DriverSchool | null = null;
 
-/** The stored binding, or null (none, unreadable storage, or a malformed
- * value — which then reads as "not set up"). */
+// The tab-only binding: set when storage refused the last confirmed school,
+// cleared by a write storage accepted and by "Change school". While set it is
+// this tab's newest answer, so it wins over anything storage still holds. One
+// object per confirmation, so useSyncExternalStore sees a stable snapshot.
+let memoryBinding: DriverSchool | null = null;
+
+/** The phone's binding, or null (none, or a malformed stored value — which
+ * then reads as "not set up"). Falls back to the tab-only binding when
+ * storage refused the write. */
 export function readDriverSchool(): DriverSchool | null {
+  if (memoryBinding) return memoryBinding;
   let raw: string | null = null;
   try {
     raw = localStorage.getItem(KEY);
@@ -58,19 +68,21 @@ export function readDriverSchool(): DriverSchool | null {
 }
 
 export function storeDriverSchool(binding: DriverSchool): void {
+  const value = { schoolId: binding.schoolId, name: binding.name ?? "" };
   try {
-    localStorage.setItem(
-      KEY,
-      JSON.stringify({ schoolId: binding.schoolId, name: binding.name ?? "" }),
-    );
+    localStorage.setItem(KEY, JSON.stringify(value));
+    memoryBinding = null;
   } catch {
-    // Storage refused (privacy modes): the binding lasts as long as the tab.
+    // Storage refused (privacy modes, quota): the binding lasts as long as
+    // the tab.
+    memoryBinding = value;
   }
   notify();
 }
 
 /** "Change school": the only way a binding is cleared. */
 export function clearDriverSchool(): void {
+  memoryBinding = null;
   try {
     localStorage.removeItem(KEY);
   } catch {

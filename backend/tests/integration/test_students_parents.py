@@ -286,6 +286,14 @@ def test_unrelated_edit_preserves_drifted_link(client, admin_headers):
         assert student["name"] in students_of_parent(client, admin_headers, renamed_email)
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        # The rename wrote a 017 audit action; the 013/016 double-apply
+        # rehearsals validate existing rows against older CHECK lists.
+        with psycopg.connect(DB_URL, autocommit=True) as conn:
+            conn.execute(
+                "delete from live_admin_audit where action = 'parent-email-changed' "
+                "and resource_id = %s",
+                (str(parent_id),),
+            )
         purge_accounts(parent_id)
 
 

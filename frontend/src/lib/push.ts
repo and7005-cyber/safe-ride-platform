@@ -9,8 +9,9 @@ export interface PushConfig {
   firebaseVapidKey: string | null;
   vapidPublicKey: string | null;
   /** Whether the platform really sends email (hardening DL1): global, never
-   * per account. Rides on this unauthenticated config response; false when
-   * the config could not be read, so no screen claims a mail on a guess. */
+   * per account. Rides on this unauthenticated config response. Screens read
+   * it through useMailEnabled (lib/publicConfig.ts), which retries a failed
+   * read; fetchPushConfig's fallback reads false. */
   mailEnabled: boolean;
 }
 
@@ -20,22 +21,34 @@ const PUSH_MODE_KEY = "saferide-push-mode";
 
 let configPromise: Promise<PushConfig> | null = null;
 
-export function fetchPushConfig(): Promise<PushConfig> {
+/** The public config, read once per page load; rejects when it could not be
+ * read, and the next call asks again (a failure is never kept). For
+ * useMailEnabled, whose query retries a rejection. */
+export function fetchPushConfigStrict(): Promise<PushConfig> {
   if (!configPromise) {
-    configPromise = api
-      .get("/api/push/config")
-      .then((config: Partial<PushConfig>) => ({
-        firebase: config.firebase ?? null,
-        firebaseVapidKey: config.firebaseVapidKey ?? null,
-        vapidPublicKey: config.vapidPublicKey ?? null,
-        mailEnabled: config.mailEnabled === true,
-      }))
-      .catch(() => {
-        configPromise = null;
-        return { firebase: null, firebaseVapidKey: null, vapidPublicKey: null, mailEnabled: false };
-      });
+    const pending = api.get("/api/push/config").then((config: Partial<PushConfig>) => ({
+      firebase: config.firebase ?? null,
+      firebaseVapidKey: config.firebaseVapidKey ?? null,
+      vapidPublicKey: config.vapidPublicKey ?? null,
+      mailEnabled: config.mailEnabled === true,
+    }));
+    configPromise = pending;
+    pending.catch(() => {
+      if (configPromise === pending) configPromise = null;
+    });
   }
   return configPromise;
+}
+
+/** The public config, or — when it could not be read — no push channel and
+ * mail off, for the push plumbing (enable, disable, the Profile switch). */
+export function fetchPushConfig(): Promise<PushConfig> {
+  return fetchPushConfigStrict().catch(() => ({
+    firebase: null,
+    firebaseVapidKey: null,
+    vapidPublicKey: null,
+    mailEnabled: false,
+  }));
 }
 
 export function getStoredPushMode(): PushMode | null {

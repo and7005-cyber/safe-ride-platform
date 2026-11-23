@@ -107,10 +107,14 @@ expected change sets, are rehearsed in the
   SQL path); then read `token-rows-by-purpose` on 1a: the `verify` row's
   `live` is 0. Nothing in 1a creates new ones; a sign-up in the minutes of
   the deploy can leave one, bounded by its 24-hour expiry.
-- **Unverified sign-ups can be linked under 1a.** 1a's student sync links
-  any parent account whose email matches, verified or not: avoid editing
-  students' parent emails while on 1a, and after returning to 1b read
-  `unverified-parent-accounts-by-age` (the `has_link` true row stays 0).
+- **Unverified sign-ups can be linked under 1a.** 1a re-runs the parent-link
+  sync on EVERY student create, edit and import, whatever field changed, and
+  links any parent account whose email matches, verified or not (it skips
+  only disabled and provider accounts). So while on 1a the office makes no
+  student saves or imports of any kind; after returning to 1b read
+  `unverified-parent-accounts-by-age` (the `has_link` true row stays 0) and
+  review any link it shows. A rollback longer than a day makes this hard to
+  hold: plan the return to 1b, or accept that 1a links as it did before 1b.
 - **The budget.** 1a's frontend template counts the whole account at
   60 USD; export `MONTHLY_BUDGET_USD=100` for the rollback's frontend deploy
   (the SafeRide-only region filter returns with 1b's frontend).
