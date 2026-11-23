@@ -14,6 +14,7 @@ from app.core.errors import (
     SafeRideError,
     to_http_exception,
 )
+from app.core.request_context import UNEXPECTED_ERROR_DETAIL, log_unexpected_error
 
 T = TypeVar("T")
 
@@ -76,7 +77,11 @@ def map_error(error: Exception) -> HTTPException:
                 getattr(diag, "message_primary", None),
             )
             return HTTPException(status_code=404, detail="Not found")
-    return HTTPException(status_code=500, detail="Unexpected backend error")
+    # Anything else is a bug or an outage (hardening U11): one redacted
+    # record with the request id, which the 5xx handler in app.main also
+    # puts in the response body for the user to quote.
+    log_unexpected_error(error)
+    return HTTPException(status_code=500, detail=UNEXPECTED_ERROR_DETAIL)
 
 
 def safe_call(action: Callable[[], T]) -> T:

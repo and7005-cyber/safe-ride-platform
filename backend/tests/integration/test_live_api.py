@@ -100,7 +100,9 @@ def no_active_run(client, driver_headers, admin_headers):
 # Health & auth ---------------------------------------------------------------
 
 def test_health(client):
-    assert client.get("/api/health").json() == {"status": "ok"}
+    # Database-aware since hardening U11; the version is "dev" off a deploy.
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok" and body["db"] == "ok" and body["version"]
 
 
 def test_wrong_password_is_a_clean_401(client):

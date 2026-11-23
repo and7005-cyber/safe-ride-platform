@@ -9,6 +9,7 @@ from app.core.auth import get_current_user
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, SafeRideError, to_http_exception
 from app.core.rate_limit import SlidingWindowLimiter, client_ip
+from app.core.request_context import UNEXPECTED_ERROR_DETAIL, log_unexpected_error
 from app.dao.membership_dao import MembershipDao
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -92,7 +93,10 @@ def map_error(error: Exception) -> HTTPException:
             getattr(diag, "message_primary", None),
         )
         return HTTPException(status_code=404, detail="Not found")
-    return HTTPException(status_code=500, detail="Unexpected backend error")
+    # Same contract as api/_helpers.map_error (hardening U11): the one
+    # redacted record, then the 500 the body handler stamps with the id.
+    log_unexpected_error(error)
+    return HTTPException(status_code=500, detail=UNEXPECTED_ERROR_DETAIL)
 
 
 def safe_call(action: Callable[[], T]) -> T:

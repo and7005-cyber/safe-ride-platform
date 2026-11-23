@@ -51,6 +51,14 @@ def _maybe_b64_json(value: str) -> str:
 
 class Settings(BaseSettings):
     app_env: str = Field(default="production", alias="APP_ENV")
+    # Hardening U11. The deployed commit's short SHA, reported by
+    # GET /api/health; the template passes the AppVersion parameter
+    # (deploy-backend.sh: git rev-parse --short HEAD). "dev" off the deploy.
+    app_version: str = Field(default="dev", alias="APP_VERSION")
+    # Root log level outside Lambda only (uvicorn, tests); inside Lambda the
+    # function's LoggingConfig sets it and this is ignored. An unknown name
+    # falls back to INFO (app.core.request_context.configure_logging).
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     database_url: str = Field(
         default="postgresql://saferide:saferide@localhost:5432/saferide",
         alias="DATABASE_URL",

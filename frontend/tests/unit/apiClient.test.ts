@@ -376,3 +376,82 @@ describe("apiClient provider auth seams", () => {
     fetchMock.mockRestore();
   });
 });
+
+// Hardening U11 / DL14 — the server's request id on every failure, and the
+// reference a user can quote appended to 5xx messages only.
+
+describe("apiClient request ids", () => {
+  const ID = "0b7e6c1a-2f3d-4c5b-8a9e-7d6c5b4a3f21";
+
+  async function failure(response: Response): Promise<ApiError> {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const { api } = await import("@/lib/apiClient");
+    const error = await api.get("/api/students").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    fetchMock.mockRestore();
+    expect(error).toBeInstanceOf(ApiError);
+    return error as ApiError;
+  }
+
+  it("takes the id from the X-Request-Id header", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.requestId).toBe(ID);
+    expect(error.status).toBe(500);
+  });
+
+  it("falls back to the 500 body's request_id when the header is unreadable", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+      }),
+    );
+    expect(error.requestId).toBe(ID);
+  });
+
+  it("appends the reference to a 5xx message", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe(`Unexpected backend error (Reference: ${ID})`);
+  });
+
+  it("appends it to any 5xx, not only 500", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ status: "error", db: "error" }), {
+        status: 503,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe(`Request failed with status 503 (Reference: ${ID})`);
+  });
+
+  it("leaves 4xx messages untouched but still records the id", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "That PIN is already in use at this school" }), {
+        status: 409,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe("That PIN is already in use at this school");
+    expect(error.message).not.toContain("Reference");
+    expect(error.requestId).toBe(ID);
+  });
+
+  it("adds no reference when the server sent no id", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error" }), { status: 500 }),
+    );
+    expect(error.requestId).toBeNull();
+    expect(error.message).toBe("Unexpected backend error");
+  });
+});

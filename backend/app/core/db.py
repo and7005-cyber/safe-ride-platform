@@ -78,10 +78,14 @@ def get_connection(scope: object = _UNSET) -> Iterator[Connection]:
 
 
 @contextmanager
-def get_global_connection() -> Iterator[Connection]:
+def get_global_connection(timeout: float | None = None) -> Iterator[Connection]:
     """A deliberately scope-free connection for non-school tables (users,
-    sessions, push tokens). Never arms the GUC, even inside a scoped request."""
-    with get_pool().connection() as connection:
+    sessions, push tokens). Never arms the GUC, even inside a scoped request.
+
+    ``timeout`` bounds the wait for a pooled connection (the pool's own
+    default, 30 s, when omitted); the health check passes one second so a
+    database that is down answers 503 instead of holding the function."""
+    with get_pool().connection(timeout=timeout) as connection:
         yield connection
 
 

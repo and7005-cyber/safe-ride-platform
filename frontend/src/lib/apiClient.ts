@@ -27,16 +27,29 @@ export function onUnauthorized(handler: () => void) {
  * `totp-step-up-required`, `totp-enrolment-required` — and the client must
  * branch on the code, never on message text. `message` stays the human
  * sentence, so every existing `(err as Error).message` call keeps working.
+ *
+ * `requestId` is the server's id for the request (hardening U11): the
+ * `X-Request-Id` header, or the `request_id` a 500 body carries. For a 5xx
+ * the message ends with "(Reference: <id>)" so every toast that shows
+ * `error.message` gives the user something to quote; 4xx messages are the
+ * server's sentence unchanged (DL14).
  */
 export class ApiError extends Error {
   status: number;
   code: string | null;
+  requestId: string | null;
 
-  constructor(message: string, status: number, code: string | null = null) {
+  constructor(
+    message: string,
+    status: number,
+    code: string | null = null,
+    requestId: string | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.requestId = requestId;
   }
 }
 
@@ -143,6 +156,17 @@ function extractDetailCode(data: any): string | null {
   return typeof code === "string" ? code : null;
 }
 
+function extractRequestId(response: Response, data: any): string | null {
+  const header = response.headers.get("X-Request-Id");
+  if (header) return header;
+  return typeof data?.request_id === "string" && data.request_id ? data.request_id : null;
+}
+
+/** The thrown message: a 5xx ends with the reference to quote (DL14). */
+function errorMessageFor(detail: string, status: number, requestId: string | null): string {
+  return status >= 500 && requestId ? `${detail} (Reference: ${requestId})` : detail;
+}
+
 async function request(
   method: string,
   path: string,
@@ -194,7 +218,13 @@ async function request(
       // the enrolment interstitial takes over.
       totpEnrolmentRequiredHandler?.();
     }
-    throw new ApiError(extractDetailMessage(data, response.status), response.status, code);
+    const requestId = extractRequestId(response, data);
+    throw new ApiError(
+      errorMessageFor(extractDetailMessage(data, response.status), response.status, requestId),
+      response.status,
+      code,
+      requestId,
+    );
   }
   return data;
 }

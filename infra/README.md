@@ -392,7 +392,7 @@ can report a dead stack: their alarms treat missing data as breaching.
 
 | Alarm | Means | First response |
 |---|---|---|
-| `ApiProbeFailing` | no healthy answer from `https://api…/api/health` for 3 minutes: the API function is not answering anyone. The probe checks that the function answers; until Release 1b's database-aware health check it does not touch the database, so a database outage alone does not trip it | curl the health endpoint; read the af-south-1 alarms and `/saferide/api`; roll back if a deploy just landed |
+| `ApiProbeFailing` | no healthy answer from `https://api…/api/health` for 3 minutes: the API function is not answering anyone, or (since Release 1b) the database is not answering it. The health check runs a one-second `select 1` and answers 503 with `"db": "error"` when that fails; before 1b it did not touch the database | curl the health endpoint: `"db": "error"` points at the database (RDS events and metrics), no answer at the function; read the af-south-1 alarms and `/saferide/api` (`health-db-error` lines name the error class); roll back if a deploy just landed |
 | `SiteProbeFailing` | the site's home page has not loaded for 3 minutes | open the site; check the distribution and its S3 bucket; redeploy the frontend from the last release tag if a deploy just landed |
 | `SiteServerErrors` | over 5% of CloudFront responses were 5xx for 10 minutes | read the distribution's error graphs and the AWS Health Dashboard for CloudFront and S3 |
 | `SiteCertificateExpiry` | the CloudFront certificate expires in under 20 days (custom domain only) | check the apex and www validation CNAMEs in Route 53 and the renewal status in ACM (us-east-1) |

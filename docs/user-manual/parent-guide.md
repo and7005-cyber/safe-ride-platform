@@ -174,3 +174,4 @@ The Profile tab shows your name, email and phone, and a card for each linked chi
 | You received "Call the office now" | If your child should be on the bus, call the school office straight away. See [If you receive "Call the office now"](#if-you-receive-call-the-office-now). |
 | "Too many cancellation changes." | There's an hourly limit on cancelling/withdrawing. Wait a while, or call the office. |
 | Wrong phone, address or stop shown | Contact the school office — parents can't edit these in the app. |
+| An error message ending "(Reference: …)" | Something went wrong on SafeRide's side, not yours. Try once more; if it happens again, take a screenshot (the message disappears after a few seconds) and send it to the school office with the time, quoting the Reference. |

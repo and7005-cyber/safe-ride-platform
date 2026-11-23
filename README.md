@@ -146,7 +146,8 @@ have been exposed.
 
 The local FastAPI/Postgres stack is ready when:
 
-- `curl http://localhost:9001/api/health` returns `{"status":"ok"}`.
+- `curl http://localhost:9001/api/health` returns `{"status":"ok","db":"ok","version":"dev"}`
+  (503 with `"db":"error"` when the database does not answer).
 - The seeded driver PIN (see the seed file) opens the driver home at `/driver`.
 - The seeded parent login lands on `/parent` and shows only their children.
 - The seeded director login lands on the admin console scoped to school #1.
