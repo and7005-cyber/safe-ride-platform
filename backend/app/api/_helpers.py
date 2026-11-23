@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from psycopg import Error as PsycopgError
 
 from app.core.errors import (
+    AccountRefusedError,
     IdempotencyConflictError,
     PingPacedError,
     PingRefusedError,
@@ -24,10 +25,11 @@ BAD_REQUEST_SQLSTATES = {"22P02", "22007", "22008", "23514"}
 
 
 def map_error(error: Exception) -> HTTPException:
-    if isinstance(error, (IdempotencyConflictError, PingRefusedError)):
-        # Same shape as the prompt conflicts (GPS plan U7/R33; U14/R28):
-        # `code` is what the client branches on; the detail never carries
-        # the stored response or any of the request's own fields.
+    if isinstance(error, (IdempotencyConflictError, PingRefusedError, AccountRefusedError)):
+        # Same shape as the prompt conflicts (GPS plan U7/R33; U14/R28;
+        # hardening U9's office parent reset): `code` is what the client
+        # branches on; the detail never carries the stored response or any
+        # of the request's own fields.
         return HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},

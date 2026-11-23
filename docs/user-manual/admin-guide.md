@@ -15,7 +15,7 @@ Staff accounts are personal — **never share a login**. Every change made in th
 
 **First sign-in with a temporary password:** the director who created your account gives you a one-time temporary password. It is valid for **72 hours** — sign in before it expires (after that, ask for a new one). The app will not show you any page until you **set your own password**; the temporary password then stops working for everyone, including the director who set it.
 
-**Changing your password:** you can change your own password any time from the console (your current password is required). Changing it signs out your other devices.
+**Changing your password:** open the account menu (your initials, top right) and choose **Change password**. Your current password is required. The dialog says *"You'll stay signed in here. Other devices will be signed out."* — and that is what happens.
 
 **Locked out?** There is no self-service e-mail reset for staff. A **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
 
@@ -359,7 +359,35 @@ This page lists every parent contact in the system. **Status** tells you where e
 
 You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). **Changing a parent's email** signs the parent out on every device, stops their push notifications and asks them to confirm the new address from the email SafeRide sends to it; their children stay linked, and the old address receives a short notice of the change. Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
 
-A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting.
+A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting. **Reset password** still works on a Shared row (either school can get the parent back in); the other school's records are not changed.
+
+### Resetting a parent's password
+
+When a parent is locked out — a lost phone, a forgotten password, no working email — a **director or a coordinator** can issue a temporary password from the key button on the parent's row (**Reset password**). The button works once the parent's link to one of your students is accepted; until then it is greyed out with *"Available once the parent accepts the link to your school in their app."*
+
+The confirmation explains what happens: *"Their current password stops working and a temporary password is shown to you once. Their other devices are signed out, alerts on their phone stop until they sign in again, and they are emailed a notice. If they are linked to another school, that school's records are not changed."* (While email isn't switched on, the notice part is left out — no email is sent.)
+
+The **Temporary password** dialog then shows 16 letters and numbers in groups of four — no I, L, O or U, so nothing reads two ways over the phone. **Copy** copies it without the spaces. It is shown **once only**: read it to the parent now.
+
+**What to tell the parent:**
+
+- "Sign in with your email and this temporary password. The spaces are only there to help reading it out: it can be typed with or without them, in capitals or not."
+- "SafeRide then asks you to choose your own password straight away."
+- "It stops working after 72 hours if you don't use it."
+- "Your other phones and browsers have been signed out. Notifications come back on your phone once you sign in there again."
+- They also receive an email, *"Your SafeRide password was reset by your school"*, which carries no password.
+
+Until the parent changes it, the row shows the chip **"Temporary password · expires …"** (date and time). If 72 hours pass unused it reads **"Temporary password expired — reset again"**: issue a new one. A second reset always replaces the first — only the newest temporary password works.
+
+Some accounts cannot be reset from here: anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account. The page then says *"This account cannot be reset from the Parents page. Ask the parent to use Forgot password."* — it never says why, or which school.
+
+### Confirm and reset (parents without a working inbox)
+
+A parent who signed up but never confirmed their email (no access to that inbox, or email isn't switched on yet) stays on **Awaiting signup**, and their children stay unlinked. Each Awaiting signup row has a **Confirm and reset** button. **Only confirm after speaking to this parent** — anyone can sign up with an address they don't own, and confirming attaches the children to that account.
+
+If an account is waiting behind that email, Confirm and reset confirms it, links the children (with the usual "Parent signup auto-linked" alert), and issues a temporary password exactly like **Reset password** — shown once, the same 72 hours, the same notice email. The password chosen at sign-up stops working, and anyone signed in to that account is signed out: if the account was not really the parent's, whoever made it is locked out. Tell the parent the same things as for a reset.
+
+If there is nothing to confirm — no sign-up with that email yet, or it is already confirmed — the page says *"Nothing to confirm yet"* / *"Ask the parent to sign up with this email."* Nothing changes.
 
 ## Alerts
 
@@ -397,7 +425,7 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Student (today) | At home, On bus, Expected on bus, At school, Dropped off, Absent today / Absent (AM) / Absent (PM), Unaccounted, Unassigned |
 | Stop exception | Open, Resolved, Confirmed by driver, Retracted, Attested by driver, Uncorroborated (plus the **Reviewed** stamp) |
 | Bus position source (Fleet Map) | Planned stop, Phone GPS (tap), Phone GPS (live), Checkpoint (older app) |
-| Parent account | Registered, Awaiting signup (plus the **Shared** mark) |
+| Parent account | Registered, Awaiting signup (plus the **Shared** mark, and **Temporary password · expires …** or **Temporary password expired — reset again** after an office reset) |
 | Driver PIN | Set, None |
 | Staff | Active, Offered |
 
@@ -409,6 +437,7 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 - Bus capacity: 1–100. Route planner: max 24 stops. Broadcasts: 500 characters, 12 per hour.
 - School Settings: address **and** map location both required; bell times `HH:MM`.
 - Staff temporary passwords: server-generated, shown once, valid unused for 72 hours, replaced at first sign-in.
+- Parent temporary passwords (Reset password, Confirm and reset): 16 letters and numbers without I, L, O or U, shown once in groups of four, typed with or without the spaces and in any case, valid unused for 72 hours, replaced at first sign-in.
 
 ## Troubleshooting — calls you will get
 
@@ -427,6 +456,9 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | New staff member's temporary password "doesn't work" | Temporary passwords expire after **72 hours** unused. Reset it and hand over the new one. |
 | Parent: "No children are linked to your account yet" | The parent's sign-up email doesn't match the student record. Fix the email on the student (or have the parent re-register with the recorded email). If the parent's other children are at another school, the link shows on their phone as a **pending card** — ask them to accept it. |
 | Alerts: "mismatched email" from a parent decline | A parent answered your link with "Not my child". The email was removed from the student's record — verify the address with the family and re-enter it. |
+| Parent: locked out, or the reset email never arrives | Parents → the key button on their row (**Reset password**), and read them the temporary password. See [Resetting a parent's password](#resetting-a-parents-password). |
+| Parent: signed up but can't confirm their email | Speak to them, then Parents → **Confirm and reset** on their Awaiting signup row. See [Confirm and reset](#confirm-and-reset-parents-without-a-working-inbox). |
+| Parent: "the temporary password doesn't work" | Check the row's chip: after 72 hours it reads "Temporary password expired — reset again". Otherwise make sure they use the newest one — each reset replaces the last. |
 | Parent: wants name/phone/address changed | Edit it on the Students or Parents page — parents can't self-edit. |
 | Parent: no notifications | Check they've registered (Parents page shows "Registered"), and that they enabled push in their Profile tab; otherwise alerts still appear in their in-app feed. |
 | Bus missing from Fleet Map | The bus only appears during an active run. Its position moves with the driver's phone — at each tap, and on its own every **Ping interval** while the app is on the driver's screen — or to the planned stop when a tap carried no fix. |

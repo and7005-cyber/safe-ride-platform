@@ -437,11 +437,14 @@ class AuthDao:
         return (web or 0) + (fcm or 0)
 
     def get_user_credentials(self, user_id: str) -> dict[str, Any] | None:
-        """id + password hash for the change-password current-password check.
+        """id + password hash for the change-password current-password check,
+        with the temporary-password flag (a relayed temporary password is
+        matched in its normalised form too — hardening U9, DL6).
         User-table read reachable from any authenticated surface → global."""
         with get_global_connection() as conn:
             row = conn.execute(
-                "select id, email, password_hash from app_users where id = %s",
+                "select id, email, password_hash, must_change_password "
+                "from app_users where id = %s",
                 (user_id,),
             ).fetchone()
         return dict(row) if row else None

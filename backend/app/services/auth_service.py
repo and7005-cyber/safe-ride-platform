@@ -4,12 +4,14 @@ import logging
 from psycopg import errors as pg_errors
 
 from app.core.config import get_settings
-from app.core.errors import BadRequestError, UnauthorizedError
+from app.core.errors import BadRequestError, ForbiddenError, UnauthorizedError
 from app.core.request_context import current_request_id
 from app.core.security import (
+    create_pin_session_token,
     create_session_token,
     hash_password,
     hash_session_token,
+    normalise_relayed_code,
     verify_password,
     verify_pin_hmac,
 )
@@ -44,6 +46,11 @@ RESET_INVALID_MESSAGE = "Reset link is invalid or has expired"
 # session, or under another account's session, links nothing.
 VERIFY_SIGN_IN_MESSAGE = "Sign in to the account you are verifying"
 VERIFY_LINK_INVALID_MESSAGE = "This verification link has expired or was already used"
+# Self-service change (hardening U9, DL13): a session created by PIN never
+# held the account password — the office set it — so it may not change it.
+PIN_SESSION_CHANGE_MESSAGE = (
+    "You signed in with a PIN. Sign in with your email and password to change your password."
+)
 
 
 class VerificationError(BadRequestError):
@@ -55,6 +62,31 @@ class VerificationError(BadRequestError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class PinSessionError(ForbiddenError):
+    """Change password from a session created by PIN (hardening U9): the
+    client hides the entry; the server refuses it with ``pin-session``."""
+
+    code = "pin-session"
+
+
+def _password_matches(user: dict, password: str) -> bool:
+    """The stored hash against what was typed. An account holding an
+    office-issued temporary password (``must_change_password``) also accepts
+    the relayed form however it was typed (DL6): any case, with the group
+    separators, O for 0, I or L for 1. Staff temporary passwords are
+    case-sensitive and never match the normalised form, so nothing changes
+    for them; a password the account chose itself is compared exactly."""
+    stored = user.get("password_hash")
+    if not stored:
+        return False
+    if verify_password(password, stored):
+        return True
+    if not user.get("must_change_password"):
+        return False
+    normalised = normalise_relayed_code(password)
+    return normalised != password and verify_password(normalised, stored)
 
 
 class AuthService:
@@ -79,8 +111,11 @@ class AuthService:
 
     # --- session helpers ---------------------------------------------------
 
-    def _issue_session(self, user: dict) -> dict:
-        token = create_session_token()
+    def _issue_session(self, user: dict, *, pin: bool = False) -> dict:
+        # A PIN session's token carries the marker (security.PIN_SESSION_TOKEN_PREFIX):
+        # the account menus hide Change password for it and the server
+        # refuses the change (hardening U9).
+        token = create_pin_session_token() if pin else create_session_token()
         self.dao.create_session(user["id"], hash_session_token(token))
         return {
             "token": token,
@@ -95,6 +130,8 @@ class AuthService:
                 # Release 1b: Home shows the verify card from the first frame
                 # instead of flashing the empty state until /me answers.
                 "emailVerified": bool(user.get("email_verified", True)),
+                # Hardening U9: no Change password entry for a PIN session.
+                "signedInWithPin": pin,
             },
         }
 
@@ -182,7 +219,7 @@ class AuthService:
 
     def login(self, email: str, password: str) -> dict:
         user = self.dao.get_user_by_email(email)
-        if not user or not verify_password(password, user["password_hash"]):
+        if not user or not _password_matches(user, password):
             raise UnauthorizedError("Invalid email or password")
         if user.get("disabled_at") is not None:
             # Indistinguishable from a bad password: no account enumeration.
@@ -209,7 +246,7 @@ class AuthService:
         if len(matches) != 1:
             raise UnauthorizedError("Invalid PIN")
         user = self.dao.get_user_by_id(matches[0]["id"])
-        return self._issue_session(user)
+        return self._issue_session(user, pin=True)
 
     def logout(self, token: str) -> None:
         if token:
@@ -290,11 +327,18 @@ class AuthService:
         """Authenticated password change (R29): ALWAYS requires the correct
         current password — a forced first change included — then rotates the
         hash, clears the temporary flag/expiry, and revokes every session but
-        the calling one."""
+        the calling one. Push registrations are kept: a voluntary change is
+        not a lost phone (hardening U9).
+
+        A session created by PIN is refused (hardening U9, DL13: it never
+        held the account password) — except while the account must replace
+        an office-issued temporary password: that session is held on the
+        change screen, and the temporary password it must type is still
+        required, so refusing would only strand it there."""
+        if user.get("pin_session") and not user.get("must_change_password"):
+            raise PinSessionError(PIN_SESSION_CHANGE_MESSAGE)
         credentials = self.dao.get_user_credentials(user["id"])
-        if not credentials or not verify_password(
-            current_password, credentials["password_hash"]
-        ):
+        if not credentials or not _password_matches(credentials, current_password):
             raise BadRequestError("Current password is incorrect")
         self.dao.set_user_password(user["id"], hash_password(new_password))
         self.dao.revoke_other_sessions(user["id"], user["session_id"])

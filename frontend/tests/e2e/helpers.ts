@@ -298,6 +298,20 @@ function psqlQuery(sql: string): string {
   ).trim();
 }
 
+/**
+ * Delete the audit rows written about one account. **Teardown only.**
+ *
+ * Hardening U9: the office reset and Confirm and reset write 017's
+ * `parent-password-reset` and `parent-email-confirmed` actions, which must
+ * not outlive a spec — the 013/016 double-apply rehearsals validate existing
+ * audit rows against older CHECK lists. Audit rows have no delete path in
+ * the product, by design.
+ */
+export function sqlDeleteAuditFor(resourceId: string): void {
+  if (!/^[0-9a-f-]{36}$/i.test(resourceId)) throw new Error("expected a uuid");
+  psql(`delete from live_admin_audit where resource_id = '${resourceId}'`);
+}
+
 // Fixture schools in SQL (U12): the app can no longer create or delete a
 // school (creation moved to the provider console, deletion is out of scope),
 // so suites that need a disposable school — admin-plan.spec.ts applies whole

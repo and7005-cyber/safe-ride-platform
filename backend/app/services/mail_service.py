@@ -10,7 +10,7 @@ whether or not the address exists.
 The failure line is the alarm's input (U12 builds a metric filter on the
 literal ``mail-send-failed``):
 
-    mail-send-failed kind=<reset|verify|existing-account|email-changed> request_id=<id> ...
+    mail-send-failed kind=<reset|verify|existing-account|email-changed|office-reset> request_id=<id> ...
 
 It never carries the recipient, the subject, the link or the provider's
 error text (an SES ``MessageRejected`` message names the address), and it is
@@ -63,7 +63,7 @@ MAIL_FAILED_TOKEN = "mail-send-failed"
 
 @dataclass(frozen=True)
 class MailMessage:
-    kind: str  # reset | verify | existing-account | email-changed
+    kind: str  # reset | verify | existing-account | email-changed | office-reset
     to: str
     subject: str
     text: str
@@ -176,6 +176,26 @@ def email_changed_notice(to: str) -> MailMessage:
     ]
     return MailMessage(
         kind="email-changed", to=to, subject="Your SafeRide sign-in email was changed",
+        text=_text(paragraphs, None), html=_html(paragraphs, None, None),
+    )
+
+
+def office_password_notice(to: str) -> MailMessage:
+    """To the account after the school office issued it a temporary password
+    (hardening U9: the Parents page's Reset password, and Confirm and reset
+    on an Awaiting-signup slot). Never the password, no link, no school
+    name: the parent hears the password from the office, and a reader of a
+    hijacked inbox learns nothing they could act on."""
+    paragraphs = [
+        "Your school office set a temporary password for your SafeRide account. "
+        "Sign in with the temporary password the office gives you; SafeRide then "
+        "asks you to choose your own. It stops working after 72 hours if it isn't used.",
+        "Your other devices have been signed out, and SafeRide notifications on your "
+        "phone stop until you sign in again there.",
+        "If you didn't ask your school office for this, contact them.",
+    ]
+    return MailMessage(
+        kind="office-reset", to=to, subject="Your SafeRide password was reset by your school",
         text=_text(paragraphs, None), html=_html(paragraphs, None, None),
     )
 

@@ -26,7 +26,7 @@ from app.schemas.auth import (
     TotpRequest,
     VerifyEmailRequest,
 )
-from app.services.auth_service import AuthService, VerificationError
+from app.services.auth_service import AuthService, PinSessionError, VerificationError
 from app.services.provider_service import AuthCodeError, ProviderService
 
 _scope_logger = logging.getLogger("saferide.scope")
@@ -87,11 +87,12 @@ _RESEND_LIMIT_MESSAGE = "Try again in a minute"
 
 
 def map_error(error: Exception) -> HTTPException:
-    if isinstance(error, (AuthCodeError, VerificationError)):
+    if isinstance(error, (AuthCodeError, VerificationError, PinSessionError)):
         # Refusals the client must branch on: the detail carries a machine
         # code — second-factor (U10: `preauth-voided`,
-        # `totp-step-up-required`) and verify-email (hardening U8, DL10:
-        # `sign-in-required`, `wrong-account`, `link-invalid`).
+        # `totp-step-up-required`), verify-email (hardening U8, DL10:
+        # `sign-in-required`, `wrong-account`, `link-invalid`) and the
+        # self-service change from a PIN session (hardening U9: `pin-session`).
         return HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
@@ -253,6 +254,7 @@ def me(user: dict = Depends(get_current_user)):
         ),
         mustChangePassword=user.get("must_change_password", False),
         emailVerified=user.get("email_verified", True),
+        signedInWithPin=user.get("pin_session", False),
     )
 
 
@@ -260,7 +262,9 @@ def me(user: dict = Depends(get_current_user)):
 def change_password(request: ChangePasswordRequest, user: dict = Depends(get_current_user)):
     """Any authenticated role; on the must-change allowlist (R30), and even
     then the CURRENT password is required. Keeps the calling session, revokes
-    every other one."""
+    every other one. A session created by PIN answers 403 {code:
+    "pin-session"} (hardening U9) unless it must replace a temporary
+    password."""
     change_password_account_limiter.check(
         str(user["id"]), "Too many password change attempts. Try again shortly."
     )

@@ -85,9 +85,18 @@ export interface AuthUser {
    * (hardening Release 1b): a new sign-up, or an account whose email the
    * office changed. Accounts made before 1b always read true. */
   emailVerified: boolean;
+  /** True when this session was created by PIN (hardening U9): it never held
+   * the account password, so no menu offers Change password. */
+  signedInWithPin: boolean;
   /** False until the first /me answered — a fresh login knows only the login
    * response's fields, and ProtectedRoute must not judge memberships yet. */
   hydrated: boolean;
+}
+
+/** Whether to offer Change password (hardening U9, DL13): every signed-in
+ * role except a session created by PIN. The server refuses it too. */
+export function canChangeOwnPassword(user: AuthUser | null): boolean {
+  return Boolean(user) && !user?.signedInWithPin;
 }
 
 const STAFF_ROLES: readonly MembershipRole[] = ["director", "coordinator"];
@@ -171,6 +180,7 @@ function mapMe(me: any): AuthUser {
     mustChangePassword: Boolean(me.mustChangePassword),
     // An older API without the field: treat as verified (no verify card).
     emailVerified: me.emailVerified !== false,
+    signedInWithPin: Boolean(me.signedInWithPin),
     hydrated: true,
   };
 }
@@ -218,6 +228,7 @@ interface AuthContextValue {
       role?: Role | null;
       mustChangePassword?: boolean;
       emailVerified?: boolean;
+      signedInWithPin?: boolean;
     },
   ) => void;
   signOut: () => Promise<void>;
@@ -270,6 +281,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // The login response carries it (Release 1b), so Home shows the
         // verify card from the first frame instead of the empty state.
         emailVerified: nextUser.emailVerified !== false,
+        signedInWithPin: Boolean(nextUser.signedInWithPin),
         hydrated: false,
       });
       setLoading(false);

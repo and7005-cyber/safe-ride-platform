@@ -111,6 +111,7 @@ export function AuthPage() {
       role?: Role | null;
       mustChangePassword?: boolean;
       emailVerified?: boolean;
+      signedInWithPin?: boolean;
     },
   ) => {
     const resolved: Role | null = user.role ?? null;
@@ -123,6 +124,8 @@ export function AuthPage() {
       // response, before /me — nothing else would answer anyway.
       mustChangePassword: Boolean(user.mustChangePassword),
       emailVerified: user.emailVerified,
+      // Hardening U9: a PIN session is offered no Change password.
+      signedInWithPin: Boolean(user.signedInWithPin),
     });
     navigate(homeFor(resolved));
   };

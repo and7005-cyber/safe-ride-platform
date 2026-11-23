@@ -32,6 +32,10 @@ class UpdateParentPayload(BaseModel):
     phone: str | None = None
 
 
+class ConfirmSlotPayload(BaseModel):
+    email: str
+
+
 # Drivers (U6: school-scoped — a driver belongs to the creating school, R28) --
 
 @router.get("/drivers")
@@ -112,6 +116,36 @@ def delete_parent(
     return safe_call(
         lambda: (service.delete_parent(scope, parent_id, actor=user), {"ok": True})[1]
     )
+
+# Office parent reset and Confirm and reset (hardening U9): either staff role.
+# The temporary password is in the response once and nowhere else — never
+# logged, never in the audit row (counts and ids only).
+
+@router.post("/parents/{parent_id}/reset-password")
+def reset_parent_password(
+    parent_id: str,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    """404 without an accepted link to one of this school's students; 409
+    ``{code: "not-resettable-here"}`` (neutral) for an identity holding a
+    membership anywhere or a provider account."""
+    return safe_call(lambda: service.reset_parent_password(scope, parent_id, actor=user))
+
+
+@router.post("/parents/slots/confirm")
+def confirm_parent_slot(
+    payload: ConfirmSlotPayload,
+    scope: SchoolScope = Depends(require_staff),
+    user: dict = Depends(get_current_user),
+):
+    """"Confirm and reset" on an Awaiting-signup row: 404 when the email is
+    not on this school's students; 409 ``{code: "nothing-to-confirm"}`` when
+    no unverified parent account the page may reset stands behind it."""
+    return safe_call(
+        lambda: service.confirm_parent_slot(scope, payload.email, actor=user)
+    )
+
 
 # Parent ↔ student links are derived from the emails on each student record
 # (R11/R12) — see student create/update sync and auth signup. There are no

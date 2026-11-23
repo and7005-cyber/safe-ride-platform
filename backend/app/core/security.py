@@ -113,5 +113,49 @@ def create_session_token() -> str:
     return secrets.token_hex(32)
 
 
+# --- sessions created by PIN (hardening U9) -------------------------------------
+# A driver's PIN session never held the account password (the office set it),
+# so it may not change it (DL13). The marker lives in the token itself rather
+# than in a new column (Release 1b adds no migration): the stored hash covers
+# the whole token, prefix included, so a password session's token cannot be
+# turned into a PIN token — or the reverse — without matching no session at
+# all.
+PIN_SESSION_TOKEN_PREFIX = "pin_"
+
+
+def create_pin_session_token() -> str:
+    return PIN_SESSION_TOKEN_PREFIX + create_session_token()
+
+
+def is_pin_session_token(session_token: str | None) -> bool:
+    return bool(session_token) and session_token.startswith(PIN_SESSION_TOKEN_PREFIX)
+
+
+# --- human-relayed temporary passwords (hardening U9, DL6) ----------------------
+# The office reads a parent's temporary password out over the phone, so it is
+# drawn from the driver code's alphabet (migration 017: Crockford base32, no
+# I, L, O or U), shown grouped in fours and accepted however the parent types
+# it: any case, with or without the spaces or hyphens between the groups, and
+# with O for 0 and I or L for 1. Sixteen characters carry 80 bits.
+RELAYED_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+RELAYED_TEMPORARY_PASSWORD_LENGTH = 16
+_RELAYED_CODE_LOOKALIKES = str.maketrans({"O": "0", "I": "1", "L": "1"})
+
+
+def generate_relayed_temporary_password(
+    length: int = RELAYED_TEMPORARY_PASSWORD_LENGTH,
+) -> str:
+    """Uniform over the 32-symbol alphabet (``secrets.choice``, no modulo
+    bias); stored and revealed ungrouped, uppercase."""
+    return "".join(secrets.choice(RELAYED_CODE_ALPHABET) for _ in range(length))
+
+
+def normalise_relayed_code(value: str) -> str:
+    """The canonical form of a typed relayed code: uppercase, whitespace and
+    hyphens removed, the look-alike letters mapped to their digits."""
+    stripped = "".join(ch for ch in str(value or "") if not ch.isspace() and ch != "-")
+    return stripped.upper().translate(_RELAYED_CODE_LOOKALIKES)
+
+
 def hash_session_token(session_token: str) -> str:
     return hashlib.sha256(session_token.encode("utf-8")).hexdigest()

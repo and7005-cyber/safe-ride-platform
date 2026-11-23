@@ -11,21 +11,37 @@ import {
 } from "@/features/admin/components/RunExceptionsPanel";
 import { TRACKING_FIELDS } from "@/features/admin/trackingFields";
 import {
+  CHANGE_PASSWORD_DIALOG_TEXT,
+  CHANGE_PASSWORD_LABEL,
+  CONFIRM_AND_RESET_LABEL,
+  CONFIRM_SLOT_WARNING,
   EMAIL_VERIFIED_TOAST,
+  LINK_NOT_ACCEPTED_TOOLTIP,
   MAIL_OFF_FORGOT,
   MAIL_OFF_VERIFY,
+  NOTHING_TO_CONFIRM_TEXT,
+  NOTHING_TO_CONFIRM_TITLE,
+  NOT_RESETTABLE_HINT,
+  PASSWORD_CHANGED_TOAST,
   RESEND_COOLDOWN,
   RESEND_LABEL,
   RESEND_SENT,
+  RESET_CONFIRM_LEAD,
   RESET_LINK_INVALID_TITLE,
+  RESET_PASSWORD_LABEL,
   SEND_NEW_LINK,
   SIGNUP_DONE_TITLE,
+  TEMPORARY_PASSWORD_EXPIRED_CHIP,
+  TEMPORARY_PASSWORD_TITLE,
+  TEMPORARY_PASSWORD_TYPING_HINT,
   VERIFY_CARD_TITLE,
   VERIFY_CARD_WRONG_ADDRESS,
   VERIFY_LINK_INVALID_TITLE,
   VERIFY_SIGN_IN_PROMPT,
   WRONG_ACCOUNT_TITLE,
   forgotSentText,
+  resetConfirmText,
+  temporaryPasswordChip,
   verifyCardText,
 } from "@/features/auth/authCopy";
 import { arrivalOfferCopy } from "@/features/driver/components/NudgeQueue";
@@ -395,5 +411,58 @@ describe("the parent guide describes sign-up, verification and recovery in the a
     expect(parent).toContain(MAIL_OFF_FORGOT);
     expect(parent).toContain(MAIL_OFF_VERIFY);
     expect(parent).toMatch(/24 hours/);
+  });
+});
+
+/**
+ * Hardening Release 1b (U9; DL6, DL12, DL13). The office can reset a parent's
+ * password and confirm a sign-up for a parent with no working inbox; anyone
+ * signed in with a password can change it. The office guide quotes the
+ * Parents page, the parent guide the screens the parent meets.
+ */
+describe("the guides describe the office reset and the self-service change in the app's words", () => {
+  // The server's neutral refusal; the page appends the hint after it.
+  const NOT_RESETTABLE = "This account cannot be reset from the Parents page";
+
+  it("gives the office every Parents-page label, confirmation, chip and refusal", () => {
+    const admin = read("admin-guide.md");
+    for (const line of [
+      RESET_PASSWORD_LABEL,
+      RESET_CONFIRM_LEAD,
+      resetConfirmText(true),
+      TEMPORARY_PASSWORD_TITLE,
+      TEMPORARY_PASSWORD_TYPING_HINT,
+      TEMPORARY_PASSWORD_EXPIRED_CHIP,
+      LINK_NOT_ACCEPTED_TOOLTIP,
+      `${NOT_RESETTABLE}. ${NOT_RESETTABLE_HINT}`,
+      CONFIRM_AND_RESET_LABEL,
+      CONFIRM_SLOT_WARNING.replace(/\.$/, ""),
+      NOTHING_TO_CONFIRM_TITLE,
+      NOTHING_TO_CONFIRM_TEXT,
+      CHANGE_PASSWORD_LABEL,
+      CHANGE_PASSWORD_DIALOG_TEXT,
+    ]) {
+      expect(admin, `admin guide never quotes "${line}"`).toContain(line);
+    }
+    // The chip's words up to the date the page fills in.
+    expect(admin).toContain(temporaryPasswordChip("…"));
+    expect(admin).toMatch(/72 hours/);
+    expect(admin).toMatch(/no I, L, O or U/);
+  });
+
+  it("tells parents how an office reset works and how to change their own password", () => {
+    const parent = read("parent-guide.md");
+    for (const line of [
+      CHANGE_PASSWORD_LABEL,
+      CHANGE_PASSWORD_DIALOG_TEXT,
+      PASSWORD_CHANGED_TOAST,
+      // The forced-change screen keeps its own words (DL13).
+      "Your temporary password must be changed before you can continue.",
+      "Your SafeRide password was reset by your school",
+    ]) {
+      expect(parent, `parent guide never quotes "${line}"`).toContain(line);
+    }
+    expect(parent).toMatch(/with or without them, in capitals or not/);
+    expect(parent).not.toMatch(/The only controls here are the push notifications switch and \*\*Sign Out\*\*/);
   });
 });

@@ -90,6 +90,19 @@ class ActionReplayed(Exception):
         self.action = action
 
 
+class AccountRefusedError(ConflictError):
+    """An office account action the target cannot take (hardening U9). The
+    ``code`` is what the Parents page branches on — ``not-resettable-here``
+    (the account holds a membership somewhere or a provider account) and
+    ``nothing-to-confirm`` (no unverified parent account behind a slot email).
+    The message is neutral: it never says which of the reasons applied, nor
+    which other school or role the account holds."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
 class TooManyRequestsError(SafeRideError):
     status_code = 429
 

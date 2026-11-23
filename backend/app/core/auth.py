@@ -4,6 +4,7 @@ from collections.abc import Callable
 from fastapi import Depends, Header, HTTPException, Request
 
 from app.core.scope import is_password_change_exempt, is_totp_enrolment_exempt
+from app.core.security import is_pin_session_token
 from app.services.auth_service import AuthService
 
 _service = AuthService()
@@ -21,7 +22,8 @@ def get_current_user(
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
         raise _unauthorized()
-    user = _service.resolve_session(token.strip())
+    token = token.strip()
+    user = _service.resolve_session(token)
     if not user:
         raise _unauthorized()
     if user.get("must_change_password") and not is_password_change_exempt(
@@ -70,6 +72,10 @@ def get_current_user(
         # Release 1b (D1): false only while the account waits for its
         # verification click; grandfathered accounts read true.
         "email_verified": bool(user.get("email_verified", True)),
+        # Hardening U9: a session created by PIN (the marker is in the
+        # token, see security.PIN_SESSION_TOKEN_PREFIX) may not change the
+        # account password.
+        "pin_session": is_pin_session_token(token),
     }
 
 

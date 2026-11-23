@@ -114,6 +114,10 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("GET", "/api/accounts/parents"): "school-scoped",
     ("PUT", "/api/accounts/parents/{parent_id}"): "school-scoped",
     ("DELETE", "/api/accounts/parents/{parent_id}"): "school-scoped",
+    # Hardening U9: the office parent reset and "Confirm and reset" on an
+    # Awaiting-signup slot — either staff role, inside the header school.
+    ("POST", "/api/accounts/parents/{parent_id}/reset-password"): "school-scoped",
+    ("POST", "/api/accounts/parents/slots/confirm"): "school-scoped",
     ("GET", "/api/staff"): "school-scoped",
     ("POST", "/api/staff"): "school-scoped",
     ("DELETE", "/api/staff/{user_id}"): "school-scoped",

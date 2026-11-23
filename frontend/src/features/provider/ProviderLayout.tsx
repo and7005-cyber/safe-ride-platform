@@ -1,6 +1,14 @@
-import { type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
-import { ArrowRight, Building2, LogOut, ScrollText, ShieldCheck, Users } from "lucide-react";
+import {
+  ArrowRight,
+  Building2,
+  KeyRound,
+  LogOut,
+  ScrollText,
+  ShieldCheck,
+  Users,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,7 +20,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/lib/auth";
+import { canChangeOwnPassword, useAuth } from "@/lib/auth";
+import { CHANGE_PASSWORD_LABEL } from "@/features/auth/authCopy";
+import { ChangePasswordDialog } from "@/features/auth/ChangePasswordPage";
 
 // The provider console shell (U13/R22): Kuumbai's cross-school surface. A
 // deliberately DIFFERENT shape from the school console — a top bar, no
@@ -29,6 +39,8 @@ const NAV = [
 export function ProviderLayout({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
+  // Hardening U9 (DL13): the voluntary Change password dialog.
+  const [changingPassword, setChangingPassword] = useState(false);
 
   const handleSignOut = async () => {
     await signOut();
@@ -91,11 +103,20 @@ export function ProviderLayout({ children }: { children: ReactNode }) {
                 )}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
+              {canChangeOwnPassword(user) && (
+                <DropdownMenuItem
+                  data-testid="menu-change-password"
+                  onSelect={() => setChangingPassword(true)}
+                >
+                  <KeyRound className="h-4 w-4" /> {CHANGE_PASSWORD_LABEL}
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onClick={handleSignOut}>
                 <LogOut className="h-4 w-4" /> Sign Out
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          <ChangePasswordDialog open={changingPassword} onOpenChange={setChangingPassword} />
         </div>
       </header>
       {user?.supportSession && (

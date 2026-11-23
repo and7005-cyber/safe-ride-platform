@@ -1,8 +1,10 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
-import { Bus, LogOut, type LucideIcon } from "lucide-react";
+import { Bus, KeyRound, LogOut, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/lib/auth";
+import { canChangeOwnPassword, useAuth } from "@/lib/auth";
+import { CHANGE_PASSWORD_LABEL } from "@/features/auth/authCopy";
+import { ChangePasswordDialog } from "@/features/auth/ChangePasswordPage";
 
 export interface NavItem {
   to: string;
@@ -25,7 +27,12 @@ export function RoleMobileLayout({
   title: string;
 }) {
   const navigate = useNavigate();
-  const { signOut } = useAuth();
+  const { user, signOut } = useAuth();
+  // Hardening U9 (DL13): a driver who signed in with email and password can
+  // change it from the header (parents have it on their Profile page). A PIN
+  // session never held the password, so it gets no entry.
+  const [changingPassword, setChangingPassword] = useState(false);
+  const offerChangePassword = user?.role === "driver" && canChangeOwnPassword(user);
   const logoClass = variant === "primary"
     ? "bg-primary text-primary-foreground"
     : "bg-accent text-accent-foreground";
@@ -44,10 +51,26 @@ export function RoleMobileLayout({
           </div>
           <span className="font-heading text-base font-semibold">{title}</span>
         </div>
-        <button onClick={handleSignOut} className="text-muted-foreground hover:text-destructive" aria-label="Sign out">
-          <LogOut className="h-5 w-5" />
-        </button>
+        <div className="flex items-center gap-1">
+          {offerChangePassword && (
+            <button
+              onClick={() => setChangingPassword(true)}
+              className="flex h-11 w-11 items-center justify-center text-muted-foreground hover:text-foreground"
+              aria-label={CHANGE_PASSWORD_LABEL}
+              title={CHANGE_PASSWORD_LABEL}
+              data-testid="header-change-password"
+            >
+              <KeyRound className="h-5 w-5" />
+            </button>
+          )}
+          <button onClick={handleSignOut} className="text-muted-foreground hover:text-destructive" aria-label="Sign out">
+            <LogOut className="h-5 w-5" />
+          </button>
+        </div>
       </header>
+      {offerChangePassword && (
+        <ChangePasswordDialog open={changingPassword} onOpenChange={setChangingPassword} />
+      )}
 
       <main className="flex-1 overflow-auto p-4 pb-20">{children}</main>
 

@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Bell, BellOff, Bus, LogOut, Mail, MapPin, User } from "lucide-react";
+import { Bell, BellOff, Bus, KeyRound, LogOut, Mail, MapPin, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { GraduationCap } from "lucide-react";
@@ -7,7 +8,9 @@ import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { ChildStatusBadge } from "@/features/parent/ParentHomePage";
 import { PARENT_NAV, useParentProfile } from "@/features/parent/parentHooks";
 import { usePushNotifications } from "@/lib/usePushNotifications";
-import { useAuth } from "@/lib/auth";
+import { canChangeOwnPassword, useAuth } from "@/lib/auth";
+import { CHANGE_PASSWORD_LABEL } from "@/features/auth/authCopy";
+import { ChangePasswordDialog } from "@/features/auth/ChangePasswordPage";
 
 function initials(name: string): string {
   return name.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
@@ -15,7 +18,9 @@ function initials(name: string): string {
 
 export function ParentProfilePage() {
   const navigate = useNavigate();
-  const { signOut } = useAuth();
+  const { user, signOut } = useAuth();
+  // Hardening U9 (DL13): the voluntary Change password dialog.
+  const [changingPassword, setChangingPassword] = useState(false);
   const { data } = useParentProfile();
   const push = usePushNotifications();
   const profile = data?.profile;
@@ -97,6 +102,17 @@ export function ParentProfilePage() {
           {pushLabel()}
         </Button>
 
+        {canChangeOwnPassword(user) && (
+          <Button
+            variant="outline"
+            className="w-full justify-start gap-2"
+            onClick={() => setChangingPassword(true)}
+            data-testid="profile-change-password"
+          >
+            <KeyRound className="h-4 w-4" /> {CHANGE_PASSWORD_LABEL}
+          </Button>
+        )}
+
         <Button
           variant="outline"
           className="w-full justify-start gap-2 text-destructive hover:text-destructive"
@@ -105,6 +121,7 @@ export function ParentProfilePage() {
           <LogOut className="h-4 w-4" /> Sign Out
         </Button>
       </div>
+      <ChangePasswordDialog open={changingPassword} onOpenChange={setChangingPassword} />
     </RoleMobileLayout>
   );
 }

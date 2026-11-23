@@ -78,6 +78,21 @@ def test_templates_carry_no_user_supplied_text(settings):
     assert RECIPIENT not in notice.text
 
 
+def test_the_office_password_notice_carries_no_password_link_or_school(settings):
+    # Hardening U9: the Parents page's reset and Confirm and reset mail the
+    # account a neutral notice. The password is heard from the office only.
+    notice = ms.office_password_notice(RECIPIENT)
+    assert notice.kind == "office-reset" and notice.to == RECIPIENT
+    assert notice.link is None and notice.purpose is None
+    for part in (notice.text, notice.html):
+        assert "http" not in part.replace("<!doctype html>", "")
+        assert RECIPIENT not in part
+        assert "school office" in part
+        assert "72 hours" in part
+        assert "signed out" in part
+    assert "SafeRide" in notice.subject
+
+
 def test_the_html_part_escapes_the_link(settings):
     settings.app_base_url = 'https://x.test/"><script>'
     message = ms.reset_mail(RECIPIENT, TOKEN)

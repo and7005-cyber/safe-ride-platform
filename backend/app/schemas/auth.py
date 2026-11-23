@@ -129,3 +129,6 @@ class MeResponse(_CamelModel):
     # the office changed) waits for its verification click. Grandfathered
     # accounts, made before 1b, always read true.
     email_verified: bool = Field(default=True, alias="emailVerified")
+    # Hardening U9: the calling session was created by PIN. The account menus
+    # hide Change password for it (the session never held the password).
+    signed_in_with_pin: bool = Field(default=False, alias="signedInWithPin")

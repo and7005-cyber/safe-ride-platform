@@ -10,6 +10,7 @@ import {
   Clock,
   GraduationCap,
   Heart,
+  KeyRound,
   LayoutDashboard,
   LifeBuoy,
   LogOut,
@@ -35,12 +36,15 @@ import {
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/apiClient";
 import {
+  canChangeOwnPassword,
   membershipAt,
   staffMemberships,
   useAuth,
   useIsDirector,
   type SupportSession,
 } from "@/lib/auth";
+import { CHANGE_PASSWORD_LABEL } from "@/features/auth/authCopy";
+import { ChangePasswordDialog } from "@/features/auth/ChangePasswordPage";
 import { clearActiveSchoolId, useActiveSchoolId } from "@/lib/school";
 import { useSwitchSchool, useUnreadAlerts } from "@/lib/queries";
 
@@ -162,6 +166,8 @@ export function AdminLayout({ children }: { children: ReactNode }) {
   const { user, signOut } = useAuth();
   const { data: unread } = useUnreadAlerts();
   const [open, setOpen] = useState(false);
+  // Hardening U9 (DL13): the voluntary Change password dialog.
+  const [changingPassword, setChangingPassword] = useState(false);
   const unreadCount = unread?.count ?? 0;
 
   const activeSchoolId = useActiveSchoolId();
@@ -362,11 +368,20 @@ export function AdminLayout({ children }: { children: ReactNode }) {
                 )}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
+              {canChangeOwnPassword(user) && (
+                <DropdownMenuItem
+                  data-testid="menu-change-password"
+                  onSelect={() => setChangingPassword(true)}
+                >
+                  <KeyRound className="h-4 w-4" /> {CHANGE_PASSWORD_LABEL}
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onClick={handleSignOut}>
                 <LogOut className="h-4 w-4" /> Sign Out
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          <ChangePasswordDialog open={changingPassword} onOpenChange={setChangingPassword} />
         </header>
         <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>

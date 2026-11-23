@@ -1,8 +1,10 @@
 from app.core.config import get_settings
 from app.core.errors import BadRequestError, ConflictError
+from app.core.request_context import log_unexpected_error
 from app.core.scope import SchoolScope
 from app.core.security import (
     create_session_token,
+    generate_relayed_temporary_password,
     hash_password,
     hash_pin_hmac,
     hash_session_token,
@@ -14,6 +16,7 @@ from app.services.mail_service import (
     MailService,
     email_changed_notice,
     get_mail_service,
+    office_password_notice,
     verification_mail,
 )
 
@@ -113,3 +116,42 @@ class AccountService:
 
     def delete_parent(self, scope: SchoolScope, parent_id, *, actor: dict):
         self.dao.delete_parent(scope, parent_id, actor=actor)
+
+    # --- office parent reset and Confirm and reset (hardening U9) ------------
+
+    def reset_parent_password(self, scope: SchoolScope, parent_id, *, actor: dict):
+        """A temporary password for a parent the office cannot otherwise get
+        back in: relayed by phone, so drawn from the unambiguous alphabet
+        (DL6). Revealed here once — never logged, never audited — and the
+        parent is mailed a neutral notice (no password, no link) after the
+        commit. A failed send never fails the request (mail service)."""
+        password = generate_relayed_temporary_password()
+        target = self.dao.reset_parent_password(
+            scope, parent_id, hash_password(password), actor=actor
+        )
+        self.mail.send(office_password_notice(target["email"]))
+        return {"ok": True, "temporaryPassword": password}
+
+    def confirm_parent_slot(self, scope: SchoolScope, email, *, actor: dict):
+        """"Confirm and reset" (execution decisions, Release 1b): verify the
+        unverified account behind an Awaiting-signup slot, give it a temporary
+        password, then run the sign-up linking rule — the same one the
+        owner's own verification runs, with its office incidents — and mail
+        the neutral notice. Returns the password once.
+
+        The linking runs after the verification commits. Should it fail, the
+        password is still returned (the office would otherwise hold an
+        account it can neither see nor reset); the failure is logged with the
+        request id, and the office's next save of the student record links
+        the now verified account (the student sync)."""
+        email = clean_email(email, required=True)
+        password = generate_relayed_temporary_password()
+        target = self.dao.confirm_parent_slot(
+            scope, email, hash_password(password), actor=actor
+        )
+        try:
+            self.dao.link_parent_to_matching_students(target["id"], target["email"])
+        except Exception as error:  # noqa: BLE001 — the credential is already issued
+            log_unexpected_error(error)
+        self.mail.send(office_password_notice(target["email"]))
+        return {"ok": True, "temporaryPassword": password}

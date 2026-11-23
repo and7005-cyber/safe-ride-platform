@@ -8,6 +8,7 @@ import pytest
 from app.core.config import get_settings
 from app.core.errors import BadRequestError, UnauthorizedError
 from app.core.security import (
+    PIN_SESSION_TOKEN_PREFIX,
     hash_password,
     hash_pin_hmac,
     hash_session_token,
@@ -18,6 +19,7 @@ from app.services.auth_service import (
     FORGOT_MESSAGE,
     VERIFY_SIGN_IN_MESSAGE,
     AuthService,
+    PinSessionError,
     VerificationError,
 )
 from app.services.mail_service import (
@@ -189,7 +191,10 @@ class FakeAuthDao:
         user = self.users.get(user_id)
         if not user:
             return None
-        return {"id": user_id, "email": user["email"], "password_hash": user["password_hash"]}
+        return {
+            "id": user_id, "email": user["email"], "password_hash": user["password_hash"],
+            "must_change_password": bool(user.get("must_change_password")),
+        }
 
     def set_user_password(self, user_id, password_hash):
         user = self.users[user_id]
@@ -356,6 +361,77 @@ def test_reset_password_clears_the_temporary_flag_and_revokes_all(service):
     assert verify_password("NewPass456", user["password_hash"])
     assert user["must_change_password"] is False
     assert service.dao.revoked_all_for == ["u-admin"]
+
+
+# --- PIN sessions, the self-service change, relayed passwords (hardening U9) ------
+
+
+def test_a_pin_sign_in_marks_its_session_and_a_password_sign_in_does_not(service):
+    by_pin = service.pin_login("1234")
+    assert by_pin["token"].startswith(PIN_SESSION_TOKEN_PREFIX)
+    assert by_pin["user"]["signedInWithPin"] is True
+    assert service.resolve_session(by_pin["token"])["id"] == "u-driver"
+    by_password = service.login("drive@test.com", "Test1234")
+    assert not by_password["token"].startswith(PIN_SESSION_TOKEN_PREFIX)
+    assert by_password["user"]["signedInWithPin"] is False
+
+
+def test_change_password_is_refused_for_a_pin_session(service):
+    pin_user = {"id": "u-driver", "session_id": "sess-keep", "pin_session": True}
+    with pytest.raises(PinSessionError) as caught:
+        service.change_password(pin_user, "Test1234", "NewPass123")
+    assert caught.value.code == "pin-session" and caught.value.status_code == 403
+    # Nothing changed: the hash, the sessions.
+    assert verify_password("Test1234", service.dao.users["u-driver"]["password_hash"])
+    assert service.dao.kept_sessions == []
+
+
+def test_a_pin_session_held_on_the_change_screen_may_replace_the_temporary_password(service):
+    # The forced change still needs the temporary password itself; refusing
+    # it would strand a session ProtectedRoute holds on the change screen.
+    _make_temporary(service.dao, "u-driver", expired=False)
+    pin_user = {
+        "id": "u-driver", "session_id": "sess-keep", "pin_session": True,
+        "must_change_password": True,
+    }
+    service.change_password(pin_user, "Test1234", "NewPass123")
+    assert verify_password("NewPass123", service.dao.users["u-driver"]["password_hash"])
+    assert service.dao.kept_sessions == [("u-driver", "sess-keep")]
+
+
+def test_a_voluntary_change_keeps_the_session_and_the_push_registrations(service):
+    service.dao.push["u-admin"] = 2
+    service.change_password(_session_user("u-admin"), "test1234.", "NewPass123")
+    assert service.dao.kept_sessions == [("u-admin", "sess-keep")]
+    assert service.dao.revoked_all_for == []
+    assert service.dao.push == {"u-admin": 2}
+
+
+RELAYED = "AB01CDEF2345GHJK"
+
+
+@pytest.mark.parametrize(
+    "typed", ["ab01cdef2345ghjk", "AB01 CDEF 2345 GHJK", "ab01-cdef-2345-ghjk", "aBoI cdef 2345 ghjk"]
+)
+def test_a_relayed_temporary_password_signs_in_however_it_is_typed(service, typed):
+    service.dao.users["u-admin"]["password_hash"] = hash_password(RELAYED)
+    _make_temporary(service.dao, "u-admin", expired=False)
+    assert service.login("admin@test.com", typed)["user"]["mustChangePassword"] is True
+    # ...and is accepted as the current password on the forced change.
+    service.change_password(
+        {**_session_user("u-admin"), "must_change_password": True}, typed, "NewPass123"
+    )
+    assert verify_password("NewPass123", service.dao.users["u-admin"]["password_hash"])
+
+
+def test_a_password_the_account_chose_is_compared_exactly(service):
+    # No temporary password held: no normalisation, ever.
+    service.dao.users["u-admin"]["password_hash"] = hash_password(RELAYED)
+    with pytest.raises(UnauthorizedError, match="Invalid email or password"):
+        service.login("admin@test.com", "ab01-cdef-2345-ghjk")
+    with pytest.raises(BadRequestError, match="Current password is incorrect"):
+        service.change_password(_session_user("u-admin"), "ab01 cdef 2345 ghjk", "NewPass123")
+    assert service.login("admin@test.com", RELAYED)["token"]
 
 
 # --- emailed tokens (hardening U7) ------------------------------------------------

@@ -61,3 +61,57 @@ export const SIGN_IN_THEN_SEND = "Sign in, then send a new link";
 export const VERIFY_LINK_MISSING_TITLE = "Verification link incomplete";
 export const VERIFY_LINK_MISSING_TEXT =
   "Open the link from the email again, or copy the whole link into your browser.";
+
+// --- Hardening U9: the office reset, Confirm and reset, the self-service
+// change (design-lens DL6, DL12, DL13). The admin and parent guides quote
+// these; tests/unit/manualVocabulary.test.ts holds them to it.
+
+// DL13 — Change password from a menu or the parent Profile (not a PIN
+// session: it never held the account password).
+export const CHANGE_PASSWORD_LABEL = "Change password";
+export const CHANGE_PASSWORD_DIALOG_TEXT =
+  "You'll stay signed in here. Other devices will be signed out.";
+export const PASSWORD_CHANGED_TOAST = "Password changed";
+
+// DL12 — the Parents page.
+export const RESET_PASSWORD_LABEL = "Reset password";
+export const RESET_CONFIRM_LEAD =
+  "Their current password stops working and a temporary password is shown to you once.";
+export function resetConfirmText(mailEnabled: boolean): string {
+  return mailEnabled
+    ? "Their other devices are signed out, alerts on their phone stop until they sign in again, and they are emailed a notice. If they are linked to another school, that school's records are not changed."
+    : "Their other devices are signed out, and alerts on their phone stop until they sign in again. If they are linked to another school, that school's records are not changed.";
+}
+export const SHARED_RESET_TOOLTIP =
+  "This parent also has a child at another school. You can still reset their password here; the other school's records are not changed.";
+export const SHARED_EDIT_TOOLTIP =
+  "This parent also has a child at another school, so their details can't be edited from here.";
+export const LINK_NOT_ACCEPTED_TOOLTIP =
+  "Available once the parent accepts the link to your school in their app.";
+export const NOT_RESETTABLE_TITLE = "Can't reset here";
+export const NOT_RESETTABLE_HINT = "Ask the parent to use Forgot password.";
+export function temporaryPasswordChip(expiresOn: string): string {
+  return `Temporary password · expires ${expiresOn}`;
+}
+export const TEMPORARY_PASSWORD_EXPIRED_CHIP = "Temporary password expired — reset again";
+
+export const CONFIRM_AND_RESET_LABEL = "Confirm and reset";
+export const CONFIRM_SLOT_WARNING = "Only confirm after speaking to this parent.";
+export const CONFIRM_SLOT_TEXT =
+  "If they have signed up with this email, their sign-up is confirmed, their children are linked, and a temporary password is shown to you once. Anyone signed in to that account is signed out.";
+export const NOTHING_TO_CONFIRM_TITLE = "Nothing to confirm yet";
+export const NOTHING_TO_CONFIRM_TEXT = "Ask the parent to sign up with this email.";
+
+// DL6 — the reveal-once dialog: grouped in fours for reading out, Copy gives
+// the ungrouped value, and the parent may type it either way.
+export const TEMPORARY_PASSWORD_TITLE = "Temporary password";
+export function temporaryPasswordRevealText(who: string): string {
+  return `Read this password to ${who} now. They sign in with it and choose their own password straight away. It stops working after 72 hours and can't be shown again.`;
+}
+export const TEMPORARY_PASSWORD_TYPING_HINT =
+  "The spaces are only there to help reading it out: it can be typed with or without them, in capitals or not.";
+
+/** A relayed code shown in groups of four (DL6). */
+export function groupInFours(code: string): string {
+  return code.replace(/(.{4})(?=.)/g, "$1 ");
+}

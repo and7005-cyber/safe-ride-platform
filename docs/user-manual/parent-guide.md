@@ -38,6 +38,10 @@ If you try to sign up with an email that already has an account, no second accou
 
 **When email isn't switched on yet:** until the school's email sending is live, **Forgot password?** reads *"Email recovery isn't switched on yet. Ask your school office to reset your password."*, and the **Verify your email** card reads *"Ask your school office to confirm your sign-up."* (there is no **Resend link** then). The school office can confirm your sign-up and reset your password for you.
 
+**When the school office resets your password:** call the office. They read you a **temporary password** of 16 letters and numbers, in groups of four. The spaces are only there to help reading it out: type it with or without them, in capitals or not. Sign in with your email and that temporary password; SafeRide shows *"Your temporary password must be changed before you can continue."* — choose your own password there and you carry on to Home. The temporary password stops working after **72 hours** if you don't use it (ask the office for a new one), and once you've chosen your own. Every phone and browser signed in to your account is signed out, and notifications on your phone stop until you sign in there again. You also receive an email, **"Your SafeRide password was reset by your school"**; it never contains the password.
+
+**When the office confirms your sign-up:** if you signed up but can't open the confirmation email, the office can confirm it for you after speaking to you. They give you a temporary password the same way — the password you chose at sign-up stops working — and your children appear on Home once you've signed in and chosen your own password.
+
 You stay signed in on your phone until you sign out. On a **shared or borrowed phone, always sign out** (Profile → **Sign Out**) — this also stops that device from receiving your family's notifications.
 
 ## The app at a glance
@@ -174,7 +178,9 @@ A few rules apply, and the app explains each one when it stops you:
 
 ## Profile
 
-The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. With children at more than one school, each child's details are managed by **that child's** school. The only controls here are the push notifications switch and **Sign Out**.
+The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. With children at more than one school, each child's details are managed by **that child's** school. The only controls here are the push notifications switch, **Change password** and **Sign Out**.
+
+**Changing your password:** tap **Change password**, type your current password, then the new one twice. The dialog says *"You'll stay signed in here. Other devices will be signed out."*: this phone stays signed in (and keeps its notifications); any other phone or browser signed in to your account has to sign in again. When it's done you see **"Password changed"**.
 
 ## Quick fixes
 
@@ -189,6 +195,7 @@ The Profile tab shows your name, email and phone, and a card for each linked chi
 | You declined a school's card by mistake | Ask that school's office to re-enter your email on the child's record — a fresh card will appear for you to accept. |
 | A child at a second school isn't showing | Check Home for a pending card from that school and accept it. No card? Ask that school's office to check the email on the child's record. |
 | No push notifications arriving | Check Profile → the button should read "Disable Push Notifications" (meaning push is on). On iPhone, make sure you opened the app from the home-screen icon. Check the phone's notification settings for your browser. |
+| The office's temporary password doesn't work | It lasts 72 hours, and only the newest one works. Ask the office to reset it again. |
 | Password reset link says "Reset link invalid" | Reset links work once and expire after 30 minutes. Tap "Request a new reset link" and use the newest email, or ask your school office to reset your password. |
 | The arrival estimate seems off | It's approximate. Rely on the Track tab's stop progress and the "Bus approaching" alert. |
 | The bus marker is faded and says "last seen …" | The driver's phone is not sending right now — usually its screen is off or the app is in the background, sometimes no signal. The bus is still running. It freshens as soon as the phone is back on the app or at the driver's next tap. If it stays that way, call the office. |
