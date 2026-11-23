@@ -159,6 +159,7 @@ Tapping a push notification opens the Alerts tab.
 - **Recent** shows the last 24 hours; **History** shows the 6 days before that.
 - Filter by period (**All / Morning / Afternoon**) or by type.
 - Unread alerts are highlighted; opening the tab marks them read. Alerts can't be deleted — they age out of History after 7 days.
+- SafeRide keeps 90 days of alert history and deletes older alerts automatically. The Alerts tab only ever shows the last 7 days.
 
 ## Cancelling a ride
 

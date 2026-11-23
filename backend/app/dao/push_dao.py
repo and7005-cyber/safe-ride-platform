@@ -389,8 +389,10 @@ class PushDao:
         window 168 — disjoint by construction (U9: R5–R7), and because both
         are WHERE predicates the exclusion happens BEFORE the row cap, so a
         busy last 24h can never starve History out of the 200 rows.
-        limit is hard-capped at 200 — the feed is windowed, never paginated,
-        and no rows are ever deleted (R36: the table is the audit trail).
+        limit is hard-capped at 200 — the feed is windowed, never paginated.
+        The table keeps 90 days of history (R36: it is the parent's record):
+        the nightly retention job deletes older rows (hardening U12,
+        retention_dao), while the display window stays 7 days.
         """
         limit = max(1, min(int(limit), 200))
         window_sql = ""

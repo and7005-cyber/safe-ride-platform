@@ -223,3 +223,27 @@ def purge_expired(conn, school_id: str, *, ttl_days: int, limit: int) -> int:
         """,
         (school_id, ttl_days, limit),
     ).rowcount
+
+
+def purge_expired_all_schools(conn, *, ttl_days: int, limit: int) -> int:
+    """The nightly retention job's step (hardening U12): the same cutoff as
+    ``purge_expired`` across every school, so keys age out even at a school
+    whose drivers stopped tapping Start Run. Up to ``limit`` keys, oldest
+    first, by ``created_at`` (served by ``driver_action_keys_created_idx``).
+    Runs as the migrate Lambda's master role, outside RLS: no school
+    predicate is the point. Returns the count."""
+    return conn.execute(
+        """
+        with victims as (
+            select school_id, driver_id, key from driver_action_keys
+            where created_at < now() - make_interval(secs => %s * 86400)
+            order by created_at
+            limit %s
+            for update skip locked
+        )
+        delete from driver_action_keys k
+        using victims v
+        where k.school_id = v.school_id and k.driver_id = v.driver_id and k.key = v.key
+        """,
+        (ttl_days, limit),
+    ).rowcount

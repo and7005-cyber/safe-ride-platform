@@ -1,15 +1,21 @@
-"""Backend stack invariants (hardening plan U4) — the template watches itself.
+"""Backend stack invariants (hardening plan U4, U12) — the template watches itself.
 
 Text inspection of infra/backend/template.yaml through template_text.py: one
 retained 90-day log group per function with JSON logging (application and
 platform INFO) pointed at it; every alarm's metric, statistic, window and
-threshold, reporting ALARM and OK to the ops topic, and Release 1a carries no
-heartbeat, metric-filter or Scheduler alarm (they ship in 1b with their
-metrics); the topic policy; the alert addresses reach the deploy script; the
-database property set (no log export, D21; maintenance clear of the backup
-window, D22); the mail DNS records and the retained trail. `sam validate
---lint` checks the shapes; these pin the decisions.
+threshold, reporting ALARM and OK to the ops topic — Release 1b adds the
+retention heartbeat (the one alarm whose missing data breaches), the
+Scheduler's target errors and the metric-filter alarms, and moves the 4xx
+burst onto a log count without 404s; the nightly schedule, its role and the
+migrate function's timeout and async retries; the topic policy; the alert
+addresses reach the deploy script; the database property set (no log export,
+D21; maintenance clear of the backup window, D22); the mail DNS records and
+the retained trail. `sam validate --lint` checks the shapes; these pin the
+decisions. The metric filters' patterns are matched against real log lines
+in test_metric_filters.py.
 """
+
+import json
 
 import re
 from typing import NamedTuple
@@ -99,10 +105,16 @@ class Alarm(NamedTuple):
 API = (("ApiId", "!Ref HttpApi"),)
 DB = (("DBInstanceIdentifier", "!Ref Database"),)
 GTE, GT, LT = "GreaterThanOrEqualToThreshold", "GreaterThanThreshold", "LessThanThreshold"
+# Release 1b's own metrics: the retention run's EMF line and the API log
+# metric filters. No dimensions.
+APP = "SafeRide"
 
 ALARMS = {
     "ApiServerErrors": Alarm("AWS/ApiGateway", "5xx", API, "Sum", 300, 1, 1, "1", GTE),
-    "ApiClientErrorsBurst": Alarm("AWS/ApiGateway", "4xx", API, "Sum", 300, 1, 1, "50", GTE),
+    # The user's decision (2026-11-23): the app's non-404 4xx from its access
+    # lines, same threshold; the logical id is kept so the alarm updates in
+    # place.
+    "ApiClientErrorsBurst": Alarm(APP, "ApiClientErrorsNon404", (), "Sum", 300, 1, 1, "50", GTE),
     "ApiLatencyP95": Alarm("AWS/ApiGateway", "Latency", API, "p95", 300, 5, 3, "3000", GT),
     "ApiFunctionErrors": Alarm(
         "AWS/Lambda", "Errors", (("FunctionName", "!Ref ApiFunction"),), "Sum", 300, 1, 1, "1", GTE
@@ -125,17 +137,148 @@ ALARMS = {
         "AWS/CertificateManager", "DaysToExpiry", (("CertificateArn", "!Ref ApiCertificateArn"),),
         "Minimum", 86400, 1, 1, "20", LT,
     ),
+    # --- Release 1b (U12) ---
+    # 26 hourly periods with no success, missing data breaching: silence is
+    # the failure this alarm exists for.
+    "RetentionHeartbeat": Alarm(
+        APP, "RetentionRunSucceeded", (), "Sum", 3600, 26, 26, "1", LT, missing_data="breaching",
+    ),
+    "RetentionScheduleTargetErrors": Alarm(
+        "AWS/Scheduler", "TargetErrorCount", (("ScheduleGroup", "!Ref OpsScheduleGroup"),),
+        "Sum", 300, 1, 1, "1", GTE,
+    ),
+    "MailSendFailed": Alarm(APP, "MailSendFailed", (), "Sum", 300, 1, 1, "1", GTE),
+    "PinFailureBurst": Alarm(APP, "PinFailures", (), "Sum", 300, 1, 1, "30", GTE),
+    "PinLocked": Alarm(APP, "PinLocked", (), "Sum", 300, 1, 1, "1", GTE),
+    "SchoolRequiredBurst": Alarm(APP, "SchoolRequired", (), "Sum", 300, 1, 1, "20", GTE),
+}
+
+# Metric filter -> (the metric it counts into, the alarm that watches it).
+METRIC_FILTERS = {
+    "ApiClientErrorsFilter": ("ApiClientErrorsNon404", "ApiClientErrorsBurst"),
+    "MailSendFailedFilter": ("MailSendFailed", "MailSendFailed"),
+    "PinFailureFilter": ("PinFailures", "PinFailureBurst"),
+    "PinLockedFilter": ("PinLocked", "PinLocked"),
+    "SchoolRequiredFilter": ("SchoolRequired", "SchoolRequiredBurst"),
 }
 
 
-def test_release_1a_carries_exactly_the_passive_alarm_set():
+def test_release_1b_carries_exactly_this_alarm_set():
     assert set(T.of_type("AWS::CloudWatch::Alarm")) == set(ALARMS)
-    # The heartbeat (missing data breaching), the metric-filter alarms and the
-    # Scheduler arrive in 1b with the metrics that feed them.
-    assert not [lid for lid in T.resources if "heartbeat" in lid.lower()]
-    assert "TreatMissingData: breaching" not in T.section("Resources")
-    assert not T.of_type("AWS::Logs::MetricFilter")
-    assert not [lid for lid in T.resources if T.type_of(lid).startswith("AWS::Scheduler::")]
+    assert set(T.of_type("AWS::Logs::MetricFilter")) == set(METRIC_FILTERS)
+    assert set(T.of_type("AWS::Scheduler::Schedule")) == {"RetentionSchedule"}
+    assert set(T.of_type("AWS::Scheduler::ScheduleGroup")) == {"OpsScheduleGroup"}
+    # The migrate function's errors alarm (1a, D9) is not duplicated.
+    migrate_alarms = [
+        lid for lid in ALARMS if "!Ref MigrateFunction" in T.block(lid)
+    ]
+    assert migrate_alarms == ["MigrateFunctionErrors"]
+
+
+def test_only_the_heartbeat_treats_missing_data_as_breaching():
+    breaching = [
+        lid for lid in T.of_type("AWS::CloudWatch::Alarm")
+        if T.properties(lid)["TreatMissingData"] == "breaching"
+    ]
+    assert breaching == ["RetentionHeartbeat"]
+
+
+def test_the_heartbeat_window_is_26_hours_within_cloudwatchs_limits():
+    props = T.properties("RetentionHeartbeat")
+    period, periods = int(props["Period"]), int(props["EvaluationPeriods"])
+    assert period * periods == 26 * 3600
+    # PutMetricAlarm: Period x EvaluationPeriods at most seven days, and at
+    # most one day for a period under an hour.
+    assert period >= 3600 and period * periods <= 604_800
+    description = " ".join(
+        line.strip() for line in re.search(
+            r"^      AlarmDescription: >-\n((?:        .*\n)+)", T.block("RetentionHeartbeat"), re.M
+        ).group(1).splitlines()
+    )
+    # The latency and the post-deploy ALARM are stated where the mail lands.
+    assert "about 26 hours after the last good run" in description
+    assert "the morning after the first missed night" in description
+    assert "in ALARM from the deploy that creates it until the first run" in description
+    assert "zero Lambda errors is not proof that it ran" in description
+    assert len(description) <= 1024
+
+
+@pytest.mark.parametrize("metric_filter", sorted(METRIC_FILTERS))
+def test_each_metric_filter_counts_the_api_log_into_the_metric_its_alarm_watches(metric_filter):
+    metric, alarm = METRIC_FILTERS[metric_filter]
+    props = T.properties(metric_filter)
+    assert props["LogGroupName"] == "!Ref ApiLogGroup"
+    transformation = re.search(
+        r"^      MetricTransformations:\n        - (\w+: .+\n(?:          \w+: .+\n)*)",
+        T.block(metric_filter), re.M,
+    )
+    assert transformation, metric_filter
+    # One transformation, its keys as written.
+    assert T.block(metric_filter).count("\n        - ") == 1
+    fields = dict(re.findall(r"(\w+): (.+?)\s*$", transformation.group(1), re.M))
+    assert fields == {
+        "MetricNamespace": APP, "MetricName": metric, "MetricValue": '"1"', "Unit": "Count",
+    }
+    # No DefaultValue: a quiet five minutes is missing data, not a zero.
+    assert "DefaultValue" not in T.block(metric_filter)
+    assert (ALARMS[alarm].namespace, ALARMS[alarm].metric) == (APP, metric)
+
+
+def test_regex_filter_patterns_stay_inside_the_log_groups_quota():
+    # CloudWatch Logs: at most 5 metric-filter patterns with regex per log
+    # group, at most 2 regexes per pattern.
+    patterns = [T.properties(lid)["FilterPattern"] for lid in METRIC_FILTERS]
+    with_regex = [p for p in patterns if "%" in p]
+    assert len(with_regex) <= 5
+    assert all(p.count("%") // 2 <= 2 for p in with_regex)
+
+
+# --- the nightly retention schedule (U12) ---------------------------------------
+
+
+def test_the_migrate_function_runs_ten_minutes_and_is_never_retried_asynchronously():
+    block = T.block("MigrateFunction")
+    assert T.properties("MigrateFunction")["Timeout"] == "600"
+    config = re.search(r"^      EventInvokeConfig:\n((?:        .*\n)+)", block, re.M)
+    assert config, "MigrateFunction has no EventInvokeConfig"
+    assert dict(re.findall(r"^        (\w+): (.+?)\s*$", config.group(1), re.M)) == {
+        "MaximumRetryAttempts": "0", "MaximumEventAgeInSeconds": "3600",
+    }
+    # The deploy's synchronous migrate invoke waits without a client timeout.
+    deploy = (REPO / "infra" / "scripts" / "deploy-backend.sh").read_text(encoding="utf-8")
+    invoke = re.search(r'aws lambda invoke [^\n]*--function-name "\$MIGRATE_FN" \\\n[^\n]*', deploy)
+    assert invoke and "--cli-read-timeout 0" in invoke.group(0)
+
+
+def test_the_schedule_invokes_retention_at_half_past_one_nairobi_time():
+    props = T.properties("RetentionSchedule")
+    assert props["ScheduleExpression"] == "cron(30 1 * * ? *)"
+    assert props["ScheduleExpressionTimezone"] == "Africa/Nairobi"
+    assert props["GroupName"] == "!Ref OpsScheduleGroup"
+    assert props["State"] == "ENABLED"
+    block = T.block("RetentionSchedule")
+    assert re.search(r'^      FlexibleTimeWindow:\n        Mode: "OFF"\n', block, re.M)
+    target = re.search(r"^      Target:\n((?:        .*\n)+)", block, re.M).group(1)
+    fields = dict(re.findall(r"^        (\w+): (.+?)\s*$", target, re.M))
+    assert fields["Arn"] == "!GetAtt MigrateFunction.Arn"
+    assert fields["RoleArn"] == "!GetAtt RetentionSchedulerRole.Arn"
+    assert json.loads(fields["Input"].strip("'")) == {"action": "retention"}
+    retry = dict(re.findall(r"^          (\w+): (.+?)\s*$", target, re.M))
+    assert retry == {"MaximumRetryAttempts": "2", "MaximumEventAgeInSeconds": "3600"}
+
+
+def test_the_scheduler_role_may_only_invoke_the_migrate_function():
+    block = T.block("RetentionSchedulerRole")
+    assert T.type_of("RetentionSchedulerRole") == "AWS::IAM::Role"
+    trust = re.search(r"^      AssumeRolePolicyDocument:\n((?:        .*\n)+)", block, re.M).group(1)
+    assert re.findall(r"Service: (\S+)", trust) == ["scheduler.amazonaws.com"]
+    assert "aws:SourceAccount: !Ref AWS::AccountId" in trust
+    actions = re.findall(r"^                Action: (.+?)\s*$", block, re.M)
+    resources = re.findall(r"^                Resource: (.+?)\s*$", block, re.M)
+    assert actions == ["lambda:InvokeFunction"]
+    assert resources == ["!GetAtt MigrateFunction.Arn"]
+    # No fixed RoleName: the deploy keeps CAPABILITY_IAM, not NAMED_IAM.
+    assert "RoleName" not in block
 
 
 @pytest.mark.parametrize("alarm", sorted(ALARMS))

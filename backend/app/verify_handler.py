@@ -455,7 +455,9 @@ _CHECK_SETS["gps"] = [
 #                                            after 017 (re-apply 017)
 #   unverified-parent-accounts-by-age        zero until 1b's sign-up sets the
 #                                            flag; no-link over 30 d is what
-#                                            the nightly purge removes
+#                                            the nightly job removes (unless a
+#                                            membership, provider account or
+#                                            other record holds the account)
 #   token-rows-by-purpose                    unpurged counts fall to 0 once the
 #                                            nightly job runs
 #   driver-pin-hash-versions-per-school      legacy falls to 0 the week after
@@ -467,7 +469,9 @@ _CHECK_SETS["gps"] = [
 #   pin-lock-state                           failures in the 15-minute window
 #   notifications-past-90-days               falls to 0 after the nightly job
 #   stale-sessions                           falls to 0 after the nightly job
-#   last-retention-run                       age under 26 h once 1b's job runs
+#   last-retention-run                       age under 26 h once 1b's job runs;
+#                                            ok or stopped (budget) is success,
+#                                            failed names failed_step
 #   parent-reset-audit-recent                the last five office actions
 #   temporary-passwords-outstanding          issued, unchanged, unexpired
 #   consent-state                            null until consent is recorded
