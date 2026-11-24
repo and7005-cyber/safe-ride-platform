@@ -30,11 +30,39 @@ Lambda is server-enforced read-only):
   and reports ``locked`` when a Start Run pass holds the school's advisory
   lock. The ``gps`` verify set's ``trail-rows-past-retention`` says when it
   is due. Nothing is migrated or seeded on this path.
+- ``{"action": "retention"}`` — the nightly retention job (hardening U12),
+  invoked asynchronously by EventBridge Scheduler at 01:30 Africa/Nairobi
+  (and by hand once after the deploy that creates the schedule). Opens an
+  ``ops_job_runs`` row (``running``); runs the cheap bounded deletes of
+  ``retention_dao.STEPS`` first, each looped until a batch comes back short,
+  so a trail backlog can never starve them; then loops every school through
+  ``position_dao.purge_batch`` under the invocation's remaining-time budget,
+  skipping a school whose purge lock is held. Under 30 seconds left it stops
+  after the current batch: ``stopped``, which is success — the next night
+  carries on. Closes the row with the status and the per-table counts, then
+  prints ONE CloudWatch embedded-metric-format line to stdout with
+  ``RetentionRunSucceeded`` = 1 (the heartbeat alarm's metric). Any error
+  closes the row ``failed`` and RAISES — the migrate function's errors alarm
+  sees a raise, never a returned error status — and prints no metric.
+- ``{"action": "purge-verify-tokens"}`` — before a rollback to Release 1a
+  (hardening D52): deletes every email-verification token. 1a's reset
+  consumes a token by its hash alone, so a live ``verify`` token would work
+  as a reset link once the backend is back on ``release/1a``. Invoked on 1b
+  immediately before the 1a backend deploy (Release 1b checklist, "Rollback
+  rehearsal"); the 1b frontend on a 1a backend creates no verification
+  tokens, so only a sign-up in the minutes of that deploy can add one, which
+  the ``hardening`` set's ``token-rows-by-purpose`` shows. A parent whose
+  link was deleted asks for a new one (Resend) once 1b is back, or the office
+  confirms the sign-up. Reports the count only.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -135,6 +163,10 @@ def handler(event=None, context=None) -> dict:
     action = (event or {}).get("action")
     if action == "gps-purge":
         return _gps_purge(event or {})
+    if action == "retention":
+        return _retention(context)
+    if action == "purge-verify-tokens":
+        return _purge_verify_tokens()
     if action is not None:
         return {"status": "error", "reason": f"unknown action {action!r}"}
     with psycopg.connect(_database_url(), autocommit=True) as conn:
@@ -366,7 +398,206 @@ def _gps_purge(event: dict) -> dict:
     }
 
 
-if __name__ == "__main__":  # local manual run against DATABASE_URL
-    import json
+# --- Before a rollback to Release 1a (hardening D52) ------------------------------
 
+# Verification tokens only: reset tokens are what 1a itself writes and reads.
+PURGE_VERIFY_TOKENS_SQL = "delete from password_reset_tokens where purpose = 'verify'"
+
+
+def _purge_verify_tokens() -> dict:
+    """Delete every email-verification token (see the module docstring)."""
+    with psycopg.connect(_database_url(), autocommit=True) as conn:
+        deleted = conn.execute(PURGE_VERIFY_TOKENS_SQL).rowcount
+    return {"status": "ok", "action": "purge-verify-tokens", "deleted": deleted}
+
+
+# --- The nightly retention job (hardening U12) -----------------------------------
+
+logger = logging.getLogger("saferide.retention")
+
+# Stop when less than this is left of the invocation (the function's timeout
+# is 600 s): the batch in hand finishes — four statements of at most 2 s —
+# and the row is closed well before Lambda would kill the run.
+RETENTION_BUDGET_FLOOR_MS = 30_000
+# The heartbeat alarm's metric (infra/backend/template.yaml, RetentionHeartbeat).
+RETENTION_METRIC_NAMESPACE = "SafeRide"
+RETENTION_METRIC_NAME = "RetentionRunSucceeded"
+
+
+class RetentionFailed(RuntimeError):
+    """Raised after the failed status is written. Its text names the run,
+    the step, the error class and SQL state only: a database error's own
+    message can quote a row, and Lambda prints the raised error's text."""
+
+
+def _time_left(context) -> bool:
+    """True while more than the floor remains. A manual run outside Lambda
+    (no context) has no budget."""
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is None:
+        return True
+    return remaining() > RETENTION_BUDGET_FLOOR_MS
+
+
+def _retention_steps(conn, counts: dict, context, progress: dict) -> bool:
+    """The cheap bounded deletes, before any trail batch. Each step loops
+    until a batch comes back short. Once the budget is gone every remaining
+    step still gets its one batch (bounded by the statement timeout), so one
+    table's backlog never starves the next. Returns True when the budget
+    stopped a loop."""
+    from app.dao import retention_dao
+
+    stopped = False
+    for key, delete_batch, batch_rows in retention_dao.STEPS:
+        progress["step"] = key
+        while True:
+            with conn.transaction():
+                retention_dao.set_statement_timeout(conn)
+                deleted = delete_batch(conn, batch_rows)
+            counts[key] += deleted
+            if deleted < batch_rows:
+                break
+            if stopped or not _time_left(context):
+                stopped = True
+                break
+    return stopped
+
+
+def _retention_trail(conn, counts: dict, context, progress: dict, locked: list[str]) -> bool:
+    """Every school through the bounded trail purge, oldest backlog first,
+    each until a batch leaves nothing past retention. A held purge lock (a
+    Start Run's pass) skips the school. Returns True when the budget stopped
+    the loop — after the batch in hand."""
+    from app.dao import retention_dao
+    from app.dao.position_dao import purge_batch
+
+    progress["step"] = "run_positions"
+    for index, school_id in enumerate(retention_dao.schools_oldest_trail_first(conn)):
+        if index and not _time_left(context):
+            return True
+        while True:
+            with conn.transaction():
+                outcome = purge_batch(conn, school_id)
+            if outcome is None:
+                counts["schools_locked"] += 1
+                locked.append(school_id)
+                break
+            counts["trail_batches"] += 1
+            counts["run_positions"] += outcome["trail_rows_deleted"]
+            counts["run_exceptions_nulled"] += outcome["exceptions_nulled"]
+            counts["run_exception_events_nulled"] += outcome["events_nulled"]
+            counts["driver_action_keys"] += outcome["keys_deleted"]
+            if (
+                outcome["trail_rows_deleted"] < outcome["batch_rows"]
+                and outcome["keys_deleted"] < outcome["batch_rows"]
+            ):
+                break
+            if not _time_left(context):
+                return True
+    return False
+
+
+def _record_failure(conn, run_id: int, counts: dict, failure: dict) -> None:
+    """Close the row ``failed`` — on the run's connection, or on a fresh one
+    when that connection died. Never raises: the caller raises the run's own
+    error either way."""
+    from app.dao import retention_dao
+
+    try:
+        if conn.closed or conn.broken:
+            with psycopg.connect(_database_url(), autocommit=True, row_factory=dict_row) as fresh:
+                retention_dao.close_run(fresh, run_id, "failed", {**counts, **failure})
+        else:
+            retention_dao.close_run(conn, run_id, "failed", {**counts, **failure})
+    except Exception as record_error:  # noqa: BLE001 — the run's error is what must surface
+        logger.error(
+            "retention-failure-unrecorded run_id=%s error=%s",
+            run_id, type(record_error).__name__,
+        )
+
+
+def retention_metric_document(run_id: int, status: str, counts: dict) -> dict:
+    """One CloudWatch embedded-metric-format document: the success count with
+    no dimensions (an empty dimension set), the counts beside it as plain
+    properties — searchable in Logs Insights, not billed as metrics."""
+    return {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": RETENTION_METRIC_NAMESPACE,
+                    "Dimensions": [[]],
+                    "Metrics": [{"Name": RETENTION_METRIC_NAME, "Unit": "Count"}],
+                }
+            ],
+        },
+        RETENTION_METRIC_NAME: 1,
+        "job": "retention",
+        "run_id": run_id,
+        "status": status,
+        "counts": counts,
+    }
+
+
+def _emit_retention_metric(run_id: int, status: str, counts: dict) -> None:
+    """Straight to stdout, one line. The function logs JSON through Lambda's
+    LoggingConfig, which wraps every ``logging`` record in its own object (the
+    document would arrive as a string inside ``message`` and CloudWatch would
+    extract nothing); stdout lines reach the log group as written, and a JSON
+    line without a ``level`` passes the INFO filter as INFO."""
+    print(
+        json.dumps(retention_metric_document(run_id, status, counts), separators=(",", ":")),
+        file=sys.stdout,
+        flush=True,
+    )
+
+
+def _retention(context=None) -> dict:
+    from app.core.request_context import database_fields, traceback_frames
+    from app.dao import retention_dao
+
+    counts = retention_dao.new_counts()
+    locked: list[str] = []
+    progress = {"step": "open"}
+    with psycopg.connect(_database_url(), autocommit=True, row_factory=dict_row) as conn:
+        run_id = retention_dao.open_run(conn)
+        try:
+            stopped = _retention_steps(conn, counts, context, progress)
+            if not stopped:
+                stopped = _retention_trail(conn, counts, context, progress, locked)
+            status = "stopped" if stopped else "ok"
+            progress["step"] = "close"
+            retention_dao.close_run(conn, run_id, status, counts)
+        except Exception as error:
+            fields = database_fields(error)
+            failure = {
+                "failed_step": progress["step"],
+                "error": type(error).__name__,
+                "sqlstate": fields["sqlstate"],
+            }
+            logger.error(
+                "retention-failed run_id=%s step=%s error=%s sqlstate=%s table=%s",
+                run_id, failure["failed_step"], failure["error"],
+                fields["sqlstate"] or "-", fields["table"] or "-",
+                extra={"traceback": traceback_frames(error)},
+            )
+            _record_failure(conn, run_id, counts, failure)
+            raise RetentionFailed(
+                f"retention run {run_id} failed at {failure['failed_step']}: "
+                f"{failure['error']} sqlstate={fields['sqlstate'] or '-'}"
+            ) from None
+
+    _emit_retention_metric(run_id, status, counts)
+    return {
+        "status": "ok",
+        "action": "retention",
+        "run_id": run_id,
+        "job_status": status,
+        "stopped": "budget" if status == "stopped" else "clean",
+        "locked_school_ids": locked,
+        "counts": counts,
+    }
+
+
+if __name__ == "__main__":  # local manual run against DATABASE_URL
     print(json.dumps(handler(), indent=2))

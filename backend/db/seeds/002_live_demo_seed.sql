@@ -6,9 +6,12 @@
 -- Test credentials (LOCAL DEV ONLY — rotate before any repo visibility change):
 --   admin@test.com     / test1234.   (role admin)
 --   and7005@gmail.com  / Test1234    (role parent)
---   and7005@yahoo.it   / Test1234    (role driver, PIN 1234)
+--   and7005@yahoo.it   / Test1234    (role driver)
 -- Password/PIN hashes below were generated with app.core.security helpers and
--- the local PIN_PEPPER 'saferide-local-pin-pepper'.
+-- the local PIN_PEPPER 'saferide-local-pin-pepper'. The driver PIN hashed here
+-- is not the one that signs in locally: seed 003 reloads the users, and after
+-- scripts/reset-local-db.sh this driver's PIN is 0322 at Greenfield Academy,
+-- driver code GFA0-7K1Q (the e2e fixture DRIVER in frontend/tests/e2e/helpers.ts).
 
 -- DEMO SEED — LOCAL DEV ONLY. Guarded so it can never run against a database
 -- unless the session explicitly opts in (the local scripts do this for you):
@@ -42,11 +45,14 @@ on conflict (user_id) do update set role = excluded.role;
 
 -- School -------------------------------------------------------------------
 
-insert into live_schools (id, name, address, phone, lat, lng) values
-  ('5cae0000-0000-0000-0000-000000000001', 'Greenfield Academy', 'Ngong Road, Nairobi', '+254709000000', -1.300100, 36.760800)
+-- A fixed driver code (hardening U10, D2: Crockford base32, stored without
+-- the hyphen, shown GFA0-7K1Q) so the local sign-in link and the e2e
+-- fixtures are stable. Seed 003 sets the same code after its reload.
+insert into live_schools (id, name, address, phone, lat, lng, driver_code) values
+  ('5cae0000-0000-0000-0000-000000000001', 'Greenfield Academy', 'Ngong Road, Nairobi', '+254709000000', -1.300100, 36.760800, 'GFA07K1Q')
 on conflict (id) do update set
   name = excluded.name, address = excluded.address, phone = excluded.phone,
-  lat = excluded.lat, lng = excluded.lng;
+  lat = excluded.lat, lng = excluded.lng, driver_code = excluded.driver_code;
 
 -- Buses (bus 6 is the dedicated always-parked fleet-map bus with GPS) -------
 

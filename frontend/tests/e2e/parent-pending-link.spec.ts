@@ -8,6 +8,7 @@ import {
   authHeaders,
   schoolHeaders,
   signInAs,
+  signUpVerifiedParent,
   uniqueName,
 } from "./helpers";
 
@@ -74,19 +75,16 @@ async function clearMismatchAlerts(request: APIRequestContext): Promise<void> {
 }
 
 test.beforeAll(async ({ request }) => {
-  // The fresh parent account (parent is the only self-service role, U13).
-  const signup = await request.post(`${API_URL}/api/auth/signup`, {
-    data: {
-      email: parentEmail,
-      password: parentPassword,
-      full_name: "E2E Pending Parent",
-      role: "parent",
-    },
+  // The fresh parent account (parent is the only self-service role, U13),
+  // verified from its own session (Release 1b) so the office's later student
+  // entry offers it a card.
+  const { token } = await signUpVerifiedParent(request, {
+    email: parentEmail,
+    password: parentPassword,
+    fullName: "E2E Pending Parent",
   });
-  expect(signup.ok()).toBeTruthy();
-  // No student carries this email yet, so signup auto-linking finds nothing:
-  // the account starts with zero links by construction.
-  const token = (await signup.json()).token as string;
+  // No student carries this email yet, so the sign-up matching run at
+  // verification finds nothing: the account starts with zero links.
   const children = await request.get(`${API_URL}/api/parent-portal/children`, {
     headers: authHeaders(token),
   });

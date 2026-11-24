@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext, type BrowserContext, type Page } 
 import {
   ADMIN,
   API_URL,
+  DRIVER,
   SCHOOL_A_ID,
   SEED,
   apiDriverToken,
@@ -293,7 +294,9 @@ test("R28: a second sign-in that taps takes the run's pings with it; this app's 
   // The same PIN on another phone taps Arrive: the server re-binds the run
   // to that session (U7), so this app's next batch is refused.
   const { active_run: run } = await driverContext(request);
-  const other = await request.post(`${API_URL}/api/auth/pin-login`, { data: { pin: "0322" } });
+  const other = await request.post(`${API_URL}/api/auth/pin-login`, {
+    data: { pin: DRIVER.pin, schoolId: DRIVER.schoolId },
+  });
   expect(other.ok()).toBeTruthy();
   const otherToken = (await other.json()).token;
   const arrived = await request.post(`${API_URL}/api/runs/driver/arrive`, {

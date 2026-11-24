@@ -11,15 +11,42 @@ Your school registers your child in SafeRide and records your **name, phone numb
 1. Open `https://saferidelive.co.ke/auth` in your phone's browser.
 2. Tap **Sign up** at the bottom of the card.
 3. Fill in your **full name**, your **email — it must be exactly the email you gave the school** — and a password (at least 6 characters). Signing up always creates a **parent** account — school staff and drivers get their accounts from their school, so there is no role to choose.
-4. Submit. You are signed in immediately. If your email is on file at **one school**, every child there whose record carries it is linked to your account automatically. If it is on file at **more than one school**, nothing links by itself — each school appears as a card asking to connect, and you approve them one by one (see [A school wants to connect](#a-school-wants-to-connect) below).
+4. Tap **Create Account**. The card changes to **"Check your email"**, showing the address you typed. Nothing is linked yet: SafeRide first checks that the address is really yours.
+5. Tap **Sign in** (your email is already filled in) and sign in with the password you just chose. Home shows a **"Verify your email"** card: *"Check your email to finish sign-up. We sent a link to …"*.
+6. Open the email **"Confirm your email for SafeRide"** and tap its link. The link works **once** and lasts **24 hours**. If the email opens in a different browser where you are not signed in, the page says **"Sign in to finish verifying your email"** — sign in there with the same email and password. When it says *"Email verified. You can close this page and open SafeRide — your children will appear on Home"*, go back to SafeRide: the card disappears by itself (no reload needed).
+7. Your children appear. If your email is on file at **one school**, every child there whose record carries it is linked to your account automatically. If it is on file at **more than one school**, nothing links by itself — each school appears as a card asking to connect, and you approve them one by one (see [A school wants to connect](#a-school-wants-to-connect) below).
 
-If the Home screen says **"No children are linked to your account yet."**, the email you signed up with does not match what the school has on file. Contact the school office to add or correct your email on the child's record.
+The verification link only works for the account it was sent to, and only while that account is signed in. If the page says **"This link is for a different account"** — *"Sign out, then sign in with the account the email was sent to."* — tap **Sign out** and do just that.
 
-Up to **two parents** can have accounts linked to each child — the school records a "Parent 1" and an optional "Parent 2". Both receive the same notifications.
+**No email?** On the **Verify your email** card tap **Resend link**. It reads *"Sent. Check spam; the link lasts 24 hours"* — and only the newest link works, so use the latest email. If you tap again too soon it says **"Try again in a minute"**. A link that has expired or was already used shows **"Verification link expired or used"** — *"Verification links work once and last 24 hours. Your newest link is the one that works."* — with a **Send a new link** button.
+
+**Typed the wrong email?** The link went to someone else's inbox, and the school cannot match it either. The card says *"Wrong address? Sign out and sign up again with the email your school has."* — tap **Sign out** on the card and create your account again with the email your school holds.
+
+**When the office changes your email:** if the school corrects the email on your account, you are signed out on every device and push notifications stop. Sign in with the new address: your children are still there, and the **Verify your email** card asks you to confirm the new address from the email sent to it. The old address receives a short notice that the change was made.
+
+If the Home screen says **"No children are linked to your account yet."** (and no **Verify your email** card is showing), the email you signed up with does not match what the school has on file. Contact the school office to add or correct your email on the child's record.
+
+Up to **two parents** can have accounts linked to each child — the school records a "Parent 1" and an optional "Parent 2". Both receive the same notifications, and each confirms their own email.
 
 **One account is all you need**, even with children at different schools: once each school's link is in place, all your children appear side by side on Home, each with their own bus, stop and alerts.
 
-**Signing in later:** use the **Email & Password** tab (ignore the **Driver PIN** tab — that is for drivers). If you forget your password, tap **"Forgot password?"** and follow the emailed link. Reset links work **once** and expire quickly, so use the newest email if you request more than one.
+**Signing in later:** use the **Email & Password** tab (ignore the **Driver PIN** tab — that is for drivers).
+
+**Forgot your password?** Tap **"Forgot password?"**, type your email and tap **Send Reset Link**. The card then reads: *"If an account exists for {your email}, a reset link is on its way. It works once and lasts 30 minutes. Nothing after a few minutes? Check spam, or ask your school office to reset your password."* The email is **"Reset your SafeRide password"**. Open its link, choose a new password, and you are signed in straight away (the link also confirms your email if it wasn't confirmed yet). Every other phone or browser signed in to your account is signed out and stops receiving your notifications — on your own phone, notifications come back as soon as you sign in again there (if you had them switched on). If the link is too old or was already used, the page says **"Reset link invalid"** — *"Reset links work once and expire after 30 minutes. Request a new one, or ask your school office to reset your password."* — tap **Request a new reset link**.
+
+If you try to sign up with an email that already has an account, no second account is created. The card reads the same as for a new account, with the note *"Already had an account with this address? The email explains how to get back in."*: the email **"You already have a SafeRide account"** explains it and carries a link to choose a new password.
+
+**When email isn't switched on yet:** until SafeRide's email sending is switched on, no screen says an email was sent:
+
+- **Forgot password?** shows **"Email recovery is off"** — *"Email recovery isn't switched on yet. Ask your school office to reset your password."*
+- After **Create Account**, the card reads **"Sign-up received"** — *"Email isn't switched on yet, so no link was sent. Sign in, then ask your school office to confirm your sign-up."*
+- The **Verify your email** card reads *"Ask your school office to confirm your sign-up."* (there is no **Resend link** then).
+
+The school office can confirm your sign-up and reset your password for you (see the next two paragraphs).
+
+**When the school office resets your password:** call the office. They read you a **temporary password** of 16 letters and numbers, in groups of four. The spaces are only there to help reading it out: type it with or without them, in capitals or not. Sign in with your email and that temporary password; SafeRide shows *"Your temporary password must be changed before you can continue."* — choose your own password there and you carry on to Home. The temporary password stops working after **72 hours** if you don't use it (ask the office for a new one), and once you've chosen your own. Every phone and browser signed in to your account is signed out, and notifications on your phone stop until you sign in there again. You also receive an email, **"Your SafeRide password was reset by your school"**; it never contains the password.
+
+**When the office confirms your sign-up:** if you signed up but can't open the confirmation email, the office can confirm it for you after speaking to you. They give you a temporary password the same way — the password you chose at sign-up stops working — and your children appear on Home once you've signed in and chosen your own password.
 
 You stay signed in on your phone until you sign out. On a **shared or borrowed phone, always sign out** (Profile → **Sign Out**) — this also stops that device from receiving your family's notifications.
 
@@ -138,6 +165,7 @@ Tapping a push notification opens the Alerts tab.
 - **Recent** shows the last 24 hours; **History** shows the 6 days before that.
 - Filter by period (**All / Morning / Afternoon**) or by type.
 - Unread alerts are highlighted; opening the tab marks them read. Alerts can't be deleted — they age out of History after 7 days.
+- SafeRide keeps 90 days of alert history and deletes older alerts automatically. The Alerts tab only ever shows the last 7 days.
 
 ## Cancelling a ride
 
@@ -157,20 +185,29 @@ A few rules apply, and the app explains each one when it stops you:
 
 ## Profile
 
-The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. With children at more than one school, each child's details are managed by **that child's** school. The only controls here are the push notifications switch and **Sign Out**.
+The Profile tab shows your name, email and phone, and a card for each linked child. These details are **managed by the school** — if anything is wrong (name, phone, address, bus), ask the office to update it. With children at more than one school, each child's details are managed by **that child's** school. The only controls here are the push notifications switch, **Change password** and **Sign Out**.
+
+**Changing your password:** tap **Change password**, type your current password, then the new one twice. The dialog says *"You'll stay signed in here. Other devices will be signed out."*: this phone stays signed in (and keeps its notifications); any other phone or browser signed in to your account has to sign in again. When it's done you see **"Password changed"**.
 
 ## Quick fixes
 
 | Problem | What to do |
 | --- | --- |
-| "No children are linked to your account yet." | Your sign-up email doesn't match the school's records. Ask the office to correct the email on the child's profile. |
+| A **Verify your email** card on Home | Your sign-up isn't finished: open the link in the email "Confirm your email for SafeRide" (check spam), or tap **Resend link**. Signed up with the wrong address? Sign out and sign up again with the email your school has. |
+| "No children are linked to your account yet." (no verify card) | Your sign-up email doesn't match the school's records. Ask the office to correct the email on the child's profile. |
+| "This link is for a different account" | You are signed in as someone else in this browser. Tap **Sign out**, then sign in with the account the email was sent to. |
+| "Verification link expired or used" | Tap **Send a new link** and use the newest email. Links last 24 hours. |
+| "Email recovery isn't switched on yet." | Email sending isn't live yet. Ask your school office to reset your password or confirm your sign-up. |
+| "Sign-up received" — no link was sent | Email sending isn't live yet. Sign in with the password you chose, then ask your school office to confirm your sign-up: they give you a temporary password, and your children appear once you've chosen your own. |
 | A card from a school you don't recognise | Tap **"Not my child"**. Nothing about any child was shown to you, and the school is told to re-check the email it entered. |
 | You declined a school's card by mistake | Ask that school's office to re-enter your email on the child's record — a fresh card will appear for you to accept. |
 | A child at a second school isn't showing | Check Home for a pending card from that school and accept it. No card? Ask that school's office to check the email on the child's record. |
 | No push notifications arriving | Check Profile → the button should read "Disable Push Notifications" (meaning push is on). On iPhone, make sure you opened the app from the home-screen icon. Check the phone's notification settings for your browser. |
-| Password reset link says "Reset link invalid" | Links are single-use and expire quickly. Tap "Request a new reset link" and use the newest email. |
+| The office's temporary password doesn't work | It lasts 72 hours, and only the newest one works. Ask the office to reset it again. |
+| Password reset link says "Reset link invalid" | Reset links work once and expire after 30 minutes. Tap "Request a new reset link" and use the newest email, or ask your school office to reset your password. |
 | The arrival estimate seems off | It's approximate. Rely on the Track tab's stop progress and the "Bus approaching" alert. |
 | The bus marker is faded and says "last seen …" | The driver's phone is not sending right now — usually its screen is off or the app is in the background, sometimes no signal. The bus is still running. It freshens as soon as the phone is back on the app or at the driver's next tap. If it stays that way, call the office. |
 | You received "Call the office now" | If your child should be on the bus, call the school office straight away. See [If you receive "Call the office now"](#if-you-receive-call-the-office-now). |
 | "Too many cancellation changes." | There's an hourly limit on cancelling/withdrawing. Wait a while, or call the office. |
 | Wrong phone, address or stop shown | Contact the school office — parents can't edit these in the app. |
+| An error message ending "(Reference: …)" | Something went wrong on SafeRide's side, not yours. Try once more; if it happens again, take a screenshot (the message disappears after a few seconds) and send it to the school office with the time, quoting the Reference. |

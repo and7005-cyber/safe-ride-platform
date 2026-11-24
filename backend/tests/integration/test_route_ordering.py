@@ -39,7 +39,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_run
+from conftest import purge_run, driver_pin, pin_login_body
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -1111,12 +1111,11 @@ def test_started_run_keeps_its_snapshot_through_a_recalc(
     """R12: a run started before a reassignment operates on its own run_stops
     snapshot — a geometry recalculation that reorders the live route stops
     must not touch it. Throwaway driver+bus (known PIN), everything deleted."""
-    import random
 
     marker = uuid.uuid4().hex[:6]
     driver = None
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT RO Driver {marker}",
@@ -1149,7 +1148,9 @@ def test_started_run_keeps_its_snapshot_through_a_recalc(
                 _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
             ))
 
-        pin_login = client.post("/api/auth/pin-login", json={"pin": driver["pin"]})
+        pin_login = client.post(
+            "/api/auth/pin-login", json=pin_login_body(driver["pin"], school["id"])
+        )
         assert pin_login.status_code == 200, pin_login.text
         driver_headers = {"Authorization": f"Bearer {pin_login.json()['token']}"}
 
@@ -1700,12 +1701,11 @@ def test_custom_to_auto_handover_lands_in_auto_and_recalculates_immediately(
 def test_started_run_keeps_its_snapshot_through_a_manual_reorder(client, admin_headers):
     """R12 (manual half): a run started before the admin reorders operates on
     its own run_stops snapshot — the reorder rewrites the live stops only."""
-    import random
 
     marker = uuid.uuid4().hex[:6]
     driver = None
     for _ in range(5):
-        pin = str(random.randint(100000, 999999))
+        pin = driver_pin()
         response = client.post(
             "/api/accounts/drivers",
             json={"full_name": f"IT RO Driver M {marker}",
@@ -1738,7 +1738,9 @@ def test_started_run_keeps_its_snapshot_through_a_manual_reorder(client, admin_h
                 _student_payload(marker, letter, pickup, lat, lng), [route["id"]],
             ))
 
-        pin_login = client.post("/api/auth/pin-login", json={"pin": driver["pin"]})
+        pin_login = client.post(
+            "/api/auth/pin-login", json=pin_login_body(driver["pin"], school["id"])
+        )
         assert pin_login.status_code == 200, pin_login.text
         driver_headers = {"Authorization": f"Bearer {pin_login.json()['token']}"}
 

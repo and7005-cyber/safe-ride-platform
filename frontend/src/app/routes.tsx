@@ -4,6 +4,7 @@ import { AdminLayout } from "@/app/layouts/AdminLayout";
 import { ProtectedRoute } from "@/features/auth/ProtectedRoute";
 import { AuthPage } from "@/features/auth/AuthPage";
 import { ResetPasswordPage } from "@/features/auth/ResetPasswordPage";
+import { VerifyEmailPage } from "@/features/auth/VerifyEmailPage";
 import { DashboardPage } from "@/features/admin/DashboardPage";
 import { FleetMapPage } from "@/features/admin/FleetMapPage";
 import { BusesPage } from "@/features/admin/BusesPage";
@@ -60,6 +61,9 @@ function provider(node: ReactNode) {
 export const router = createBrowserRouter([
   { path: "/auth", element: <AuthPage /> },
   { path: "/reset-password", element: <ResetPasswordPage /> },
+  // Public (hardening U8): the page signs the parent in itself when needed;
+  // the server verifies only from the token owner's own session.
+  { path: "/verify-email", element: <VerifyEmailPage /> },
 
   { path: "/", element: admin(<DashboardPage />) },
   { path: "/fleet-map", element: admin(<FleetMapPage />) },

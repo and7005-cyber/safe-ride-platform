@@ -6,6 +6,7 @@ from app.core.scope import SchoolScope
 from app.dao.audit_dao import record_audit
 from app.dao.fleet_dao import regenerate_route_stops
 from app.dao.status_sql import display_status_case
+from app.dao.verification_sql import verified_sql
 
 STUDENT_COLUMNS = (
     "name", "grade", "parent_name", "parent_phone", "parent_phone2", "parent_email",
@@ -30,11 +31,15 @@ class _ConnParentLinks:
     def parent_account_id(self, email: str) -> Any | None:
         # An ELIGIBLE parent account only (U8): provider identities and
         # disabled accounts must never be auto-linked as parents, whatever
-        # email a student's slot carries.
+        # email a student's slot carries — and (hardening U8) neither is an
+        # account still waiting for its verification click: the office
+        # typing a slot email must not hand a child to whoever signed up with
+        # it first. Verifying runs the sign-up matching, which links it then.
         row = self._conn.execute(
             "select u.id from app_users u join app_user_roles r on r.user_id = u.id "
             "where lower(u.email) = lower(%s) and r.role = 'parent' "
             "and u.disabled_at is null "
+            f"and {verified_sql('u')} "
             "and not exists (select 1 from provider_accounts p "
             "                where p.user_id = u.id and p.removed_at is null)",
             (email,),

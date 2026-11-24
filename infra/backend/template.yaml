@@ -273,7 +273,12 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Whether the API sends mail through SES; false until Release 1b's sender ships.
+    Description: >
+      The operator's mail switch (MAIL_ENABLED). true: the API sends reset,
+      verification and notice mail through SES and the screens offer email
+      recovery. false: nothing is sent and the screens send people to their
+      school office. Keep false while SES is in the sandbox, except for a
+      drill to verified addresses.
 
 Conditions:
   HasApiCert: !Not [!Equals [!Ref ApiCertificateArn, ""]]
@@ -671,8 +676,18 @@ Resources:
     Properties:
       CodeUri: ../../backend
       Handler: app.migrate_handler.handler
-      Timeout: 120
+      # Ten minutes for the nightly retention job (hardening U12), which
+      # stops itself with 30 s left; the deploy's synchronous migrate invoke
+      # already waits without a client timeout (--cli-read-timeout 0).
+      Timeout: 600
       MemorySize: 256
+      # The Scheduler invokes asynchronously. Lambda would retry a failed
+      # async run twice, on top of a run that may have half-finished; the
+      # errors alarm reports the failure and the next night runs anyway. The
+      # schedule keeps its own retries for an invoke that never started.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 3600
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: INFO
@@ -738,6 +753,56 @@ Resources:
           # same default the API and the purge resolve (GPS plan U11).
           GPS_POSITION_RETENTION_DAYS: !Ref GpsPositionRetentionDays
 
+  # ------------------------------------------------- Nightly retention (U12)
+  # EventBridge Scheduler invokes the migrate function with
+  # {"action": "retention"} at 01:30 Nairobi time (no daylight saving), in its
+  # own schedule group so the target-error alarm counts this schedule only.
+  # Two retries for an invoke that fails to start (a throttle, a permission
+  # error); a run that starts and fails is the function's errors alarm, and
+  # silence is the heartbeat's.
+  OpsScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+
+  RetentionSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-migrate-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt MigrateFunction.Arn
+
+  RetentionSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Nightly retention deletes and position-trail purge (hardening U12).
+      GroupName: !Ref OpsScheduleGroup
+      ScheduleExpression: cron(30 1 * * ? *)
+      ScheduleExpressionTimezone: Africa/Nairobi
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt MigrateFunction.Arn
+        RoleArn: !GetAtt RetentionSchedulerRole.Arn
+        Input: '{"action": "retention"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
   # ---------------------------------------------------- Custom domain (gated)
   ApiDomain:
     Type: AWS::ApiGatewayV2::DomainName
@@ -776,8 +841,10 @@ Resources:
   # rates: with under a hundred requests on most days, one 5xx is an event.
   # Missing data is not breaching, so quiet days (December) stay OK; a dead
   # stack is reported by the external probes (frontend stack), not here. The
-  # retention heartbeat and the metric-filter alarms ship in Release 1b with
-  # the metrics that feed them.
+  # one exception is the retention heartbeat (Release 1b): there, silence is
+  # the failure. Release 1b's metric filters read the API's JSON log lines
+  # (the formatted text is in `message`, the logger name in `logger`) into
+  # counts in the SafeRide namespace.
   OpsTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -870,19 +937,36 @@ Resources:
       OKActions:
         - !Ref OpsTopic
 
+  # Counts the app's own 4xx answers except 404 (the user's decision,
+  # 2026-11-23): bots scanning for /.env and /.git fired the gateway's 4xx
+  # count twice in the first week, every request a 404. Mangum logs one
+  # access line per request, `<METHOD> <path> <status>`, with the status
+  # last; the regex anchors on it (CloudWatch regex has no parentheses, so
+  # the two alternatives spell "4xx but not 404"). Gateway-made 4xx (a route
+  # throttle's 429) never reach the function and are not counted; the
+  # pin-failure and pin-locked filters below watch sign-in abuse.
+  ApiClientErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ ($.logger = "mangum.http") && ($.message = %\s40[0-35-9]$|\s4[1-9]\d$%) }'
+      MetricTransformations:
+        - MetricNamespace: SafeRide
+          MetricName: ApiClientErrorsNon404
+          MetricValue: "1"
+          Unit: Count
+
   ApiClientErrorsBurst:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmDescription: >-
-        The API answered fifty or more 4xx in five minutes (a broken client
-        release, a looping phone or someone probing sign-in); first, read
-        /saferide/api around that time for the paths and whether one client
-        repeats.
-      Namespace: AWS/ApiGateway
-      MetricName: 4xx
-      Dimensions:
-        - Name: ApiId
-          Value: !Ref HttpApi
+        The API answered fifty or more 4xx other than 404 in five minutes (a
+        broken client release, a looping phone or someone probing sign-in);
+        404s from bots scanning for files and 429s made by the gateway's
+        throttle are not counted; first, read /saferide/api for the paths
+        and whether one client repeats.
+      Namespace: SafeRide
+      MetricName: ApiClientErrorsNon404
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -974,9 +1058,11 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmDescription: >-
-        The migrate function failed (a migration or an on-demand action
-        raised), and the live API may depend on what did not apply; first,
-        read /saferide/migrate and re-run the migrate step once the cause is
+        The migrate function failed (a migration, the nightly retention run
+        or an on-demand action raised, or it timed out), and the live API may
+        depend on what did not apply; first, read /saferide/migrate (a
+        retention failure logs retention-failed with the step) and re-run the
+        migrate step, or invoke the retention action, once the cause is
         fixed.
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -1136,6 +1222,215 @@ Resources:
       DatapointsToAlarm: 1
       Threshold: 20
       ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # ------------------------------------------- Release 1b: retention (U12)
+  # The retention action prints one embedded-metric-format line per finished
+  # or budget-stopped run: SafeRide / RetentionRunSucceeded = 1, no
+  # dimensions. Missing data is BREACHING here: 26 empty hourly periods in a
+  # row mean no success for 26 hours (a nightly run plus two hours of slack).
+  # It is in ALARM from the deploy that creates it until the first run.
+  RetentionHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        No nightly retention run has reported success for 26 hours: the 01:30
+        EAT job was not started or did not finish (a run that raises also
+        trips MigrateFunctionErrors, but zero Lambda errors is not proof that
+        it ran). It fires about 26 hours after the last good run, the morning
+        after the first missed night, and it is in ALARM from the deploy that
+        creates it until the first run, invoked by hand at the release;
+        first, read last-retention-run in verify-db.sh hardening and
+        /saferide/migrate, check RetentionScheduleTargetErrors and that the
+        schedule is enabled, then invoke the retention action by hand.
+      Namespace: SafeRide
+      MetricName: RetentionRunSucceeded
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 26
+      DatapointsToAlarm: 26
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  RetentionScheduleTargetErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        EventBridge Scheduler could not start the nightly retention run: the
+        invoke of the migrate function failed (its role, a throttle, a
+        missing function), and the schedule retries twice within the hour;
+        first, read the schedule's target and role in the Scheduler console
+        and the migrate function's state, then invoke the retention action by
+        hand.
+      Namespace: AWS/Scheduler
+      MetricName: TargetErrorCount
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: !Ref OpsScheduleGroup
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # ----------------------------------- Release 1b: API log metric filters (U12)
+  # Each filter counts one of the app's own log lines in /saferide/api. The
+  # runtime's JSON record carries the formatted text in `message` and the
+  # logger name in `logger` (backend/tests/lambda_json_log.py); a quoted
+  # value with `*` is a whole-value wildcard match. The patterns are checked
+  # against lines the code really emits (tests/core/test_metric_filters.py);
+  # run `aws logs test-metric-filter` with the same sample lines before the
+  # deploy (infra/README.md, "Alarms").
+  MailSendFailedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ ($.logger = "saferide.mail") && ($.message = "mail-send-failed kind=*") }'
+      MetricTransformations:
+        - MetricNamespace: SafeRide
+          MetricName: MailSendFailed
+          MetricValue: "1"
+          Unit: Count
+
+  MailSendFailed:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A reset, verification or notice mail failed to send at least once in
+        five minutes; the request still answered its neutral message, so
+        someone is waiting for a mail that will not come; first, read the
+        mail-send-failed lines in /saferide/api for the kind and the SES
+        error code (sandbox, paused sending, throttling) and send affected
+        parents to the office reset meanwhile.
+      Namespace: SafeRide
+      MetricName: MailSendFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  # Every failed PIN at a known school, and at an unknown or malformed school
+  # id (school=unknown), from every phone: the per-school aggregate across
+  # sources (D3), summed over the schools.
+  PinFailureFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ ($.logger = "saferide.auth") && ($.message = "pin-failure school=*") }'
+      MetricTransformations:
+        - MetricNamespace: SafeRide
+          MetricName: PinFailures
+          MetricValue: "1"
+          Unit: Count
+
+  PinFailureBurst:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Thirty or more driver PIN sign-ins failed in five minutes across the
+        schools and their phones: someone guessing PINs, or phones holding an
+        old PIN after a re-issue; first, read the pin-failure lines in
+        /saferide/api for the school codes (unknown is a school id that does
+        not exist) and call the office of the school that repeats.
+      Namespace: SafeRide
+      MetricName: PinFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 30
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  PinLockedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ ($.logger = "saferide.auth") && ($.message = "pin-locked school=*") }'
+      MetricTransformations:
+        - MetricNamespace: SafeRide
+          MetricName: PinLocked
+          MetricValue: "1"
+          Unit: Count
+
+  PinLocked:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A phone was refused PIN sign-in because its school's lock held: more
+        than twenty failures from that source in fifteen minutes. Signed-in
+        drivers are unaffected and the lock lifts by itself as those failures
+        leave the window (the phone counts down); first, read the pin-locked
+        lines in /saferide/api for the school code and call that office to
+        learn whether a driver is stuck or someone is guessing.
+      Namespace: SafeRide
+      MetricName: PinLocked
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      OKActions:
+        - !Ref OpsTopic
+
+  SchoolRequiredFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ ($.logger = "saferide.auth") && ($.message = "school-required") }'
+      MetricTransformations:
+        - MetricNamespace: SafeRide
+          MetricName: SchoolRequired
+          MetricValue: "1"
+          Unit: Count
+
+  SchoolRequiredBurst:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Twenty or more PIN sign-ins in five minutes came from phones with no
+        school set: driver phones not yet set up with the driver code (every
+        phone needs it once after Release 1b), or an old app still cached;
+        first, have the offices give their drivers the driver code from the
+        Drivers page and check that phones load the current app.
+      Namespace: SafeRide
+      MetricName: SchoolRequired
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions:
         - !Ref OpsTopic

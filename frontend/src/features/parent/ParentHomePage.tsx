@@ -17,16 +17,22 @@ import { useToast } from "@/components/ui/use-toast";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { RoleMobileLayout } from "@/app/layouts/RoleMobileLayout";
 import { cn } from "@/lib/utils";
-import { api } from "@/lib/apiClient";
+import { ApiError, api } from "@/lib/apiClient";
+import { useAuth } from "@/lib/auth";
+import { useMailEnabled } from "@/lib/publicConfig";
+import { EMAIL_VERIFIED_TOAST } from "@/features/auth/authCopy";
 import {
   PARENT_NAV,
   useAnswerPendingLink,
   useChildren,
   usePendingLinks,
+  useResendVerification,
+  useVerificationWatch,
   type CancelScope,
   type ChildCancellation,
   type PendingLink,
 } from "@/features/parent/parentHooks";
+import { VerifyEmailCard, type ResendState } from "@/features/parent/VerifyEmailCard";
 import {
   PARENT_STUDENT_STATUS_LABEL,
   PARENT_STUDENT_STATUS_NOTE,
@@ -176,6 +182,28 @@ export function ParentHomePage() {
   const { data: pendingLinks = [] } = usePendingLinks();
   const answerLink = useAnswerPendingLink();
   const [pendingBusy, setPendingBusy] = useState(false);
+  // Hardening U8 (DL9): the verify card replaces the empty state while the
+  // address is unverified; the watch polls /me and flips it in place.
+  const { user, signOut } = useAuth();
+  const mailEnabled = useMailEnabled();
+  const { unverified, justVerified } = useVerificationWatch();
+  const resendVerification = useResendVerification();
+  const [resendState, setResendState] = useState<ResendState>("idle");
+
+  const resend = async () => {
+    setResendState("sending");
+    try {
+      await resendVerification.mutateAsync();
+      setResendState("sent");
+    } catch (err) {
+      setResendState(err instanceof ApiError && err.status === 429 ? "cooldown" : "error");
+    }
+  };
+
+  const signOutToSignUp = async () => {
+    await signOut();
+    navigate("/auth");
+  };
 
   const acceptLink = async (link: PendingLink) => {
     setPendingBusy(true);
@@ -299,6 +327,22 @@ export function ParentHomePage() {
           <p className="text-sm text-muted-foreground">Today's bus status at a glance</p>
         </div>
 
+        {/* The verify card (DL9) inside a polite live region (DL17): the flip
+            to verified is announced, not only drawn. */}
+        <div aria-live="polite" data-testid="verify-region">
+          {unverified ? (
+            <VerifyEmailCard
+              email={user?.email ?? ""}
+              mailEnabled={mailEnabled}
+              resendState={resendState}
+              onResend={() => void resend()}
+              onSignOut={() => void signOutToSignUp()}
+            />
+          ) : justVerified ? (
+            <p className="sr-only">{EMAIL_VERIFIED_TOAST}</p>
+          ) : null}
+        </div>
+
         {/* Pending link cards (U13/AE22): the school and a claim count only —
             no child details exist here until the parent accepts. */}
         {pendingLinks.map((link) => (
@@ -349,7 +393,9 @@ export function ParentHomePage() {
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : children.length === 0 ? (
-          <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No children are linked to your account yet.</CardContent></Card>
+          unverified ? null : (
+            <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No children are linked to your account yet.</CardContent></Card>
+          )
         ) : (
           <>
             {children.map((child: any) => {

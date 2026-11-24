@@ -28,7 +28,11 @@ import { PageHeader } from "@/features/admin/components/PageHeader";
 import { api } from "@/lib/apiClient";
 import { useIsDirector } from "@/lib/auth";
 import { emailError, phoneError } from "@/lib/validation";
-import { useDrivers, useSchoolKey } from "@/lib/queries";
+import { useDrivers, useSchoolKey, useSchoolSettings } from "@/lib/queries";
+import { formatDriverCode } from "@/lib/driverSchool";
+import { PIN_LENGTH, generatePin as generateNewPin, newPinProblem } from "@/lib/driverPin";
+import { DriverCodeCard } from "@/features/admin/components/DriverCodeCard";
+import { pinRevealCodeLine } from "@/features/admin/driverCodeCopy";
 
 const EMPTY = { full_name: "", email: "", password: "", phone: "", pin: "" };
 
@@ -39,6 +43,9 @@ export function DriversPage() {
   const { toast } = useToast();
   const confirm = useConfirm();
   const { data: drivers = [] } = useDrivers();
+  // Hardening U10: the school's driver code (the settings row carries it).
+  const { data: school } = useSchoolSettings();
+  const driverCode = school?.driver_code ? formatDriverCode(school.driver_code) : null;
   const [open, setOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY });
@@ -64,11 +71,9 @@ export function DriversPage() {
     setOpen(true);
   };
 
-  const generatePin = () => {
-    let p = "";
-    for (let i = 0; i < 4; i++) p += Math.floor(Math.random() * 10);
-    setForm({ ...form, pin: p });
-  };
+  // DL8: six digits from the browser's cryptographic generator, drawn again
+  // until the same rules the server applies accept them.
+  const generatePin = () => setForm({ ...form, pin: generateNewPin() });
 
   const save = async () => {
     setSaving(true);
@@ -111,6 +116,9 @@ export function DriversPage() {
 
   const emailErr = emailError(form.email, true);
   const phoneErr = phoneError(form.phone);
+  // DL8: a new or re-issued PIN is six digits and not an easy guess; blank
+  // means "no PIN yet" on create and "keep the current PIN" on edit.
+  const pinErr = newPinProblem(form.pin);
 
   return (
     <div className="space-y-6">
@@ -119,6 +127,8 @@ export function DriversPage() {
         subtitle={`${drivers.length} driver${drivers.length === 1 ? "" : "s"}`}
         action={<Button onClick={startCreate}><Plus className="h-4 w-4" /> Add Driver</Button>}
       />
+
+      <DriverCodeCard school={school} isDirector={isDirector} />
 
       <Card>
         <Table>
@@ -184,9 +194,18 @@ export function DriversPage() {
                 {editId && <span className="ml-1 text-xs text-muted-foreground">(leave blank to keep the current PIN)</span>}
               </Label>
               <div className="flex gap-2">
-                <Input inputMode="numeric" maxLength={4} placeholder="4 digits" value={form.pin} onChange={(e) => setForm({ ...form, pin: e.target.value.replace(/\D/g, "").slice(0, 4) })} />
+                <Input
+                  inputMode="numeric"
+                  maxLength={PIN_LENGTH}
+                  placeholder="6 digits"
+                  aria-label={editId ? "Reset PIN" : "Driver PIN"}
+                  aria-invalid={pinErr ? true : undefined}
+                  value={form.pin}
+                  onChange={(e) => setForm({ ...form, pin: e.target.value.replace(/\D/g, "").slice(0, PIN_LENGTH) })}
+                />
                 <Button type="button" variant="outline" onClick={generatePin}>Generate</Button>
               </div>
+              {pinErr && <p className="text-xs text-destructive" data-testid="pin-error">{pinErr}</p>}
               <p className="text-xs text-muted-foreground">
                 You'll see the PIN once after saving — it's stored encrypted and can't be shown again.
               </p>
@@ -194,7 +213,7 @@ export function DriversPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={save} disabled={saving || !form.full_name || !!emailErr || !!phoneErr || (!editId && form.password.length < 6)}>
+            <Button onClick={save} disabled={saving || !form.full_name || !!emailErr || !!phoneErr || !!pinErr || (!editId && form.password.length < 6)}>
               {saving ? "Saving…" : "Save"}
             </Button>
           </DialogFooter>
@@ -211,6 +230,11 @@ export function DriversPage() {
                 <span className="font-medium"> Driver PIN</span> tab. For security it's stored
                 encrypted and can't be shown again.
               </DialogDescription>
+              {driverCode && (
+                <p className="text-sm text-muted-foreground" data-testid="pin-reveal-code">
+                  {pinRevealCodeLine(driverCode)}
+                </p>
+              )}
               <div className="flex items-center justify-between rounded-md border bg-muted px-4 py-3">
                 <span className="font-mono text-2xl font-semibold tracking-[0.3em]">{pinReveal.pin}</span>
                 <Button variant="outline" size="sm" onClick={() => copyPin(pinReveal.pin)}>

@@ -18,10 +18,10 @@ from typing import Any
 from app.core.db import get_connection, get_global_connection
 from app.core.errors import ConflictError, NotFoundError
 from app.core.scope import STAFF_ROLES, SchoolScope
+from app.dao.account_dao import TEMPORARY_PASSWORD_TTL_HOURS, issue_temporary_password
 from app.dao.audit_dao import masked_display_sql, record_audit
 
 LAST_DIRECTOR_MESSAGE = "A school must keep at least one director"
-TEMPORARY_PASSWORD_TTL_HOURS = 72
 
 
 def _offer_uuid_or_404(offer_id: str) -> str:
@@ -288,7 +288,9 @@ class MembershipDao:
         """Replace the target's password with a temporary one (AE23), one
         transaction: flag + 72-hour expiry, every session revoked, and every
         outstanding reset and pre-auth token voided — the old credentials and
-        recovery paths all die together. Returns the target's staff roles."""
+        recovery paths all die together (the shared helper, hardening U9;
+        staff keep their push registrations). Returns the target's staff
+        roles."""
         with get_connection(scope) as conn:
             roles = [
                 r["role"]
@@ -303,29 +305,7 @@ class MembershipDao:
             ]
             if not roles:
                 raise NotFoundError("Staff member not found")
-            conn.execute(
-                """
-                update app_users
-                set password_hash = %s, must_change_password = true,
-                    temporary_password_expires_at = now() + make_interval(hours => %s),
-                    password_changed_at = null
-                where id = %s
-                """,
-                (password_hash, TEMPORARY_PASSWORD_TTL_HOURS, user_id),
-            )
-            conn.execute(
-                "update auth_sessions set revoked_at = now() "
-                "where user_id = %s and revoked_at is null",
-                (user_id,),
-            )
-            conn.execute(
-                "update password_reset_tokens set used_at = now() "
-                "where user_id = %s and used_at is null",
-                (user_id,),
-            )
-            conn.execute(
-                "delete from auth_preauth_tokens where user_id = %s", (user_id,)
-            )
+            issue_temporary_password(conn, user_id, password_hash, delete_push=False)
             record_audit(
                 conn, action="staff-password-reset", actor=actor, scope=scope,
                 resource_type="staff", resource_id=user_id,

@@ -21,7 +21,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import purge_accounts, school_sandbox
+from conftest import purge_accounts, school_sandbox, signup_unverified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -226,14 +226,12 @@ def test_pin_map_non_admin_is_403_and_writes_no_audit_row(client, admin_headers,
     marker = uuid.uuid4().hex[:6]
     school = {"id": sandbox["id"], "name": sandbox["name"]}
     parent_email = f"it-pinmap-parent-{marker}@test.local"
-    signup = client.post(
-        "/api/auth/signup",
-        json={"email": parent_email, "password": "ParentPass1!",
-              "full_name": f"IT PinMap NonAdmin {marker}", "role": "parent"},
+    # Any signed-in parent will do (a role check, not a link check).
+    parent = signup_unverified_parent(
+        client, parent_email, "ParentPass1!", f"IT PinMap NonAdmin {marker}"
     )
-    assert signup.status_code == 200, signup.text
-    parent_id = signup.json()["user"]["id"]
-    parent_headers = {"Authorization": f"Bearer {signup.json()['token']}"}
+    parent_id = parent["id"]
+    parent_headers = parent["headers"]
     try:
         refused = client.get(
             "/api/students/pin-map", params={"school_id": school["id"]},

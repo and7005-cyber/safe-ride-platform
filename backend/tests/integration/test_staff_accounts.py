@@ -31,7 +31,9 @@ from conftest import (
     SCHOOL_A_ID,
     TEST_PASSWORD,
     purge_accounts,
+    signup_verified_parent,
     temp_school,
+    pin_login_body,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -173,17 +175,11 @@ def purge_audit(*resource_ids: str | None) -> None:
 
 
 def signup_parent(client, tag: str) -> tuple[str, str, str]:
-    """A throwaway parent account via the real signup; (email, user_id, token)."""
+    """A throwaway, verified parent account via the real sign-up, sign-in and
+    verification (Release 1b); (email, user_id, token)."""
     email = unique_email(tag)
-    resp = client.post(
-        "/api/auth/signup",
-        json={
-            "email": email, "password": PARENT_SIGNUP_PASSWORD,
-            "full_name": f"IT U8 {tag}", "role": "parent",
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    return email, str(resp.json()["user"]["id"]), resp.json()["token"]
+    parent = signup_verified_parent(client, email, PARENT_SIGNUP_PASSWORD, f"IT U8 {tag}")
+    return email, parent["id"], parent["token"]
 
 
 def create_staff(client, school_id: str, email: str, role: str, full_name: str | None = None):
@@ -932,7 +928,7 @@ def test_disable_user_kills_pin_sessions_and_reset_tokens(client):
         driver_id = str(created.json()["id"])
 
         # Working before the disable: PIN and password both sign in.
-        assert client.post("/api/auth/pin-login", json={"pin": pin}).status_code == 200
+        assert client.post("/api/auth/pin-login", json=pin_login_body(pin, SCHOOL_A_ID)).status_code == 200
         session_token = login(client, email, "DriverPass1").json()["token"]
         assert client.get("/api/auth/me", headers=hdr(session_token)).status_code == 200
         raw_reset = create_session_token()
@@ -946,7 +942,7 @@ def test_disable_user_kills_pin_sessions_and_reset_tokens(client):
             ).fetchone()["disabled_at"] is not None
         # The PIN no longer resolves, the live session is dead, the password
         # is refused with the generic message, and the reset link is void.
-        assert client.post("/api/auth/pin-login", json={"pin": pin}).status_code == 401
+        assert client.post("/api/auth/pin-login", json=pin_login_body(pin, SCHOOL_A_ID)).status_code == 401
         assert client.get("/api/auth/me", headers=hdr(session_token)).status_code == 401
         assert login(client, email, "DriverPass1").status_code == 401
         assert client.post(
@@ -998,16 +994,11 @@ def test_provider_and_disabled_emails_never_auto_link_as_parents(client):
 
         AuthDao().disable_user(disabled_id)
         # A parent-role account that ALSO holds a provider account — the
-        # provider predicate, independent of the seeded Kuumbai identity.
-        signup = client.post(
-            "/api/auth/signup",
-            json={
-                "email": provider_parent_email, "password": PARENT_SIGNUP_PASSWORD,
-                "full_name": "IT U8 Provider Parent", "role": "parent",
-            },
-        )
-        assert signup.status_code == 200
-        provider_parent_id = str(signup.json()["user"]["id"])
+        # provider predicate, independent of the seeded Kuumbai identity
+        # (verified, so only the provider rule can keep it unlinked).
+        provider_parent_id = signup_verified_parent(
+            client, provider_parent_email, PARENT_SIGNUP_PASSWORD, "IT U8 Provider Parent"
+        )["id"]
         with db() as conn:
             conn.execute(
                 "insert into provider_accounts (user_id, totp_salt) values (%s, %s)",

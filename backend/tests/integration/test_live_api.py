@@ -19,7 +19,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import purge_accounts, purge_run
+from conftest import purge_accounts, purge_run, signup_verified_parent, SCHOOL_A_ID, pin_login_body
 
 # Since U4 a run cannot close with unaccounted children; complete_run walks the
 # path a driver must now walk before ending one.
@@ -69,7 +69,7 @@ def parent_headers(client):
 
 @pytest.fixture(scope="module")
 def driver_headers(client):
-    response = client.post("/api/auth/pin-login", json={"pin": DRIVER_PIN})
+    response = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_PIN, SCHOOL_A_ID))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
@@ -100,7 +100,9 @@ def no_active_run(client, driver_headers, admin_headers):
 # Health & auth ---------------------------------------------------------------
 
 def test_health(client):
-    assert client.get("/api/health").json() == {"status": "ok"}
+    # Database-aware since hardening U11; the version is "dev" off a deploy.
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok" and body["db"] == "ok" and body["version"]
 
 
 def test_wrong_password_is_a_clean_401(client):
@@ -240,16 +242,9 @@ def test_driver_account_crud_and_parent_link(client, admin_headers):
     driver_id = driver.json()["id"]
 
     parent_email = f"it-parent-{marker}@test.local"
-    signup = client.post(
-        "/api/auth/signup",
-        json={"email": parent_email, "password": "ParentPass1!",
-              "full_name": f"IT Parent {marker}", "role": "parent"},
-    )
-    assert signup.status_code == 200, signup.text
-    parent_id = signup.json()["user"]["id"] if "user" in signup.json() else None
-    if parent_id is None:
-        parents = client.get("/api/accounts/parents", headers=admin_headers).json()
-        parent_id = next(p["id"] for p in parents if p.get("email") == parent_email)
+    parent_id = signup_verified_parent(
+        client, parent_email, "ParentPass1!", f"IT Parent {marker}"
+    )["id"]
 
     # Linking is email-driven (R11/R12): creating a student that carries the
     # registered parent's email auto-links it — no manual link endpoint.
@@ -623,7 +618,9 @@ def test_notifications_mark_read(client, parent_headers):
 
 def test_push_config_is_public_and_secretless(client):
     config = client.get("/api/push/config").json()
-    assert set(config.keys()) == {"firebase", "firebaseVapidKey", "vapidPublicKey"}
+    # mailEnabled (hardening DL1): the global mail-availability flag, a boolean.
+    assert set(config.keys()) == {"firebase", "firebaseVapidKey", "vapidPublicKey", "mailEnabled"}
+    assert isinstance(config["mailEnabled"], bool)
 
 
 def test_fcm_token_register_and_unregister(client, parent_headers):

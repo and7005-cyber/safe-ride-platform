@@ -23,7 +23,14 @@ import uuid
 import psycopg
 import pytest
 
-from conftest import DIRECTOR_A, DSN, TEST_PASSWORD, purge_accounts, temp_school
+from conftest import (
+    DIRECTOR_A,
+    DSN,
+    TEST_PASSWORD,
+    purge_accounts,
+    signup_verified_parent,
+    temp_school,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -63,14 +70,10 @@ def staff(client, schools):
 
 
 def signup_parent(client, email: str, name: str) -> tuple[str, dict]:
-    resp = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!", "full_name": name,
-              "role": "parent"},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    return body["user"]["id"], {"Authorization": f"Bearer {body['token']}"}
+    """A verified parent (Release 1b): the sign-up grouping rule runs when the
+    account verifies from its own session."""
+    parent = signup_verified_parent(client, email, "ParentPass1!", name)
+    return parent["id"], parent["headers"]
 
 
 def student_payload(name: str, email: str, email2: str | None = None) -> dict:

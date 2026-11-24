@@ -58,6 +58,13 @@ Every notification is stored in `live_notifications` and shown in the parent
 **Alerts** tab even when push is unavailable. Push delivery (FCM and/or Web
 Push) is best-effort on top.
 
+**The feed keeps 90 days of history; the display window stays 7 days.** The
+Alerts tab shows the last 24 hours (Recent) and the six days before (History).
+Rows stay in `live_notifications` for 90 days, then the nightly retention job
+(01:30 Nairobi time, the migrate function's `retention` action, hardening
+U12) deletes them in bounded batches. See `infra/README.md`, "Nightly
+retention".
+
 ## Architecture
 
 - `backend/app/services/push_service.py` — fan-out: resolves parents, writes

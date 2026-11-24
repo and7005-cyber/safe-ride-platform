@@ -401,6 +401,51 @@ def test_signup_does_not_double_link(store):
     assert len(store.links) == 1
 
 
+# Verification gating (hardening U8, D1) -----------------------------------------
+
+class _CapturingConn:
+    """Records the SQL a _ConnParentLinks method sends; answers no row."""
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    def execute(self, sql, params=None):
+        self.sql.append(sql)
+        return self
+
+    def fetchone(self):
+        return None
+
+
+def test_the_office_side_sync_only_matches_verified_accounts():
+    """An account still waiting for its verification click is no match for a
+    slot email the office types: the store's account lookup carries the one
+    shared predicate (required false, or verified_at stamped)."""
+    from app.dao.student_live_dao import _ConnParentLinks
+    from app.dao.verification_sql import verified_sql
+
+    conn = _CapturingConn()
+    assert _ConnParentLinks(conn).parent_account_id("new@test.com") is None
+    (sql,) = conn.sql
+    assert verified_sql("u") in sql
+    assert verified_sql("u") == (
+        "(not u.email_verification_required or u.email_verified_at is not null)"
+    )
+
+
+def test_two_unverified_signups_for_both_slots_link_nothing(store):
+    """Parent 1 and Parent 2 both signed up but neither verified: the store
+    (which, like the SQL, returns only verified accounts) has no account for
+    either slot, so an office edit links nothing and offers no card."""
+    store.students = {"s1": ("p1@test.com", "p2@test.com")}
+    assert sync_parent_links(store, "s1", ("p1@test.com", "p2@test.com"), school_id=SCHOOL) == 0
+    assert store.links == []
+    # Once each verifies, the next sync links both.
+    store.add_account("acc-p1", "p1@test.com")
+    store.add_account("acc-p2", "p2@test.com")
+    assert sync_parent_links(store, "s1", ("p1@test.com", "p2@test.com"), school_id=SCHOOL) == 2
+
+
 # Payload invariant (_clean_student) -------------------------------------------
 
 def _payload(**overrides) -> dict:

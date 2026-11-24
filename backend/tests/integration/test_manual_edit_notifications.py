@@ -42,7 +42,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import purge_accounts, DSN, school_sandbox
+from conftest import purge_accounts, DSN, school_sandbox, signup_verified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -105,17 +105,8 @@ def admin_headers(client, sandbox):
 
 def signup_parent(client, marker: str, tag: str) -> dict:
     email = f"it-men-{tag}-{marker}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!",
-              "full_name": f"IT MEN {tag} {marker}", "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    return {
-        "id": response.json()["user"]["id"],
-        "email": email,
-        "headers": login(client, email, "ParentPass1!"),
-    }
+    parent = signup_verified_parent(client, email, "ParentPass1!", f"IT MEN {tag} {marker}")
+    return {"id": parent["id"], "email": email, "headers": parent["headers"]}
 
 
 def accept_pending(client, parent_headers):

@@ -2,7 +2,7 @@
 
 Hardening plan U6 (R21), moved out of [README.md](README.md) on 2026-11-18;
 the deploy rules it relies on (deploy safety, the SSM parameters,
-`verify-db.sh`) stay there, and the Release 1a checklists are in
+`verify-db.sh`) stay there, and the Release 1a and 1b checklists are in
 [docs/runbooks/hardening-release-checklists.md](../docs/runbooks/hardening-release-checklists.md).
 
 One bash session from `infra/`, started with the lines below; the variables
@@ -78,6 +78,50 @@ role, and `./scripts/verify-db.sh migrations` (a rollback never removes a
 migration; the two cosmetic `015_tenancy_constraints_rls 2`/`3` rows are
 expected, README "Database checks"). Record the start and end times of both
 deploys.
+
+**Rolling back Release 1b means `release/1a` (`a66d53b`), backend then
+frontend — never the frontend alone.** The 1a frontend sends a driver PIN
+without a school, and the 1b backend refuses every such sign-in
+(`school-required`); the 1a backend accepts the 1b frontend's extra
+`schoolId` for the minutes between the two deploys. The steps, with the
+expected change sets, are rehearsed in the
+[Release 1b deploy checklist](../docs/runbooks/hardening-release-checklists.md#release-1b-deploy-checklist),
+"Rollback rehearsal". What is specific to 1b:
+
+- **No schema to undo.** 1b has no migration; its tag's scripts are the
+  same as 1a's. 1a's template removes 1b's schedule, alarms and metric
+  filters and puts `ApiClientErrorsBurst` back on the gateway's 4xx count.
+  What the nightly retention job deleted stays deleted (only a data restore
+  brings it back).
+- **Salted PINs.** 1a checks only the legacy hash, so every driver whose PIN
+  was salted under 1b — re-issued from the Drivers card, or signed in since
+  the deploy (`verify-db.sh hardening` → `driver-pin-hash-versions-per-school`,
+  `salted_v2`) — is refused under 1a with "Invalid PIN" until the office
+  gives them a new PIN from 1a's Drivers page. That count is the cost of a
+  real rollback, which is decided within 48 hours of the deploy.
+- **Verification tokens.** 1a's reset consumes a token by its hash alone,
+  ignoring `purpose`, so a live verification link (24 hours) would work as a
+  password-reset link. Delete them on 1b immediately before the 1a backend
+  deploy with the migrate function's `{"action": "purge-verify-tokens"}`
+  (1a's migrate function has no such action, and production has no other
+  SQL path); then read `token-rows-by-purpose` on 1a: the `verify` row's
+  `live` is 0. Nothing in 1a creates new ones; a sign-up in the minutes of
+  the deploy can leave one, bounded by its 24-hour expiry.
+- **Unverified sign-ups can be linked under 1a.** 1a re-runs the parent-link
+  sync on EVERY student create, edit and import, whatever field changed, and
+  links any parent account whose email matches, verified or not (it skips
+  only disabled and provider accounts). So while on 1a the office makes no
+  student saves or imports of any kind; after returning to 1b read
+  `unverified-parent-accounts-by-age` (the `has_link` true row stays 0) and
+  review any link it shows. A rollback longer than a day makes this hard to
+  hold: plan the return to 1b, or accept that 1a links as it did before 1b.
+- **The budget.** 1a's frontend template counts the whole account at
+  60 USD; export `MONTHLY_BUDGET_USD=100` for the rollback's frontend deploy
+  (the SafeRide-only region filter returns with 1b's frontend).
+- **No mail under 1a.** 1a's API has no sender: forgot-password sends
+  nothing, whatever `MailEnabled` says, while 1a's screen still says a link
+  is on its way. Parents locked out meanwhile need 1b back (1a has no office
+  parent reset).
 
 **Rolling back Release 1a means `release/0`, whose scripts predate the
 hardening:**

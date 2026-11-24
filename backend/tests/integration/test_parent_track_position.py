@@ -42,7 +42,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from conftest import DSN, purge_accounts, purge_run, school_sandbox
+from conftest import DSN, purge_accounts, purge_run, school_sandbox, SCHOOL_A_ID, SCHOOL_B_ID
 from test_gps_actions import (
     _create_driver,
     arrive,
@@ -181,8 +181,8 @@ def fleet(client, admin_headers, sandbox):
         yield {
             "marker": marker, "school_id": sandbox["id"],
             "driver1": driver1, "driver2": driver2,
-            "driver_headers": pin_login(client, driver1["pin"]),
-            "driver2_headers": pin_login(client, driver2["pin"]),
+            "driver_headers": pin_login(client, driver1["pin"], sandbox["id"]),
+            "driver2_headers": pin_login(client, driver2["pin"], sandbox["id"]),
             "bus1": bus1, "bus2": bus2,
             "morning": morning, "afternoon": afternoon, "afternoon2": afternoon2,
             "a": a, "b": b,
@@ -606,8 +606,8 @@ def test_a_parent_with_children_at_two_schools_sees_each_childs_bus_and_an_unlin
     amina = login(client, AMINA["email"], AMINA["password"])
     admin_a = login(client, ADMIN_A["email"], ADMIN_A["password"])
     director_b = login(client, DIRECTOR_B["email"], DIRECTOR_B["password"])
-    driver_a = pin_login(client, DRIVER_A_PIN)
-    driver_b = pin_login(client, DRIVER_B_PIN)
+    driver_a = pin_login(client, DRIVER_A_PIN, SCHOOL_A_ID)
+    driver_b = pin_login(client, DRIVER_B_PIN, SCHOOL_B_ID)
     children = {c["name"]: c for c in client.get("/api/parent-portal/children", headers=amina).json()}
     assert {FAITH, BEN, GRACE} <= set(children)
     simba_id = children[FAITH]["bus_id"]

@@ -87,9 +87,11 @@ export function CreateSchoolDialog({
         directorEmail: form.directorEmail.trim(),
         directorName: form.directorName.trim() || null,
       });
-      await qc.invalidateQueries({ queryKey: ["provider", "schools"] });
+      // Reveal first (code review #8): the director's temporary password is
+      // shown once, so the schools refetch must not stand in front of it.
       onOpenChange(false);
       setResult({ school: res.school, director: res.director });
+      void qc.invalidateQueries({ queryKey: ["provider", "schools"] });
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {

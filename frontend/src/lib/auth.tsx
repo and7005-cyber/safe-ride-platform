@@ -27,6 +27,7 @@ import {
   setActiveSchoolId,
   useActiveSchoolId,
 } from "@/lib/school";
+import { adoptSessionSchool } from "@/lib/driverSchool";
 
 export type Role = "admin" | "driver" | "parent";
 export type MembershipRole = "director" | "coordinator" | "driver";
@@ -81,9 +82,22 @@ export interface AuthUser {
   /** The session's live step-in (providers only, U13); null otherwise. */
   supportSession: SupportSession | null;
   mustChangePassword: boolean;
+  /** False only while the account waits for its verification click
+   * (hardening Release 1b): a new sign-up, or an account whose email the
+   * office changed. Accounts made before 1b always read true. */
+  emailVerified: boolean;
+  /** True when this session was created by PIN (hardening U9): it never held
+   * the account password, so no menu offers Change password. */
+  signedInWithPin: boolean;
   /** False until the first /me answered — a fresh login knows only the login
    * response's fields, and ProtectedRoute must not judge memberships yet. */
   hydrated: boolean;
+}
+
+/** Whether to offer Change password (hardening U9, DL13): every signed-in
+ * role except a session created by PIN. The server refuses it too. */
+export function canChangeOwnPassword(user: AuthUser | null): boolean {
+  return Boolean(user) && !user?.signedInWithPin;
 }
 
 const STAFF_ROLES: readonly MembershipRole[] = ["director", "coordinator"];
@@ -165,6 +179,9 @@ function mapMe(me: any): AuthUser {
         }
       : null,
     mustChangePassword: Boolean(me.mustChangePassword),
+    // An older API without the field: treat as verified (no verify card).
+    emailVerified: me.emailVerified !== false,
+    signedInWithPin: Boolean(me.signedInWithPin),
     hydrated: true,
   };
 }
@@ -199,20 +216,24 @@ export function reconcileSchoolStore(user: AuthUser): void {
   // renders the choose-school screen (the plan's first-landing answer).
 }
 
+/** The user object of every login response (password, provider code step,
+ * driver PIN, verify and reset links): the fields that apply before /me
+ * answers. One declaration for signIn and its callers. */
+export interface LoginResponseUser {
+  id: string;
+  email: string;
+  fullName?: string | null;
+  role?: Role | null;
+  mustChangePassword?: boolean;
+  emailVerified?: boolean;
+  signedInWithPin?: boolean;
+}
+
 interface AuthContextValue {
   user: AuthUser | null;
   role: Role | null;
   loading: boolean;
-  signIn: (
-    token: string,
-    user: {
-      id: string;
-      email: string;
-      fullName?: string | null;
-      role?: Role | null;
-      mustChangePassword?: boolean;
-    },
-  ) => void;
+  signIn: (token: string, user: LoginResponseUser) => void;
   signOut: () => Promise<void>;
   refresh: () => Promise<void>;
 }
@@ -235,6 +256,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const me = await api.get("/api/auth/me");
       const mapped = mapMe(me);
       reconcileSchoolStore(mapped);
+      // Hardening U10 (AE10): a signed-in driver on a phone that is not set
+      // up for a school adopts the session's school, so the next PIN
+      // sign-in asks for nothing. The binding survives sign-out.
+      adoptSessionSchool(mapped);
       setUser(mapped);
     } catch {
       setUser(null);
@@ -244,7 +269,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signIn = useCallback(
-    (token: string, nextUser: Parameters<AuthContextValue["signIn"]>[1]) => {
+    (token: string, nextUser: LoginResponseUser) => {
       setToken(token);
       // The login response's own fields apply immediately — above all
       // mustChangePassword (R30): the change screen must not wait for /me,
@@ -260,10 +285,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         provider: null,
         supportSession: null,
         mustChangePassword: Boolean(nextUser.mustChangePassword),
+        // The login response carries it (Release 1b), so Home shows the
+        // verify card from the first frame instead of the empty state.
+        emailVerified: nextUser.emailVerified !== false,
+        signedInWithPin: Boolean(nextUser.signedInWithPin),
         hydrated: false,
       });
       setLoading(false);
       void refresh();
+      // A reset deleted this account's push registrations; a browser that
+      // still holds its subscription re-attaches it now (hardening U7).
+      void import("@/lib/push")
+        .then(({ reattachPushSubscription }) => reattachPushSubscription())
+        .catch(() => {});
     },
     [refresh],
   );

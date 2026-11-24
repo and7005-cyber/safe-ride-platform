@@ -23,6 +23,7 @@ from conftest import (
     SCHOOL_A_ID,
     SCHOOL_B_ID,
     TEST_PASSWORD,
+    pin_login_body,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -179,7 +180,9 @@ def test_scoped_responses_are_uncacheable_and_header_variant(client):
     login = client.post(
         "/api/auth/login", json={"email": COORDINATOR_A, "password": TEST_PASSWORD}
     )
-    assert login.headers.get("Cache-Control") != "no-store"  # unscoped route
+    # Hardening U11 made no-store universal (every API response); what stays
+    # scoped-only is the Vary on the school header.
+    assert "X-School-Id" not in login.headers.get("Vary", "")  # unscoped route
 
 
 # --- role limits (AE2) -------------------------------------------------------
@@ -267,7 +270,7 @@ def test_staff_switch_persists_last_school_on_the_session(client):
 
 
 def test_driver_scope_is_derived_and_a_header_is_refused(client):
-    resp = client.post("/api/auth/pin-login", json={"pin": DRIVER_A_PIN})
+    resp = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_A_PIN, SCHOOL_A_ID))
     assert resp.status_code == 200, resp.text
     token = resp.json()["token"]
     body = client.get("/t/driver", headers=hdr(token)).json()

@@ -110,10 +110,10 @@ export function StaffPage() {
         fullName: form.full_name || null,
         role: form.role,
       });
-      await refetchStaff();
       setOpen(false);
       if (res.status === "created") {
-        // The one and only reveal (R6/AE23).
+        // The one and only reveal (R6/AE23) — before the refetch, so a
+        // stalled refetch or a page left mid-refetch cannot lose it.
         setReveal({ who: res.fullName ?? res.email, password: res.temporaryPassword });
       } else {
         toast({
@@ -121,6 +121,7 @@ export function StaffPage() {
           description: `${res.email} already has a SafeRide account — they will be asked to accept the ${ROLE_LABEL[res.role] ?? res.role} role at their next sign-in.`,
         });
       }
+      void refetchStaff();
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {
@@ -189,8 +190,9 @@ export function StaffPage() {
     setBusyId(member.userId);
     try {
       const res = await api.post(`/api/staff/${member.userId}/reset-password`);
-      await refetchStaff();
+      // Reveal first: only a hash is kept server-side (see save above).
       setReveal({ who: member.fullName ?? member.email, password: res.temporaryPassword });
+      void refetchStaff();
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
     } finally {

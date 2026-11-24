@@ -28,6 +28,14 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/auth/offers/{offer_id}/accept"): "auth",
     ("POST", "/api/auth/offers/{offer_id}/decline"): "auth",
     ("GET", "/api/auth/dev/last-reset-link"): "auth",
+    # Release 1b (hardening U7/U8): session-bound verification, the signed-in
+    # resend, and the local-only last verification link (404 outside local).
+    ("POST", "/api/auth/verify-email"): "auth",
+    ("POST", "/api/auth/resend-verification"): "auth",
+    ("GET", "/api/auth/dev/last-verification-link"): "auth",
+    # Hardening U10: the public driver code lookup ({schoolId, name} or 404),
+    # throttled at the gateway (D6) and in process.
+    ("GET", "/api/auth/schools/{code}"): "public",
     ("GET", "/api/fleet/buses"): "school-scoped",
     ("POST", "/api/fleet/buses"): "school-scoped",
     ("PUT", "/api/fleet/buses/{bus_id}"): "school-scoped",
@@ -106,9 +114,15 @@ MANIFEST: dict[tuple[str, str], str] = {
     ("POST", "/api/accounts/drivers"): "school-scoped",
     ("PUT", "/api/accounts/drivers/{driver_id}"): "school-scoped",
     ("DELETE", "/api/accounts/drivers/{driver_id}"): "school-scoped",
+    # Hardening U10: replace the active school's driver code (director only).
+    ("POST", "/api/accounts/school/driver-code/regenerate"): "school-scoped",
     ("GET", "/api/accounts/parents"): "school-scoped",
     ("PUT", "/api/accounts/parents/{parent_id}"): "school-scoped",
     ("DELETE", "/api/accounts/parents/{parent_id}"): "school-scoped",
+    # Hardening U9: the office parent reset and "Confirm and reset" on an
+    # Awaiting-signup slot — either staff role, inside the header school.
+    ("POST", "/api/accounts/parents/{parent_id}/reset-password"): "school-scoped",
+    ("POST", "/api/accounts/parents/slots/confirm"): "school-scoped",
     ("GET", "/api/staff"): "school-scoped",
     ("POST", "/api/staff"): "school-scoped",
     ("DELETE", "/api/staff/{user_id}"): "school-scoped",

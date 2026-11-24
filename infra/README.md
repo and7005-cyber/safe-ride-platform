@@ -352,29 +352,108 @@ new address on the next deploy, and it *replaces* that email subscription:
 the change-set gate prints a `WARN` for the replaced `AWS::SNS::Subscription`
 (a stateless type) and lets it through, and the new inbox must confirm the
 fresh subscription mail. Thresholds are counts, not rates, and missing data
-counts as OK.
+counts as OK — except for `RetentionHeartbeat`, where silence is the failure.
 
 | Alarm | Means | First response |
 |---|---|---|
 | `ApiServerErrors` | at least one API 5xx in 5 minutes | find the ERROR lines in `/saferide/api` at that time; roll back if a deploy just landed |
-| `ApiClientErrorsBurst` | 50 or more API 4xx in 5 minutes | read `/saferide/api` for the paths and whether one client repeats (broken release, looping phone, sign-in probing); a throttled request (429) never reaches the function or its log and there is no access log, so if the log is quiet read the API's `4xx` metric and ask the drivers |
+| `ApiClientErrorsBurst` | 50 or more API 4xx **other than 404** in 5 minutes, counted from the app's own access lines (since Release 1b; bots scanning for `/.env` and `/.git` answered 404 used to trip it). A 429 the gateway's route throttle makes never reaches the function and is not counted — the PIN alarms below watch sign-in abuse | read `/saferide/api` for the paths and whether one client repeats (broken release, looping phone, sign-in probing): Logs Insights `filter logger = "mangum.http" and message like / 4\d\d$/ and message not like / 404$/ \| stats count() by message`; for throttling, read the API's own `4xx` metric (`AWS/ApiGateway`) and ask the drivers |
 | `ApiLatencyP95` | p95 over 3 s in 3 of 5 five-minute periods | check the database CPU and credit alarms and the API function's duration |
 | `ApiFunctionErrors` | the API function failed (init crash or timeout) | read the latest `/saferide/api` errors; roll back if a deploy just landed |
 | `ApiFunctionThrottles` | the API function was throttled in the last minute | check `AccountConcurrency` and the pings route for a looping client; raise the quota |
-| `MigrateFunctionErrors` | the migrate function failed | read `/saferide/migrate`; fix and re-run the migrate step (the live API may need it) |
+| `MigrateFunctionErrors` | the migrate function failed: a migration, the nightly retention run or an on-demand action raised, or it timed out | read `/saferide/migrate`; a retention failure logs `retention-failed` with the step and its `ops_job_runs` row reads `failed` (`verify-db.sh hardening`, `last-retention-run`); fix, then re-run the migrate step (the live API may need it) or invoke the retention action ("Nightly retention" below) |
 | `AccountConcurrency` | Lambda concurrency at `ConcurrencyAlarmThreshold` (80% of the account limit, 8 today) | find the runaway client; request a quota increase, then export `CONCURRENCY_ALARM_THRESHOLD` (80% of the new limit) on every backend deploy until a release raises the Default |
 | `DbFreeStorageLow` | database free storage under 2 GiB | check the storage graph and that the position-trail purge runs |
 | `DbFreeableMemoryLow` | freeable memory under 100 MB for 15 minutes | compare the `DatabaseConnections` graph in RDS with the API's request count for a surge of connections |
 | `DbCpuHigh` | database CPU over 80% for 15 minutes | line the CPU graph up with the API's request count and latency and with any migrate or verify run at that time |
 | `DbCpuCreditsLow` | under 30 CPU credits for 15 minutes; the instance will be held to baseline | find what burns CPU (`DbCpuHigh`, the API's request count, any migrate or verify run); consider a larger class |
 | `ApiCertificateExpiry` | the API certificate expires in under 20 days (custom domain only) | check the api validation CNAME in Route 53 and the renewal status in ACM |
+| `RetentionHeartbeat` | no nightly retention run reported success for 26 hours (`SafeRide` / `RetentionRunSucceeded`, missing data **breaching**): the 01:30 EAT run was not started or did not finish. It fires about 26 hours after the last good run — around 04:00 EAT the morning after the first missed night — and it is in ALARM from the deploy that creates it until the first run | read `last-retention-run` in `verify-db.sh hardening` (status, age, counts) and `/saferide/migrate` for the night; check `RetentionScheduleTargetErrors` and that the schedule is enabled; then invoke the retention action by hand ("Nightly retention" below) |
+| `RetentionScheduleTargetErrors` | EventBridge Scheduler could not start the run: its invoke of the migrate function failed (the role, a throttle, a missing function); the schedule retries twice within the hour | read the schedule's target and role in the Scheduler console (group from `OpsScheduleGroup`) and the migrate function's state; invoke the retention action by hand once fixed |
+| `MailSendFailed` | a reset, verification or notice mail failed to send (`mail-send-failed` in `/saferide/api`) at least once in 5 minutes; the request still answered its neutral message | read the `mail-send-failed` lines for the `kind` and the SES `code` (sandbox, paused sending, throttling) and the SES account state; until mail works, parents get an office reset |
+| `PinFailureBurst` | 30 or more failed driver PIN sign-ins in 5 minutes, every school and phone together (`pin-failure school=<code>`; `school=unknown` is a school id that does not exist) | read the `pin-failure` lines for the school codes; call the office of the school that repeats (a phone holding an old PIN after a re-issue, or someone guessing) |
+| `PinLocked` | at least one PIN sign-in refused by a school's lock (`pin-locked school=<code>`): more than 20 failures from one source at that school in 15 minutes | read the `pin-locked` lines for the school code and call that office. Signed-in drivers are unaffected, and the lock lifts by itself: each refused phone is told how long to wait (`Retry-After`, counted down on screen) and can sign in once enough of its failures are older than 15 minutes. Nobody clears it by hand |
+| `SchoolRequiredBurst` | 20 or more PIN sign-ins in 5 minutes from phones with no school set (`school-required`): phones not yet set up with the driver code, or an old app still cached | have the offices give their drivers the driver code from the Drivers page; check that phones load the current app |
 
 Application exceptions surface as API 5xx: FastAPI answers an unhandled
 exception with a 500 response, so `ApiServerErrors` is the application alarm
-and Lambda `Errors` means init failures or timeouts. The retention heartbeat
-and the metric-filter alarms arrive in Release 1b. There is no
-`DatabaseConnections` alarm yet: its threshold waits for `max_connections`,
-read from the `hardening` set's `instance-settings` row after the 1a deploy.
+and Lambda `Errors` means init failures or timeouts. **Lambda errors zero is
+not no errors:** a schedule that never fires, or a run that never starts,
+raises nothing, which is why the retention run has a heartbeat as well as
+`MigrateFunctionErrors`. There is no `DatabaseConnections` alarm yet: its
+threshold waits for `max_connections`, read from the `hardening` set's
+`instance-settings` row after the 1a deploy.
+
+**Metric filters (Release 1b).** Five `AWS::Logs::MetricFilter` resources
+count lines of `/saferide/api` into the `SafeRide` namespace. The functions
+log JSON (the formatted text in `message`, the logger in `logger`), so each
+pattern selects both; a quoted value with `*` is a whole-value wildcard, and
+the 4xx pattern is a regex anchored on the status, the access line's last
+word. `backend/tests/core/test_metric_filters.py` matches every pattern
+against lines the code really writes; CloudWatch is the authority, so run
+these once before the Release 1b deploy (read-only; each prints `matches`,
+and only event 1 may appear there):
+
+```bash
+aws logs test-metric-filter --region af-south-1 \
+  --filter-pattern '{ ($.logger = "mangum.http") && ($.message = %\s40[0-35-9]$|\s4[1-9]\d$%) }' \
+  --log-event-messages '{"timestamp": "2026-12-04T05:12:09Z", "level": "INFO", "message": "GET /api/auth/me 401", "logger": "mangum.http", "requestId": "3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d"}' \
+    '{"timestamp": "2026-12-04T05:12:10Z", "level": "INFO", "message": "GET /.env 404", "logger": "mangum.http", "requestId": "4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e"}' \
+    '{"timestamp": "2026-12-04T05:12:11Z", "level": "INFO", "message": "GET /files/report-401 404", "logger": "mangum.http", "requestId": "5f3e8b4c-0d6a-4b2c-9e4f-7a8b9c0d1e2f"}' \
+    '{"timestamp": "2026-12-04T05:12:12Z", "level": "INFO", "message": "GET /api/health 200", "logger": "mangum.http", "requestId": "6a4f9c5d-1e7b-4c3d-8f5a-8b9c0d1e2f3a"}'
+aws logs test-metric-filter --region af-south-1 \
+  --filter-pattern '{ ($.logger = "saferide.mail") && ($.message = "mail-send-failed kind=*") }' \
+  --log-event-messages '{"timestamp": "2026-12-04T05:12:09Z", "level": "ERROR", "message": "mail-send-failed kind=reset request_id=3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d error=ClientError code=MessageRejected", "logger": "saferide.mail", "requestId": "3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d"}' \
+    '{"timestamp": "2026-12-04T05:12:10Z", "level": "INFO", "message": "mail-capped kind=reset request_id=4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e", "logger": "saferide.auth", "requestId": "4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e"}'
+aws logs test-metric-filter --region af-south-1 \
+  --filter-pattern '{ ($.logger = "saferide.auth") && ($.message = "pin-failure school=*") }' \
+  --log-event-messages '{"timestamp": "2026-12-04T05:12:09Z", "level": "WARNING", "message": "pin-failure school=GFA-001", "logger": "saferide.auth", "requestId": "3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d"}' \
+    '{"timestamp": "2026-12-04T05:12:10Z", "level": "WARNING", "message": "pin-locked school=GFA-001", "logger": "saferide.auth", "requestId": "4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e"}'
+aws logs test-metric-filter --region af-south-1 \
+  --filter-pattern '{ ($.logger = "saferide.auth") && ($.message = "pin-locked school=*") }' \
+  --log-event-messages '{"timestamp": "2026-12-04T05:12:09Z", "level": "WARNING", "message": "pin-locked school=GFA-001", "logger": "saferide.auth", "requestId": "3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d"}' \
+    '{"timestamp": "2026-12-04T05:12:10Z", "level": "WARNING", "message": "pin-failure school=GFA-001", "logger": "saferide.auth", "requestId": "4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e"}'
+aws logs test-metric-filter --region af-south-1 \
+  --filter-pattern '{ ($.logger = "saferide.auth") && ($.message = "school-required") }' \
+  --log-event-messages '{"timestamp": "2026-12-04T05:12:09Z", "level": "WARNING", "message": "school-required", "logger": "saferide.auth", "requestId": "3d1c6f2a-8b4e-4f0a-9c2d-5e6f7a8b9c0d"}' \
+    '{"timestamp": "2026-12-04T05:12:10Z", "level": "WARNING", "message": "pin-failure school=unknown", "logger": "saferide.auth", "requestId": "4e2d7a3b-9c5f-4a1b-8d3e-6f7a8b9c0d1e"}'
+```
+
+The `ApiClientErrorsBurst` change is an in-place update of the alarm (same
+logical id; namespace, metric and dimensions change without replacement), so
+the change-set gate lists it as a `Modify` with no `WARN`. The gate warns,
+and lets through, a replaced alarm or metric filter (stateless types), and
+prints removals in its table without stopping on them; Release 1b removes
+nothing.
+
+**Nightly retention.** EventBridge Scheduler (`RetentionSchedule`, in the
+`OpsScheduleGroup` group) invokes the migrate function asynchronously at
+01:30 Africa/Nairobi with `{"action": "retention"}`; the function's async
+config retries nothing (a failed run alarms and the next night runs), and its
+timeout is 600 s, of which the job leaves 30 s unused. It opens an
+`ops_job_runs` row, then deletes in batches of 2,000 (50 for accounts), each
+under a 2-second statement timeout and skipping locked rows: notification
+feed rows older than 90 days, reset and verify tokens used or expired over a
+day ago, sessions and pre-auth tokens expired over 7 days ago, PIN-failure
+rows older than a day, GPS idempotency keys older than 7 days, and parent
+accounts still unverified 30 days after sign-up that hold no student link,
+membership or provider account and that no incident, audit entry, run or
+other record names. Then it runs the position-trail purge school by school
+(oldest backlog first; a school whose purge lock a Start Run holds is skipped
+until the next night) until 30 seconds remain: a stop on that budget is
+status `stopped`, which is success — the backlog carries over. Incidents and
+the audit log are never touched. Every finished or stopped run prints one
+embedded-metric line (`RetentionRunSucceeded` = 1, the counts beside it);
+an error closes the row `failed` and raises. To run it by hand (the first
+run after the 1b deploy, or after a fix), asynchronously as the schedule
+does, then read the witness:
+
+```bash
+aws lambda invoke --region af-south-1 --function-name <MigrateFunctionName> \
+  --invocation-type Event --cli-binary-format raw-in-base64-out \
+  --payload '{"action": "retention"}' /dev/null
+./scripts/verify-db.sh hardening   # last-retention-run: status ok or stopped, counts
+```
 
 **us-east-1 (frontend stack).** Route 53 health-check, CloudFront and
 CloudFront-certificate metrics exist only in us-east-1, so the frontend stack
@@ -392,7 +471,7 @@ can report a dead stack: their alarms treat missing data as breaching.
 
 | Alarm | Means | First response |
 |---|---|---|
-| `ApiProbeFailing` | no healthy answer from `https://api…/api/health` for 3 minutes: the API function is not answering anyone. The probe checks that the function answers; until Release 1b's database-aware health check it does not touch the database, so a database outage alone does not trip it | curl the health endpoint; read the af-south-1 alarms and `/saferide/api`; roll back if a deploy just landed |
+| `ApiProbeFailing` | no healthy answer from `https://api…/api/health` for 3 minutes: the API function is not answering anyone, or (since Release 1b) the database is not answering it. The health check runs a one-second `select 1` and answers 503 with `"db": "error"` when that fails; before 1b it did not touch the database | curl the health endpoint: `"db": "error"` points at the database (RDS events and metrics), no answer at the function; read the af-south-1 alarms and `/saferide/api` (`health-db-error` lines name the error class); roll back if a deploy just landed |
 | `SiteProbeFailing` | the site's home page has not loaded for 3 minutes | open the site; check the distribution and its S3 bucket; redeploy the frontend from the last release tag if a deploy just landed |
 | `SiteServerErrors` | over 5% of CloudFront responses were 5xx for 10 minutes | read the distribution's error graphs and the AWS Health Dashboard for CloudFront and S3 |
 | `SiteCertificateExpiry` | the CloudFront certificate expires in under 20 days (custom domain only) | check the apex and www validation CNAMEs in Route 53 and the renewal status in ACM (us-east-1) |
@@ -462,15 +541,20 @@ Maps key and Map ID, the Route 53 preflight, the alert addresses, the deploy
 day and window) and the Release 1a deploy checklist (the gates before the
 deploy — the 017 rehearsal on a production copy, the gate dry run, the
 fixed-name pre-checks, the baselines — what to watch in both deploys, the
-verification after it and the first 48 hours) are in
+verification after it and the first 48 hours) and the Release 1b deploy
+checklist (the mail decision and baselines, the metric-filter tests, the
+expected change sets, the first retention run, the mail, PIN and parent
+drills, the rollback rehearsal to `release/1a`, the PIN re-issue, the alarm
+drill and the next morning) are in
 [docs/runbooks/hardening-release-checklists.md](../docs/runbooks/hardening-release-checklists.md).
 
 ## Restore and rollback
 
 The restore and rollback runbook is [RESTORE.md](RESTORE.md): the decision
 between a code rollback, a data restore and a pepper rotation; code rollback
-by release tag (and what rolling back to `release/0` takes away, the checks
-immediately before and after it); point-in-time restore into a scratch
+by release tag (what rolling back Release 1b to `release/1a` means for
+salted PINs, verification tokens and unverified sign-ups; what rolling back
+to `release/0` takes away, the checks immediately before and after it); point-in-time restore into a scratch
 instance checked through the verify function; the rename swap that replaces
 production; the rehearsal, with 017 applied to the production copy; retained
 resources after a failed or reverted Release 1a; pepper rotation; who may run

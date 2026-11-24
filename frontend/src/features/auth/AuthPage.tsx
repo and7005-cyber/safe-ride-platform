@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Bus, KeyRound } from "lucide-react";
+import { Bus, KeyRound, MailCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -14,8 +14,22 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from "@/lib/apiClient";
-import { useAuth, type Role } from "@/lib/auth";
+import { useAuth, type LoginResponseUser, type Role } from "@/lib/auth";
+import { useMailEnabled } from "@/lib/publicConfig";
 import { TotpChallengePage } from "@/features/auth/TotpChallengePage";
+import { DriverPinSignIn } from "@/features/auth/DriverPinSignIn";
+import { readDriverSchool } from "@/lib/driverSchool";
+import {
+  FORGOT_SENT_TITLE,
+  MAIL_OFF_FORGOT,
+  MAIL_OFF_FORGOT_TITLE,
+  MAIL_OFF_SIGNUP,
+  SIGNUP_DONE_MAIL_OFF_TITLE,
+  SIGNUP_DONE_NOTE,
+  SIGNUP_DONE_TITLE,
+  forgotSentText,
+  signupDoneText,
+} from "@/features/auth/authCopy";
 
 function homeFor(role: Role | null): string {
   // Staff access now comes from memberships, which the login response does
@@ -26,19 +40,77 @@ function homeFor(role: Role | null): string {
   return "/";
 }
 
+/** The persistent in-card end state of sign-up (DL2) and forgot password
+ * (DL11): the words stay on screen while the parent goes to their inbox.
+ * `role="status"` announces it once it replaces the form. */
+export function AuthNotice({
+  title,
+  text,
+  note,
+  actionLabel,
+  onAction,
+  testId,
+}: {
+  title: string;
+  text: string;
+  note?: string;
+  actionLabel: string;
+  onAction: () => void;
+  testId: string;
+}) {
+  return (
+    <div className="space-y-4" role="status" data-testid={testId}>
+      <div className="flex items-start gap-3">
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+          <MailCheck className="h-5 w-5" aria-hidden="true" />
+        </span>
+        <div className="space-y-1">
+          <p className="font-heading text-base font-semibold">{title}</p>
+          <p className="text-sm text-muted-foreground">{text}</p>
+          {note && <p className="text-xs text-muted-foreground">{note}</p>}
+        </div>
+      </div>
+      <Button type="button" className="w-full" onClick={onAction}>
+        {actionLabel}
+      </Button>
+    </div>
+  );
+}
+
 export function AuthPage() {
   const navigate = useNavigate();
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const { signIn } = useAuth();
   const { toast } = useToast();
+  // DL1: whether a mail really goes out. null while the config loads.
+  const mailEnabled = useMailEnabled();
+  // DL2 / DL11: the address the sign-up or the reset request was made for,
+  // once it was answered — the card then shows its end state, not the form.
+  const [signupDoneFor, setSignupDoneFor] = useState<string | null>(null);
+  const [forgotSentFor, setForgotSentFor] = useState<string | null>(null);
 
   const [isLogin, setIsLogin] = useState(true);
   const [showForgot, setShowForgot] = useState(params.get("forgot") === "1");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
-  const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
+  // Hardening U10 (DL3): a sign-in link (`?school=<driver code>`) or a phone
+  // already set up for a school opens on the Driver PIN tab.
+  const linkCode = params.get("school");
+  const [tab, setTab] = useState<string>(() =>
+    linkCode || readDriverSchool() ? "pin" : "email",
+  );
+  const consumeLink = useCallback(() => {
+    setParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("school");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setParams]);
   // Provider two-step login (U13/AE19): the pre-auth token from the password
   // step, held in COMPONENT STATE ONLY — a reload forgets it and returns to
   // the password step. While set, the code screen replaces the card below.
@@ -47,16 +119,7 @@ export function AuthPage() {
   // step after the pre-auth token was voided (AE19).
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
 
-  const finishAuth = (
-    token: string,
-    user: {
-      id: string;
-      email: string;
-      fullName?: string | null;
-      role?: Role | null;
-      mustChangePassword?: boolean;
-    },
-  ) => {
+  const finishAuth = (token: string, user: LoginResponseUser) => {
     const resolved: Role | null = user.role ?? null;
     signIn(token, {
       id: user.id,
@@ -66,6 +129,9 @@ export function AuthPage() {
       // Respected immediately (R30): the change screen renders off the login
       // response, before /me — nothing else would answer anyway.
       mustChangePassword: Boolean(user.mustChangePassword),
+      emailVerified: user.emailVerified,
+      // Hardening U9: a PIN session is offered no Change password.
+      signedInWithPin: Boolean(user.signedInWithPin),
     });
     navigate(homeFor(resolved));
   };
@@ -105,32 +171,14 @@ export function AuthPage() {
     try {
       // Parent is the ONLY self-service role (U13): staff join through their
       // school's offers and drivers are set up by the school office.
+      // Release 1b: no session either way (a new address and an existing one
+      // get the same answer); the card ends on "check your email" and the
+      // parent signs in with the password just chosen (DL2).
       await api.post("/api/auth/signup", { email, password, fullName, role: "parent" });
-      toast({
-        title: "Account created!",
-        description: "Please check your email to verify your account.",
-      });
-      const res = await api.post("/api/auth/login", { email, password });
-      finishAuth(res.token, res.user);
+      setSignupDoneFor(email.trim());
+      setPassword("");
     } catch (err) {
       toast({ title: "Error", description: (err as Error).message, variant: "destructive" });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handlePinLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const res = await api.post("/api/auth/pin-login", { pin });
-      finishAuth(res.token, res.user);
-    } catch {
-      toast({
-        title: "Invalid PIN",
-        description: "Please check your PIN and try again.",
-        variant: "destructive",
-      });
     } finally {
       setLoading(false);
     }
@@ -141,8 +189,8 @@ export function AuthPage() {
     setLoading(true);
     try {
       await api.post("/api/auth/forgot-password", { email });
-      toast({ title: "Reset link sent", description: "Check your email for a password reset link." });
-      setShowForgot(false);
+      // DL11: a persistent in-card state, never a vanishing toast.
+      setForgotSentFor(email.trim());
     } catch (err) {
       toast({
         title: "Error",
@@ -189,14 +237,49 @@ export function AuthPage() {
             </CardTitle>
             <CardDescription>
               {showForgot
-                ? "Enter your email to receive a reset link"
+                ? mailEnabled === false
+                  ? "Your school office can help"
+                  : "Enter your email to receive a reset link"
                 : isLogin
                   ? "Sign in to your account"
                   : "Parent sign-up for SafeRide"}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {showForgot ? (
+            {showForgot && forgotSentFor ? (
+              <AuthNotice
+                testId="forgot-sent"
+                title={mailEnabled ? FORGOT_SENT_TITLE : MAIL_OFF_FORGOT_TITLE}
+                text={mailEnabled ? forgotSentText(forgotSentFor) : MAIL_OFF_FORGOT}
+                actionLabel="Back to sign in"
+                onAction={() => {
+                  setForgotSentFor(null);
+                  setShowForgot(false);
+                }}
+              />
+            ) : showForgot && mailEnabled === false ? (
+              <AuthNotice
+                testId="forgot-mail-off"
+                title={MAIL_OFF_FORGOT_TITLE}
+                text={MAIL_OFF_FORGOT}
+                actionLabel="Back to sign in"
+                onAction={() => setShowForgot(false)}
+              />
+            ) : !showForgot && !isLogin && signupDoneFor ? (
+              <AuthNotice
+                testId="signup-done"
+                title={mailEnabled ? SIGNUP_DONE_TITLE : SIGNUP_DONE_MAIL_OFF_TITLE}
+                text={mailEnabled ? signupDoneText(signupDoneFor) : MAIL_OFF_SIGNUP}
+                note={mailEnabled ? SIGNUP_DONE_NOTE : undefined}
+                actionLabel="Sign in"
+                onAction={() => {
+                  // The email stays prefilled; the password is typed again.
+                  setEmail(signupDoneFor);
+                  setSignupDoneFor(null);
+                  setIsLogin(true);
+                }}
+              />
+            ) : showForgot ? (
               <form onSubmit={handleForgot} className="space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="email">Email</Label>
@@ -212,7 +295,7 @@ export function AuthPage() {
                 </div>
               </form>
             ) : isLogin ? (
-              <Tabs defaultValue="email">
+              <Tabs value={tab} onValueChange={setTab}>
                 <TabsList className="grid w-full grid-cols-2 mb-4">
                   <TabsTrigger value="email">Email &amp; Password</TabsTrigger>
                   <TabsTrigger value="pin" className="gap-1.5">
@@ -248,23 +331,11 @@ export function AuthPage() {
                   </form>
                 </TabsContent>
                 <TabsContent value="pin">
-                  <form onSubmit={handlePinLogin} className="space-y-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="pin">Driver PIN</Label>
-                      <Input
-                        id="pin"
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        placeholder="••••"
-                        maxLength={6}
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
-                      />
-                    </div>
-                    <Button type="submit" className="w-full" disabled={loading || pin.length < 4}>
-                      {loading ? "Please wait..." : "Sign In with PIN"}
-                    </Button>
-                  </form>
+                  <DriverPinSignIn
+                    linkCode={linkCode}
+                    onLinkConsumed={consumeLink}
+                    onSignedIn={(token, user) => finishAuth(token, user)}
+                  />
                 </TabsContent>
               </Tabs>
             ) : (
@@ -297,7 +368,7 @@ export function AuthPage() {
         </Card>
         )}
 
-        {!showForgot && !preauth && (
+        {!showForgot && !preauth && !signupDoneFor && (
           <p className="text-center text-sm text-muted-foreground">
             {isLogin ? "New parent here? " : "Already have an account? "}
             <button type="button" className="text-primary font-medium hover:underline" onClick={() => setIsLogin(!isLogin)}>

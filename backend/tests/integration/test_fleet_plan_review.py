@@ -32,7 +32,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, DSN, school_sandbox
+from conftest import purge_accounts, DSN, school_sandbox, signup_verified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -145,13 +145,8 @@ def _make_student(client, headers, marker: str, i: int, school_id: str,
 def signup_parent(client, marker: str, tag: str) -> dict:
     """A fresh parent account; fresh email per run = fresh limiter budget."""
     email = f"it-fpr-{tag}-{marker}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!",
-              "full_name": f"IT FPR {tag} {marker}", "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    return {"id": response.json()["user"]["id"], "email": email}
+    parent = signup_verified_parent(client, email, "ParentPass1!", f"IT FPR {tag} {marker}")
+    return {"id": parent["id"], "email": email}
 
 
 def _confirm(client, headers, school_id: str, bus_ids: list[str]) -> None:

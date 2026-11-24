@@ -1,5 +1,19 @@
 import { expect, test } from "@playwright/test";
-import { PARENT, SEED, cardContaining, clearCancellationState, signInAs } from "./helpers";
+import {
+  ADMIN,
+  API_URL,
+  PARENT,
+  SCHOOL_A_ID,
+  SEED,
+  apiToken,
+  cardContaining,
+  clearCancellationState,
+  lastMailLink,
+  linkPath,
+  schoolHeaders,
+  signInAs,
+  uniqueName,
+} from "./helpers";
 
 // Parent journey: home, tracking, profile, push state, Cancel-a-Ride.
 
@@ -114,5 +128,78 @@ test("parent cancels the afternoon ride, sees chip and confirmation, then withdr
     // Idempotent office-side restore: absence row (if the withdraw step never
     // ran) and the admin "Ride Cancellation" alert this journey raised.
     await clearCancellationState(request, SEED.parentChild);
+  }
+});
+
+// Hardening Release 1b (U8; AE4, DL2, DL9, DL10): a new parent reaches a child
+// only after confirming the address from their own signed-in session. The
+// mail is opened in a different browser (a fresh context, signed out), which
+// signs in on the verify page itself; the first tab — signed in and polling —
+// shows the child without a reload.
+test("a new parent signs up, verifies from another browser, and Home shows the child without reload", async ({
+  page,
+  browser,
+  request,
+}) => {
+  const email = `e2e-verify-${Date.now()}@saferide.test`;
+  const password = "Verify123!";
+  const childName = uniqueName("E2E Verify Kid");
+  const headers = schoolHeaders(await apiToken(request, ADMIN.email, ADMIN.password), SCHOOL_A_ID);
+  const student = await request.post(`${API_URL}/api/students`, {
+    headers,
+    data: {
+      name: childName, grade: "Grade 2",
+      parent_name: "E2E Verify Parent", parent_phone: "+254711222555", parent_email: email,
+      home_address: "Verify Lane, Nairobi", route_ids: [],
+    },
+  });
+  expect(student.ok()).toBeTruthy();
+  const studentId = (await student.json()).id;
+  const other = await browser.newContext();
+
+  try {
+    // Tab 1: sign up, read "Check your email", sign in.
+    await page.goto("/auth");
+    await page.getByRole("button", { name: "Sign up", exact: true }).click();
+    await page.locator("#fullName").fill("E2E Verify Parent");
+    await page.locator("#email").fill(email);
+    await page.locator("#password").fill(password);
+    await page.getByRole("button", { name: "Create Account" }).click();
+    await page.getByTestId("signup-done").getByRole("button", { name: "Sign in" }).click();
+    await page.locator("#password").fill(password);
+    await page.getByRole("button", { name: "Sign In", exact: true }).click();
+    await page.waitForURL("/parent");
+    // Nothing linked yet, even though the school's record carries the email.
+    await expect(page.getByTestId("verify-email-card")).toBeVisible();
+    await expect(page.getByText(childName)).toHaveCount(0);
+
+    // Tab 2 (another browser): the emailed link, signed out → sign in there.
+    const link = await lastMailLink(request, "verification");
+    const second = await other.newPage();
+    await second.goto(new URL(linkPath(link), page.url()).toString());
+    await expect(second.getByTestId("verify-title")).toHaveText(
+      "Sign in to finish verifying your email",
+    );
+    await second.locator("#verify-email").fill(email);
+    await second.locator("#verify-password").fill(password);
+    await second.getByRole("button", { name: "Sign in and verify" }).click();
+    await expect(second.getByTestId("verify-title")).toHaveText("Email verified");
+    await expect(second.getByText(/your children will appear on Home/)).toBeVisible();
+
+    // Tab 1, no reload: the card flips away and the child appears.
+    await expect(page.getByText(childName)).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByTestId("verify-email-card")).toHaveCount(0);
+  } finally {
+    await other.close();
+    await request.delete(`${API_URL}/api/students/${studentId}`, { headers });
+    // The sign-up incident the verification raised at school A.
+    const incidents = await request.get(`${API_URL}/api/incidents`, { headers });
+    if (incidents.ok()) {
+      for (const row of await incidents.json()) {
+        if (String(row.description ?? "").includes(email)) {
+          await request.delete(`${API_URL}/api/incidents/${row.id}`, { headers });
+        }
+      }
+    }
   }
 });

@@ -15,9 +15,9 @@ Staff accounts are personal — **never share a login**. Every change made in th
 
 **First sign-in with a temporary password:** the director who created your account gives you a one-time temporary password. It is valid for **72 hours** — sign in before it expires (after that, ask for a new one). The app will not show you any page until you **set your own password**; the temporary password then stops working for everyone, including the director who set it.
 
-**Changing your password:** you can change your own password any time from the console (your current password is required). Changing it signs out your other devices.
+**Changing your password:** open the account menu (your initials, top right) and choose **Change password**. Your current password is required. The dialog says *"You'll stay signed in here. Other devices will be signed out."* — and that is what happens.
 
-**Locked out?** There is no self-service e-mail reset for staff. A **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
+**Locked out?** Tap **Forgot password?** on the sign-in page. Once SafeRide's email is switched on, it emails you a reset link that works once and lasts 30 minutes; choosing a new password there signs you in and signs out every other device. Until then the page shows **"Email recovery is off"** (*"Email recovery isn't switched on yet. Ask your school office to reset your password."*) and sends nothing: a **director** (or SafeRide support) issues you a fresh temporary password from the Staff page — your old password and any open sessions stop working immediately, and you set a new password at your next sign-in.
 
 ## Director and transport coordinator
 
@@ -39,7 +39,7 @@ The rule of thumb: removals that are part of the daily job (an absence, a studen
 
 ## Your school, and switching schools
 
-The bottom of the sidebar shows the **active school** — its name and its **school code** (e.g. `MSB-001`, assigned by SafeRide and never editable). Quote the code when you contact support.
+The bottom of the sidebar shows the **active school** — its name and its **school code** (e.g. `MSB-001`, assigned by SafeRide and never editable). Quote the code when you contact support. It is not the **driver code** your drivers type on their phones — see [Share the driver code](#share-the-driver-code).
 
 Most people belong to one school and never think about this. If you hold a role at **more than one school** (for example an owner who is director at both), the school card becomes a **switcher**: click it and pick a school from **"Your schools"**. Switching replaces everything on screen with the other school's data — nothing from the first school remains — and lands you on its Dashboard. On sign-in with several schools, the app asks you to **choose a school to work in** first.
 
@@ -65,7 +65,7 @@ The left sidebar lists the sections of the console (everything scoped to your ac
 | **Students** | Student records, parent contacts, route assignment, daily absences |
 | **Run History** | Every run, with a detailed report per run |
 | **Parents** | Registered parent accounts |
-| **Drivers** | Driver accounts and PINs |
+| **Drivers** | Driver accounts and PINs, and the school's driver code |
 | **Alerts** | Incident feed from drivers and parent cancellations |
 | **Staff** | Staff accounts and role offers — **directors only** |
 | **Settings** | The school's own record: name, contact, bell times, gate location; the **Tracking** card for the GPS thresholds |
@@ -80,11 +80,11 @@ Set things up in this order — each step depends on the previous one:
 
 1. **Check School Settings** — your school is created by SafeRide, but routes and runs need the **gate location** and bell times to be right. Confirm them (Settings) before anything else.
 2. **Add staff** (Staff, director only) — give the coordinator their own account.
-3. **Add drivers** (Drivers) — each gets a 4-digit PIN to sign in with, and is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run.
+3. **Add drivers** (Drivers) — each gets a six-digit PIN to sign in with and your school's driver code to set up their phone, and is taken through the [Driver GPS Briefing](driver-gps-briefing.md) before their first run.
 4. **Add buses** (Buses) — and assign a driver to each.
 5. **Add students** (Students) — with parent contacts and home locations.
 6. **Create routes** (Routes, the Fleet Plan page, or the Fleet Map route planner) — assign a bus, and put students on the route.
-7. **Dry-run**: have a driver sign in with their PIN and confirm they see the bus and route on their Home screen.
+7. **Dry-run**: have a driver set up their phone with the driver code, sign in with their PIN and confirm they see the bus and route on their Home screen.
 
 The sections below cover each screen in detail.
 
@@ -135,11 +135,35 @@ Staff creation is rate-limited (about 20 per hour) — enough for onboarding, an
 
 ## Drivers
 
-Click **Add Driver** and fill in **Full name**, **Email**, **Password** (min 6 characters — drivers can use this on the Email & Password tab, though most will only ever use the PIN), **Phone**, and the **Driver PIN**. Use **Generate** for a random 4-digit PIN.
+### Share the driver code
 
-**The PIN is shown exactly once.** After saving, a **"Driver PIN set"** dialog reveals the PIN with a **Copy** button — share it with the driver right there and then. It is stored encrypted and cannot be viewed again. If a driver forgets their PIN, edit their record and use **Reset PIN** (leaving it blank keeps the current one).
+A driver's PIN works only at your school, so each driver's phone is set up for your school once, with your school's **driver code**. The **Driver code** card at the top of the Drivers page shows it, large, in two groups of four (for example `GFA0-7K1Q`), under the line *"Drivers type this code once on each phone, then sign in with their PIN. It is not the school code."* It is **not** the school code (`MSB-001`) shown in the sidebar and in Settings — that is a different code, and a driver who types it is told "That isn't a driver code. The school code in Settings is a different code."
 
-PINs are **unique across drivers** — if you pick one that's taken you'll see "That PIN is already in use by another driver".
+- **Copy code** copies the driver code. Reading it out or sending it is the surest way: it works on every phone, including an iPhone's installed app. Drivers can type it in capitals or small letters, with or without the hyphen; the code never contains the letters I, L, O or U, so nothing can be misread.
+- **Copy message for drivers** copies a ready-to-send message: the code first, then the link, then the PIN step. For Greenfield Academy it reads:
+
+  ```text
+  SafeRide driver sign-in for Greenfield Academy.
+  Open the SafeRide app. When it asks for the driver code, type GFA0-7K1Q. If it shows another school's name, tap Change school.
+  Or open this link on your phone: https://saferidelive.co.ke/auth?school=GFA07K1Q
+  Then sign in with your PIN.
+  ```
+
+  It never contains a PIN: give each driver their PIN yourself (the PIN dialog below).
+- **Share by link or QR** shows the sign-in link (`…/auth?school=` followed by the code) and a QR code of it, with **Copy link**. Opening the link sets the phone up the same way as typing the code; the driver still confirms "Is this your school?". On iPhones a link from a chat often opens in Safari rather than the installed app, which keeps its own settings — so lead with the code.
+- **Regenerate** (director only) replaces the code. It asks first: **"Replace the driver code? Links and QR codes already sent stop working. Phones already set up keep working."** Use it at the start of a term, or when the code reached someone it should not have. Drivers whose phones are already set up are not affected; only new phones need the new code.
+
+### Adding a driver and the PIN
+
+Click **Add Driver** and fill in **Full name**, **Email**, **Password** (min 6 characters — drivers can use this on the Email & Password tab, though most will only ever use the PIN), **Phone**, and the **Driver PIN**. A new PIN is **six digits**. Use **Generate** for a random six-digit PIN; it never makes one the app would refuse.
+
+**Save** stays unavailable until the PIN is right, with the reason under the field: **"PIN must be 6 digits"**, or **"That PIN is too easy to guess"** for repeated digits (`111111`), runs (`123456`, `654321`), a repeated pattern (`121212`, `123123`) and a few other common choices. Drivers who had a shorter PIN before December 2026 keep signing in with it until you give them a new one.
+
+**The PIN is shown exactly once.** After saving, a **"Driver PIN set"** dialog reveals the PIN with a **Copy** button — share it with the driver right there and then, together with the driver code the dialog repeats ("On a new phone they first enter the driver code …"). It is stored encrypted and cannot be viewed again. If a driver forgets their PIN, edit their record and use **Reset PIN** (leaving it blank keeps the current one).
+
+PINs are **unique within your school** — if you pick one another of your drivers already has, you'll see **"That PIN is already in use at this school"**; pick another (or use Generate). The same PIN at another school is not a clash, and nothing here tells you about other schools' PINs.
+
+**A driver signs in by PIN at one school only.** If someone already drives for another school on SafeRide, setting a PIN for them here is refused with "This driver already drives for another school. A driver can sign in by PIN at one school only." — contact SafeRide support to sort it out.
 
 A driver **belongs to your school**: they are created here, sign in by PIN, and only ever see your school's buses, routes and runs. There is no driver self-signup. **Before a driver's first run, Kuumbai takes them through the [Driver GPS Briefing](driver-gps-briefing.md)** — the notice of what the app records about their phone's location during a run, who sees it and for how long — and signs it off with the school informed. A driver who has not been briefed should be, before their next run; the office's part is to make sure it happened. If you see "That email is already in use", the address already has a SafeRide account — use a different email for the driver.
 
@@ -167,7 +191,7 @@ Click **Add Student** and fill in:
 - **Pickup time** (e.g. `06:45`).
 - **Morning route** and **Afternoon route**. Students are assigned to routes; the bus is whatever bus runs the route. (The student belongs to your active school automatically — there is no school field.)
 
-**Parent emails matter:** the email you record here is what links the parent's app account. When a parent signs up with that exact email, their account attaches to the child automatically (up to two parent accounts per child). If a parent says the app shows no children, the email on the student record is almost always the mismatch.
+**Parent emails matter:** the email you record here is what links the parent's app account. When a parent signs up with that exact email **and confirms it** from the link SafeRide emails them, their account attaches to the child automatically (up to two parent accounts per child). Until the parent confirms, nothing attaches — even if you type their address on a student record — and the Parents page keeps showing the email as **Awaiting signup**. If a parent says the app shows no children, the email on the student record is almost always the mismatch.
 
 **If the email belongs to a parent whose children are at another school**, nothing attaches automatically: the parent sees a **pending card** naming your school (never the child) and the link takes effect only when they **accept** it. If they tap **"Not my child"**, the link is cleared, that email is removed from the student record, and your Alerts page gets a **mismatched-email alert** — re-check the address with the family.
 
@@ -355,11 +379,39 @@ Two other admin powers live here:
 This page lists every parent contact in the system. **Status** tells you where each stands:
 
 - **Registered** — the parent has created their app account.
-- **Awaiting signup** — the email exists on a student record but the parent hasn't signed up yet. Chase these before launch day so parents get notifications from day one.
+- **Awaiting signup** — the email exists on a student record but no parent has signed up with it and confirmed the address yet. Chase these before launch day so parents get notifications from day one.
 
-You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
+You can **edit** a registered parent's name, email and phone, or **delete** the account (director only; deleting removes its student links). **Changing a parent's email** signs the parent out on every device, stops their push notifications and asks them to confirm the new address from the email SafeRide sends to it; their children stay linked, and the old address receives a short notice of the change. The email of anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account, cannot be changed here: the page says *"This account's email cannot be changed from the Parents page. Keep the current email to save a name or phone change."* — it never says why, or which school. Parents cannot edit their own details in their app — corrections come to you. Note you can't create parent accounts here: parents self-register with the email you put on the student record.
 
-A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting.
+A parent marked **Shared** also has a child at another school. You see and manage only **your own students** on that parent, and their account details are **read-only** here — a change or deletion would reach the other school too, so ask SafeRide support if the account itself needs correcting. **Reset password** still works on a Shared row (either school can get the parent back in); the other school's records are not changed.
+
+### Resetting a parent's password
+
+When a parent is locked out — a lost phone, a forgotten password, no working email — a **director or a coordinator** can issue a temporary password from the key button on the parent's row (**Reset password**). The button works once the parent's link to one of your students is accepted; until then it is greyed out with *"Available once the parent accepts the link to your school in their app."*
+
+The confirmation explains what happens: *"Their current password stops working and a temporary password is shown to you once. Their other devices are signed out, alerts on their phone stop until they sign in again, and they are emailed a notice. If they are linked to another school, that school's records are not changed."* (While email isn't switched on, the notice part is left out — no email is sent.)
+
+The **Temporary password** dialog then shows 16 letters and numbers in groups of four — no I, L, O or U, so nothing reads two ways over the phone. **Copy** copies it without the spaces. It is shown **once only**: read it to the parent now.
+
+**What to tell the parent:**
+
+- "Sign in with your email and this temporary password. The spaces are only there to help reading it out: it can be typed with or without them, in capitals or not."
+- "SafeRide then asks you to choose your own password straight away."
+- "It stops working after 72 hours if you don't use it."
+- "Your other phones and browsers have been signed out. Notifications come back on your phone once you sign in there again."
+- They also receive an email, *"Your SafeRide password was reset by your school"*, which carries no password.
+
+Until the parent changes it, the row shows the chip **"Temporary password · expires …"** (date and time). If 72 hours pass unused it reads **"Temporary password expired — reset again"**: issue a new one. A second reset always replaces the first — only the newest temporary password works.
+
+Some accounts cannot be reset from here: anyone who is also staff or a driver at any school, or a SafeRide (Kuumbai) account. The page then says *"This account cannot be reset from the Parents page. Ask the parent to use Forgot password."* — it never says why, or which school. While email isn't switched on, Forgot password sends nothing either: if the person is staff at your own school, a director resets them from the Staff page (**Reset password**); otherwise ask SafeRide support.
+
+### Confirm and reset (parents without a working inbox)
+
+A parent who signed up but never confirmed their email (no access to that inbox, or email isn't switched on yet) stays on **Awaiting signup**, and their children stay unlinked. Each Awaiting signup row has a **Confirm and reset** button. **Only confirm after speaking to this parent** — anyone can sign up with an address they don't own, and confirming attaches the children to that account. If the parent phoned you, ring them back on the parent phone number on the student's record before you confirm — a caller can claim to be anyone, and the temporary password goes to whoever you are speaking to.
+
+If an account is waiting behind that email, Confirm and reset confirms it, links the children (with the usual "Parent signup auto-linked" alert), and issues a temporary password exactly like **Reset password** — shown once, the same 72 hours, the same notice email. The password chosen at sign-up stops working, and anyone signed in to that account is signed out: if the account was not really the parent's, whoever made it is locked out. Tell the parent the same things as for a reset.
+
+If there is nothing to confirm — no sign-up with that email yet, it is already confirmed, or the parent is also on another school's records (such a family confirms from the email SafeRide sends them; while email isn't switched on, ask SafeRide support) — the page says *"Nothing to confirm yet"* / *"Ask the parent to sign up with this email."* Nothing changes.
 
 ## Alerts
 
@@ -397,18 +449,20 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Student (today) | At home, On bus, Expected on bus, At school, Dropped off, Absent today / Absent (AM) / Absent (PM), Unaccounted, Unassigned |
 | Stop exception | Open, Resolved, Confirmed by driver, Retracted, Attested by driver, Uncorroborated (plus the **Reviewed** stamp) |
 | Bus position source (Fleet Map) | Planned stop, Phone GPS (tap), Phone GPS (live), Checkpoint (older app) |
-| Parent account | Registered, Awaiting signup (plus the **Shared** mark) |
+| Parent account | Registered, Awaiting signup (plus the **Shared** mark, and **Temporary password · expires …** or **Temporary password expired — reset again** after an office reset) |
 | Driver PIN | Set, None |
 | Staff | Active, Offered |
 
 **Validation rules**
 
 - Phone numbers: Kenyan mobile formats (`07…`, `01…`, `+2547…`, `+2541…`), normalized to `+254…`. Schools may also use landlines.
-- Passwords: 6–72 characters. Driver PINs: 4 digits, unique per driver, viewable only once at creation/reset.
+- Passwords: 6–72 characters. Driver PINs: six digits for a new or reset PIN (older four- or five-digit PINs keep working until replaced), not an easy guess, unique within your school, viewable only once at creation/reset.
+- Driver code: eight letters and numbers without I, L, O or U, shown in two groups of four; typed in any case, with or without the hyphen; replaced only by **Regenerate**.
 - Students: Parent 1 name required; at least one phone and one email across the two parent contacts.
 - Bus capacity: 1–100. Route planner: max 24 stops. Broadcasts: 500 characters, 12 per hour.
 - School Settings: address **and** map location both required; bell times `HH:MM`.
 - Staff temporary passwords: server-generated, shown once, valid unused for 72 hours, replaced at first sign-in.
+- Parent temporary passwords (Reset password, Confirm and reset): 16 letters and numbers without I, L, O or U, shown once in groups of four, typed with or without the spaces and in any case, valid unused for 72 hours, replaced at first sign-in.
 
 ## Troubleshooting — calls you will get
 
@@ -422,11 +476,20 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: yellow **Location off** or **Turn on precise location** banner | Their phone refused location, or is sharing a rough one. Taps still work; the map shows planned stops instead of the bus. The banner's **How to turn it on** lists the steps per phone (also in the Driver Guide). |
 | Driver: "the app keeps asking me to confirm" | Taps made further than the **Custody distance** from the child's stop, after accuracy. Check the stop pins on the route and the phone's accuracy on the run report before loosening the threshold in Settings → Tracking. |
 | Driver forgot their PIN | Drivers → edit → Reset PIN; the new PIN shows once. |
-| Staff member locked out of their account | A director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
+| Driver: the app asks for a driver code | Their phone is not set up for your school (a new phone, or an iPhone that forgot after a week unused). Give them the code from the **Driver code** card; they open the installed app and type it. |
+| Driver: "That code didn't match a school" | They mistyped it, or the code was regenerated. Read them the current code from the Drivers page. |
+| Driver: "Sign-in for your school is paused for a few minutes" | Too many wrong PINs were tried from their network at your school. It lifts by itself after the minutes shown; drivers already signed in are not affected. Confirm the driver's PIN with them (or reset it) before they try again. |
+| Driver: "Invalid PIN" with the right PIN, and the app never asked for the driver code | The phone is still running the app from before an update (the December 2026 update added the driver code). Ask them to close SafeRide completely and open it again from the home-screen icon; it then asks for the driver code. |
+| Driver: "This driver already drives for another school" when you set a PIN | A driver can sign in by PIN at one school only. Contact SafeRide support. |
+| Staff member locked out of their account | Once email is switched on they can use **Forgot password?** themselves. Otherwise a director resets it: Staff → **Reset password**. The new temporary password shows once and must be replaced at their next sign-in. |
 | A director is locked out and there is no other director | Contact SafeRide support — they can step in and issue the reset. |
 | New staff member's temporary password "doesn't work" | Temporary passwords expire after **72 hours** unused. Reset it and hand over the new one. |
 | Parent: "No children are linked to your account yet" | The parent's sign-up email doesn't match the student record. Fix the email on the student (or have the parent re-register with the recorded email). If the parent's other children are at another school, the link shows on their phone as a **pending card** — ask them to accept it. |
 | Alerts: "mismatched email" from a parent decline | A parent answered your link with "Not my child". The email was removed from the student's record — verify the address with the family and re-enter it. |
+| Parent: locked out, the reset email never arrives, or "Email recovery isn't switched on yet" | Parents → the key button on their row (**Reset password**), and read them the temporary password. See [Resetting a parent's password](#resetting-a-parents-password). |
+| Parent: "Sign-up received" — no link was sent | Email isn't switched on yet. Speak to them, then Parents → **Confirm and reset** on their Awaiting signup row. |
+| Parent: signed up but can't confirm their email | Speak to them, then Parents → **Confirm and reset** on their Awaiting signup row. See [Confirm and reset](#confirm-and-reset-parents-without-a-working-inbox). |
+| Parent: "the temporary password doesn't work" | Check the row's chip: after 72 hours it reads "Temporary password expired — reset again". Otherwise make sure they use the newest one — each reset replaces the last. |
 | Parent: wants name/phone/address changed | Edit it on the Students or Parents page — parents can't self-edit. |
 | Parent: no notifications | Check they've registered (Parents page shows "Registered"), and that they enabled push in their Profile tab; otherwise alerts still appear in their in-app feed. |
 | Bus missing from Fleet Map | The bus only appears during an active run. Its position moves with the driver's phone — at each tap, and on its own every **Ping interval** while the app is on the driver's screen — or to the planned stop when a tap carried no fix. |
@@ -434,3 +497,4 @@ New items carry a **"New"** badge and count toward the bell and sidebar badges. 
 | Driver: "Live tracking is paused: this run was started from another sign-in" | The run was started from another sign-in of the same PIN. Any tap from the phone the driver is holding moves the run to it and live tracking resumes. The run report shows it as **Check not verified — live pings refused from a second sign-in**. Check that one PIN is not being used on two phones at once. |
 | Driver: "the app drains my battery on a run" | Expected: the app keeps the screen awake for the whole run so the phone keeps sending. The phone should be on its charger on the bus. A longer **Ping interval** helps a little; the screen is the main cost. |
 | Fleet Map: "No GPS for this run — checkpoint positions only" | None of the run's taps carried a position — location is off on the driver's phone. The run is fine; ask the driver to turn location on (Driver Guide). |
+| Anyone: an error message ending "(Reference: …)" | Something failed on SafeRide's side, not a mistake by the person using it. Ask them for the Reference — a screenshot is easiest, the message disappears after a few seconds — and the time it happened, and send both to SafeRide support: the Reference finds the exact error. Trying once more is fine. |

@@ -20,7 +20,7 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox
+from conftest import driver_pin, pin_login_body, purge_accounts, purge_run, school_sandbox, signup_verified_parent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -110,7 +110,7 @@ def accept_pending(client, parent_headers):
 def fleet(client, admin_headers, sandbox):
     marker = uuid.uuid4().hex[:6]
     created: dict = {"marker": marker}
-    pin = str(random.randint(100000, 999999))
+    pin = driver_pin()
 
     created["driver"] = client.post(
         "/api/accounts/drivers",
@@ -138,11 +138,11 @@ def fleet(client, admin_headers, sandbox):
             headers=admin_headers,
         ).json()
 
-    signup = client.post("/api/auth/signup", json={
-        "email": f"it-ds-parent-{marker}@test.local", "password": "ParentPass1!",
-        "full_name": f"IT DS Parent {marker}", "role": "parent"}).json()
-    created["parent_id"] = signup["user"]["id"]
-    created["parent_headers"] = {"Authorization": f"Bearer {signup['token']}"}
+    parent = signup_verified_parent(
+        client, f"it-ds-parent-{marker}@test.local", "ParentPass1!", f"IT DS Parent {marker}"
+    )
+    created["parent_id"] = parent["id"]
+    created["parent_headers"] = parent["headers"]
 
     created["student"] = client.post(
         "/api/students",
@@ -174,7 +174,7 @@ def fleet(client, admin_headers, sandbox):
 
 @pytest.fixture
 def driver_headers(client, fleet):
-    token = client.post("/api/auth/pin-login", json={"pin": fleet["pin"]}).json()["token"]
+    token = client.post("/api/auth/pin-login", json=pin_login_body(fleet["pin"], fleet["school"]["id"])).json()["token"]
     return {"Authorization": f"Bearer {token}"}
 
 

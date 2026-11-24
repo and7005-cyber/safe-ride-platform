@@ -5,8 +5,10 @@ values someone set: each Settings field is a template Parameter whose Default
 equals the Settings default, lands in the API function's environment under
 the alias Settings reads, is passable from deploy-backend.sh under that same
 name, and is documented in backend/.env.example. The live-parity rule of
-test_gps_settings.py, for string parameters. No code sends mail yet, so
-MAIL_ENABLED is false everywhere. Pure text inspection of the template
+test_gps_settings.py, for string parameters. MAIL_ENABLED defaults to false:
+the operator switches it on once SES production access is granted (the
+sender, app.services.mail_service, is tested in tests/services/test_mail_service.py).
+Pure text inspection of the template
 (template_text.py).
 """
 

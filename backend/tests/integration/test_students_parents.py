@@ -23,7 +23,14 @@ import httpx
 import psycopg
 import pytest
 
-from conftest import purge_accounts, purge_run, school_sandbox
+from conftest import (
+    purge_accounts,
+    purge_run,
+    school_sandbox,
+    signup_verified_parent,
+    SCHOOL_A_ID,
+    pin_login_body,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INTEGRATION") != "1",
@@ -96,16 +103,11 @@ def student_payload(marker: str, **overrides) -> dict:
 
 
 def signup_parent(client, marker: str, tag: str) -> tuple[str, str, dict]:
-    """Create a parent account; returns (parent_id, email, headers)."""
+    """Create a verified parent account (Release 1b: sign-up, sign-in and the
+    session-bound verification); returns (parent_id, email, headers)."""
     email = f"it-{tag}-{marker}@test.local"
-    response = client.post(
-        "/api/auth/signup",
-        json={"email": email, "password": "ParentPass1!", "full_name": f"IT {tag} {marker}",
-              "role": "parent"},
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    return body["user"]["id"], email, {"Authorization": f"Bearer {body['token']}"}
+    parent = signup_verified_parent(client, email, "ParentPass1!", f"IT {tag} {marker}")
+    return parent["id"], email, parent["headers"]
 
 
 def students_of_parent(client, admin_headers, email: str) -> list[str]:
@@ -284,6 +286,14 @@ def test_unrelated_edit_preserves_drifted_link(client, admin_headers):
         assert student["name"] in students_of_parent(client, admin_headers, renamed_email)
     finally:
         client.delete(f"/api/students/{student['id']}", headers=admin_headers)
+        # The rename wrote a 017 audit action; the 013/016 double-apply
+        # rehearsals validate existing rows against older CHECK lists.
+        with psycopg.connect(DB_URL, autocommit=True) as conn:
+            conn.execute(
+                "delete from live_admin_audit where action = 'parent-email-changed' "
+                "and resource_id = %s",
+                (str(parent_id),),
+            )
         purge_accounts(parent_id)
 
 
@@ -403,7 +413,7 @@ U3_HOME = {
 
 @pytest.fixture(scope="module")
 def driver_headers(client):
-    response = client.post("/api/auth/pin-login", json={"pin": DRIVER_PIN})
+    response = client.post("/api/auth/pin-login", json=pin_login_body(DRIVER_PIN, SCHOOL_A_ID))
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
 

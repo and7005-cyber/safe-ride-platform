@@ -301,6 +301,37 @@ describe("apiClient structured error details", () => {
   });
 });
 
+describe("apiClient Retry-After (hardening U10, DL4)", () => {
+  it("exposes the seconds a 429 asks for, from the header or the body", async () => {
+    const { api } = await import("@/lib/apiClient");
+    const locked = {
+      detail: { code: "school-pin-locked", message: "paused", retry_after_s: 240 },
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(locked), { status: 429, headers: { "Retry-After": "300" } }),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify(locked), { status: 429 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Invalid PIN" }), {
+          status: 401,
+          headers: { "Retry-After": "30" },
+        }),
+      );
+    const body = { pin: "482915", schoolId: "s" };
+    const fromHeader = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(fromHeader).toBeInstanceOf(ApiError);
+    expect(fromHeader.code).toBe("school-pin-locked");
+    expect(fromHeader.retryAfter).toBe(300);
+    const fromBody = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(fromBody.retryAfter).toBe(240);
+    const notA429 = await api.post("/api/auth/pin-login", body).catch((e) => e);
+    expect(notA429.retryAfter).toBeNull();
+    fetchMock.mockRestore();
+  });
+});
+
 // U13 — the provider second factor's client seams.
 
 describe("apiClient provider auth seams", () => {
@@ -374,5 +405,84 @@ describe("apiClient provider auth seams", () => {
     await expect(api.get("/api/provider/schools")).rejects.toThrow(/enrol your second factor/);
     expect(handler).toHaveBeenCalledOnce();
     fetchMock.mockRestore();
+  });
+});
+
+// Hardening U11 / DL14 — the server's request id on every failure, and the
+// reference a user can quote appended to 5xx messages only.
+
+describe("apiClient request ids", () => {
+  const ID = "0b7e6c1a-2f3d-4c5b-8a9e-7d6c5b4a3f21";
+
+  async function failure(response: Response): Promise<ApiError> {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const { api } = await import("@/lib/apiClient");
+    const error = await api.get("/api/students").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    fetchMock.mockRestore();
+    expect(error).toBeInstanceOf(ApiError);
+    return error as ApiError;
+  }
+
+  it("takes the id from the X-Request-Id header", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.requestId).toBe(ID);
+    expect(error.status).toBe(500);
+  });
+
+  it("falls back to the 500 body's request_id when the header is unreadable", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+      }),
+    );
+    expect(error.requestId).toBe(ID);
+  });
+
+  it("appends the reference to a 5xx message", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error", request_id: ID }), {
+        status: 500,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe(`Unexpected backend error (Reference: ${ID})`);
+  });
+
+  it("appends it to any 5xx, not only 500", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ status: "error", db: "error" }), {
+        status: 503,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe(`Request failed with status 503 (Reference: ${ID})`);
+  });
+
+  it("leaves 4xx messages untouched but still records the id", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "That PIN is already in use at this school" }), {
+        status: 409,
+        headers: { "X-Request-Id": ID },
+      }),
+    );
+    expect(error.message).toBe("That PIN is already in use at this school");
+    expect(error.message).not.toContain("Reference");
+    expect(error.requestId).toBe(ID);
+  });
+
+  it("adds no reference when the server sent no id", async () => {
+    const error = await failure(
+      new Response(JSON.stringify({ detail: "Unexpected backend error" }), { status: 500 }),
+    );
+    expect(error.requestId).toBeNull();
+    expect(error.message).toBe("Unexpected backend error");
   });
 });
