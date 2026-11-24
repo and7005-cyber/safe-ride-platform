@@ -30,4 +30,3 @@ def unverified_sql(alias: str = "u") -> str:
         f"({alias}.email_verification_required"
         f" and {alias}.email_verified_at is null)"
     )
-
