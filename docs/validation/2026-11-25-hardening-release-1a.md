@@ -28,9 +28,9 @@
   changes: nothing reads 017's objects until Release 1b.
 - **Deployed 2026-11-19, 09:15–09:25 UTC (12:15–12:25 EAT),** backend then
   frontend, from `release/1a`; details in "Deployed" below. Open after the
-  deploy: the Samsung Internet phone check and Chromium's CSP console
-  lines (iOS Safari done 2026-11-19; Android Chrome done by eye on the
-  apex 2026-11-24). The
+  deploy: the Samsung Internet phone check (iOS Safari done 2026-11-19;
+  Android Chrome by eye on the apex and Chrome's CSP console lines on a
+  desktop, 2026-11-24). The
   first-48-hours checks (run late, 2026-11-23) and the post-1a restore
   rehearsal (2026-11-23) are met.
 
@@ -105,7 +105,7 @@
 | SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. +24 h (2026-11-20 09:25Z): the same three. The +72 h read ran late, at +95 h (2026-11-23 08:14Z): the same three. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h, +24 h, +95 h) |
 | CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | 2026-11-19, the user on the iPhone: driver PIN sign-in at Voluntari Academy (driver's last session 10:44:19Z, read 10:45:45Z; no PIN failures) proves `pin-pepper`; provider password plus six-digit code proves `totp-pepper`; school admin password sign-in about 11:10Z proves the API's database path | **met** |
-| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android postponed on 2026-11-19 (no Android phone to hand). Android Chrome on the apex origin, 2026-11-24 09:53–10:21Z, by eye (the phone was not detected for USB debugging from a Windows laptop, so no console lines): parent Track drew the map with no Maps error, which proves the browser key's apex referrer; push enable succeeded; driver PIN sign-in, Start Run with location, End run passed. Provider and school-admin checks on a phone waived by the user (admins work on a computer). Samsung Internet and Chromium's CSP console lines (desktop Chrome runs the same engine) are due before Release 2 enforces the CSP | **iOS and Android Chrome met; Samsung Internet and Chromium console lines open** |
+| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android postponed on 2026-11-19 (no Android phone to hand). Android Chrome on the apex origin, 2026-11-24 09:53–10:21Z, by eye (the phone was not detected for USB debugging from a Windows laptop, so no console lines): parent Track drew the map with no Maps error, which proves the browser key's apex referrer; push enable succeeded; driver PIN sign-in, Start Run with location, End run passed. Provider and school-admin checks on a phone waived by the user (admins work on a computer). Chrome's CSP console lines captured on a desktop the same day (same engine): `connect-src` to `https://www.gstatic.com` and `script-src` WebAssembly compilation by Google Maps' own scripts (verbatim in "Deployed" → "Chrome CSP lines"). Samsung Internet is due before Release 2 enforces the CSP | **iOS, Android Chrome and Chrome CSP lines met; Samsung Internet open** |
 | 90-day retention set on the three old `/aws/lambda/*` groups | 2026-11-19 09:47:20Z on the user's go (it drops their events older than 90 days): `put-retention-policy --retention-in-days 90` on the API, migrate and verify functions' `/aws/lambda/*` groups, each exit 0; read back: all three 90, and `/saferide/api`, `/saferide/migrate`, `/saferide/verify` 90 | **met** |
 | First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | +1 h, +4 h and +24 h on time; the +47 h and +48 h reads ran late, at +95 h on 2026-11-23 (the ERROR search covers 2026-11-20 09:25:09Z onward without a gap). Every item clean; details under "Deployed", "First 48 hours". The 4xx-burst alarm fired twice on scanners (404s only), see there | **met** (late: +47/+48 h read at +95 h) |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | 2026-11-23 on the user's go (infra/RESTORE.md A, the property dry run, B, C, E). Target `2026-11-19T10:44:30+00:00`, eight seconds before the iOS phone check's test run started, so production holds known writes after it (latest restorable 2026-11-23 10:06:12Z). Decision 10:11:59Z → `saferide-restore-test` (db.t4g.micro, 16.14, the stack's subnet group, database security group and `default.postgres16`, not public, single-AZ) available 10:28:53Z (**16 min 54 s**) → 1a property set applied and read back 10:29:28Z (deletion protection on, retention 35, max storage 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, nothing pending; deletion protection off 10:29:45Z) → verify function on the copy 10:29:57Z, first query answered 10:30:10Z: **restore to first query 18 min 11 s** (26 min before 1a), inside the one-hour target. Verify function put back 10:30:32Z, environment `MATCH`, private directory removed; the production reads then passed the verify-target check without the override. Scratch deleted without a final snapshot and with its automated backups, 10:31:57Z to 10:33:30Z; afterwards only the production instance exists. `restore-compare`, copy then production (all rows / at or before the target): `saferide_migrations` 23/23 and 23/23 (newest 09:20:48Z, 017); `live_admin_audit` 93/93 and 98/93 (production newest 11:08:32Z); `run_positions` 271/271 and 292/271; `live_runs` 25/25 and 26/25 (production newest 10:44:37.85Z); `live_incidents` 74/74 and 80/74 (production newest 10:57:43.81Z); `live_notifications` 15/15 and 23/15 (production newest 10:45:23.21Z). On the copy every table's newest row is before the target, and production's rows at or before it equal the copy's totals. Every later production row comes from the phone checks: the test run (1 run created 10:44:37.85Z; 21 position rows, its 9 action and 12 ping rows; 8 notifications, the newest at Run End 10:45:23Z), 5 audit rows matching the five provider and admin writes after the target (step-in 10:54:46Z, student edit 10:56:12Z, step-in 11:07:51Z, staff password reset 11:08:14Z, step-out 11:08:32Z), and 6 incident rows, the newest written during the parent sign-up at 10:57:43Z. No row straddles the target. `migrations` (23 rows), `gps` (9 checks) and `baseline` for Msingi Bora (5 checks) identical; Voluntari Academy `run-count` 4 on the copy and 5 in production (the test run), its other four checks identical; no error rows | **met** |
@@ -611,10 +611,35 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
     - Every alarm `OK` in both regions (12 + 4).
   - Waived by the user: the provider (Fleet Map) and school-admin (address
     suggestions) checks on a phone, because admins work on a computer.
-- **Still open:** the Samsung Internet phone check, and Chromium's CSP
-  console lines (desktop Chrome on the provider, school-admin and parent
-  pages runs the same engine), both before Release 2 enforces the CSP.
-  Also SES production access (reply sent 2026-11-20; still `DENIED`
+- **Chrome CSP lines (desktop Chrome, same engine as Android Chrome),
+  2026-11-24, the user:**
+  - First capture, on `www` with the user's extensions on: no Maps error
+    and no `RefererNotAllowedMapError`.
+    - Five `script-src` WebAssembly lines and twenty `connect-src` lines.
+      **Save as** replaces every address with `<URL>`, even inside the
+      policy text.
+    - The rest was extension noise (Grammarly, a wallet extension), one
+      wrong-password `401`, and the Radix dialog warning fixed in PR #18.
+  - Second capture, read in the console and DevTools' **Issues** tab:
+    - The **Issues** tab lists one blocked resource, `connect-src`
+      report-only, from Google Maps' `main.js:355`:
+      `https://www.gstatic.com/maps/res/CompactLegendSdk-Roadmap-EnhancedNavStyleHoldbackForGeoD-FetchableStyleSetSdk-65d2d80fbdd34e9211eb57a111269bc7`
+      (the iOS address with another hash).
+    - The console groups ten `connect-src` lines. It also shows three
+      WebAssembly lines, from Google Maps' `common.js:223` and
+      `labeler_wrapper.js:40` (twice), verbatim:
+      `Compiling or instantiating a WebAssembly module violates the following Content Security policy directive because 'unsafe-eval' is not an allowed source of script: "script-src 'self' https://maps.googleapis.com". The policy is report-only, so the violation has been logged but no further action has been taken.`
+  - So Google Maps compiles WebAssembly in Chrome; Safari did not report it.
+    Enforced as deployed, the policy would block it, and the map's labels
+    or the map itself could fail in Chrome.
+  - **For Release 2:** before the policy is enforced:
+    - `script-src` needs `'wasm-unsafe-eval'`. It allows WebAssembly only,
+      not JavaScript `eval`.
+    - `connect-src` needs `https://www.gstatic.com` and `data:` (from iOS).
+  - Check the full policy against Google's published Maps JavaScript API
+    CSP guidance in the Release 2 unit.
+- **Still open:** the Samsung Internet phone check, before Release 2
+  enforces the CSP. Also SES production access (reply sent 2026-11-20; still `DENIED`
   2026-11-23). The user chose the 4xx-burst alarm on 2026-11-23: count
   non-404 4xx, built in Release 1b's U12 (see "+95 h" below). The post-1a
   restore rehearsal is met (2026-11-23, gates table).
