@@ -28,7 +28,9 @@
   changes: nothing reads 017's objects until Release 1b.
 - **Deployed 2026-11-19, 09:15–09:25 UTC (12:15–12:25 EAT),** backend then
   frontend, from `release/1a`; details in "Deployed" below. Open after the
-  deploy: the Android phone checks (the user's; iOS Safari done). The
+  deploy: the Samsung Internet phone check and Chromium's CSP console
+  lines (iOS Safari done 2026-11-19; Android Chrome done by eye on the
+  apex 2026-11-24). The
   first-48-hours checks (run late, 2026-11-23) and the post-1a restore
   rehearsal (2026-11-23) are met.
 
@@ -103,7 +105,7 @@
 | SES DKIM and MAIL FROM `SUCCESS` (checked at +24 h and +72 h) | Already at +0 h (2026-11-19 09:25Z): `VerifiedForSendingStatus` true, DKIM `SUCCESS`, MAIL FROM `SUCCESS`. +24 h (2026-11-20 09:25Z): the same three. The +72 h read ran late, at +95 h (2026-11-23 08:14Z): the same three. Sending to unverified recipients still waits on SES production access (case `179501229800147`); `MailEnabled` stays `false` in 1a | **met** (+0 h, +24 h, +95 h) |
 | CloudTrail logging, objects in the bucket | 2026-11-19 09:25Z: `IsLogging` true, latest delivery 09:25:19Z, no delivery error; digest objects under `AWSLogs/<account-id>/CloudTrail-Digest/` from 09:17:59Z | **met** |
 | Driver PIN, provider TOTP and staff password sign-ins after the deploy | 2026-11-19, the user on the iPhone: driver PIN sign-in at Voluntari Academy (driver's last session 10:44:19Z, read 10:45:45Z; no PIN failures) proves `pin-pepper`; provider password plus six-digit code proves `totp-pepper`; school admin password sign-in about 11:10Z proves the API's database path | **met** |
-| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android Chrome and Samsung Internet postponed: no Android phone to hand on 2026-11-19. They and a Maps load on the apex origin (only `www` was exercised, so the key's apex referrer is unproved) are due before Release 2 enforces the CSP, which the plan conditions on the Android Chrome check | **iOS met; Android open** |
+| Phone checks (Android Chrome, Samsung Internet, iOS Safari standalone): sign-in, Track, Fleet Map, planner autocomplete, push enable, driver Start Run; every CSP console line copied | iOS Safari standalone on `www`, 2026-11-19, finished about 11:10Z: every item passed, two report-only `connect-src` kinds (verbatim in "Deployed" → "Phone checks"). Android postponed on 2026-11-19 (no Android phone to hand). Android Chrome on the apex origin, 2026-11-24 09:53–10:21Z, by eye (the phone was not detected for USB debugging from a Windows laptop, so no console lines): parent Track drew the map with no Maps error, which proves the browser key's apex referrer; push enable succeeded; driver PIN sign-in, Start Run with location, End run passed. Provider and school-admin checks on a phone waived by the user (admins work on a computer). Samsung Internet and Chromium's CSP console lines (desktop Chrome runs the same engine) are due before Release 2 enforces the CSP | **iOS and Android Chrome met; Samsung Internet and Chromium console lines open** |
 | 90-day retention set on the three old `/aws/lambda/*` groups | 2026-11-19 09:47:20Z on the user's go (it drops their events older than 90 days): `put-retention-policy --retention-in-days 90` on the API, migrate and verify functions' `/aws/lambda/*` groups, each exit 0; read back: all three 90, and `/saferide/api`, `/saferide/migrate`, `/saferide/verify` 90 | **met** |
 | First 48 hours: subscriptions at +1 h and +47 h; `DatabaseConnections` against `max_connections`; ERROR searches at +1/+4/+24/+48 h; first automated backup, events, nothing pending; trail delivery error empty; blank-map reports; daily spend | +1 h, +4 h and +24 h on time; the +47 h and +48 h reads ran late, at +95 h on 2026-11-23 (the ERROR search covers 2026-11-20 09:25:09Z onward without a gap). Every item clean; details under "Deployed", "First 48 hours". The 4xx-burst alarm fired twice on scanners (404s only), see there | **met** (late: +47/+48 h read at +95 h) |
 | Restore rehearsal with `restore-compare` against both databases, after 1a and before 1b (R21) | 2026-11-23 on the user's go (infra/RESTORE.md A, the property dry run, B, C, E). Target `2026-11-19T10:44:30+00:00`, eight seconds before the iOS phone check's test run started, so production holds known writes after it (latest restorable 2026-11-23 10:06:12Z). Decision 10:11:59Z → `saferide-restore-test` (db.t4g.micro, 16.14, the stack's subnet group, database security group and `default.postgres16`, not public, single-AZ) available 10:28:53Z (**16 min 54 s**) → 1a property set applied and read back 10:29:28Z (deletion protection on, retention 35, max storage 100, backup `23:00-23:30`, maintenance `sun:00:00-sun:01:00`, nothing pending; deletion protection off 10:29:45Z) → verify function on the copy 10:29:57Z, first query answered 10:30:10Z: **restore to first query 18 min 11 s** (26 min before 1a), inside the one-hour target. Verify function put back 10:30:32Z, environment `MATCH`, private directory removed; the production reads then passed the verify-target check without the override. Scratch deleted without a final snapshot and with its automated backups, 10:31:57Z to 10:33:30Z; afterwards only the production instance exists. `restore-compare`, copy then production (all rows / at or before the target): `saferide_migrations` 23/23 and 23/23 (newest 09:20:48Z, 017); `live_admin_audit` 93/93 and 98/93 (production newest 11:08:32Z); `run_positions` 271/271 and 292/271; `live_runs` 25/25 and 26/25 (production newest 10:44:37.85Z); `live_incidents` 74/74 and 80/74 (production newest 10:57:43.81Z); `live_notifications` 15/15 and 23/15 (production newest 10:45:23.21Z). On the copy every table's newest row is before the target, and production's rows at or before it equal the copy's totals. Every later production row comes from the phone checks: the test run (1 run created 10:44:37.85Z; 21 position rows, its 9 action and 12 ping rows; 8 notifications, the newest at Run End 10:45:23Z), 5 audit rows matching the five provider and admin writes after the target (step-in 10:54:46Z, student edit 10:56:12Z, step-in 11:07:51Z, staff password reset 11:08:14Z, step-out 11:08:32Z), and 6 incident rows, the newest written during the parent sign-up at 10:57:43Z. No row straddles the target. `migrations` (23 rows), `gps` (9 checks) and `baseline` for Msingi Bora (5 checks) identical; Voluntari Academy `run-count` 4 on the copy and 5 in production (the test run), its other four checks identical; no error rows | **met** |
@@ -574,13 +576,48 @@ end of the 2026-11-18 pre-checks; the deploy ran the next morning).
     `aria-describedby={undefined}` for {DialogContent}": 22 admin and
     provider dialogs and the confirm dialog, pre-existing. Fixed in PR #18
     (merge `f7b1a51`); it ships with the next frontend deploy.
-  - Not yet: Android Chrome and Samsung Internet (no Android phone to hand),
-    and a Maps load on the apex origin.
-- **Still open:** the Android Chrome and Samsung Internet phone checks and
-  a Maps load on the apex origin (the user; before Release 2 enforces the
-  CSP); SES production access (reply sent 2026-11-20; still `DENIED`
-  2026-11-23); and the user's choice on the 4xx-burst alarm (see "+95 h"
-  below). The post-1a restore rehearsal is met (2026-11-23, gates table).
+  - Not done that day: Android Chrome and Samsung Internet (no Android
+    phone to hand), and a Maps load on the apex origin.
+- **Phone check (Android Chrome, apex `saferidelive.co.ke`), 2026-11-24,
+  the user:**
+  - By eye only: the phone was not detected in `chrome://inspect` on a
+    Windows laptop, so no console lines were captured.
+  - Parent: sign-in 09:53:15Z, Track 09:53:49Z. The map drew in colour,
+    with no Maps error box, which proves the browser key's apex referrer.
+    Enable Push first showed "Notifications blocked in browser" (Chrome's
+    site permission was Block). Once notifications were allowed in Chrome's
+    site settings: `POST /api/push/subscribe 200` at 09:58:25Z. The
+    sign-out unsubscribed it at 10:00:15Z (`push-subscriptions-by-kind`
+    web-push 0 afterwards, as after the iOS check).
+  - Driver: PIN sign-in 10:00:28Z, Start Run 10:01:18Z with location
+    allowed, End run 10:02:27Z. Run `f50f36b0…`: 8 action rows and 8 ping
+    rows over 2 active minutes, fix coverage 7/8.
+    `open-runs-and-today`: 0 open, 1 today.
+  - The run left 3 unreviewed `stop-bypassed` exceptions on the test school
+    (the phone was not on the route). A driver incident report
+    (`POST /api/incidents/driver 200`, 10:04:04Z) also sits on the test
+    school.
+  - A provider session (TOTP 09:59:37Z) stepped into the test school and
+    reset the Voluntari Academy driver's PIN
+    (`PUT /api/accounts/drivers/… 200`, 09:59:55Z). Under 1a it is still a
+    legacy hash: `driver-pin-hash-versions-per-school` Voluntari Academy
+    `legacy_hmac` 1, `salted_v2` 0. `pin-lock-state`: no failures.
+  - Logs from 09:00Z to 15:20Z: 0 ERROR or WARNING records over
+    `/saferide/api`, `/saferide/migrate` and `/saferide/verify` (16,382
+    scanned).
+    - The only non-2xx responses: `GET /.env 404` and `GET / 404`
+      (scanners), and `GET /api/provider/schools 401` before the TOTP step
+      (expected).
+    - Every alarm `OK` in both regions (12 + 4).
+  - Waived by the user: the provider (Fleet Map) and school-admin (address
+    suggestions) checks on a phone, because admins work on a computer.
+- **Still open:** the Samsung Internet phone check, and Chromium's CSP
+  console lines (desktop Chrome on the provider, school-admin and parent
+  pages runs the same engine), both before Release 2 enforces the CSP.
+  Also SES production access (reply sent 2026-11-20; still `DENIED`
+  2026-11-23). The user chose the 4xx-burst alarm on 2026-11-23: count
+  non-404 4xx, built in Release 1b's U12 (see "+95 h" below). The post-1a
+  restore rehearsal is met (2026-11-23, gates table).
   The first school morning is 2027-01-04 (the 4xx, driver sign-in and trail
   checks wait for it).
 - **First 48 hours:**
