@@ -1,11 +1,12 @@
 # Validation record — production hardening Release 1b (code)
 
-- **Status: draft** (drafted 2026-11-23, before the code review). Nothing is
-  tagged or deployed; every gate below is `open`.
-- **Date:** planned 2026-12-04 · **Release commit:** to be tagged
-  `release/1b` on the `feat/hardening-r1b` tip after the code review and the
-  final certify (the branch is cut from `main` at `42a20b7`, which holds all
-  of Release 1a, live since 2026-11-19) · **Plan:**
+- **Status: draft** (drafted 2026-11-23, before the code review; the gates
+  before the deploy read on 2026-11-24 and 2026-11-25). `release/1b` is
+  tagged and pushed; nothing is deployed.
+- **Date:** planned 2026-11-26, 09:30 GMT (first planned for 2026-12-04) ·
+  **Release commit:** `634224a`, tagged `release/1b`: `main` after PR #22
+  (`feat/hardening-r1b`, cut from `main` at `42a20b7`, which holds all of
+  Release 1a, live since 2026-11-19) and PR #23 (records only) · **Plan:**
   `docs/plans/2026-11-16-001-feat-production-hardening-plan.md`, U7–U12 and
   U13 (U16 shipped in Release 1a, D8), as amended by the execution decisions
   D1–D27 (the Release 1a record) and D28–D59 below.
@@ -53,15 +54,15 @@ Each gate is a step of the
 
 | Gate | Observed | Verdict |
 |---|---|---|
-| Release 1a stable for a week (from 2026-11-26): alarms `OK` in both regions, both subscriptions confirmed, SES identity verified with DKIM and MAIL FROM `SUCCESS`, no unexplained ERROR line | Through 2026-11-23 (the 1a record, "+95 h"): all `OK` except two `ApiClientErrorsBurst` pairs from scanners (404s, D47); subscriptions confirmed; `true`/`SUCCESS`/`SUCCESS`; 0 ERROR lines | **open** |
-| SES production access state recorded and the `MAIL_ENABLED` decision taken, with the UI state that ships | 2026-11-23: still `DENIED` in the sandbox (the case is in the 1a record); by the checklist, sandbox means `MAIL_ENABLED` unset (`false`) and the mail-off screens | **open** |
+| Release 1a stable for a week (from 2026-11-26): alarms `OK` in both regions, both subscriptions confirmed, SES identity verified with DKIM and MAIL FROM `SUCCESS`, no unexplained ERROR line | Through 2026-11-23 (the 1a record, "+95 h"): all `OK` except two `ApiClientErrorsBurst` pairs from scanners (404s, D47); subscriptions confirmed; `true`/`SUCCESS`/`SUCCESS`; 0 ERROR lines. 2026-11-25 13:13Z (a partial read; the final one is on the deploy day): all 16 alarms `OK` (12 in af-south-1, 4 in us-east-1); one subscription per topic, each a full ARN (one operator address, 1a record U1.7); `true`/`SUCCESS`/`SUCCESS`; the search from 2026-11-24 00:00Z over the three groups: 0 ERROR lines, 2 `psycopg.pool` WARNING lines, explained below; no `5xx` | **open** |
+| SES production access state recorded and the `MAIL_ENABLED` decision taken, with the UI state that ships | 2026-11-23: still `DENIED` in the sandbox (the case is in the 1a record); by the checklist, sandbox means `MAIL_ENABLED` unset (`false`) and the mail-off screens. 2026-11-24: still `DENIED`; the user sent a follow-up on the case (about 50 mails a day). The user's decision, 2026-11-24: `MAIL_ENABLED` stays unset, the mail-off screens ship, and the mail drill and parent drill step 2 wait for production access (recorded as "not run: mail off") | **met** |
 | `hardening` baselines: `drivers-with-several-driver-memberships` 0, every PIN `legacy_hmac`, `unverified-parent-accounts-by-age` all 0, `token-rows-by-purpose` `verify` all 0, `last-retention-run` empty | At 1a (2026-11-19 09:21Z): 0; Msingi Bora 4 and Voluntari Academy 1 `legacy_hmac`; 0; 0; empty. To be read again before the deploy | **open** |
 | The active drivers of both production schools listed by name (outside the repository) with who gives each the PIN and the code | — | **open** |
-| Five `aws logs test-metric-filter` runs: each matches only event 1 | — | **open** |
-| The deploying identity can create the Scheduler group and schedule and pass the new role | — | **open** |
-| `scripts/certify.sh` green at the release commit | Per unit in "Test evidence"; the run at the release commit is pending the code review | **open** |
-| `release/1b` tagged on the certified commit and pushed on the user's go; HEAD on it | — | **open** |
-| Gate dry run: the expected backend change set (15 `Add`, 5 `Modify`, no `Remove`, no `Database` row, no `WARN`) | — | **open** |
+| Five `aws logs test-metric-filter` runs: each matches only event 1 | 2026-11-24: each of the five matches only event 1 | **met** |
+| The deploying identity can create the Scheduler group and schedule and pass the new role | 2026-11-24: the IAM user that deployed 1a, with `AdministratorAccess` attached | **met** |
+| `scripts/certify.sh` green at the release commit | Per unit in "Test evidence". 2026-11-24 at `634224a`: exit 0; backend unit 1015 passed (642 skipped, the integration tests), integration 642 passed (2 skipped), `tsc` clean, vitest 470 passed, build ok, Playwright 111 passed | **met** |
+| `release/1b` tagged on the certified commit and pushed on the user's go; HEAD on it | Annotated tag `1414ffc` on `634224a`, tagged 2026-11-25 13:12:29Z and pushed on the user's go (given 2026-11-24); the dry run ran with HEAD on it and `git status --short` showing only `.claude/` and `justfile` | **met** |
+| Gate dry run: the expected backend change set (15 `Add`, 5 `Modify`, no `Remove`, no `Database` row, no `WARN`) | 2026-11-25 13:13–13:14Z: the 15 `Add` as expected; **6** `Modify`, the expected five plus `HttpApi` (`AWS::ApiGatewayV2::Api`, replacement `False`, `Body`), explained below; no `Remove`, no `Database` row, no `WARN`; answered `N`, the change set deleted, `list-change-sets` empty, the stack still `UPDATE_COMPLETE` from 2026-11-19 | **met** (the user accepted the `HttpApi` row, 2026-11-25; the checklist now expects six `Modify`) |
 | No run on the deploy day (`open-runs-and-today` 0/0), clear of the backup and maintenance windows; manual snapshot `saferide-pre-1b-<date>` | — | **open** |
 | Exports and the stray-variable check: `CONCURRENCY_ALARM_THRESHOLD=800`, `MAIL_ENABLED` only by decision, no `ALLOW_*` | — | **open** |
 | Backend deploy: the change set as the dry run, migrate `applied` `[]`, seeds skipped, `app_role.synced` | — | **open** |
@@ -81,6 +82,64 @@ Each gate is a step of the
 | The next morning: the first scheduled run in `last-retention-run`, a `RetentionRunSucceeded` point, the Scheduler metrics under the `ScheduleGroup` dimension, `MigrateFunctionErrors` and target errors `OK` | — | **open** |
 | Guides match the live copy: `manualVocabulary` green | 36 tests green at U13 (uncommitted), "Test evidence" | **open** |
 | Both operators confirm the drill mails (plan U13 verification; one operator address today, 1a record U1.7) | — | **open** |
+
+### Before the deploy: the gate dry run and the reads (2026-11-24 and 2026-11-25)
+
+- **Gate dry run**, 2026-11-25, HEAD `634224a` on `release/1b`, no stray
+  variables: `CONCURRENCY_ALARM_THRESHOLD=800 CONFIRM_CHANGESET=1
+  ./scripts/deploy-backend.sh`, answered `N`. The script's lines before the
+  build: a clean checkout (HEAD is `origin/main`),
+  `ConcurrencyAlarmThreshold=800`, the live-parity parameters at their
+  defaults, the alert address kept from the stack, `open-runs: 0`; the
+  overrides carry `MailEnabled` `false` and `AppVersion` `634224a`. The
+  script's table:
+
+  ```text
+    Action  LogicalResourceId                 ResourceType                    Replacement  Changed
+    Modify  ApiClientErrorsBurst              AWS::CloudWatch::Alarm          False        MetricName, Dimensions, Namespace, AlarmDescription
+    Add     ApiClientErrorsFilter             AWS::Logs::MetricFilter         -            -
+    Modify  ApiFunction                       AWS::Lambda::Function           False        Code, Environment
+    Modify  HttpApi                           AWS::ApiGatewayV2::Api          False        Body
+    Add     MailSendFailedFilter              AWS::Logs::MetricFilter         -            -
+    Add     MailSendFailed                    AWS::CloudWatch::Alarm          -            -
+    Modify  MigrateFunctionErrors             AWS::CloudWatch::Alarm          False        AlarmDescription
+    Add     MigrateFunctionEventInvokeConfig  AWS::Lambda::EventInvokeConfig  -            -
+    Modify  MigrateFunction                   AWS::Lambda::Function           False        Code, Timeout
+    Add     OpsScheduleGroup                  AWS::Scheduler::ScheduleGroup   -            -
+    Add     PinFailureBurst                   AWS::CloudWatch::Alarm          -            -
+    Add     PinFailureFilter                  AWS::Logs::MetricFilter         -            -
+    Add     PinLockedFilter                   AWS::Logs::MetricFilter         -            -
+    Add     PinLocked                         AWS::CloudWatch::Alarm          -            -
+    Add     RetentionHeartbeat                AWS::CloudWatch::Alarm          -            -
+    Add     RetentionScheduleTargetErrors     AWS::CloudWatch::Alarm          -            -
+    Add     RetentionSchedulerRole            AWS::IAM::Role                  -            -
+    Add     RetentionSchedule                 AWS::Scheduler::Schedule        -            -
+    Add     SchoolRequiredBurst               AWS::CloudWatch::Alarm          -            -
+    Add     SchoolRequiredFilter              AWS::Logs::MetricFilter         -            -
+    Modify  VerifyFunction                    AWS::Lambda::Function           False        Code
+  ```
+
+- **The extra `HttpApi` row.** The expected table came from the template
+  diff, and the 1b diff touches neither `HttpApi` nor the function's route
+  events. `Body` is the OpenAPI document SAM generates from those events.
+  Translated locally (SAM CLI 1.162.1, translator 1.110.0) from `release/1a`
+  and from `release/1b`, it is identical to the deployed one (the stack's
+  processed template, compared with sorted keys: no difference, the same five
+  paths). Its only intrinsic reference is `${ApiFunction.Arn}`, in the
+  integration URI. `ApiFunction` is a `Modify` row, so CloudFormation
+  evaluates `Body` when the update runs (a dynamic change) and lists it; the
+  function is not replaced, so `Body` resolves to the same ARN and the same
+  document. Any release that modifies `ApiFunction` shows this row. In 1a it
+  was also a real change: the two new routes.
+- **The two WARNING lines** in the search, both `psycopg.pool` "error
+  connecting in 'pool-1'": 2026-11-24 15:28:37Z ("SSL connection has been
+  closed unexpectedly") and 2026-11-25 08:31:18Z ("connection timeout
+  expired"). They are the pool's reconnect in the background. The first
+  invocation still answered `GET /api/incidents/today-count` `200` in 30 ms;
+  the second line falls between health probes, all `200`. The database's
+  events show only the nightly backups. Responses from 2026-11-24 00:00Z to
+  2026-11-25 13:15Z: 26,963 `2xx`, 28 `4xx`, no `5xx`. 1b's database-aware
+  health check makes a lasting fault visible to the probe.
 
 ### Baselines carried from Release 1a
 
