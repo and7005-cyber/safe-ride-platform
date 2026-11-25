@@ -882,9 +882,10 @@ the deploy session.
    | Modify | `MigrateFunctionErrors` | `AWS::CloudWatch::Alarm` | `False` | `AlarmDescription` |
    | Modify | `MigrateFunction` | `AWS::Lambda::Function` | `False` | `Code`, `Timeout` (120 → 600) |
    | Modify | `ApiFunction` | `AWS::Lambda::Function` | `False` | `Code`, `Environment` (`APP_VERSION`) |
+   | Modify | `HttpApi` | `AWS::ApiGatewayV2::Api` | `False` | `Body`: a dynamic change, since SAM's generated `Body` takes `${ApiFunction.Arn}` and `ApiFunction` is modified; identical as written (the 2026-11-25 dry run, the 1b record) |
    | Modify | `VerifyFunction` | `AWS::Lambda::Function` | `False` | `Code` |
 
-   Fifteen `Add`, five `Modify`, **no `Remove`, no `Database` row, no
+   Fifteen `Add`, six `Modify`, **no `Remove`, no `Database` row, no
    `WARN` line** (a stateless replacement would print one; there should be
    none). The `MailEnabled` description change and the parity parameters
    leave no row.
