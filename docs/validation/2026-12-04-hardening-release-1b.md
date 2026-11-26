@@ -1,9 +1,10 @@
 # Validation record — production hardening Release 1b (code)
 
-- **Status: draft** (drafted 2026-11-23, before the code review; the gates
-  before the deploy read on 2026-11-24 and 2026-11-25). `release/1b` is
-  tagged and pushed; nothing is deployed.
-- **Date:** planned 2026-11-26, 09:30 GMT (first planned for 2026-12-04) ·
+- **Status: deployed** 2026-11-26 (backend 12:22:08Z, frontend 12:45:51Z),
+  **with mail on**; smoke, rollback rehearsal and drills done ("Deployed").
+  The next-morning checks and the first 48 hours are open.
+- **Date:** 2026-11-26, started 12:07Z (planned 09:30 GMT; first planned
+  for 2026-12-04) ·
   **Release commit:** `634224a`, tagged `release/1b`: `main` after PR #22
   (`feat/hardening-r1b`, cut from `main` at `42a20b7`, which holds all of
   Release 1a, live since 2026-11-19) and PR #23 (records only) · **Plan:**
@@ -54,34 +55,34 @@ Each gate is a step of the
 
 | Gate | Observed | Verdict |
 |---|---|---|
-| Release 1a stable for a week (from 2026-11-26): alarms `OK` in both regions, both subscriptions confirmed, SES identity verified with DKIM and MAIL FROM `SUCCESS`, no unexplained ERROR line | Through 2026-11-23 (the 1a record, "+95 h"): all `OK` except two `ApiClientErrorsBurst` pairs from scanners (404s, D47); subscriptions confirmed; `true`/`SUCCESS`/`SUCCESS`; 0 ERROR lines. 2026-11-25 13:13Z (a partial read; the final one is on the deploy day): all 16 alarms `OK` (12 in af-south-1, 4 in us-east-1); one subscription per topic, each a full ARN (one operator address, 1a record U1.7); `true`/`SUCCESS`/`SUCCESS`; the search from 2026-11-24 00:00Z over the three groups: 0 ERROR lines, 2 `psycopg.pool` WARNING lines, explained below; no `5xx` | **open** |
-| SES production access state recorded and the `MAIL_ENABLED` decision taken, with the UI state that ships | 2026-11-23: still `DENIED` in the sandbox (the case is in the 1a record); by the checklist, sandbox means `MAIL_ENABLED` unset (`false`) and the mail-off screens. 2026-11-24: still `DENIED`; the user sent a follow-up on the case (about 50 mails a day). The user's decision, 2026-11-24: `MAIL_ENABLED` stays unset, the mail-off screens ship, and the mail drill and parent drill step 2 wait for production access (recorded as "not run: mail off") | **met** |
-| `hardening` baselines: `drivers-with-several-driver-memberships` 0, every PIN `legacy_hmac`, `unverified-parent-accounts-by-age` all 0, `token-rows-by-purpose` `verify` all 0, `last-retention-run` empty | At 1a (2026-11-19 09:21Z): 0; Msingi Bora 4 and Voluntari Academy 1 `legacy_hmac`; 0; 0; empty. To be read again before the deploy | **open** |
-| The active drivers of both production schools listed by name (outside the repository) with who gives each the PIN and the code | — | **open** |
+| Release 1a stable for a week (from 2026-11-26): alarms `OK` in both regions, both subscriptions confirmed, SES identity verified with DKIM and MAIL FROM `SUCCESS`, no unexplained ERROR line | Through 2026-11-23 (the 1a record, "+95 h"): all `OK` except two `ApiClientErrorsBurst` pairs from scanners (404s, D47); subscriptions confirmed; `true`/`SUCCESS`/`SUCCESS`; 0 ERROR lines. 2026-11-25 13:13Z (a partial read; the final one is on the deploy day): all 16 alarms `OK` (12 in af-south-1, 4 in us-east-1); one subscription per topic, each a full ARN (one operator address, 1a record U1.7); `true`/`SUCCESS`/`SUCCESS`; the search from 2026-11-24 00:00Z over the three groups: 0 ERROR lines, 2 `psycopg.pool` WARNING lines, explained below; no `5xx`. 2026-11-26 12:08:53Z (the final read): 16 alarms `OK`; one subscription per topic, full ARNs; `true`/`SUCCESS`/`SUCCESS`; since the 2026-11-25 read 0 ERROR or WARNING lines, the gateway 15,970 requests, 25 `4xx`, 0 `5xx` | **met** |
+| SES production access state recorded and the `MAIL_ENABLED` decision taken, with the UI state that ships | 2026-11-23: still `DENIED` in the sandbox (the case is in the 1a record); by the checklist, sandbox means `MAIL_ENABLED` unset (`false`) and the mail-off screens. 2026-11-24: still `DENIED`; the user sent a follow-up on the case (about 50 mails a day). The user's decision, 2026-11-24: `MAIL_ENABLED` stays unset, the mail-off screens ship, and the mail drill and parent drill step 2 wait for production access (recorded as "not run: mail off"). **2026-11-26: production access GRANTED** (`production` true, `sending` true, review `GRANTED`, 50,000 a day). The user's new decision the same day: `MAIL_ENABLED=true` on this deploy, the mail-on screens ship, the mail drill and parent drill step 2 run; every later 1b backend deploy exports it | **met** (decision changed 2026-11-26: mail on) |
+| `hardening` baselines: `drivers-with-several-driver-memberships` 0, every PIN `legacy_hmac`, `unverified-parent-accounts-by-age` all 0, `token-rows-by-purpose` `verify` all 0, `last-retention-run` empty | At 1a (2026-11-19 09:21Z): 0; Msingi Bora 4 and Voluntari Academy 1 `legacy_hmac`; 0; 0; empty. To be read again before the deploy. 2026-11-26 12:10Z: 0; Msingi Bora 4 and Voluntari Academy 1 `legacy_hmac`, `salted_v2` 0, `no_pin` 0; every bucket 0; `verify` all 0; empty; `notifications-past-90-days` 1, `stale-sessions` 272/23; `migrations` ends on `017` | **met** |
+| The active drivers of both production schools listed by name (outside the repository) with who gives each the PIN and the code | 2026-11-26: Msingi Bora's 4 driver accounts are placeholders, not real people (the user); Voluntari Academy's is the test driver. Nobody to reach | **met** (n/a: no real drivers) |
 | Five `aws logs test-metric-filter` runs: each matches only event 1 | 2026-11-24: each of the five matches only event 1 | **met** |
 | The deploying identity can create the Scheduler group and schedule and pass the new role | 2026-11-24: the IAM user that deployed 1a, with `AdministratorAccess` attached | **met** |
 | `scripts/certify.sh` green at the release commit | Per unit in "Test evidence". 2026-11-24 at `634224a`: exit 0; backend unit 1015 passed (642 skipped, the integration tests), integration 642 passed (2 skipped), `tsc` clean, vitest 470 passed, build ok, Playwright 111 passed | **met** |
 | `release/1b` tagged on the certified commit and pushed on the user's go; HEAD on it | Annotated tag `1414ffc` on `634224a`, tagged 2026-11-25 13:12:29Z and pushed on the user's go (given 2026-11-24); the dry run ran with HEAD on it and `git status --short` showing only `.claude/` and `justfile` | **met** |
 | Gate dry run: the expected backend change set (15 `Add`, 5 `Modify`, no `Remove`, no `Database` row, no `WARN`) | 2026-11-25 13:13–13:14Z: the 15 `Add` as expected; **6** `Modify`, the expected five plus `HttpApi` (`AWS::ApiGatewayV2::Api`, replacement `False`, `Body`), explained below; no `Remove`, no `Database` row, no `WARN`; answered `N`, the change set deleted, `list-change-sets` empty, the stack still `UPDATE_COMPLETE` from 2026-11-19 | **met** (the user accepted the `HttpApi` row, 2026-11-25; the checklist now expects six `Modify`) |
-| No run on the deploy day (`open-runs-and-today` 0/0), clear of the backup and maintenance windows; manual snapshot `saferide-pre-1b-<date>` | — | **open** |
-| Exports and the stray-variable check: `CONCURRENCY_ALARM_THRESHOLD=800`, `MAIL_ENABLED` only by decision, no `ALLOW_*` | — | **open** |
-| Backend deploy: the change set as the dry run, migrate `applied` `[]`, seeds skipped, `app_role.synced` | — | **open** |
-| First retention run by hand: `last-retention-run` `ok` or `stopped`; `RetentionHeartbeat` back to `OK` | — | **open** |
-| Frontend deploy: one `Modify MonthlyCostBudget` row, no `WARN`; invalidation complete; **the reload time recorded** | — | **open** |
-| Health `{"status":"ok","db":"ok","version":"<sha>"}` (GET); `/docs`, `/redoc`, `/openapi.json` 404; `X-Request-Id` (an inbound one not echoed) and the API headers | — | **open** |
-| Which mail state shipped (`mailEnabled`) | — | **open** |
-| PIN drill: `school-required` refused and counted; the driver code binds by typing and by link; a wrong PIN leaves a `pin-failure` line, a metric point and a `pin-lock-state` failure; the right PIN signs in and the row is salted | — | **open** |
-| Mail drill (only inside a drill-only toggle while in the sandbox): a real reset to an operator's SES-verified address with `dkim=pass`, `spf=pass`, `dmarc=pass`; a forced send failure trips `MailSendFailed` end to end; the toggle switched back and the window recorded | — | **open** |
-| Parent drill: a sign-up stays unlisted; it verifies from its own session and links (mail window); an office reset and a Confirm and reset leave their audit rows | — | **open** |
-| `hardening` final, diffed against the baselines, every difference explained | — | **open** |
-| Alarms after the smoke: `OK`/`INSUFFICIENT_DATA` apart from the drills' recorded ALARM/OK pairs | — | **open** |
-| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student saves or imports on 1a; back to `release/1b`; both durations | — | **open** |
-| Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | — | **open** |
-| Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | — | **open** |
-| The old unrestricted Maps browser key restricted to localhost or deleted (D45) | — | **open** |
+| No run on the deploy day (`open-runs-and-today` 0/0), clear of the backup and maintenance windows; manual snapshot `saferide-pre-1b-<date>` | 2026-11-26 12:10Z: 0/0 (holiday, D25); windows `23:00-23:30` and `sun:00:00-sun:01:00`, nothing pending, the deploy ran 12:18–12:46Z; snapshot `saferide-pre-1b-20261126` created 12:13:17Z, `available` 12:17:49Z (20 GB, encrypted) | **met** |
+| Exports and the stray-variable check: `CONCURRENCY_ALARM_THRESHOLD=800`, `MAIL_ENABLED` only by decision, no `ALLOW_*` | The deploy shell printed only `CONCURRENCY_ALARM_THRESHOLD` and `MAIL_ENABLED` (`true`, by the 2026-11-26 decision); no `ALLOW_*` | **met** |
+| Backend deploy: the change set as the dry run, migrate `applied` `[]`, seeds skipped, `app_role.synced` | 12:18:10–12:22:08Z: overrides `MailEnabled=true` and `ConcurrencyAlarmThreshold=800` only; the table row for row the dry run's (15 `Add`, 6 `Modify`); `y` 12:20:53Z on the user's yes; migrate `applied` `[]`, seeds skipped (`APP_ENV=production`), `app_role.synced` `true` | **met** |
+| First retention run by hand: `last-retention-run` `ok` or `stopped`; `RetentionHeartbeat` back to `OK` | 12:22:33Z (202): `run_id` 1 `ok` at 12:22:38Z (272 sessions, 23 pre-auth tokens, 1 notification, 1 reset token, 39 action keys, 2 trail batches). `RetentionHeartbeat`: `ALARM` at its first evaluation, 12:59:21Z (complete hours only); deleted by the rehearsal before its next; the re-created alarm was still `ALARM` at 15:19Z, the drill's state, with no evaluation recorded since | **met** for the run; the heartbeat's `OK` **open** (the next morning) |
+| Frontend deploy: one `Modify MonthlyCostBudget` row, no `WARN`; invalidation complete; **the reload time recorded** | 12:23:35–12:45:51Z: one `Modify MonthlyCostBudget` row, but `Conditional` with a `WARN` in the gate's summary view; property-level `False`, `CostFilters` added and `BudgetLimit` 60 → 100, both `RequiresRecreation: Never` (the live budget already held both); `y` 12:45:06Z on the user's yes; invalidation `I6C5CPBFDUJHZO5UGYS5TCT0GN` `Completed` at about 12:46Z (**the reload time**); 13 iCloud conflict copies uploaded and removed ("Deployed") | **met** (the user accepted the `Conditional` row; the checklist line needs it) |
+| Health `{"status":"ok","db":"ok","version":"<sha>"}` (GET); `/docs`, `/redoc`, `/openapi.json` 404; `X-Request-Id` (an inbound one not echoed) and the API headers | 12:47:00Z: `{"status":"ok","db":"ok","version":"634224a"}`; three `404`; a fresh `x-request-id`, HSTS, `nosniff`, `no-store`, `default-src 'none'; frame-ancestors 'none'`; the site's headers unchanged | **met** |
+| Which mail state shipped (`mailEnabled`) | `mailEnabled` `True` (mail on) | **met** |
+| PIN drill: `school-required` refused and counted; the driver code binds by typing and by link; a wrong PIN leaves a `pin-failure` line, a metric point and a `pin-lock-state` failure; the right PIN signs in and the row is salted | 12:47:14Z `school-required` body, line and point; 13:10:17Z the typed code and 13:16:07Z the link both asked "Is this your school?"; 13:11:43Z a wrong PIN: `pin-failure school=VOL-001`, a `PinFailures` point, one `pin-lock-state` failure; 13:10:56Z the right PIN signed in, `salted_v2` 0 → 1 and `legacy_hmac` 1 → 0 at Voluntari Academy | **met** |
+| Mail drill (only inside a drill-only toggle while in the sandbox): a real reset to an operator's SES-verified address with `dkim=pass`, `spf=pass`, `dmarc=pass`; a forced send failure trips `MailSendFailed` end to end; the toggle switched back and the window recorded | Production access, so no toggle. 13:19:23Z a real reset to the user's inbox: SPF, DKIM (`saferidelive.co.ke`) and DMARC `PASS`, the return path on `mail.saferidelive.co.ke`, the link to "Set a new password" signed in. The forced failure by pausing `saferide-transactional` 13:23:31–13:25:35Z on the user's go: `mail-send-failed kind=reset … code=SendingPausedException` (no address), a `MailSendFailed` point, `ALARM` 13:26:38Z → `OK` 13:41:38Z | **met** |
+| Parent drill: a sign-up stays unlisted; it verifies from its own session and links (mail window); an office reset and a Confirm and reset leave their audit rows | Sign-up A 13:33:10Z stayed unlisted (the user; the count proven on sign-up B, `has_link` false `under_7d` 1); A verified from its own session 13:34:37Z, linked, Registered, the office alerted (the user); office reset 13:44:38Z and Confirm and reset 13:46:48Z left `parent-password-reset` and `parent-email-confirmed` rows (plus one reset on a wrongly chosen student, 13:47:49Z); both chose their own passwords | **met** |
+| `hardening` final, diffed against the baselines, every difference explained | 13:49:07Z `--strict` exit 0; every difference explained ("Deployed", smoke 8) | **met** |
+| Alarms after the smoke: `OK`/`INSUFFICIENT_DATA` apart from the drills' recorded ALARM/OK pairs | 13:49Z: all `OK` except `RetentionHeartbeat` (`ALARM` since its first evaluation, explained); the drill pair `MailSendFailed` 13:26:38Z → 13:41:38Z | **met** |
+| Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student saves or imports on 1a; back to `release/1b`; both durations | 13:53–14:26Z on the user's go: `purge-verify-tokens` deleted 2 (both used); to 1a 15 `Remove` / 6 `Modify`, health `{"status":"ok"}`, a staff sign-in, the salted PIN refused, a four-digit PIN set on 1a signed in; `verify` 0 live; no student saves; back to 1b with the deploy's table, `mailEnabled` `True`, the 1a PIN salted again, then a six-digit PIN. 1b → 1a 11 min 53 s, 1a → 1b 4 min 42 s | **met** |
+| Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | Msingi Bora 4 of 4 `salted_v2` (14:35:45–14:36:49Z; placeholder accounts, the PINs given to no one), Voluntari Academy 1 of 1 (the test driver, 14:25:39Z); `legacy_hmac` 0, `no_pin` 0. No message: no real drivers | **met** (no message needed) |
+| Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | 14:27:15Z on the user's go: `ApiServerErrors` `ALARM` 14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z → still `ALARM` at 15:19Z (open, as above); the user received the mails | **met** for `ApiServerErrors`; `RetentionHeartbeat`'s `OK` **open** |
+| The old unrestricted Maps browser key restricted to localhost or deleted (D45) | 14:34:33Z through `gcloud` on the user's go: "SafeRide Web (browser)" allows only `localhost:5173`, `127.0.0.1:5173` and `localhost:4173`; the live bundle carries the production key; the Fleet Map drew (the user) | **met** |
 | The next morning: the first scheduled run in `last-retention-run`, a `RetentionRunSucceeded` point, the Scheduler metrics under the `ScheduleGroup` dimension, `MigrateFunctionErrors` and target errors `OK` | — | **open** |
-| Guides match the live copy: `manualVocabulary` green | 36 tests green at U13 (uncommitted), "Test evidence" | **open** |
-| Both operators confirm the drill mails (plan U13 verification; one operator address today, 1a record U1.7) | — | **open** |
+| Guides match the live copy: `manualVocabulary` green | 36 tests green at U13 (uncommitted), "Test evidence". The certify run at `634224a` (2026-11-24) ran vitest 470, the `manualVocabulary` tests among them; the drills met the guides' words on the live screens | **met** |
+| Both operators confirm the drill mails (plan U13 verification; one operator address today, 1a record U1.7) | 2026-11-26: the user confirmed the mail drill's and the alarm drill's mails (one operator address) | **met** |
 
 ### Before the deploy: the gate dry run and the reads (2026-11-24 and 2026-11-25)
 
@@ -401,7 +402,7 @@ Fixes verified by the suites each batch ran and by a full certify (below).
 | U13: `../.venv/bin/python -m pytest -q tests/core` (backend, after the `MailEnabled` description change) | 636 passed |
 | U13: `git diff --check` | clean |
 | `scripts/certify.sh` after the code-review fixes (`00ea5d0`, after a reseed) | unit 1015 passed, 642 skipped; integration 642 passed, 2 skipped; vitest 470; Playwright 111 — green |
-| `scripts/certify.sh` at the release commit | **open** |
+| `scripts/certify.sh` at the release commit (`634224a`, 2026-11-24) | exit 0: unit 1015 passed, 642 skipped; integration 642 passed, 2 skipped; `tsc` clean; vitest 470; build ok; Playwright 111 |
 
 ## Rollback position
 
@@ -417,9 +418,15 @@ Fixes verified by the suites each batch ran and by a full certify (below).
 - **Salted PINs:** 1a checks only the legacy hash, so every driver counted
   under `salted_v2` is refused under 1a until re-issued from 1a's Drivers
   page. After the deploy-day re-issue that is every driver.
-- **Decision window for a real rollback: 48 hours** from the deploy, with
-  `driver-pin-hash-versions-per-school` as the count of drivers who would
-  need a new PIN under 1a. After that, fix forward.
+- **Decision window for a real rollback: 48 hours** from the deploy (to
+  about 2026-11-28 12:22Z), with `driver-pin-hash-versions-per-school` as
+  the count of drivers who would need a new PIN under 1a: all five since
+  the deploy-day re-issue. After that, fix forward.
+- **Mail is on** (`MAIL_ENABLED=true` since the deploy): a rollback's 1a
+  backend deploy leaves it unset, and every 1b backend deploy exports it.
+- **The iCloud guard is on `main` only** (PR #25): a deploy from
+  `release/1a` or `release/1b` checks `frontend/dist` for conflict copies
+  by hand before answering `y`.
 - **Verification tokens:** deleted on 1b just before the 1a backend deploy
   with the migrate function's `purge-verify-tokens` action (D52), since 1a's
   reset ignores `purpose`; a sign-up in the deploy's minutes is bounded by the
@@ -437,8 +444,327 @@ Fixes verified by the suites each batch ran and by a full certify (below).
 
 ## Deployed
 
-Not deployed. Filled from the Release 1b deploy checklist: the window, the
-release, the pre-checks, both change sets, the migrate result, the first
-retention run, the reload time, the smoke and drills, the rollback
-rehearsal and its durations, the PIN re-issue (counts per school), the alarm
-drill, the Maps key, the next morning and the first 48 hours.
+Release 1b is live: backend 2026-11-26 12:22:08Z, frontend 12:45:51Z, from
+`release/1b` (`634224a`), **with mail on**. Started at 12:07Z, 2 h 40 min
+after the planned 09:30 GMT; the user chose to keep the whole day on the
+deploy day. Every time below is UTC; the commands are the Release 1b deploy
+checklist's, run from `infra/` with `AWS_PAGER=""`, answers to the deploy
+gates written through a pipe after the user's yes in chat (the Release 1a
+method). The schools are on holiday (D25): no runs all day.
+
+### Before the deploy (12:08–12:18Z)
+
+- **Item 1, 12:08:53Z:** all 16 alarms `OK` (12 in af-south-1, 4 in
+  us-east-1); one subscription per topic, each a full ARN; the SES identity
+  `true`/`SUCCESS`/`SUCCESS`; since the 2026-11-25 13:13Z read, 0 ERROR or
+  WARNING lines over the three groups, and the gateway answered 15,970
+  requests: 25 `4xx`, 0 `5xx`.
+- **Item 2:** SES production access **granted** since the last read:
+  `production` true, `sending` true, review `GRANTED`, 50,000 mails a day.
+  The user's decision, 2026-11-26: `MAIL_ENABLED=true` on this deploy, so the
+  mail-on screens ship; the mail drill and parent drill step 2 run today
+  (replacing the 2026-11-24 "not run: mail off"). From now on every 1b
+  backend deploy exports `MAIL_ENABLED=true` (live parity) until a release
+  changes the Default; a rollback's 1a deploy leaves it unset.
+- **Item 3, 12:10Z** (`verify-db.sh --strict`, exit 0): `migrations` ends on
+  `017_account_hardening`; `drivers-with-several-driver-memberships` 0;
+  `driver-pin-hash-versions-per-school` Msingi Bora 4 `legacy_hmac`,
+  Voluntari Academy 1, `salted_v2` 0, `no_pin` 0;
+  `unverified-parent-accounts-by-age` every bucket 0; `token-rows-by-purpose`
+  `verify` all 0 (`reset` 0 live, 1 used); `last-retention-run` empty;
+  `notifications-past-90-days` 1; `stale-sessions` 272 sessions and 23
+  pre-auth tokens expired over 7 days; `pin-lock-state` no failures;
+  `temporary-passwords-outstanding` none; `consent-state` 6 parents;
+  `open-runs-and-today` 0/0.
+- **Item 4:** Msingi Bora's 4 driver accounts are placeholders, not real
+  people (the user, 2026-11-26); Voluntari Academy's is the test driver.
+  Nobody had to be reached; the re-issue below gave the PINs to no one.
+- **Item 10:** `open-runs-and-today` 0/0; the database windows
+  `23:00-23:30` and `sun:00:00-sun:01:00`, nothing pending; the deploy ran
+  12:18–12:46Z, clear of both.
+- **Item 11:** manual snapshot `saferide-pre-1b-20261126`, created 12:13:17Z,
+  `available` at 12:17:49Z (20 GB, encrypted). Keep it at least 35 days.
+- **Items 12–13:** the stray-variable check in the deploy shell printed only
+  `CONCURRENCY_ALARM_THRESHOLD` and `MAIL_ENABLED`; HEAD `634224a` tagged
+  `release/1b`, `git status --short` only `.claude/` and `justfile`.
+
+### Backend (12:18:10–12:22:08Z)
+
+`CONCURRENCY_ALARM_THRESHOLD=800 MAIL_ENABLED=true CONFIRM_CHANGESET=1
+./scripts/deploy-backend.sh`: a clean checkout (HEAD tagged `release/1b`);
+overrides `MailEnabled=true` and `ConcurrencyAlarmThreshold=800` only, every
+other parity value at its Default; the alert address kept from the stack;
+`open-runs: 0`. The change-set table was **row for row the dry run's**
+(above): 15 `Add`, 6 `Modify` including `HttpApi` `Body`, no `Remove`, no
+`Database` row, no `WARN` (`ApiFunction` changed `Environment, Code`, as in
+the dry run). The user said yes; `y` at 12:20:53Z; the open-run re-check 0;
+`Stack saferide-backend deployed` at 12:22:08Z. Migrate: `applied` `[]` (17
+skipped, the last `017_account_hardening`), seeds skipped by name
+(`APP_ENV=production`), `app_role.synced` `true`, provider bootstrap already
+applied. Health: `{"status":"ok","db":"ok","version":"634224a"}`.
+
+### The first retention run (12:22:33Z)
+
+Invoked asynchronously (`StatusCode` 202). `run_id` 1, `status` `ok`,
+12:22:38.24–12:22:38.38Z, counts: `live_notifications` 1,
+`password_reset_tokens` 1, `auth_sessions` 272, `auth_preauth_tokens` 23,
+`driver_action_keys` 39, `trail_batches` 2, every other count 0. Afterwards
+`notifications-past-90-days` 0 and `stale-sessions` 0/0, the drop the
+baselines predicted. `RetentionRunSucceeded` 1 in that hour.
+
+`RetentionHeartbeat` (1 h period, 26 of 26, missing data breaching) was
+created at 12:21:02Z `INSUFFICIENT_DATA` and went to `ALARM` at its first
+evaluation, 12:59:21Z ("no datapoints were received for 26 periods"): that
+evaluation covered the complete hours up to 11:00–12:00 only, not the hour
+of the run. The rehearsal deleted the alarm at 13:57:07Z, before its next
+evaluation, so that first alarm never showed `OK`. The alarm re-created at
+14:13:22Z was `INSUFFICIENT_DATA` until
+the alarm drill set it to `ALARM` at 14:27:18Z, and at 15:19Z it was still
+`ALARM` with no evaluation recorded since, although the run's hour
+(12:00–13:00Z, `Sum` 1) lies inside its 26-hour window. Its `OK` is
+**open**: the next-morning check reads it after the night's run, and a
+heartbeat that stays in `ALARM` with a fresh point is a defect to fix
+forward.
+
+### Frontend (12:23:35–12:45:51Z)
+
+`CONFIRM_CHANGESET=1 CSP_MODE=report-only ./scripts/deploy-frontend.sh`:
+overrides `DomainName`, `HostedZoneId`, `ApiOrigin`, `CspMode=report-only`;
+`MonthlyBudgetUsd=100` at its Default; the alert address kept. One row, as
+expected, but **not as written in the checklist**:
+
+```text
+  Action  LogicalResourceId  ResourceType          Replacement  Changed
+  Modify  MonthlyCostBudget  AWS::Budgets::Budget  Conditional  Budget
+
+WARN: MonthlyCostBudget (AWS::Budgets::Budget) may be replaced (Replacement: Conditional)
+```
+
+The checklist expected `False` with no `WARN`. The gate reads
+`describe-change-set` without property values, where CloudFormation judges
+the whole `Budget` property ("Conditionally", since one of its
+sub-properties, the name, would replace). With `--include-property-values`
+the same change set reads `Replacement` `False` and two changes, both
+`RequiresRecreation: Never`: `CostFilters` added (`Region` af-south-1,
+us-east-1, global) and `BudgetLimit.Amount` 60 → 100, the values the live
+budget already held since 2026-11-20 (PR #19). The name is generated and
+unchanged. The user accepted the row; `y` at 12:45:06Z; the stack updated in
+place (the live budget read at 14:42Z, after the rehearsal: the same
+generated name, 100 USD, the region filter). The build uploaded; invalidation `I6C5CPBFDUJHZO5UGYS5TCT0GN`
+created 12:45:51Z and `Completed` when read at about 12:46Z: **the reload
+time**. The site serves `index-DJ0EAJZ3.js`; `sw.js` is byte-identical to the
+build.
+
+**iCloud conflict copies.** The working copy lives in a Documents folder that
+iCloud syncs. At 12:42Z, while the deploy waited at its prompt, iCloud put 13
+stale copies of a 2026-11-24 build into `frontend/dist` ("`index 2.html`",
+"`sw 2.js`", four assets, five icons, the manifest and the push payload),
+and the sync uploaded them at 12:45:43–48Z. Nothing linked to them and the
+live `index.html` and assets were the new build. On the user's go they were
+removed at 12:52:09Z (the 13 keys exactly; the bucket back to its 14 files)
+with the local copies. The guard that now refuses such copies before an
+upload is on `main` (PR #25, `a59ed5f`), not in `release/1b` or
+`release/1a`: a deploy from either tag checks `frontend/dist` by hand before
+answering `y` (done at each frontend deploy of the rehearsal: none).
+
+### Smoke (12:47–13:49Z)
+
+1. **Health:** `{"status":"ok","db":"ok","version":"634224a"}`.
+2. **No API docs:** `docs 404`, `redoc 404`, `openapi.json 404`.
+3. **Request id and headers:** `x-request-id` a fresh UUID (not
+   `drill-not-echoed`); `strict-transport-security: max-age=31536000;
+   includeSubDomains`; `x-content-type-options: nosniff`; `cache-control:
+   no-store`; `content-security-policy: default-src 'none'; frame-ancestors
+   'none'`. The site's headers over the four URLs identical to before the
+   deploy (CSP report-only).
+4. **Mail state:** `mailEnabled` `True`.
+5. **PIN drill**, on the user's phone (installed app) and a private window:
+   1. 12:47:14Z: the PIN without a school answered the `school-required`
+      body (401); a `school-required` line and a `SchoolRequired` point.
+   2. 13:10:17Z: the typed driver code looked up (200), "Is this your
+      school?" with Voluntari Academy, **Yes**; 13:16:07Z the card's link in
+      a private window asked the same.
+   3. 13:11:43Z: a wrong PIN, "Invalid PIN" (401), a `pin-failure
+      school=VOL-001` line, a `PinFailures` point, `pin-lock-state` one
+      failure at the test school.
+   4. 13:10:56Z: the right (legacy) PIN signed in;
+      `driver-pin-hash-versions-per-school` at Voluntari Academy
+      `salted_v2` 0 → 1, `legacy_hmac` 1 → 0.
+
+   Two operator slips worth the drivers' and offices' messages: the user's
+   first try typed the PIN into the new **Driver code** box (refused on the
+   phone, no request sent), and the computer's tab, opened before 12:45Z,
+   still ran the 1a screens (no Driver code card) until it was closed and
+   reopened.
+6. **Mail drill**, with production access (no drill-only toggle):
+   1. Not needed: mail was on from the deploy.
+   2. 13:19:23Z: Forgot password for a drill parent with the user's own
+      inbox: "Reset your SafeRide password" from `no-reply@saferidelive.co.ke`;
+      Gmail's original: SPF `PASS` (from an Amazon SES address), DKIM `PASS`
+      for `saferidelive.co.ke`, DMARC `PASS`; the return path on
+      `mail.saferidelive.co.ke`; the link opened "Set a new password" and
+      landed signed in. The three-an-hour cap was not exercised.
+   3. Parent drill step 2: below.
+   4. The forced failure: on the user's go the configuration set
+      `saferide-transactional` was paused at 13:23:31Z; Forgot password at
+      13:25:25Z answered the neutral card (200) and logged `mail-send-failed
+      kind=reset request_id=38ad7964-… error=SendingPausedException
+      code=SendingPausedException`, with no address in it (a paused set
+      answers `SendingPausedException`, not the sandbox's
+      `MessageRejected`); sending resumed at 13:25:35Z (read back
+      `SendingEnabled` true; the window 2 min 4 s). A `MailSendFailed`
+      point at 13:25; the alarm `ALARM` 13:26:38Z, `OK` 13:41:38Z (it needs
+      three empty five-minute periods to clear).
+   5. Not applicable: mail stays on.
+7. **Parent drill** at Voluntari Academy (two test students given drill
+   parent emails at 13:30:56Z and 13:31:27Z, before the rehearsal):
+   1. 13:33:10Z: sign-up A (the user's inbox): "Check your email"; the
+      Parents page still **Awaiting signup**; no "Parent signup auto-linked"
+      (the user). The `has_link` false `under_7d` count was read only after
+      step 2; it was proven on sign-up B instead: 13:42:04Z, sign-up B
+      (`success+…@simulator.amazonses.com`, the SES mailbox simulator, so
+      no bounce), `has_link` false `under_7d` 1, one live `verify` token.
+   2. 13:34:37Z: A signed in and verified from its own session ("Email
+      verified", 200); the child on Home without a reload; **Registered**;
+      the office's "Parent signup auto-linked" (the user). Unverified
+      buckets back to 0. (A self-service email reset of A at
+      13:40:32–13:40:58Z also passed.)
+   3. 13:44:38Z: **Reset password** on A: a `parent-password-reset` row;
+      A signed in with the temporary password at 13:45:55Z and chose their
+      own at 13:46:16Z.
+   4. 13:46:48Z: **Confirm and reset** on B's Awaiting signup row:
+      `parent-email-confirmed` and `parent-password-reset` rows. A second
+      **Reset password** at 13:47:49Z (the user had first chosen the wrong
+      student) left a fourth row; B signed in at 13:47:56Z and chose their
+      own at 13:48:21Z. `temporary-passwords-outstanding` back to none.
+8. **`hardening` final**, 13:49:07Z, `--strict` exit 0, diffed against the
+   12:10Z read. Unchanged: `017-objects-present`,
+   `audit-check-widening-017`, `unverified-parent-accounts-by-age` (all 0),
+   `drivers-with-several-driver-memberships`, `schools-without-driver-code`,
+   `pin-lock-state`, `temporary-passwords-outstanding`,
+   `push-subscriptions-by-kind`, `instance-settings`,
+   `open-runs-and-today` 0/0. Changed, each explained:
+   `token-rows-by-purpose` (`reset` 1 live, the failed send's token, 30
+   minutes; `verify` 0 live); Voluntari Academy `salted_v2` 1, `legacy_hmac`
+   0; the retention deletions and `last-retention-run` `ok`;
+   `parent-reset-audit-recent` the four drill rows, all `actor_kind`
+   provider; `consent-state` 6 → 8 parents (the two drill parents);
+   `driver-last-sign-in-per-school` — see the findings.
+9. **Alarms**, 13:49Z: every alarm `OK` except `RetentionHeartbeat`
+   (`ALARM` since 12:59:21Z, above). The drills' pairs: `MailSendFailed`
+   13:26:38Z → 13:41:38Z.
+
+One `psycopg.pool` WARNING ("error connecting in 'pool-1': connection
+timeout expired") at 13:13:27Z, the same background reconnect as the two of
+2026-11-24: no failed request, 0 `5xx` since the deploy.
+
+### Rollback rehearsal (13:53–14:26Z)
+
+On the user's go; no student saves or imports from step 1 to step 8.
+
+1. 13:53Z: `open-runs-and-today` 0/0; the salted test driver at Voluntari
+   Academy; `verify` 0 live. `purge-verify-tokens` at 13:53:53Z:
+   `{"status": "ok", "action": "purge-verify-tokens", "deleted": 2}` (the
+   two used drill tokens; none live), `FunctionError` `None`.
+2. **Backend to `release/1a`** (`a66d53b`), 13:54:13Z, `MAIL_ENABLED` unset,
+   `CONCURRENCY_ALARM_THRESHOLD=800`: 15 `Remove` (the 1b additions) and 6
+   `Modify` (`ApiClientErrorsBurst`, `ApiFunction`, `HttpApi` `Body` — the
+   same dynamic row — `MigrateFunctionErrors`, `MigrateFunction`,
+   `VerifyFunction`), no `WARN`; the user's yes; deployed 13:58:49Z; migrate
+   `[]`; health `{"status":"ok"}`.
+3. **Frontend to `release/1a`**, 13:59:04Z, `MONTHLY_BUDGET_USD=100`: the
+   budget row `Conditional` again, property-level `False` (`CostFilters`
+   removed, `Never`); no conflict copies; the user's yes; done 14:05:37Z;
+   invalidation `I1WLFI8R9QO9TQL8DM98082I2D` `Completed` 14:06:06Z; the site
+   on `index-CtM7Urah.js`.
+4. On 1a (tabs and the app closed and reopened): a staff password and TOTP
+   sign-in, 14:09:17–39Z.
+5. The salted PIN refused (`pin-login` 401, 14:10:17Z); a four-digit PIN set
+   on 1a's Drivers page (14:10:53Z) signed in (14:11:02Z): **a legacy PIN
+   sign-in on 1a**; Voluntari Academy back to `legacy_hmac` 1.
+6. `verify` 0 live on 1a.
+7. No student saves or imports.
+8. **Back to `release/1b`:** backend 14:11:39Z, `MAIL_ENABLED=true`
+   exported again, the table identical row for row to the deploy's, the
+   user's yes, deployed 14:14:27Z, migrate `[]`, health `634224a` `db` ok,
+   `mailEnabled` `True`; frontend 14:14:40Z, the budget row (`CostFilters`
+   added, `Never`), no conflict copies, the user's yes, done 14:16:04Z,
+   invalidation `I2TMQT0DRD1NOTG4C3BHMAZCMS` `Completed` 14:16:21Z,
+   `index-DJ0EAJZ3.js`.
+9. On 1b: the four-digit PIN signed in at 14:19:00Z and was salted again
+   (`salted_v2` 1). The six-digit re-issue was refused twice (PUT 400 at
+   14:22:02Z and 14:22:56Z): the computer's tab still ran the 1a bundle,
+   whose form sends four digits, which 1b refuses ("PIN must be 6 digits").
+   After closing and reopening it: saved 14:25:39Z, signed in with the
+   six-digit PIN at 14:26:17Z.
+10. **Durations** (backend start to invalidation complete, including the
+    pauses for the user's answers): 1b → 1a **11 min 53 s**, 1a → 1b
+    **4 min 42 s**. Everything went back; the only residue is the first
+    heartbeat alarm's history (deleted while in `ALARM`).
+
+### PINs, the alarm drill and the Maps key (14:27–14:37Z)
+
+- **PIN re-issue:** at Msingi Bora, six-digit PINs generated and saved for
+  the 4 placeholder drivers at 14:35:45–14:36:49Z (four PUT 200) and given to
+  no one; no message was sent (no real drivers). Voluntari Academy's test
+  driver re-issued in rehearsal step 9.
+  `driver-pin-hash-versions-per-school`: Msingi Bora `salted_v2` 4 of 4,
+  Voluntari Academy 1 of 1, `legacy_hmac` 0, `no_pin` 0;
+  `drivers-with-several-driver-memberships` 0. A rollback to 1a would now
+  need a new PIN for all five.
+- **Alarm drill**, on the user's go, 14:27:15Z: `ApiServerErrors` `ALARM`
+  14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z →
+  still `ALARM` at 15:19Z (open, as above); each transition's SNS action succeeded. The user
+  confirmed the ALARM and OK mails arrived (one operator address, the 1a
+  record's U1.7).
+- **The old Maps key** (D45), on the user's go, through `gcloud` at
+  14:34:33Z: "SafeRide Web (browser)" now allows only
+  `http://localhost:5173/*`, `http://127.0.0.1:5173/*` and
+  `http://localhost:4173/*` (the two `saferidelive.co.ke` entries removed);
+  its API list unchanged. The live bundle carries the "Saferide production"
+  key (apex and www only), not the old one (compared without printing
+  either), and the Fleet Map drew (the user).
+
+### Findings and follow-ups
+
+- **The checklist's frontend row** reads the gate's summary view: expect
+  `Conditional` with its `WARN`, and confirm `False` / `Never` with
+  `describe-change-set --include-property-values` (here and in the
+  rehearsal's two frontend deploys).
+- **`RetentionHeartbeat` timing:** a new heartbeat goes `ALARM` at its first
+  evaluation even after a successful run, because that evaluation covers
+  complete hours only, so the checklist's "back to `OK` at its next
+  evaluation" does not hold for the first one. No `OK` was observed on the
+  deploy day: the re-created heartbeat was still `ALARM` at 15:19Z, more
+  than two hours after the run. If the next morning still shows `ALARM`
+  with the night's point present, the alarm's definition needs a fix.
+- **The forced mail failure in production** logs `SendingPausedException`,
+  not `MessageRejected`; the checklist's Go line names only the latter.
+- **`driver-last-sign-in-per-school`** reads sessions, which the retention
+  job deletes once expired for 7 days: after the first run every Msingi Bora
+  driver reads `null`, which the checklist calls "never signed in". The
+  check or its wording needs fixing before it is used to find drivers.
+- **Stale tabs:** a tab or app opened before a frontend deploy keeps the old
+  screens until it is closed. A 1a tab on 1b cannot set a PIN; offices and
+  drivers need the "close it completely and open it again" line.
+- **Dashboard requests after step-out and sign-out:** a few queries for the
+  school just left answer 403 (13:19:06Z, 14:19:17Z) or 401 after sign-out
+  (14:24:48Z). Harmless, but they count toward the non-404 4xx alarm.
+- **iCloud:** above; the guard is PR #25 on `main`.
+
+### Cost
+
+No fixed-cost resource is added. 1b adds six CloudWatch alarms, five log
+metric filters, one Scheduler schedule (one run a night) and SES sending at
+production rates; it was not priced on the deploy day. The SafeRide-only
+budget (100 USD a month, PR #19) is live and tracks it.
+
+### Still open
+
+- **The next morning** (the first scheduled run at 22:30Z): the checklist's
+  four reads, and `RetentionHeartbeat` back to `OK` (with its
+  mail).
+- **The first 48 hours** and the **rollback decision window** to about
+  2026-11-28 12:22Z; after that, fix forward.
+- The Samsung Internet check before Release 2 enforces the CSP (the 1a
+  record).
