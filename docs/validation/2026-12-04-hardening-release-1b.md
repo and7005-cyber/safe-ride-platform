@@ -67,7 +67,7 @@ Each gate is a step of the
 | No run on the deploy day (`open-runs-and-today` 0/0), clear of the backup and maintenance windows; manual snapshot `saferide-pre-1b-<date>` | 2026-11-26 12:10Z: 0/0 (holiday, D25); windows `23:00-23:30` and `sun:00:00-sun:01:00`, nothing pending, the deploy ran 12:18–12:46Z; snapshot `saferide-pre-1b-20261126` created 12:13:17Z, `available` 12:17:49Z (20 GB, encrypted) | **met** |
 | Exports and the stray-variable check: `CONCURRENCY_ALARM_THRESHOLD=800`, `MAIL_ENABLED` only by decision, no `ALLOW_*` | The deploy shell printed only `CONCURRENCY_ALARM_THRESHOLD` and `MAIL_ENABLED` (`true`, by the 2026-11-26 decision); no `ALLOW_*` | **met** |
 | Backend deploy: the change set as the dry run, migrate `applied` `[]`, seeds skipped, `app_role.synced` | 12:18:10–12:22:08Z: overrides `MailEnabled=true` and `ConcurrencyAlarmThreshold=800` only; the table row for row the dry run's (15 `Add`, 6 `Modify`); `y` 12:20:53Z on the user's yes; migrate `applied` `[]`, seeds skipped (`APP_ENV=production`), `app_role.synced` `true` | **met** |
-| First retention run by hand: `last-retention-run` `ok` or `stopped`; `RetentionHeartbeat` back to `OK` | 12:22:33Z (202): `run_id` 1 `ok` at 12:22:38Z (272 sessions, 23 pre-auth tokens, 1 notification, 1 reset token, 39 action keys, 2 trail batches). `RetentionHeartbeat`: `ALARM` at its first evaluation, 12:59:21Z (complete hours only); deleted by the rehearsal before its next; the re-created alarm was still `ALARM` at 15:19Z, the drill's state, with no evaluation recorded since | **met** for the run; the heartbeat's `OK` **open** (the next morning) |
+| First retention run by hand: `last-retention-run` `ok` or `stopped`; `RetentionHeartbeat` back to `OK` | 12:22:33Z (202): `run_id` 1 `ok` at 12:22:38Z (272 sessions, 23 pre-auth tokens, 1 notification, 1 reset token, 39 action keys, 2 trail batches). `RetentionHeartbeat`: `ALARM` at its first evaluation, 12:59:21Z (complete hours only); deleted by the rehearsal before its next; the re-created alarm returned to `OK` at 15:27:22Z, an hour after the drill, on the 12:00Z point | **met** |
 | Frontend deploy: one `Modify MonthlyCostBudget` row, no `WARN`; invalidation complete; **the reload time recorded** | 12:23:35–12:45:51Z: one `Modify MonthlyCostBudget` row, but `Conditional` with a `WARN` in the gate's summary view; property-level `False`, `CostFilters` added and `BudgetLimit` 60 → 100, both `RequiresRecreation: Never` (the live budget already held both); `y` 12:45:06Z on the user's yes; invalidation `I6C5CPBFDUJHZO5UGYS5TCT0GN` `Completed` at about 12:46Z (**the reload time**); 13 iCloud conflict copies uploaded and removed ("Deployed") | **met** (the user accepted the `Conditional` row; the checklist line needs it) |
 | Health `{"status":"ok","db":"ok","version":"<sha>"}` (GET); `/docs`, `/redoc`, `/openapi.json` 404; `X-Request-Id` (an inbound one not echoed) and the API headers | 12:47:00Z: `{"status":"ok","db":"ok","version":"634224a"}`; three `404`; a fresh `x-request-id`, HSTS, `nosniff`, `no-store`, `default-src 'none'; frame-ancestors 'none'`; the site's headers unchanged | **met** |
 | Which mail state shipped (`mailEnabled`) | `mailEnabled` `True` (mail on) | **met** |
@@ -78,7 +78,7 @@ Each gate is a step of the
 | Alarms after the smoke: `OK`/`INSUFFICIENT_DATA` apart from the drills' recorded ALARM/OK pairs | 13:49Z: all `OK` except `RetentionHeartbeat` (`ALARM` since its first evaluation, explained); the drill pair `MailSendFailed` 13:26:38Z → 13:41:38Z | **met** |
 | Rollback rehearsal: `release/1a` backend then frontend; 1a health and a legacy PIN sign-in; a salted driver refused under 1a and re-issued from 1a's Drivers page; `verify` tokens deleted on 1b just before the 1a backend deploy (`purge-verify-tokens`, D52); no student saves or imports on 1a; back to `release/1b`; both durations | 13:53–14:26Z on the user's go: `purge-verify-tokens` deleted 2 (both used); to 1a 15 `Remove` / 6 `Modify`, health `{"status":"ok"}`, a staff sign-in, the salted PIN refused, a four-digit PIN set on 1a signed in; `verify` 0 live; no student saves; back to 1b with the deploy's table, `mailEnabled` `True`, the 1a PIN salted again, then a six-digit PIN. 1b → 1a 11 min 53 s, 1a → 1b 4 min 42 s | **met** |
 | Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | Msingi Bora 4 of 4 `salted_v2` (14:35:45–14:36:49Z; placeholder accounts, the PINs given to no one), Voluntari Academy 1 of 1 (the test driver, 14:25:39Z); `legacy_hmac` 0, `no_pin` 0. No message: no real drivers | **met** (no message needed) |
-| Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | 14:27:15Z on the user's go: `ApiServerErrors` `ALARM` 14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z → still `ALARM` at 15:19Z (open, as above); the user received the mails | **met** for `ApiServerErrors`; `RetentionHeartbeat`'s `OK` **open** |
+| Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | 14:27:15Z on the user's go: `ApiServerErrors` `ALARM` 14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z → `OK` 15:27:22Z, an hour after the drill; the user received the mails | **met** |
 | The old unrestricted Maps browser key restricted to localhost or deleted (D45) | 14:34:33Z through `gcloud` on the user's go: "SafeRide Web (browser)" allows only `localhost:5173`, `127.0.0.1:5173` and `localhost:4173`; the live bundle carries the production key; the Fleet Map drew (the user) | **met** |
 | The next morning: the first scheduled run in `last-retention-run`, a `RetentionRunSucceeded` point, the Scheduler metrics under the `ScheduleGroup` dimension, `MigrateFunctionErrors` and target errors `OK` | — | **open** |
 | Guides match the live copy: `manualVocabulary` green | 36 tests green at U13 (uncommitted), "Test evidence". The certify run at `634224a` (2026-11-24) ran vitest 470, the `manualVocabulary` tests among them; the drills met the guides' words on the live screens | **met** |
@@ -519,12 +519,10 @@ evaluation covered the complete hours up to 11:00–12:00 only, not the hour
 of the run. The rehearsal deleted the alarm at 13:57:07Z, before its next
 evaluation, so that first alarm never showed `OK`. The alarm re-created at
 14:13:22Z was `INSUFFICIENT_DATA` until
-the alarm drill set it to `ALARM` at 14:27:18Z, and at 15:19Z it was still
-`ALARM` with no evaluation recorded since, although the run's hour
-(12:00–13:00Z, `Sum` 1) lies inside its 26-hour window. Its `OK` is
-**open**: the next-morning check reads it after the night's run, and a
-heartbeat that stays in `ALARM` with a fresh point is a defect to fix
-forward.
+the alarm drill set it to `ALARM` at 14:27:18Z, and returned to `OK` at
+15:27:22Z, one hour after the drill: "1 out of the last 26 datapoints
+[1.0 (26/11/26 12:00:00)] was not less than the threshold", the 25 missing
+ones treated as breaching; its OK mail was sent.
 
 ### Frontend (12:23:35–12:45:51Z)
 
@@ -714,7 +712,7 @@ On the user's go; no student saves or imports from step 1 to step 8.
   need a new PIN for all five.
 - **Alarm drill**, on the user's go, 14:27:15Z: `ApiServerErrors` `ALARM`
   14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z →
-  still `ALARM` at 15:19Z (open, as above); each transition's SNS action succeeded. The user
+  `OK` 15:27:22Z, an hour after the drill; each transition's SNS action succeeded. The user
   confirmed the ALARM and OK mails arrived (one operator address, the 1a
   record's U1.7).
 - **The old Maps key** (D45), on the user's go, through `gcloud` at
@@ -734,10 +732,10 @@ On the user's go; no student saves or imports from step 1 to step 8.
 - **`RetentionHeartbeat` timing:** a new heartbeat goes `ALARM` at its first
   evaluation even after a successful run, because that evaluation covers
   complete hours only, so the checklist's "back to `OK` at its next
-  evaluation" does not hold for the first one. No `OK` was observed on the
-  deploy day: the re-created heartbeat was still `ALARM` at 15:19Z, more
-  than two hours after the run. If the next morning still shows `ALARM`
-  with the night's point present, the alarm's definition needs a fix.
+  evaluation" does not hold for the first one. A drilled heartbeat comes
+  back about one period after the drill, not within a minute as the 1a
+  alarms do: `ALARM` 14:27:18Z, `OK` 15:27:22Z, on the run's point. The
+  checklist's alarm-drill line needs "about an hour" for it.
 - **The forced mail failure in production** logs `SendingPausedException`,
   not `MessageRejected`; the checklist's Go line names only the latter.
 - **`driver-last-sign-in-per-school`** reads sessions, which the retention
@@ -762,8 +760,7 @@ budget (100 USD a month, PR #19) is live and tracks it.
 ### Still open
 
 - **The next morning** (the first scheduled run at 22:30Z): the checklist's
-  four reads, and `RetentionHeartbeat` back to `OK` (with its
-  mail).
+  four reads.
 - **The first 48 hours** and the **rollback decision window** to about
   2026-11-28 12:22Z; after that, fix forward.
 - The Samsung Internet check before Release 2 enforces the CSP (the 1a
