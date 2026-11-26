@@ -23,7 +23,10 @@
 #   lets the named resources be replaced on this deploy, loudly, but never the
 #   CloudFront distribution or the site bucket. CONFIRM_CHANGESET=1 also asks
 #   the operator y/N before executing. Nothing is uploaded unless the stack is
-#   deployed (or has no changes).
+#   deployed (or has no changes);
+# - nothing in frontend/dist may be named like an iCloud sync-conflict copy
+#   ("index 2.html"; conflict_copy_guard, config.sh), checked after the build
+#   and again just before the upload.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/parity-params.sh"
@@ -83,6 +86,14 @@ VITE_API_BASE_URL="$API_BASE_URL" \
   VITE_GOOGLE_MAPS_MAP_ID="$MAPS_MAP_ID" \
   npm run build
 
+# iCloud sync-conflict copies (conflict_copy_guard, config.sh): refused here,
+# before the stack changes, and again just before the upload, because on
+# 2026-11-26 they appeared while the stack update ran.
+if ! conflict_copy_guard "$REPO_DIR/frontend/dist"; then
+  echo "ERROR: refused after the build; nothing was deployed or uploaded." >&2
+  exit 1
+fi
+
 echo "==> Deploying frontend stack (region ${CF_REGION}, cert: ${CF_CERT_ARN:-<none>}, CspMode=${CSP_MODE})"
 
 # --- Change-set gate (hardening E3) ---------------------------------------------
@@ -132,8 +143,16 @@ BUCKET="$(cfn_output "$FRONTEND_STACK" "$CF_REGION" BucketName)"
 DIST_ID="$(cfn_output "$FRONTEND_STACK" "$CF_REGION" DistributionId)"
 SITE_URL="$(cfn_output "$FRONTEND_STACK" "$CF_REGION" SiteUrl)"
 
+if ! conflict_copy_guard "$REPO_DIR/frontend/dist"; then
+  echo "ERROR: refused before the upload; the stack is deployed (or was unchanged) but nothing was uploaded." >&2
+  exit 1
+fi
+
 echo "==> Uploading build to s3://${BUCKET}"
 # Hashed assets: cache forever. index.html + service worker: never cache.
+# No --exclude for conflict copies: the guard above refuses them, and
+# `sync --delete` never deletes an object an --exclude matches, so one would
+# keep copies already in the bucket (the 13 of 2026-11-26) there for good.
 aws s3 sync "$REPO_DIR/frontend/dist" "s3://${BUCKET}" --delete \
   --exclude index.html --exclude sw.js \
   --cache-control "public,max-age=31536000,immutable"

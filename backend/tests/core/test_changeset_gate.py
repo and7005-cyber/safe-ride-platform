@@ -634,7 +634,8 @@ def _uploaded(fake):
     return [call[:2] for call in fake.calls("aws") if call[0] in ("s3", "cloudfront")]
 
 
-UPLOAD = [["s3", "sync"], ["s3", "cp"], ["cloudfront", "create-invalidation"]]
+# The fake build writes index.html and sw.js, each copied with no-cache.
+UPLOAD = [["s3", "sync"], ["s3", "cp"], ["s3", "cp"], ["cloudfront", "create-invalidation"]]
 
 
 def test_a_clean_frontend_deploy_builds_reviews_executes_then_uploads(front):

@@ -972,6 +972,8 @@ each start and end time.
    lets the new budget be created first.) The build uploads and the
    invalidation id is printed.
 
+   *Note (2026-11-26):* iCloud wrote 13 conflict copies (`index 2.html`, …) into `frontend/dist` during this step and they were uploaded; the deploy script after `release/1b` refuses them (`ERROR: sync-conflict copies in …`): delete the listed files and re-run (infra/README.md, "Deploy safety").
+
    **The reload time.** Record when the invalidation completes:
 
    ```bash

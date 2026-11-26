@@ -46,7 +46,7 @@ Set the domain's nameservers at Truehost to the four Route 53 values
 
 # 5. Build frontend against the API (Maps key + Map ID from SSM), deploy
 #    S3+CloudFront + headers, probes, alarms, budget through the change-set
-#    gate; upload, invalidate
+#    gate; upload (refused while dist holds iCloud conflict copies), invalidate
 ./scripts/deploy-frontend.sh         # CSP_MODE=report-only (default) | enforce; CONFIRM_CHANGESET=1
 ```
 
@@ -276,6 +276,28 @@ executed. The script then executes it and waits for
 `stack-update-complete` (`stack-create-complete` on a first deploy),
 printing the latest stack events on a failure; "no changes" goes straight
 to the upload.
+
+**iCloud conflict copies.** The checkout lives under `~/Documents`, which
+iCloud "Desktop & Documents" syncs. On 2026-11-26 (Release 1b) iCloud wrote
+13 conflict copies of an older build (`index 2.html`, `sw 2.js`,
+`assets/index.esm-CDWZK7Vo 2.js`, `icons/icon-192 2.png`, …) into
+`frontend/dist` about 19 minutes after `vite build`, while the stack update
+ran, and the sync uploaded them. `deploy-frontend.sh` now runs
+`conflict_copy_guard` (`scripts/config.sh`) after the build and again just
+before the upload: any path under `frontend/dist` whose name has a space and
+a number before the extension (or at the end) stops the deploy with
+`ERROR: sync-conflict copies in …/frontend/dist …`, one line per path. A
+refusal after the build has deployed nothing; one before the upload leaves
+the stack update live and uploads nothing. Delete the listed files and run
+the deploy again: the build rewrites `dist`, and the stack, already
+deployed, has no changes, so the re-run goes from the build straight to the
+upload. The sync has no `--exclude` for such names on purpose: `sync
+--delete` never deletes an object an exclude matches, so copies already in
+the bucket (the 13 of 2026-11-26, unless removed by hand) are deleted by the
+next deploy, one `delete: s3://…` line each. A deploy from a release tag cut
+before this change (`release/1a`, `release/1b`, e.g. a rollback) runs that
+tag's script, without the guard. `backend/tests/core/test_conflict_copy_guard.py`
+pins the pattern and both refusals.
 
 **Live-parity parameters.** SAM CLI (1.162.1) and `aws cloudformation
 deploy` both send `UsePreviousValue` for every parameter a deploy does not
