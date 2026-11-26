@@ -1,11 +1,11 @@
-"""Fake `aws`, `sam` and `git` for the deploy-script tests — no AWS call, build
+"""Fake `aws`, `sam`, `git` and `npm` for the deploy-script tests — no AWS call, build
 or deploy ever runs (the FakeAws pattern of test_copy_ssm_script.py).
 
 FakeCli copies the scripts under test into a private repository layout
 (tmp/repo: infra/scripts, both templates, scripts/provider-bootstrap.sh and
 empty backend/app, backend/db/{migrations,seeds}), so STATE_DIR, backend/.env
 and every path a script derives from its own location are the test's own.
-Stubs named aws, sam and git go first on PATH. Each reads the JSON "world"
+Stubs named aws, sam, git and npm go first on PATH. Each reads the JSON "world"
 (FakeCli.world, saved before every run) and appends its argv, tagged with the
 tool name, to one call log, so a test can assert what ran and in which order.
 
@@ -27,6 +27,12 @@ World keys (all optional):
   cfn_deploy      `aws cloudformation deploy --no-execute-changeset`:
                   "changeset" (default) | "no-changes" | "unnamed"
   git             {"head", "origin_main", "dirty", "staged", "tags"}
+  build           the paths `npm run build` writes into frontend/dist after
+                  emptying it, as `vite build` does (default BUILD_OUTPUT)
+  dist_copies     {moment: [path, ...]}: iCloud sync-conflict copies dropped
+                  into frontend/dist at that moment — "build" (left by the
+                  build), "deploy" (`aws cloudformation deploy`) or "wait"
+                  (`aws cloudformation wait`, the stack update)
 """
 
 import json
@@ -46,6 +52,14 @@ FRONTEND_CHANGESET_ARN = (
     "awscli-cloudformation-package-deploy-1763460000/9d8e7f6a"
 )
 HEAD = "0123456789abcdef0123456789abcdef01234567"
+# What `vite build` writes into frontend/dist today (public/ and assets/).
+BUILD_OUTPUT = [
+    "index.html", "sw.js", "push-payload.js", "manifest.webmanifest",
+    "icons/apple-touch-icon.png", "icons/favicon-32.png", "icons/icon-192.png",
+    "icons/icon-512.png", "icons/icon-maskable-512.png",
+    "assets/index-Cj2uO5w_.css", "assets/index-DJ0EAJZ3.js",
+    "assets/index.esm-BkqI2nGz.js", "assets/index.esm-CDWZK7Vo.js",
+]
 
 _COMMON = r'''
 import json, os, re, signal, stat, sys
@@ -78,6 +92,20 @@ def opt(flag):
 def fail(code, error, operation, message=""):
     sys.stderr.write("\nAn error occurred (%s) when calling the %s operation: %s\n" % (error, operation, message))
     sys.exit(code)
+
+
+def write_dist(paths):
+    dist = os.path.join(os.environ["FAKE_REPO"], "frontend", "dist")
+    for rel in paths:
+        path = os.path.join(dist, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(rel + "\n")
+
+
+def drop_copies(moment):
+    """iCloud writing sync-conflict copies into frontend/dist at this moment."""
+    write_dist(world.get("dist_copies", {}).get(moment, []))
 '''
 
 AWS_STUB = "#!/usr/bin/env python3\n" + _COMMON + r'''
@@ -176,9 +204,11 @@ if args[:2] in (["cloudformation", "delete-change-set"], ["cloudformation", "exe
     sys.exit(0)
 
 if args[:2] == ["cloudformation", "wait"]:
+    drop_copies("wait")
     sys.exit(255 if world.get("wait_fails") else 0)
 
 if args[:2] == ["cloudformation", "deploy"]:
+    drop_copies("deploy")
     # The AWS CLI's own wording (awscli/customizations/cloudformation/deploy.py).
     if "--no-execute-changeset" not in args:
         print("Successfully created/updated stack - %s" % opt("--stack-name"))
@@ -280,8 +310,13 @@ sys.stderr.write("fake git: unsupported call %r\n" % (args,))
 sys.exit(2)
 '''
 
-NPM_STUB = "#!/usr/bin/env python3\n" + _COMMON + r'''
+NPM_STUB = "#!/usr/bin/env python3\n" + _COMMON + "import shutil\nBUILD_OUTPUT = %s\n" % json.dumps(BUILD_OUTPUT) + r'''
 log("npm")
+if args[:2] == ["run", "build"]:
+    # Like `vite build`: dist is emptied, then written.
+    shutil.rmtree(os.path.join(os.environ["FAKE_REPO"], "frontend", "dist"), ignore_errors=True)
+    write_dist(world.get("build", BUILD_OUTPUT))
+    drop_copies("build")
 sys.exit(0)
 '''
 
@@ -356,6 +391,7 @@ class FakeCli:
             "TMPDIR": str(self.tmpdir),
             "LANG": "en_US.UTF-8",
             "FAKE_CLI_ROOT": str(self.root),
+            "FAKE_REPO": str(self.repo),
             "FAKE_CHANGESET_ARN": CHANGESET_ARN,
             "FAKE_FRONTEND_CHANGESET_ARN": FRONTEND_CHANGESET_ARN,
             "FAKE_HEAD": HEAD,

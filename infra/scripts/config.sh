@@ -248,3 +248,39 @@ require_clean_checkout() {
   return 1
 }
 export -f require_clean_checkout
+
+# --- Sync-conflict copies (2026-11-26) --------------------------------------------
+# The checkout lives under ~/Documents, which iCloud "Desktop & Documents"
+# syncs. During the Release 1b frontend deploy iCloud wrote conflict copies of
+# an older build ("index 2.html", "sw 2.js", "assets/index.esm-CDWZK7Vo 2.js",
+# "icons/icon-192 2.png") into frontend/dist between `vite build` and the
+# upload, and the sync published all 13. A copy is named like the original
+# with a space and a number before the extension (or at the end, without
+# one); no build output is named like that.
+conflict_copies() { # dir -> every path under dir named like a sync-conflict copy, sorted; non-zero when dir cannot be listed
+  local listing
+  listing="$(find "$1" -mindepth 1)" || return 1
+  # grep exits 1 when nothing matches: that is the clean answer.
+  printf '%s\n' "$listing" | LC_ALL=C grep -E '/[^/]* [0-9]+(\.[^/]*)?$' | LC_ALL=C sort || [ "$?" -eq 1 ]
+}
+
+# conflict_copy_guard dir -> 0 when nothing under dir is named like a
+# sync-conflict copy; 1, printing every such path and what to do on stderr,
+# when something is, or when dir cannot be listed. Prints nothing on stdout.
+conflict_copy_guard() {
+  local dir="$1" found path
+  if ! found="$(conflict_copies "$dir")"; then
+    echo "ERROR: could not list $dir to check it for sync-conflict copies." >&2
+    return 1
+  fi
+  if [ -z "$found" ]; then
+    return 0
+  fi
+  echo "ERROR: sync-conflict copies in $dir (a space and a number before the extension) — the upload would publish them:" >&2
+  while IFS= read -r path; do
+    echo "         ${path#"$dir"/}" >&2
+  done <<< "$found"
+  echo "       iCloud (Desktop & Documents) wrote them; no build output is named like that." >&2
+  echo "       Delete them and run the deploy again (infra/README.md, \"Deploy safety\")." >&2
+  return 1
+}
