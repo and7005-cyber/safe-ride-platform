@@ -2,7 +2,8 @@
 
 - **Status: deployed** 2026-11-26 (backend 12:22:08Z, frontend 12:45:51Z),
   **with mail on**; smoke, rollback rehearsal and drills done ("Deployed").
-  The next-morning checks and the first 48 hours are open.
+  The next-morning checks (2026-11-27) and the first 48 hours (to
+  2026-11-28 12:22Z) are done, with no rollback: fix forward from here.
 - **Date:** 2026-11-26, started 12:07Z (planned 09:30 GMT; first planned
   for 2026-12-04) ·
   **Release commit:** `634224a`, tagged `release/1b`: `main` after PR #22
@@ -80,7 +81,7 @@ Each gate is a step of the
 | Six-digit PINs re-issued from the Drivers card to every active driver (D28): `salted_v2` = active drivers, `legacy_hmac` 0, `no_pin` 0 per school; Kuumbai's message, leading with the installed app and the typed code, sent to each driver by name | Msingi Bora 4 of 4 `salted_v2` (14:35:45–14:36:49Z; placeholder accounts, the PINs given to no one), Voluntari Academy 1 of 1 (the test driver, 14:25:39Z); `legacy_hmac` 0, `no_pin` 0. No message: no real drivers | **met** (no message needed) |
 | Alarm drill on `ApiServerErrors` and `RetentionHeartbeat`: ALARM and OK mails received | 14:27:15Z on the user's go: `ApiServerErrors` `ALARM` 14:27:16Z → `OK` 14:27:54Z; `RetentionHeartbeat` `ALARM` 14:27:18Z → `OK` 15:27:22Z, an hour after the drill; the user received the mails | **met** |
 | The old unrestricted Maps browser key restricted to localhost or deleted (D45) | 14:34:33Z through `gcloud` on the user's go: "SafeRide Web (browser)" allows only `localhost:5173`, `127.0.0.1:5173` and `localhost:4173`; the live bundle carries the production key; the Fleet Map drew (the user) | **met** |
-| The next morning: the first scheduled run in `last-retention-run`, a `RetentionRunSucceeded` point, the Scheduler metrics under the `ScheduleGroup` dimension, `MigrateFunctionErrors` and target errors `OK` | — | **open** |
+| The next morning: the first scheduled run in `last-retention-run`, a `RetentionRunSucceeded` point, the Scheduler metrics under the `ScheduleGroup` dimension, `MigrateFunctionErrors` and target errors `OK` | 2026-11-27 10:29–10:45Z: `run_id` 2 `ok`, started by the schedule at 22:30:55Z, 11 h 58 min old; a `RetentionRunSucceeded` point in the night's hour, `RetentionHeartbeat` `OK`; `InvocationAttemptCount` under `ScheduleGroup`, the dimension the target-error alarm watches (`TargetErrorCount` not listed yet: no error so far); `MigrateFunctionErrors` and `RetentionScheduleTargetErrors` `OK`; the only ERROR line the mail drill's ("Deployed") | **met** |
 | Guides match the live copy: `manualVocabulary` green | 36 tests green at U13 (uncommitted), "Test evidence". The certify run at `634224a` (2026-11-24) ran vitest 470, the `manualVocabulary` tests among them; the drills met the guides' words on the live screens | **met** |
 | Both operators confirm the drill mails (plan U13 verification; one operator address today, 1a record U1.7) | 2026-11-26: the user confirmed the mail drill's and the alarm drill's mails (one operator address) | **met** |
 
@@ -318,7 +319,7 @@ row's own school, and a link whose school cannot be seen counts as shared.
 | DL12: the reset confirmation says "Their other devices are signed out", while every session of the parent ends | wording; not raised by the code review |
 | `infra/scripts/parity-params.sh` still comments "MAIL_ENABLED stays false until then" | comment only; U13 changed only the template's parameter description |
 | `test_parent_feeds::test_display_status_matches_raw_at_school` fails on a second back-to-back run without a reseed (pre-existing, U12) | reseed between runs |
-| The Scheduler's `TargetErrorCount` dimension (`ScheduleGroup`) is confirmed only after the first night | the checklist's next-morning step |
+| The Scheduler's `TargetErrorCount` dimension (`ScheduleGroup`) is confirmed only after the first night | confirmed 2026-11-27 through `InvocationAttemptCount` ("Deployed", the next morning); `TargetErrorCount` itself appears with the first target error |
 | The heartbeat reports a silent failure about 26 hours after the last success | stated in the checklist and infra/README.md |
 
 ## Code review
@@ -421,7 +422,8 @@ Fixes verified by the suites each batch ran and by a full certify (below).
 - **Decision window for a real rollback: 48 hours** from the deploy (to
   about 2026-11-28 12:22Z), with `driver-pin-hash-versions-per-school` as
   the count of drivers who would need a new PIN under 1a: all five since
-  the deploy-day re-issue. After that, fix forward.
+  the deploy-day re-issue. **The window closed at 2026-11-28 12:22Z with
+  no rollback** ("Deployed", the first 48 hours): fix forward.
 - **Mail is on** (`MAIL_ENABLED=true` since the deploy): a rollback's 1a
   backend deploy leaves it unset, and every 1b backend deploy exports it.
 - **The iCloud guard is on `main` only** (PR #25): a deploy from
@@ -723,6 +725,72 @@ On the user's go; no student saves or imports from step 1 to step 8.
   key (apex and www only), not the old one (compared without printing
   either), and the Fleet Map drew (the user).
 
+### The next morning (2026-11-27, 10:29–10:45Z)
+
+- `last-retention-run`: `run_id` 2, `ok`, started by the schedule at
+  22:30:55Z and finished in the same second, 11 h 58 min old at the read;
+  `trail_batches` 2, every other count 0. `RetentionRunSucceeded` 1 in the
+  night's hour; `RetentionHeartbeat` `OK` (since 15:27:22Z).
+- The Scheduler: `InvocationAttemptCount` (1 at 22:30Z) under
+  `ScheduleGroup` = the stack's `OpsScheduleGroup`, the dimension
+  `RetentionScheduleTargetErrors` watches (`AWS/Scheduler`
+  `TargetErrorCount`, the sum over 5 minutes, missing data not breaching).
+  `TargetErrorCount` is not listed yet (no target error so far), so the
+  sibling metric proves the dimension.
+- All 22 alarms `OK` (18 in af-south-1, 4 in us-east-1),
+  `MigrateFunctionErrors` and `RetentionScheduleTargetErrors` among them.
+- ERROR lines over the three groups since 12:18Z: one, the mail drill's
+  `SendingPausedException` (13:25:25Z). WARNING lines: the drills'
+  `school-required` and two `pin-failure`, and two `psycopg.pool`
+  reconnects (13:13:27Z on the deploy day, 06:36:17Z; "Findings").
+- Also read: the gateway since the smoke, 15,290 requests, 266 `4xx` (251
+  `404` from scanners probing for secret files; the 15 others all in the
+  14:10–14:35Z drill and rehearsal session) and 0 `5xx`; database
+  connections at most 24 of 79 (14:10Z, the drills); the automated backup
+  23:11–23:15Z, nothing pending; CloudTrail logging, no delivery error. No
+  app use overnight (school holiday, no runs).
+
+### The first 48 hours (to 2026-11-28 12:22Z)
+
+Read at 11:30–11:36Z (+47 h) and at 12:23Z (+48 h):
+
+- **Subscriptions** (+47 h): one per topic, `email`, a full ARN in both
+  regions; none `PendingConfirmation`.
+- **Alarms:** all 22 `OK` at both reads; no state change since 15:27:22Z
+  on the deploy day (`describe-alarm-history` since 12:18Z holds only the
+  deploy's and the rehearsal's creations, the heartbeat's first evaluation
+  and the two drills). `SchoolRequiredBurst`, `PinFailureBurst`, `PinLocked`
+  and `ApiClientErrorsBurst` never fired.
+- **The second nightly run:** `run_id` 3, `ok` at 22:30:55Z on 2026-11-27:
+  `auth_sessions` 8, `password_reset_tokens` 3, `pin_login_failures` 2,
+  `trail_batches` 2, every other count 0; `stale-sessions` 0/0 after it.
+  `RetentionRunSucceeded` has a point in the hour of each of the three runs.
+- **`hardening`** (11:31Z): `salted_v2` 4 and 1, `legacy_hmac` 0, `no_pin`
+  0; no driver with several memberships; no school without a driver code;
+  no PIN failures in the last 15 minutes; no live token; no unverified
+  account; no temporary password; no open run.
+- **ERROR lines** over the three groups since the deploy: still only the
+  mail drill's (read at 12:23Z); no WARNING line since the 2026-11-27 read;
+  no failed invocation since the deploy.
+- **The gateway** since the 2026-11-27 read: 17,407 requests, 4 `4xx` (no
+  non-404 one in the API log), 0 `5xx`; 0 `5xx` since the deploy. One app
+  request apart from the health checks (05:08Z, `GET /api/push/config`,
+  200).
+- **The database:** at most 8 connections in the last 24 hours (of 79);
+  the automated backups at 23:11Z each night, `available`; no pending
+  maintenance. CloudTrail logging, no delivery error. Health
+  `{"status":"ok","db":"ok","version":"634224a"}`; both stacks
+  `UPDATE_COMPLETE` from the deploy day.
+- **Spend** (Cost Explorer, the whole account): 5.33–5.76 USD a day from
+  2026-11-19 to 2026-11-25, 5.37 USD on 2026-11-26 and 4.81 USD on
+  2026-11-27 (estimated, the day not yet complete); no new service line.
+- **Not read:** the first school morning (database connections at the
+  peak, drivers' sign-ins, the `gps` trail rows): a school holiday, no runs.
+  Blank-map reports: no app use in the window apart from the deploy day's
+  drills, so nothing to report.
+- **Rollback decision:** none needed. The window closed at 12:22Z; fix
+  forward from here.
+
 ### Findings and follow-ups
 
 - **The checklist's frontend row** reads the gate's summary view: expect
@@ -749,19 +817,34 @@ On the user's go; no student saves or imports from step 1 to step 8.
   school just left answer 403 (13:19:06Z, 14:19:17Z) or 401 after sign-out
   (14:24:48Z). Harmless, but they count toward the non-404 4xx alarm.
 - **iCloud:** above; the guard is PR #25 on `main`.
+- **`psycopg.pool` reconnect warnings:** "error connecting in 'pool-1'"
+  (a connection timeout, or "SSL connection has been closed
+  unexpectedly") at 13:13:27Z on the deploy day and 06:36:17Z on
+  2026-11-27, with no failed request: the health check in the same second
+  answered 200. Not new in 1b: five under 1a (three on 2026-11-19, one
+  each on 2026-11-24 and 2026-11-25). A WARNING the pool recovers from;
+  worth a look only if a request fails with it.
+- **Retention and sessions:** the second night deleted the 8 sessions
+  that had passed 7 days expired since the first run, so `stale-sessions`
+  stays near 0, and `driver-last-sign-in-per-school` reads `null` for a
+  driver 7 days after their last session expires (the finding above).
 
 ### Cost
 
 No fixed-cost resource is added. 1b adds six CloudWatch alarms, five log
 metric filters, one Scheduler schedule (one run a night) and SES sending at
 production rates; it was not priced on the deploy day. The SafeRide-only
-budget (100 USD a month, PR #19) is live and tracks it.
+budget (100 USD a month, PR #19) is live and tracks it. The spend read in
+the first 48 hours (above) shows no new service line and the account's
+daily spend unchanged.
 
 ### Still open
 
-- **The next morning** (the first scheduled run at 22:30Z): the checklist's
-  four reads.
-- **The first 48 hours** and the **rollback decision window** to about
-  2026-11-28 12:22Z; after that, fix forward.
+- **Before the first route day** (the checklist's freeze readiness
+  check, two working days before the term; it carries into Release 2's
+  record), with the first school morning's reads: database connections
+  at the peak, the drivers' sign-ins and the `gps` trail rows. Fix
+  `driver-last-sign-in-per-school` first ("Findings").
+- The checklist follow-ups in "Findings and follow-ups".
 - The Samsung Internet check before Release 2 enforces the CSP (the 1a
   record).
